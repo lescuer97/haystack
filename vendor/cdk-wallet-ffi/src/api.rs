@@ -233,6 +233,7 @@ fn send_error(e: FfiErr) -> CdkSendResult {
 /// path. On success the returned `handle` is owned by the caller and must be
 /// freed with [`cdk_wallet_close`].
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_open(
     seed: Option<c_slice::Ref<'_, u8>>,
     db_path: Option<char_p::Ref<'_>>,
@@ -280,6 +281,7 @@ pub fn cdk_wallet_open(
 /// passing `NULL` is a safe no-op. No call using the handle may still be in
 /// flight.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_close(handle: Option<repr_c::Box<crate::wallet::CdkWallet>>) -> CdkStatusResult {
     guard(
         || CdkStatusResult::err(CdkStatus::InternalError, "internal panic during close"),
@@ -302,6 +304,7 @@ pub fn cdk_wallet_close(handle: Option<repr_c::Box<crate::wallet::CdkWallet>>) -
 /// Idempotent for an already-approved mint. Requires network access to fetch
 /// the mint's advertised units.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_add_mint(
     handle: Option<&mut crate::wallet::CdkWallet>,
     mint_url: Option<char_p::Ref<'_>>,
@@ -332,6 +335,7 @@ pub fn cdk_wallet_add_mint(
 
 /// List approved mint URLs.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_list_mints(handle: Option<&crate::wallet::CdkWallet>) -> CdkMintListResult {
     let poison = handle.as_ref().map(|h| h.poison_flag());
     guard_poison(
@@ -358,6 +362,7 @@ pub fn cdk_wallet_list_mints(handle: Option<&crate::wallet::CdkWallet>) -> CdkMi
 
 /// List approved mints with their locally spendable Sat balance.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_list_balances(handle: Option<&crate::wallet::CdkWallet>) -> CdkBalanceListResult {
     let poison = handle.as_ref().map(|h| h.poison_flag());
     guard_poison(
@@ -394,6 +399,7 @@ pub fn cdk_wallet_list_balances(handle: Option<&crate::wallet::CdkWallet>) -> Cd
 
 /// Receive a token, returning the net Sat amount credited.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_receive(
     handle: Option<&mut crate::wallet::CdkWallet>,
     token: Option<char_p::Ref<'_>>,
@@ -432,6 +438,7 @@ pub fn cdk_wallet_receive(
 /// is cancelled. On success the returned `token` is a bearer secret owned by
 /// the caller and must be freed with [`cdk_string_free`].
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_send(
     handle: Option<&mut crate::wallet::CdkWallet>,
     mint_url: Option<char_p::Ref<'_>>,
@@ -474,6 +481,7 @@ pub fn cdk_wallet_send(
 
 /// List pending outgoing tokens (created but not claimed).
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_list_pending_tokens(
     handle: Option<&crate::wallet::CdkWallet>,
 ) -> CdkPendingListResult {
@@ -512,6 +520,7 @@ pub fn cdk_wallet_list_pending_tokens(
 
 /// Retrieve a single pending outgoing token by its 16-byte operation id.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_get_pending_token(
     handle: Option<&crate::wallet::CdkWallet>,
     operation_id: Option<c_slice::Ref<'_, u8>>,
@@ -555,6 +564,7 @@ pub fn cdk_wallet_get_pending_token(
 ///
 /// Pass `NULL` for `mint_url` to recover every approved mint.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_recover(
     handle: Option<&mut crate::wallet::CdkWallet>,
     mint_url: Option<char_p::Ref<'_>>,

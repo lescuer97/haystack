@@ -14,15 +14,25 @@
 //! * Never log or echo bearer tokens.
 
 use std::collections::BTreeSet;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::{self, DirBuilder, File, OpenOptions};
+#[cfg(not(target_arch = "wasm32"))]
 use std::io;
+#[cfg(not(target_arch = "wasm32"))]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::OnceLock;
 use std::time::Duration;
 
+#[cfg(target_arch = "wasm32")]
+use crate::browser_db::BrowserDatabase as WalletSqliteDatabase;
+#[cfg(target_arch = "wasm32")]
+use crate::browser_platform::{timeout, BrowserLock as File};
 use cdk::mint_url::MintUrl;
 use cdk::nuts::{CurrencyUnit, Id, Proofs, SecretKey, SwapRequest, Token};
 use cdk::wallet::{
@@ -33,9 +43,13 @@ use cdk::{Amount, Error as CdkError};
 use cdk_common::bitcoin::hashes::{sha256, Hash as _, HashEngine as _};
 use cdk_common::database::{self, WalletDatabase};
 use cdk_common::wallet::{OperationData, WalletSagaState};
+#[cfg(not(target_arch = "wasm32"))]
 use cdk_sqlite::WalletSqliteDatabase;
+#[cfg(not(target_arch = "wasm32"))]
 use rusqlite::OptionalExtension as _;
 use safer_ffi::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::time::timeout;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -74,9 +88,11 @@ const RECOVERY_DEADLINE: Duration = Duration::from_secs(120);
 ///
 /// A single runtime is created lazily and never shut down. Every blocking ABI
 /// call drives its future on this runtime with [`tokio::runtime::Runtime::block_on`].
+#[cfg(not(target_arch = "wasm32"))]
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 /// Borrow (initializing on first use) the process-wide Tokio runtime.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -264,104 +280,111 @@ impl CdkWallet {
         let mut seed = Zeroizing::new([0u8; 64]);
         seed.copy_from_slice(seed_bytes);
 
-        if path_str.is_empty() {
-            return Err(FfiErr::new(
-                CdkStatus::InvalidPath,
-                "database path is empty",
-            ));
-        }
-        let path = PathBuf::from(path_str);
-        if path.is_dir() {
-            return Err(FfiErr::new(
-                CdkStatus::InvalidPath,
-                "database path points at a directory",
-            ));
-        }
-        ensure_parent_dirs(&path)?;
-
-        // Distinguish a genuinely new database from any pre-existing path
-        // (including an empty file). `symlink_metadata` does not follow the
-        // final component, so a symlink is detected here.
-        let existed = match fs::symlink_metadata(&path) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    return Err(FfiErr::new(
-                        CdkStatus::InvalidPath,
-                        "database path is a symbolic link; refusing to follow it",
-                    ));
-                }
-                true
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-            Err(e) => {
+        #[cfg(not(target_arch = "wasm32"))]
+        let (db, file) = {
+            if path_str.is_empty() {
                 return Err(FfiErr::new(
                     CdkStatus::InvalidPath,
-                    format!("could not inspect the database path: {e}"),
-                ))
+                    "database path is empty",
+                ));
             }
-        };
+            let path = PathBuf::from(path_str);
+            if path.is_dir() {
+                return Err(FfiErr::new(
+                    CdkStatus::InvalidPath,
+                    "database path points at a directory",
+                ));
+            }
+            ensure_parent_dirs(&path)?;
 
-        // `O_NOFOLLOW` refuses a symlinked final component at open time;
-        // `O_CLOEXEC` keeps the lock fd out of child processes. `create(true)`
-        // plus an explicit mode keeps a brand-new file 0600.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .map_err(|e| {
-                FfiErr::new(CdkStatus::InvalidPath, format!("could not open file: {e}"))
+            // Distinguish a genuinely new database from any pre-existing path
+            // (including an empty file). `symlink_metadata` does not follow the
+            // final component, so a symlink is detected here.
+            let existed = match fs::symlink_metadata(&path) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(FfiErr::new(
+                            CdkStatus::InvalidPath,
+                            "database path is a symbolic link; refusing to follow it",
+                        ));
+                    }
+                    true
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => {
+                    return Err(FfiErr::new(
+                        CdkStatus::InvalidPath,
+                        format!("could not inspect the database path: {e}"),
+                    ))
+                }
+            };
+
+            // `O_NOFOLLOW` refuses a symlinked final component at open time;
+            // `O_CLOEXEC` keeps the lock fd out of child processes. `create(true)`
+            // plus an explicit mode keeps a brand-new file 0600.
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)
+                .map_err(|e| {
+                    FfiErr::new(CdkStatus::InvalidPath, format!("could not open file: {e}"))
+                })?;
+
+            // `try_lock` gives process-wide mutual exclusion between wrapper handles.
+            file.try_lock().map_err(|e| {
+                FfiErr::new(
+                    CdkStatus::AlreadyOpen,
+                    format!("database is already open by another handle: {e}"),
+                )
             })?;
 
-        // `try_lock` gives process-wide mutual exclusion between wrapper handles.
-        file.try_lock().map_err(|e| {
-            FfiErr::new(
-                CdkStatus::AlreadyOpen,
-                format!("database is already open by another handle: {e}"),
-            )
-        })?;
+            // Validate the *opened* file (fstat): regular file, owner-only perms.
+            check_regular_file(&file)?;
 
-        // Validate the *opened* file (fstat): regular file, owner-only perms.
-        check_regular_file(&file)?;
-
-        // Validate an existing marker read-only, before any migration runs.
-        if existed {
-            validate_existing_marker(&path, &seed)?;
-        }
-
-        // Reject an inherited database whose permissions are too broad, before
-        // upstream migrations are allowed to touch it. New files are created
-        // 0600 above, so this only fires for pre-existing files.
-        check_permissions(&file)?;
-
-        let db = WalletSqliteDatabase::new(path.clone()).await.map_err(|e| {
+            // Validate an existing marker read-only, before any migration runs.
             if existed {
-                FfiErr::new(
-                    CdkStatus::UnsupportedDatabase,
-                    format!("could not open existing database: {e}"),
-                )
-            } else {
-                FfiErr::new(
-                    CdkStatus::DatabaseError,
-                    format!("could not create database: {e}"),
-                )
+                validate_existing_marker(&path, &seed)?;
             }
-        })?;
-        let db = Arc::new(db);
 
-        // A genuinely new database is marked with a single KV write before the
-        // wallet is used. Existing databases were validated above.
-        if !existed {
-            let mut marker = [0u8; MARKER_LEN];
-            marker[..4].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-            marker[4..].copy_from_slice(&seed_fingerprint(&seed[..]));
-            db.kv_write(KV_NAMESPACE, "", KEY_MARKER, &marker)
-                .await
-                .map_err(db_error)?;
-        }
+            // Reject an inherited database whose permissions are too broad, before
+            // upstream migrations are allowed to touch it. New files are created
+            // 0600 above, so this only fires for pre-existing files.
+            check_permissions(&file)?;
+
+            let db = WalletSqliteDatabase::new(path.clone()).await.map_err(|e| {
+                if existed {
+                    FfiErr::new(
+                        CdkStatus::UnsupportedDatabase,
+                        format!("could not open existing database: {e}"),
+                    )
+                } else {
+                    FfiErr::new(
+                        CdkStatus::DatabaseError,
+                        format!("could not create database: {e}"),
+                    )
+                }
+            })?;
+            let db = Arc::new(db);
+
+            // A genuinely new database is marked with a single KV write before the
+            // wallet is used. Existing databases were validated above.
+            if !existed {
+                let mut marker = [0u8; MARKER_LEN];
+                marker[..4].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+                marker[4..].copy_from_slice(&seed_fingerprint(&seed[..]));
+                db.kv_write(KV_NAMESPACE, "", KEY_MARKER, &marker)
+                    .await
+                    .map_err(db_error)?;
+            }
+
+            (db, file)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let (db, file) = crate::browser_platform::open_database(&seed, path_str).await?;
 
         let localstore: Arc<dyn WalletDatabase<database::Error> + Send + Sync> = db.clone();
         let repo = WalletRepositoryBuilder::new()
@@ -428,8 +451,7 @@ impl CdkWallet {
         }
 
         let deadline = self.network_deadline();
-        let info = match tokio::time::timeout(deadline, self.repo.fetch_mint_info(&mint_url)).await
-        {
+        let info = match timeout(deadline, self.repo.fetch_mint_info(&mint_url)).await {
             Ok(result) => result.map_err(|e| {
                 let status = match &e {
                     CdkError::HttpError(..) | CdkError::Timeout | CdkError::CouldNotGetMintInfo => {
@@ -536,7 +558,7 @@ impl CdkWallet {
             .map_err(|e| FfiErr::new(CdkStatus::InternalError, format!("{e}")))?;
 
         let deadline = self.network_deadline();
-        let amount = match tokio::time::timeout(
+        let amount = match timeout(
             deadline,
             wallet.receive(token_str, receive_options(signing_keys)),
         )
@@ -580,7 +602,7 @@ impl CdkWallet {
         let mint_url = parse_mint_url(mint_url_str)?;
         let wallet = self.approved_wallet(&mint_url).await?;
         let deadline = self.network_deadline();
-        let keyset = match tokio::time::timeout(deadline, wallet.active_keyset()).await {
+        let keyset = match timeout(deadline, wallet.active_keyset()).await {
             Ok(Ok(keyset)) => keyset,
             Ok(Err(e)) => return Err(map_keyset_error(&e)),
             Err(_) => {
@@ -608,7 +630,7 @@ impl CdkWallet {
         })?;
         let wallet = self.approved_wallet(&mint_url).await?;
         let deadline = self.network_deadline();
-        let keyset = match tokio::time::timeout(deadline, wallet.keyset(keyset_id)).await {
+        let keyset = match timeout(deadline, wallet.keyset(keyset_id)).await {
             Ok(Ok(keyset)) => keyset,
             Ok(Err(e)) => return Err(map_keyset_error(&e)),
             Err(_) => {
@@ -668,7 +690,7 @@ impl CdkWallet {
         })?;
         let client = HttpClient::new(mint_url, None);
         let deadline = self.network_deadline();
-        match tokio::time::timeout(deadline, client.post_swap(swap_request)).await {
+        match timeout(deadline, client.post_swap(swap_request)).await {
             Ok(Ok(response)) => serde_json::to_string(&response).map_err(|e| {
                 FfiErr::new(
                     CdkStatus::InternalError,
@@ -718,7 +740,7 @@ impl CdkWallet {
 
         let wallet = self.approved_wallet(&mint_url).await?;
         let deadline = self.network_deadline();
-        let amount = match tokio::time::timeout(
+        let amount = match timeout(
             deadline,
             wallet.receive_proofs(proofs, receive_options(signing_keys), None, None),
         )
@@ -799,7 +821,7 @@ impl CdkWallet {
         };
 
         let deadline = self.network_deadline();
-        let prepared = match tokio::time::timeout(
+        let prepared = match timeout(
             deadline,
             wallet.prepare_send(Amount::from(amount_sats), opts),
         )
@@ -866,7 +888,7 @@ impl CdkWallet {
                 .await);
         }
 
-        match tokio::time::timeout(deadline, prepared.confirm(None)).await {
+        match timeout(deadline, prepared.confirm(None)).await {
             Ok(Ok(token)) => Ok(SendOutcome {
                 token: token.to_string(),
                 operation_id,
@@ -917,7 +939,7 @@ impl CdkWallet {
         message: String,
     ) -> FfiErr {
         let deadline = self.network_deadline();
-        match tokio::time::timeout(deadline, prepared.cancel()).await {
+        match timeout(deadline, prepared.cancel()).await {
             Ok(Ok(())) => FfiErr::with_op(status, message, operation_id, total_fee),
             Ok(Err(e)) => {
                 self.unresolved.insert(mint_url.clone());
@@ -1024,9 +1046,7 @@ impl CdkWallet {
         let deadline = self.recovery_deadline();
         let mut reports = Vec::with_capacity(wallets.len());
         for wallet in wallets {
-            let report = match tokio::time::timeout(deadline, wallet.recover_incomplete_sagas())
-                .await
-            {
+            let report = match timeout(deadline, wallet.recover_incomplete_sagas()).await {
                 Ok(Ok(report)) => {
                     let failed = report.failed as u32;
                     let skipped = report.skipped as u32;
@@ -1162,7 +1182,7 @@ impl std::fmt::Debug for PendingToken {
 /// Compute the domain-separated SHA-256 fingerprint of the seed.
 ///
 /// Uses the hash engine directly so no seed-sized buffer is ever allocated.
-fn seed_fingerprint(seed: &[u8]) -> [u8; 32] {
+pub(crate) fn seed_fingerprint(seed: &[u8]) -> [u8; 32] {
     let mut engine = sha256::Hash::engine();
     engine.input(FINGERPRINT_PREFIX);
     engine.input(seed);
@@ -1171,6 +1191,7 @@ fn seed_fingerprint(seed: &[u8]) -> [u8; 32] {
 
 /// Create any missing parent directories of `path` with owner-only (0700)
 /// permissions. Existing directories are never re-permissioned.
+#[cfg(not(target_arch = "wasm32"))]
 fn ensure_parent_dirs(path: &Path) -> FfiResult<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -1205,6 +1226,7 @@ fn ensure_parent_dirs(path: &Path) -> FfiResult<()> {
 }
 
 /// Validate the opened database file (via `fstat`): it must be a regular file.
+#[cfg(not(target_arch = "wasm32"))]
 fn check_regular_file(file: &File) -> FfiResult<()> {
     let meta = file.metadata().map_err(|e| {
         FfiErr::new(
@@ -1224,6 +1246,7 @@ fn check_regular_file(file: &File) -> FfiResult<()> {
 /// Reject an inherited database whose group/other permissions are non-zero.
 ///
 /// The file is never chmod-ed silently; the caller must fix the permissions.
+#[cfg(not(target_arch = "wasm32"))]
 fn check_permissions(file: &File) -> FfiResult<()> {
     let meta = file.metadata().map_err(|e| {
         FfiErr::new(
@@ -1250,6 +1273,7 @@ fn check_permissions(file: &File) -> FfiResult<()> {
 /// `UnsupportedDatabase` (not `SeedMismatch`), an incompatible version as
 /// `UnsupportedFormatVersion`, and only a genuine fingerprint mismatch as
 /// `SeedMismatch`.
+#[cfg(not(target_arch = "wasm32"))]
 fn validate_existing_marker(path: &Path, seed: &[u8; 64]) -> FfiResult<()> {
     let conn =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)

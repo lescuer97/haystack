@@ -1,0 +1,39 @@
+[package]
+name = "cdk-wallet-browser"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cdk = { version = "=0.18.3", default-features = false, features = ["wallet"] }
+cdk-common = { version = "=0.18.3", default-features = false, features = ["wallet"] }
+cdk-spilman = { path = "../../vendor/cdk-spilman", default-features = false, features = ["wallet"] }
+safer-ffi = { version = "=0.1.13", features = ["proc_macros"] }
+bip39 = { version = "=2.2.2", features = ["rand", "zeroize"] }
+zeroize = "1"
+url = "2"
+uuid = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-time = "1"
+web-sys = { version = "0.3", features = ["Window", "Storage", "console"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+
+[dev-dependencies]
+cdk-common = { version = "=0.18.3", default-features = false, features = ["wallet", "test"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+paste = "1"
