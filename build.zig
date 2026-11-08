@@ -49,6 +49,49 @@ pub fn build(b: *std.Build) void {
     const raylib = raylib_dep.module("raylib"); // main raylib module
     const raygui = raylib_dep.module("raygui"); // raygui module
     const raylib_artifact = raylib_dep.artifact("raylib"); // raylib C library
+
+    // -------------------------------------------------------------------------
+    // Vendored Rust `cdk-wallet-ffi` static library and its generated C header.
+    // -------------------------------------------------------------------------
+    // Native Linux libraries required by the Rust staticlib, verified with
+    // `cargo rustc --release --locked --lib -- --print=native-static-libs`.
+    // (Do not copy Iroh's macOS `-lSystem` flags.)
+    //
+    // The Rust staticlib is built with `panic = "unwind"` (required so the ABI
+    // can `catch_unwind` panics instead of aborting), so its `_Unwind_*`
+    // references must be resolved. This host ships `libunwind` (with a
+    // `libunwind.so` dev symlink) rather than a `libgcc_s.so` symlink, so we
+    // link `libunwind` explicitly.
+    const native_libs = [_][]const u8{ "unwind", "pthread", "dl", "rt", "util", "m" };
+    const rust_manifest = "vendor/cdk-wallet-ffi/Cargo.toml";
+    const rust_static_lib = "vendor/cdk-wallet-ffi/target/release/libcdk_wallet_ffi.a";
+    const rust_include_dir = "vendor/cdk-wallet-ffi/include";
+
+    // Build the Rust staticlib (release) with the pinned toolchain, `--locked`.
+    const rust_build = b.addSystemCommand(&.{
+        "cargo",           "+stable",     "build", "--release", "--locked",
+        "--manifest-path", rust_manifest,
+    });
+    rust_build.setCwd(b.path("."));
+    rust_build.has_side_effects = true;
+
+    // The `cdk` module exposes the generated C header. Zig 0.17 removed
+    // `@cImport`, so the header is translated to a Zig module by the build
+    // system (`b.addTranslateC`) and re-exported as `cdk.c`.
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/cdk-wallet-ffi/include/cdk_wallet.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    translate_c.addIncludePath(b.path(rust_include_dir));
+    const cdk_c_mod = translate_c.addModule("cdk_c");
+
+    const cdk_mod = b.addModule("cdk", .{
+        .root_source_file = b.path("src/cdk.zig"),
+        .target = target,
+    });
+    cdk_mod.addImport("cdk_c", cdk_c_mod);
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -93,6 +136,15 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkLibrary(raylib_artifact);
     exe.root_module.addImport("raylib", raylib);
     exe.root_module.addImport("raygui", raygui);
+
+    // Link the vendored wallet FFI static library and expose the `cdk` module.
+    exe.root_module.addImport("cdk", cdk_mod);
+    exe.root_module.addObjectFile(b.path(rust_static_lib));
+    exe.root_module.link_libc = true;
+    for (native_libs) |name| {
+        exe.root_module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
+    }
+    exe.step.dependOn(&rust_build.step);
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
@@ -148,6 +200,9 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    // The executable links the Rust staticlib, so a clean `zig build test` must
+    // build it first.
+    exe_tests.step.dependOn(&rust_build.step);
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
@@ -158,6 +213,83 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+
+    // -------------------------------------------------------------------------
+    // Wallet-specific build steps.
+    // -------------------------------------------------------------------------
+
+    // `zig build wallet` just builds the vendored Rust static library.
+    const wallet_step = b.step("wallet", "Build the vendored Rust wallet FFI static library");
+    wallet_step.dependOn(&rust_build.step);
+
+    // `zig build header-check` verifies the committed header matches the sources.
+    const header_check = b.addSystemCommand(&.{
+        "cargo",           "+stable",     "run",   "--locked",         "--features", "headers",
+        "--manifest-path", rust_manifest, "--bin", "generate-headers", "--",         "--check",
+    });
+    header_check.setCwd(b.path("."));
+    header_check.has_side_effects = true;
+    const header_check_step = b.step("header-check", "Verify the generated C header is up to date");
+    header_check_step.dependOn(&header_check.step);
+
+    // `zig build test-wallet` runs the Rust test suite (policy + fake-mint
+    // end-to-end) and the Zig C-ABI consumer test.
+    const rust_test = b.addSystemCommand(&.{
+        "cargo", "+stable", "test", "--locked", "--manifest-path", rust_manifest,
+    });
+    rust_test.setCwd(b.path("."));
+    rust_test.has_side_effects = true;
+
+    const wallet_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/wallet_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wallet_test_mod.addImport("cdk", cdk_mod);
+    wallet_test_mod.addObjectFile(b.path(rust_static_lib));
+    wallet_test_mod.link_libc = true;
+    for (native_libs) |name| {
+        wallet_test_mod.linkSystemLibrary(name, .{ .use_pkg_config = .no });
+    }
+
+    const wallet_tests = b.addTest(.{
+        .root_module = wallet_test_mod,
+    });
+    wallet_tests.step.dependOn(&rust_build.step);
+    const run_wallet_tests = b.addRunArtifact(wallet_tests);
+
+    // `zig build test-spilman` runs the offline CDK ⇄ Spilman integration suite
+    // (contract, handoff, and fixture-replay tests). It links the same static
+    // library but has its own module so the two suites stay readable.
+    const spilman_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/spilman_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    spilman_test_mod.addImport("cdk", cdk_mod);
+    spilman_test_mod.addObjectFile(b.path(rust_static_lib));
+    spilman_test_mod.link_libc = true;
+    for (native_libs) |name| {
+        spilman_test_mod.linkSystemLibrary(name, .{ .use_pkg_config = .no });
+    }
+
+    const spilman_tests = b.addTest(.{
+        .root_module = spilman_test_mod,
+    });
+    spilman_tests.step.dependOn(&rust_build.step);
+    const run_spilman_tests = b.addRunArtifact(spilman_tests);
+
+    const test_spilman_step = b.step(
+        "test-spilman",
+        "Run the offline CDK and Spilman channel C-ABI integration tests",
+    );
+    test_spilman_step.dependOn(&run_spilman_tests.step);
+
+    const test_wallet_step = b.step("test-wallet", "Run the Rust wallet tests and the Zig C-ABI consumer test");
+    test_wallet_step.dependOn(&header_check.step);
+    test_wallet_step.dependOn(&rust_test.step);
+    test_wallet_step.dependOn(&run_wallet_tests.step);
+    test_wallet_step.dependOn(test_spilman_step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

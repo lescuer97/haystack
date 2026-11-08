@@ -37,13 +37,21 @@
             .hash = "raylib_zig-6.2.0-KE8RELGmBQDX1v1DqBN57pNxJ-b-MIa1S-M7NXT9Eplr",
         },
     },
+    // Only the sources needed to build the Zig executable and its vendored
+    // Rust staticlib. The Rust build directory (`vendor/cdk-wallet-ffi/target`,
+    // multi-gigabyte and gitignored) must never be packaged, so the vendor tree
+    // is listed file-by-file rather than as a whole directory.
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
         "assets",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        "docs",
+        "vendor/cdk-wallet-ffi/Cargo.toml",
+        "vendor/cdk-wallet-ffi/Cargo.lock",
+        "vendor/cdk-wallet-ffi/README.md",
+        "vendor/cdk-wallet-ffi/include",
+        "vendor/cdk-wallet-ffi/src",
+        "vendor/cdk-spilman",
     },
 }
