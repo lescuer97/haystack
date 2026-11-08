@@ -1,0 +1,77 @@
+[package]
+name = "cdk-wallet-ffi"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+description = "Minimal, boring C ABI wrapper around a subset of cdk::wallet::WalletRepository"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# A `staticlib` for the Zig application to link, plus an `rlib` so that the
+# header generator binary and integration/unit tests can depend on the crate
+# normally. No `cdylib` is produced.
+[lib]
+name = "cdk_wallet_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "generate-headers"
+path = "src/bin/generate_headers.rs"
+required-features = ["headers"]
+
+[features]
+default = []
+# Enables safer-ffi's header generation machinery. Only needed for the
+# `generate-headers` binary and the `headers-check` test.
+headers = ["safer-ffi/headers"]
+
+[dependencies]
+# Exact pins required by the project brief.
+cdk = { version = "=0.18.3", default-features = false, features = ["wallet"] }
+cdk-sqlite = { version = "=0.18.3", default-features = false, features = ["wallet"] }
+# Used only for the `bitcoin::hashes` SHA-256 re-export (no bespoke crypto) and
+# for the `WalletDatabase` trait / saga types.
+cdk-common = { version = "=0.18.3", default-features = false }
+safer-ffi = { version = "=0.1.13", features = ["proc_macros"] }
+# Persistent multi-threaded runtime; the Zig side calls the blocking ABI from a
+# worker thread.
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "time",
+    "net",
+    "sync",
+] }
+# URL policy validation. `MintUrl` is not a full validator.
+url = "2"
+uuid = "1"
+# `O_NOFOLLOW` / `O_CLOEXEC` for the database open; already transitive.
+libc = "0.2"
+# Read-only marker precheck *before* upstream migrations run. Already
+# transitive through `cdk-sqlite`; no new SQL schema is introduced.
+rusqlite = { version = "0.31", features = ["bundled"] }
+# Best-effort scrubbing of stack copies of the seed. Already transitive.
+zeroize = "1"
+# BIP-39 mnemonic generation / parsing / seed derivation, with the same
+# semantics as upstream CDK. `rand` powers `Mnemonic::generate` with a
+# cryptographic RNG; `zeroize` scrubs the mnemonic on drop. Already present in
+# the dependency graph transitively; this only adds a direct edge. English is
+# always compiled in, so no language feature is required.
+bip39 = { version = "=2.2.2", features = ["rand", "zeroize"] }
+
+# Vendored Spilman payment-channel library. The FFI layer exposes a stateless
+# subset of its pure primitives plus a handful of CDK wallet conversion helpers.
+cdk-spilman = { path = "../cdk-spilman", default-features = false, features = ["wallet"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Dev-only. These pull `cdk` with the `mint` feature and a local axum server so
+# the end-to-end test can run against an in-process fake mint. They are never
+# part of a normal `cargo build` of the library.
+[dev-dependencies]
+cdk = { version = "=0.18.3", features = ["mint"] }
+cdk-sqlite = { version = "=0.18.3", features = ["mint"] }
+cdk-axum = "=0.18.3"
+cdk-fake-wallet = "=0.18.3"
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }
+tempfile = "3"

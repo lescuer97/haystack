@@ -1,0 +1,3189 @@
+#![allow(missing_docs)]
+//! Spilman Protocol Bridge
+//!
+//! This module provides a high-level bridge for implementing Spilman payment channels
+//! in any service provider. It handles the core protocol logic, validation, and
+//! signature verification, while delegating storage and pricing to a host hook.
+//!
+//! # Sans-IO integration model
+//!
+//! The preferred integration path for durable services is to use explicit phases:
+//! validate or prepare protocol data, let the caller perform mint I/O and retry
+//! orchestration, then explicitly record or mark the completed state. The
+//! all-in-one close/funding helpers remain as convenience wrappers for simple
+//! callers and tests.
+
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use serde::{Deserialize, Serialize};
+
+use super::params::Stage2Role;
+use super::{
+    verify_valid_channel, BalanceUpdateMessage, ChannelParameters, CommitmentOutputs,
+    DeterministicSecretWithBlinding, EstablishedChannel, KeysetInfo,
+};
+use async_trait::async_trait;
+use cashu::nuts::{BlindSignature, CurrencyUnit, Id, Proof, PublicKey, SwapRequest};
+use cashu::util::hex;
+use std::str::FromStr;
+
+use crate::mint_errors::{extract_nut00_error_code, is_retryable_keyset_error_code};
+use crate::{
+    with_active_keyset_retry, with_active_keyset_retry_async, KeysetRetryError,
+    SelectedOutputKeyset,
+};
+
+/// Funding data for a channel
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelFunding {
+    /// Serialized channel parameters
+    pub params_json: String,
+    /// Serialized funding proofs
+    pub funding_proofs_json: String,
+    /// Hex-encoded channel secret
+    pub channel_secret_hex: String,
+    /// Serialized keyset info
+    pub keyset_info_json: String,
+}
+
+/// Payment proof for a channel
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentProof {
+    /// Current balance
+    pub balance: u64,
+    /// Alice's signature over the balance
+    pub signature: String,
+}
+
+/// Channel lifecycle states
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelState {
+    /// Channel is open and accepting payments
+    Open,
+    /// Channel is closing (swap pending, no more payments accepted)
+    Closing,
+    /// Channel is closed (swap completed, proofs stored)
+    Closed,
+    /// Mint-attested sender refund; no receiver-close payout exists.
+    SenderRefundedAfterExpiry,
+}
+
+impl ChannelState {
+    /// Decode a receiver host callback state. Absence means an unknown channel;
+    /// empty or unrecognized strings are errors, never an implicit Open state.
+    pub fn from_host_value(value: Option<&str>) -> Result<Option<Self>, String> {
+        match value {
+            None => Ok(None),
+            Some("open") => Ok(Some(Self::Open)),
+            Some("closing") => Ok(Some(Self::Closing)),
+            Some("closed") => Ok(Some(Self::Closed)),
+            Some("sender_refunded_after_expiry") => Ok(Some(Self::SenderRefundedAfterExpiry)),
+            Some(_) => Err("invalid receiver channel state".to_string()),
+        }
+    }
+}
+
+/// Data stored when a channel enters CLOSING state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClosingData {
+    /// The channel's expiry timestamp
+    pub expiry_timestamp: u64,
+    /// The balance at close
+    pub balance: u64,
+    /// The client's Schnorr signature authorizing this balance
+    pub signature: String,
+}
+
+/// Host hooks for the Spilman bridge
+///
+/// Implement this trait to provide storage, policy, signing, and pricing logic
+/// for your service. Mint network I/O is intentionally outside the host trait;
+/// durable integrations should drive that I/O around the bridge's explicit
+/// prepare/complete/mark phases.
+/// The generic type `C` allows for a custom request context used in pricing.
+pub trait SpilmanHost<C = String> {
+    /// Check if the receiver pubkey in the channel params is acceptable
+    fn receiver_key_is_acceptable(&self, receiver_pubkey: &PublicKey) -> bool;
+
+    /// Check if the mint and keyset are acceptable
+    fn mint_and_keyset_is_acceptable(&self, mint: &str, keyset_id: &cashu::nuts::Id) -> bool;
+
+    /// Get cached funding data for a channel
+    fn get_funding(&self, channel_id: &str) -> Option<ChannelFunding>;
+
+    /// Save funding data for a channel, including the initial payment proof
+    fn save_funding(
+        &self,
+        channel_id: &str,
+        funding: ChannelFunding,
+        initial_payment: PaymentProof,
+    );
+
+    /// Get the current amount due for a channel
+    fn get_amount_due(&self, channel_id: &str, context: Option<&C>) -> u64;
+
+    /// Record a successful payment and update usage
+    fn record_payment(&self, channel_id: &str, payment: PaymentProof, context: &C);
+
+    /// Get a known channel's state, or None if it does not exist.
+    /// Lookup failures and malformed stored states must return Err, not None/Open.
+    fn get_channel_state(&self, channel_id: &str) -> Result<Option<ChannelState>, String>;
+
+    /// Mark a channel as closing (pre-swap state).
+    fn mark_channel_closing(
+        &self,
+        channel_id: &str,
+        expiry_timestamp: u64,
+        payment: PaymentProof,
+    ) -> Result<(), String>;
+
+    /// Get the stored closing data for a channel in CLOSING state.
+    fn get_closing_data(&self, channel_id: &str) -> Option<ClosingData>;
+
+    /// Get channel policy for a given unit: funding-time validation thresholds.
+    /// Returns `None` if the unit is not supported.
+    fn get_channel_policy(&self, unit: &str) -> Option<ChannelPolicy>;
+
+    /// Get the current time in seconds
+    fn now_seconds(&self) -> u64;
+
+    /// Get the balance and signature for a unilateral exit
+    fn get_balance_and_signature_for_unilateral_exit(
+        &self,
+        channel_id: &str,
+    ) -> Option<PaymentProof>;
+
+    /// Get active keyset IDs for a mint and unit
+    fn get_active_keyset_ids(&self, mint: &str, unit: &CurrencyUnit) -> Vec<Id>;
+
+    /// True if any keyset is cached for a mint and unit, including inactive keysets.
+    fn has_keysets_for_unit(&self, mint: &str, unit: &CurrencyUnit) -> bool;
+
+    /// Get full KeysetInfo JSON for a specific keyset
+    fn get_keyset_info(&self, mint: &str, keyset_id: &Id) -> Option<String>;
+
+    /// Mark a channel as closed and persist the final state
+    #[allow(clippy::too_many_arguments)]
+    fn mark_channel_closed(
+        &self,
+        channel_id: &str,
+        expiry_timestamp: u64,
+        balance: u64,
+        receiver_proofs_json: &str,
+        sender_proofs_json: &str,
+        receiver_sum: u64,
+        sender_sum: u64,
+    ) -> Result<(), String>;
+
+    /// Compute the ECDH-derived channel secret.
+    fn compute_channel_secret(
+        &self,
+        receiver_pubkey_hex: &str,
+        sender_pubkey_hex: &str,
+    ) -> Result<String, String>;
+
+    /// Sign a message with the tweaked (P2BK-blinded) server key.
+    fn sign_with_tweaked_key(
+        &self,
+        signer_pubkey_hex: &str,
+        message_hex: &str,
+        tweak_scalar_hex: &str,
+    ) -> Result<String, String>;
+}
+
+/// Sync mint HTTP hooks for the Spilman bridge.
+pub trait SpilmanMintClient {
+    /// Call the mint's /v1/swap endpoint
+    fn call_mint_swap(&self, mint_url: &str, swap_request_json: &str) -> Result<String, String>;
+}
+
+/// Sync keyset cache refresh hook for the Spilman bridge.
+pub trait SpilmanKeysetRefresher {
+    /// Refresh the keyset cache for a mint.
+    fn refresh(&self, mint: &str) -> Result<(), String>;
+}
+
+/// Async mint HTTP hooks for the Spilman bridge.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait SpilmanAsyncMintClient {
+    /// Call the mint's /v1/swap endpoint
+    async fn call_mint_swap(
+        &self,
+        mint_url: &str,
+        swap_request_json: &str,
+    ) -> Result<String, String>;
+}
+
+/// Async keyset cache refresh hook for the Spilman bridge.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait SpilmanAsyncKeysetRefresher {
+    /// Refresh the keyset cache for a mint.
+    async fn refresh(&self, mint: &str) -> Result<(), String>;
+}
+
+/// Bridge for processing Spilman payments
+#[derive(Debug)]
+pub struct SpilmanBridge<H: SpilmanHost<C>, C = String> {
+    host: H,
+    _phantom: std::marker::PhantomData<C>,
+}
+
+/// A signed payment for a Spilman channel.
+///
+/// This is the core protocol message exchanged between client and server.
+/// The client creates it via `SpilmanClientBridge::sign_payment()`,
+/// the server validates it via `SpilmanBridge::process_payment()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Payment {
+    /// Channel identifier
+    pub channel_id: String,
+    /// Cumulative balance the receiver can claim.
+    ///
+    /// Normal payments usually increase this value. Cooperative adjustments may
+    /// intentionally sign a lower value when the receiver agrees to reduce its
+    /// claim.
+    pub balance: u64,
+    /// BIP-340 Schnorr signature over the balance commitment
+    pub signature: String,
+    /// Channel parameters (required on first payment to register channel)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    /// Funding proofs (required on first payment to register channel)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funding_proofs: Option<Vec<Proof>>,
+}
+
+impl Payment {
+    /// Create a payment without funding data (for subsequent payments)
+    pub fn new(channel_id: String, balance: u64, signature: String) -> Self {
+        Self {
+            channel_id,
+            balance,
+            signature,
+            params: None,
+            funding_proofs: None,
+        }
+    }
+
+    /// Create a payment with funding data (for first payment)
+    pub fn with_funding(
+        channel_id: String,
+        balance: u64,
+        signature: String,
+        params: serde_json::Value,
+        funding_proofs: Vec<Proof>,
+    ) -> Self {
+        Self {
+            channel_id,
+            balance,
+            signature,
+            params: Some(params),
+            funding_proofs: Some(funding_proofs),
+        }
+    }
+
+    /// Check if this payment includes funding data
+    pub fn has_funding(&self) -> bool {
+        self.params.is_some() && self.funding_proofs.is_some()
+    }
+}
+
+/// Result of a successful payment
+#[derive(Debug, Clone, Serialize)]
+pub struct PaymentSuccess {
+    pub channel_id: String,
+    pub balance: u64,
+    pub amount_due: u64,
+    pub capacity: u64,
+}
+
+/// Data needed to close a channel
+#[derive(Debug)]
+pub struct CloseData {
+    pub swap_request: SwapRequest,
+    pub sig_all_message_hash: String,
+    pub blinded_receiver_pubkey: String,
+    pub expected_total: u64,
+    pub secrets_with_blinding: Vec<(DeterministicSecretWithBlinding, bool)>,
+    pub output_keyset_info: KeysetInfo,
+}
+
+impl CloseData {
+    pub fn to_json_value(self) -> serde_json::Value {
+        let swap_request_json =
+            serde_json::to_value(&self.swap_request).unwrap_or(serde_json::Value::Null);
+
+        let secrets_with_blinding: Vec<serde_json::Value> = self
+            .secrets_with_blinding
+            .into_iter()
+            .map(|(s, is_receiver)| {
+                serde_json::json!({
+                    "secret": s.secret.to_string(),
+                    "blinding_factor": hex::encode(s.blinding_factor.secret_bytes()),
+                    "amount": s.amount,
+                    "index": s.index,
+                    "is_receiver": is_receiver
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "success": true,
+            "swap_request": swap_request_json,
+            "sig_all_message_hash": self.sig_all_message_hash,
+            "blinded_receiver_pubkey": self.blinded_receiver_pubkey,
+            "expected_total": self.expected_total,
+            "secrets_with_blinding": secrets_with_blinding,
+            "output_keyset_info": serde_json::to_value(&self.output_keyset_info).unwrap_or(serde_json::Value::Null)
+        })
+    }
+}
+
+/// A proof with its (amount, index) metadata from the commitment outputs
+#[derive(Debug)]
+pub struct ProofWithMeta {
+    pub proof: Proof,
+    pub amount: u64,
+    pub index: usize,
+    pub is_receiver: bool,
+}
+
+/// Result of unblinding and verifying stage 1 swap response
+#[derive(Debug)]
+pub struct UnblindResult {
+    pub receiver_proofs: Vec<ProofWithMeta>,
+    pub sender_proofs: Vec<ProofWithMeta>,
+    pub receiver_sum: u64,
+    pub sender_sum: u64,
+}
+
+/// Everything needed to execute a close operation after sync validation.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PreparedClose {
+    pub channel_id: String,
+    pub balance: u64,
+    pub mint_url: String,
+    pub swap_request: serde_json::Value,
+    pub sig_all_message_hash: String,
+    pub blinded_receiver_pubkey: String,
+    pub secrets_with_blinding: serde_json::Value,
+    pub output_keyset_info: serde_json::Value,
+    pub params_json: String,
+    pub keyset_info_json: String,
+    pub channel_secret: String,
+}
+
+/// Prepared close plus the host state transition data needed before mint I/O.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PreparedCloseTransition {
+    pub prepared_close: PreparedClose,
+    pub expiry_timestamp: u64,
+    pub payment: PaymentProof,
+}
+
+/// Result of completing a close mint response before marking the channel closed.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CompletedClose {
+    pub channel_id: String,
+    pub expiry_timestamp: u64,
+    pub balance: u64,
+    pub receiver_proofs_json: String,
+    pub sender_proofs_json: String,
+    pub receiver_sum: u64,
+    pub sender_sum: u64,
+}
+
+impl core::fmt::Debug for PreparedClose {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreparedClose").finish_non_exhaustive()
+    }
+}
+
+impl PreparedClose {
+    /// Whether a spent NUT-07 witness contains a receiver signature for this
+    /// exact close transaction. The preparation must first be authenticated
+    /// with [`SpilmanBridge::verify_prepared_close`].
+    pub fn matches_spent_witness(
+        &self,
+        proof_state: &cashu::nuts::ProofState,
+    ) -> Result<bool, String> {
+        if proof_state.state != cashu::nuts::State::Spent {
+            return Ok(false);
+        }
+        let Some(cashu::nuts::Witness::P2PKWitness(witness)) = &proof_state.witness else {
+            return Ok(false);
+        };
+        if witness.signatures.is_empty() {
+            return Ok(false);
+        }
+
+        let digest: [u8; 32] = hex::decode(&self.sig_all_message_hash)
+            .map_err(|_| "invalid cached SIG_ALL message hash".to_string())?
+            .try_into()
+            .map_err(|_| "invalid cached SIG_ALL message hash length".to_string())?;
+        let message = bitcoin::secp256k1::Message::from_digest(digest);
+        let receiver = PublicKey::from_str(&self.blinded_receiver_pubkey)
+            .map_err(|_| "invalid cached blinded receiver public key".to_string())?;
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+
+        let mut matched = false;
+        for signature in &witness.signatures {
+            let signature = bitcoin::secp256k1::schnorr::Signature::from_str(signature)
+                .map_err(|_| "invalid NUT-07 witness signature".to_string())?;
+            if secp
+                .verify_schnorr(&signature, &message, &receiver.x_only_public_key())
+                .is_ok()
+            {
+                matched = true;
+            }
+        }
+        Ok(matched)
+    }
+}
+
+impl core::fmt::Debug for PreparedCloseTransition {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreparedCloseTransition")
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for CompletedClose {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CompletedClose").finish_non_exhaustive()
+    }
+}
+
+/// HTTP-friendly error for close preparation.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClosePreparationError {
+    pub error: String,
+    pub reason: String,
+    pub status: u16,
+    #[serde(flatten)]
+    pub extra: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl ClosePreparationError {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    pub fn bad_request(reason: impl Into<String>) -> Self {
+        Self {
+            error: "Bad request".into(),
+            reason: reason.into(),
+            status: 400,
+            extra: None,
+        }
+    }
+
+    pub fn payment_required(reason: impl Into<String>) -> Self {
+        Self {
+            error: "Payment required".into(),
+            reason: reason.into(),
+            status: 402,
+            extra: None,
+        }
+    }
+
+    pub fn not_found(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self {
+            error: reason.clone(),
+            reason,
+            status: 404,
+            extra: None,
+        }
+    }
+
+    pub fn internal(reason: impl Into<String>) -> Self {
+        Self {
+            error: "Internal error".into(),
+            reason: reason.into(),
+            status: 500,
+            extra: None,
+        }
+    }
+
+    pub fn conflict(reason: impl Into<String>) -> Self {
+        Self {
+            error: "Channel closing".into(),
+            reason: reason.into(),
+            status: 409,
+            extra: None,
+        }
+    }
+
+    pub fn gone(reason: impl Into<String>) -> Self {
+        Self {
+            error: "Channel closed".into(),
+            reason: reason.into(),
+            status: 410,
+            extra: None,
+        }
+    }
+
+    pub fn with_extra(mut self, extra: serde_json::Map<String, serde_json::Value>) -> Self {
+        self.extra = Some(extra);
+        self
+    }
+
+    pub fn from_bridge_error(err: BridgeError) -> Self {
+        let reason = err.to_string();
+        match &err {
+            BridgeError::ChannelClosed => Self::gone(reason),
+            BridgeError::ChannelClosing => Self::conflict(reason),
+            BridgeError::UnknownChannel => Self::not_found(reason),
+            BridgeError::InvalidRequest(msg) if msg.contains("no payment proof") => {
+                Self::bad_request(reason)
+            }
+            BridgeError::Internal(_) | BridgeError::ServerMisconfigured(_) => {
+                Self::internal(reason)
+            }
+            BridgeError::BalanceMismatch { expected, actual } => {
+                let mut extra = serde_json::Map::new();
+                extra.insert("expected".into(), serde_json::json!(expected));
+                extra.insert("actual".into(), serde_json::json!(actual));
+                Self::payment_required(reason).with_extra(extra)
+            }
+            _ => Self::payment_required(reason),
+        }
+    }
+}
+
+/// HTTP-friendly error for payment/validation failures.
+#[derive(Debug, Clone, Serialize)]
+pub struct BridgeErrorResponse {
+    pub error: String,
+    pub reason: String,
+    pub status: u16,
+    pub code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl BridgeErrorResponse {
+    pub fn from_bridge_error(err: &BridgeError) -> Self {
+        let reason = err.to_string();
+        let mut extra: Option<serde_json::Map<String, serde_json::Value>> = None;
+
+        let (status, error, code) = match err {
+            BridgeError::InvalidRequest(_) => (400, "Bad request", "invalid_request"),
+            BridgeError::UnknownChannel => (404, "Not found", "unknown_channel"),
+            BridgeError::ChannelClosing => (409, "Channel closing", "channel_closing"),
+            BridgeError::ChannelClosed => (410, "Channel closed", "channel_closed"),
+            BridgeError::ServerMisconfigured(_) => (500, "Internal error", "server_misconfigured"),
+            BridgeError::Internal(_) => (500, "Internal error", "internal"),
+            BridgeError::BalanceMismatch { expected, actual } => {
+                let mut map = serde_json::Map::new();
+                map.insert("expected".into(), serde_json::json!(expected));
+                map.insert("actual".into(), serde_json::json!(actual));
+                extra = Some(map);
+                (402, "Payment required", "balance_mismatch")
+            }
+            BridgeError::BalanceExceedsCapacity { balance, capacity } => {
+                let mut map = serde_json::Map::new();
+                map.insert("balance".into(), serde_json::json!(balance));
+                map.insert("capacity".into(), serde_json::json!(capacity));
+                extra = Some(map);
+                (402, "Payment required", "balance_exceeds_capacity")
+            }
+            BridgeError::InsufficientBalance {
+                balance,
+                amount_due,
+            } => {
+                let mut map = serde_json::Map::new();
+                map.insert("balance".into(), serde_json::json!(balance));
+                map.insert("amount_due".into(), serde_json::json!(amount_due));
+                extra = Some(map);
+                (402, "Payment required", "insufficient_balance")
+            }
+            BridgeError::CapacityTooSmall {
+                capacity,
+                min_capacity,
+            } => {
+                let mut map = serde_json::Map::new();
+                map.insert("capacity".into(), serde_json::json!(capacity));
+                map.insert("min_capacity".into(), serde_json::json!(min_capacity));
+                extra = Some(map);
+                (402, "Payment required", "capacity_too_small")
+            }
+            BridgeError::ExpiryTooSoon {
+                expiry_timestamp,
+                min_expiry,
+                now,
+            } => {
+                let mut map = serde_json::Map::new();
+                map.insert(
+                    "expiry_timestamp".into(),
+                    serde_json::json!(expiry_timestamp),
+                );
+                map.insert("min_expiry".into(), serde_json::json!(min_expiry));
+                map.insert("now".into(), serde_json::json!(now));
+                extra = Some(map);
+                (402, "Payment required", "expiry_too_soon")
+            }
+            BridgeError::MaxAmountExceeded {
+                amount,
+                max_allowed,
+            } => {
+                let mut map = serde_json::Map::new();
+                map.insert("amount".into(), serde_json::json!(amount));
+                map.insert("max_allowed".into(), serde_json::json!(max_allowed));
+                extra = Some(map);
+                (402, "Payment required", "max_amount_exceeded")
+            }
+            BridgeError::UnsupportedUnit(_) => (402, "Payment required", "unsupported_unit"),
+            BridgeError::ChannelIdMismatch => (402, "Payment required", "channel_id_mismatch"),
+            BridgeError::ValidationFailed(_) => (402, "Payment required", "validation_failed"),
+            BridgeError::InvalidSignature(_) => (402, "Payment required", "invalid_signature"),
+            BridgeError::ReceiverKeyNotAcceptable => {
+                (402, "Payment required", "receiver_key_not_acceptable")
+            }
+            BridgeError::MintOrKeysetNotAcceptable => {
+                (402, "Payment required", "mint_or_keyset_not_acceptable")
+            }
+        };
+
+        Self {
+            error: error.to_string(),
+            reason,
+            status,
+            code: code.to_string(),
+            extra,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            "{\"error\":\"Internal error\",\"reason\":\"failed to serialize bridge error\",\"status\":500,\"code\":\"internal\"}"
+                .to_string()
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PaymentValidationResult {
+    pub channel_id: String,
+    pub balance: u64,
+    pub amount_due: u64,
+    pub capacity: u64,
+    pub sender_signature: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FundChannelResult {
+    pub channel_id: String,
+    pub capacity: u64,
+    pub already_known: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ValidatedNewChannel {
+    pub channel_id: String,
+    pub balance: u64,
+    pub capacity: u64,
+    pub sender_signature: String,
+    pub funding: ChannelFunding,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CloseSuccess {
+    pub channel_id: String,
+    pub total_value: u64,
+    pub receiver_sum: u64,
+    pub sender_sum: u64,
+    pub sender_proofs: String,
+    pub already_closed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum CloseError {
+    #[serde(rename = "validation_failed")]
+    ValidationFailed {
+        reason: String,
+        status: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expected_balance: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actual_balance: Option<u64>,
+    },
+    #[serde(rename = "unknown_channel")]
+    UnknownChannel { status: u16 },
+    #[serde(rename = "already_closed")]
+    AlreadyClosed {
+        closed_balance: u64,
+        requested_balance: u64,
+        status: u16,
+    },
+    #[serde(rename = "mint_rejected")]
+    MintRejected {
+        mint_error: serde_json::Value,
+        status: u16,
+    },
+    #[serde(rename = "mint_rejected_after_retry")]
+    MintRejectedAfterRetry {
+        original_error: serde_json::Value,
+        retry_error: serde_json::Value,
+        status: u16,
+    },
+    #[serde(rename = "unblind_failed")]
+    UnblindFailed { reason: String, status: u16 },
+    #[serde(rename = "storage_failed")]
+    StorageFailed { reason: String, status: u16 },
+}
+
+impl CloseError {
+    pub fn status_code(&self) -> u16 {
+        match self {
+            Self::ValidationFailed { status, .. }
+            | Self::UnknownChannel { status }
+            | Self::AlreadyClosed { status, .. }
+            | Self::MintRejected { status, .. }
+            | Self::MintRejectedAfterRetry { status, .. }
+            | Self::UnblindFailed { status, .. }
+            | Self::StorageFailed { status, .. } => *status,
+        }
+    }
+
+    pub fn from_preparation_error(err: ClosePreparationError) -> Self {
+        let (expected_balance, actual_balance) = if let Some(extra) = &err.extra {
+            (
+                extra.get("expected").and_then(|v| v.as_u64()),
+                extra.get("actual").and_then(|v| v.as_u64()),
+            )
+        } else {
+            (None, None)
+        };
+        Self::ValidationFailed {
+            reason: err.reason,
+            status: err.status,
+            expected_balance,
+            actual_balance,
+        }
+    }
+
+    pub fn unknown_channel() -> Self {
+        Self::UnknownChannel { status: 404 }
+    }
+    pub fn mint_rejected(mint_error: serde_json::Value) -> Self {
+        Self::MintRejected {
+            mint_error,
+            status: 502,
+        }
+    }
+    pub fn mint_rejected_after_retry(
+        original_error: serde_json::Value,
+        retry_error: serde_json::Value,
+    ) -> Self {
+        Self::MintRejectedAfterRetry {
+            original_error,
+            retry_error,
+            status: 502,
+        }
+    }
+    pub fn unblind_failed(reason: impl Into<String>) -> Self {
+        Self::UnblindFailed {
+            reason: reason.into(),
+            status: 500,
+        }
+    }
+    pub fn storage_failed(reason: impl Into<String>) -> Self {
+        Self::StorageFailed {
+            reason: reason.into(),
+            status: 500,
+        }
+    }
+}
+
+fn parse_mint_error_value(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+}
+
+fn close_expiry_timestamp(prep: &PreparedClose) -> u64 {
+    serde_json::from_str::<serde_json::Value>(&prep.params_json).unwrap_or_default()
+        ["expiry_timestamp"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
+/// Determine if a swap error should trigger a retry (refresh keysets + re-attempt).
+/// Keyset errors (12xxx) and code 99999 (nutmix workaround) are retryable.
+/// All other errors fail immediately. If the error can't be parsed, fail immediately.
+fn should_retry_swap_error(raw: &str) -> bool {
+    match extract_nut00_error_code(raw) {
+        Some(code) => {
+            let retryable = is_retryable_keyset_error_code(code);
+            if retryable {
+                tracing::debug!(
+                    code,
+                    "Keyset error detected, will retry after refreshing keysets"
+                );
+            } else {
+                tracing::debug!(code, "Non-retryable NUT-00 error code, failing immediately");
+            }
+            retryable
+        }
+        None => {
+            tracing::debug!(error = %raw, "Could not parse NUT-00 error code, failing immediately");
+            false
+        }
+    }
+}
+
+impl std::fmt::Display for CloseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ValidationFailed { reason, .. } => write!(f, "validation failed: {}", reason),
+            Self::UnknownChannel { .. } => write!(f, "unknown channel"),
+            Self::AlreadyClosed {
+                closed_balance,
+                requested_balance,
+                ..
+            } => write!(
+                f,
+                "channel already closed with balance {} (requested {})",
+                closed_balance, requested_balance
+            ),
+            Self::MintRejected { mint_error, .. } => {
+                write!(f, "mint rejected swap: {}", mint_error)
+            }
+            Self::MintRejectedAfterRetry {
+                original_error,
+                retry_error,
+                ..
+            } => write!(
+                f,
+                "mint rejected swap after retry: original={}, retry={}",
+                original_error, retry_error
+            ),
+            Self::UnblindFailed { reason, .. } => write!(f, "unblind failed: {}", reason),
+            Self::StorageFailed { reason, .. } => write!(f, "storage failed: {}", reason),
+        }
+    }
+}
+
+impl std::error::Error for CloseError {}
+
+/// Funding-time validation thresholds for a given unit, returned by
+/// [`SpilmanHost::get_channel_policy`].
+#[derive(Debug, Clone)]
+pub struct ChannelPolicy {
+    /// Minimum seconds between now and the channel expiry timestamp.
+    pub min_expiry_in_seconds: u64,
+    /// Minimum channel capacity (in the unit's base denomination).
+    pub min_capacity: u64,
+    /// Optional cap on the largest single proof denomination.
+    pub max_amount_per_output: Option<u64>,
+}
+
+#[derive(Debug)]
+pub enum BridgeError {
+    InvalidRequest(String),
+    ChannelClosed,
+    ChannelClosing,
+    ServerMisconfigured(String),
+    CapacityTooSmall {
+        capacity: u64,
+        min_capacity: u64,
+    },
+    ExpiryTooSoon {
+        expiry_timestamp: u64,
+        min_expiry: u64,
+        now: u64,
+    },
+    MaxAmountExceeded {
+        amount: u64,
+        max_allowed: u64,
+    },
+    BalanceExceedsCapacity {
+        balance: u64,
+        capacity: u64,
+    },
+    UnsupportedUnit(String),
+    ChannelIdMismatch,
+    ValidationFailed(String),
+    UnknownChannel,
+    InvalidSignature(String),
+    InsufficientBalance {
+        balance: u64,
+        amount_due: u64,
+    },
+    BalanceMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    Internal(String),
+    ReceiverKeyNotAcceptable,
+    MintOrKeysetNotAcceptable,
+}
+
+impl std::fmt::Display for BridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequest(s) => write!(f, "{}", s),
+            Self::ChannelClosed => write!(f, "channel closed"),
+            Self::ChannelClosing => write!(f, "channel closing, swap pending"),
+            Self::ServerMisconfigured(s) => write!(f, "server misconfigured: {}", s),
+            Self::CapacityTooSmall {
+                capacity,
+                min_capacity,
+            } => write!(f, "capacity too small: {} < {}", capacity, min_capacity),
+            Self::ExpiryTooSoon {
+                expiry_timestamp,
+                min_expiry,
+                now,
+            } => write!(
+                f,
+                "expiry too soon: {} < {} ({}s remaining)",
+                expiry_timestamp,
+                min_expiry,
+                expiry_timestamp.saturating_sub(*now)
+            ),
+            Self::MaxAmountExceeded {
+                amount,
+                max_allowed,
+            } => write!(
+                f,
+                "max_amount_per_output exceeded: {} > {}",
+                amount, max_allowed
+            ),
+            Self::BalanceExceedsCapacity { balance, capacity } => {
+                write!(f, "balance exceeds capacity: {} > {}", balance, capacity)
+            }
+            Self::UnsupportedUnit(u) => write!(f, "unsupported unit: {}", u),
+            Self::ChannelIdMismatch => write!(f, "channel_id mismatch"),
+            Self::ValidationFailed(s) => write!(f, "channel validation failed: {}", s),
+            Self::UnknownChannel => write!(f, "unknown channel"),
+            Self::InvalidSignature(s) => write!(f, "invalid signature: {}", s),
+            Self::InsufficientBalance {
+                balance,
+                amount_due,
+            } => write!(f, "insufficient balance: {} < {}", balance, amount_due),
+            Self::BalanceMismatch { expected, actual } => {
+                write!(f, "balance mismatch: expected {}, got {}", expected, actual)
+            }
+            Self::Internal(s) => write!(f, "internal error: {}", s),
+            Self::ReceiverKeyNotAcceptable => write!(f, "receiver key not acceptable"),
+            Self::MintOrKeysetNotAcceptable => write!(f, "mint or keyset not acceptable"),
+        }
+    }
+}
+
+impl BridgeError {
+    pub fn to_response(&self) -> BridgeErrorResponse {
+        BridgeErrorResponse::from_bridge_error(self)
+    }
+
+    pub fn to_response_json(&self) -> String {
+        self.to_response().to_json()
+    }
+}
+
+pub fn unblind_and_verify_stage1_response(
+    blind_signatures: Vec<BlindSignature>,
+    secrets_with_blinding: Vec<(DeterministicSecretWithBlinding, bool)>,
+    params: &ChannelParameters,
+    output_keyset_info: &KeysetInfo,
+    balance: u64,
+) -> Result<UnblindResult, BridgeError> {
+    if blind_signatures.len() != secrets_with_blinding.len() {
+        return Err(BridgeError::Internal(
+            "Length mismatch between signatures and secrets".into(),
+        ));
+    }
+    let mut expected = Vec::with_capacity(secrets_with_blinding.len());
+    let mut is_receiver_flags = Vec::with_capacity(secrets_with_blinding.len());
+    let mut amount_index_pairs = Vec::with_capacity(secrets_with_blinding.len());
+
+    for (swb, is_receiver) in secrets_with_blinding {
+        let (blinded_secret, _) = cashu::dhke::blind_message(
+            swb.secret.to_bytes().as_ref(),
+            Some(swb.blinding_factor.clone()),
+        )
+        .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        expected.push(crate::bindings::PreparedOutput {
+            blinded_message: cashu::nuts::BlindedMessage::new(
+                swb.amount.into(),
+                output_keyset_info.keyset_id,
+                blinded_secret,
+            ),
+            secret: swb.secret,
+            blinding_factor: swb.blinding_factor,
+        });
+        is_receiver_flags.push(is_receiver);
+        amount_index_pairs.push((swb.amount, swb.index));
+    }
+
+    let proofs = crate::bindings::complete_exact_signatures(
+        blind_signatures,
+        expected,
+        output_keyset_info,
+        None,
+    )
+    .map_err(BridgeError::ValidationFailed)?;
+
+    let mut receiver_proofs = Vec::new();
+    let mut sender_proofs = Vec::new();
+    let mut receiver_sum = 0;
+    let mut sender_sum = 0;
+
+    for ((mut proof, is_receiver), (amount, index)) in proofs
+        .into_iter()
+        .zip(is_receiver_flags)
+        .zip(amount_index_pairs)
+    {
+        let role = if is_receiver {
+            Stage2Role::Receiver
+        } else {
+            Stage2Role::Sender
+        };
+        params
+            .attach_stage2_p2pk_e(&mut proof, role, amount, index)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+
+        if is_receiver {
+            let expected_pubkey = params
+                .get_receiver_blinded_pubkey_for_stage2_output(amount, index)
+                .map_err(|e| BridgeError::Internal(e.to_string()))?;
+            let secret_json: serde_json::Value = serde_json::from_str(&proof.secret.to_string())
+                .map_err(|e| BridgeError::Internal(e.to_string()))?;
+            if secret_json.get(0).and_then(|v| v.as_str()) != Some("P2PK")
+                || secret_json
+                    .get(1)
+                    .and_then(|v| v.get("data"))
+                    .and_then(|v| v.as_str())
+                    != Some(&expected_pubkey.to_hex())
+            {
+                return Err(BridgeError::ValidationFailed(
+                    "Receiver proof locked to wrong pubkey".into(),
+                ));
+            }
+            receiver_sum += u64::from(proof.amount);
+            receiver_proofs.push(ProofWithMeta {
+                proof,
+                amount,
+                index,
+                is_receiver: true,
+            });
+        } else {
+            sender_sum += u64::from(proof.amount);
+            sender_proofs.push(ProofWithMeta {
+                proof,
+                amount,
+                index,
+                is_receiver: false,
+            });
+        }
+    }
+
+    // Payment authorization fixes the nominal split using funding metadata.
+    // Rotated output keys may charge different fees on a later spend; those
+    // fees cannot change the already signed commitment amounts.
+    let expected_nominal = params
+        .keyset_info
+        .inverse_deterministic_value_after_fees(balance, params.maximum_amount_for_one_output)
+        .map_err(|e| BridgeError::Internal(e.to_string()))?
+        .nominal_value;
+    if receiver_sum != expected_nominal {
+        return Err(BridgeError::ValidationFailed(format!(
+            "Receiver nominal mismatch: expected {}, got {}",
+            expected_nominal, receiver_sum
+        )));
+    }
+
+    Ok(UnblindResult {
+        receiver_proofs,
+        sender_proofs,
+        receiver_sum,
+        sender_sum,
+    })
+}
+
+impl<H: SpilmanHost<C>, C> SpilmanBridge<H, C> {
+    /// Authenticate an immutable close request against separately stored funding
+    /// and payment authorization. Does not read lifecycle state, time, or active
+    /// keys. Receiver signatures may use randomness and are verified, not rebuilt.
+    pub fn verify_prepared_close(
+        &self,
+        prepared: &PreparedClose,
+        funding: &ChannelFunding,
+        payment: &PaymentProof,
+        receiver: &PublicKey,
+    ) -> Result<(), CloseError> {
+        use cashu::nuts::nut10::SpendingConditionVerification;
+        let invalid = || CloseError::unblind_failed("Invalid immutable close binding");
+        if prepared.balance != payment.balance
+            || prepared.params_json != funding.params_json
+            || prepared.keyset_info_json != funding.keyset_info_json
+            || prepared.channel_secret != funding.channel_secret_hex
+        {
+            return Err(invalid());
+        }
+        let secret: [u8; 32] = hex::decode(&funding.channel_secret_hex)
+            .map_err(|_| invalid())?
+            .try_into()
+            .map_err(|_| invalid())?;
+        let params = ChannelParameters::from_json_with_channel_secret(
+            &funding.params_json,
+            super::parse_keyset_info_from_json(&funding.keyset_info_json).map_err(|_| invalid())?,
+            secret,
+        )
+        .map_err(|_| invalid())?;
+        let output_keyset =
+            super::parse_keyset_info_from_json(&prepared.output_keyset_info.to_string())
+                .map_err(|_| invalid())?;
+        if &params.receiver_pubkey != receiver
+            || params.get_channel_id() != prepared.channel_id
+            || params.mint != prepared.mint_url
+            || params.unit != output_keyset.unit
+        {
+            return Err(invalid());
+        }
+        let expected = self
+            .prepare_close_data_impl(
+                &prepared.channel_id,
+                payment.balance,
+                &payment.signature,
+                funding.clone(),
+                output_keyset,
+                false,
+            )
+            .map_err(|_| invalid())?;
+        let expected = Self::wrap_close_data(
+            expected,
+            &prepared.channel_id,
+            payment.balance,
+            funding.clone(),
+        )
+        .map_err(|_| invalid())?;
+        if expected.secrets_with_blinding != prepared.secrets_with_blinding {
+            return Err(invalid());
+        }
+        let mut request: SwapRequest =
+            serde_json::from_value(prepared.swap_request.clone()).map_err(|_| invalid())?;
+        if serde_json::to_value(&request).map_err(|_| invalid())? != prepared.swap_request {
+            return Err(invalid());
+        }
+        if super::balance_update::sig_all_message_hash_hex(&request)
+            != prepared.sig_all_message_hash
+            || params
+                .get_receiver_blinded_pubkey_for_stage1()
+                .map_err(|_| invalid())?
+                .to_hex()
+                != prepared.blinded_receiver_pubkey
+        {
+            return Err(invalid());
+        }
+        match request
+            .inputs()
+            .first()
+            .and_then(|proof| proof.witness.as_ref())
+        {
+            Some(cashu::nuts::Witness::P2PKWitness(witness))
+                if witness.signatures.len() == 2 && witness.signatures[0] == payment.signature => {}
+            _ => return Err(invalid()),
+        }
+        let signatures = super::balance_update::get_signatures_from_swap_request(&request)
+            .map_err(|_| invalid())?;
+        if signatures.len() != 2 || signatures[0].to_string() != payment.signature {
+            return Err(invalid());
+        }
+        params
+            .get_receiver_blinded_pubkey_for_stage1()
+            .map_err(|_| invalid())?
+            .verify(request.sig_all_msg_to_sign().as_bytes(), &signatures[1])
+            .map_err(|_| invalid())?;
+        let mut expected_request: SwapRequest =
+            serde_json::from_value(expected.swap_request).map_err(|_| invalid())?;
+        // Only the two first-input signatures vary between preparations.
+        request
+            .inputs_mut()
+            .first_mut()
+            .ok_or_else(invalid)?
+            .witness = None;
+        expected_request
+            .inputs_mut()
+            .first_mut()
+            .ok_or_else(invalid)?
+            .witness = None;
+        if serde_json::to_value(request).map_err(|_| invalid())?
+            != serde_json::to_value(expected_request).map_err(|_| invalid())?
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    pub fn new(host: H) -> Self {
+        Self {
+            host,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+    pub fn host(&self) -> &H {
+        &self.host
+    }
+
+    fn decode_payment_header(base64_header: &str) -> Result<Payment, BridgeError> {
+        let decoded = BASE64
+            .decode(base64_header)
+            .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+        let json =
+            String::from_utf8(decoded).map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+        serde_json::from_str(&json).map_err(|e| BridgeError::InvalidRequest(e.to_string()))
+    }
+
+    pub fn process_payment(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        signature: &str,
+        params: Option<&serde_json::Value>,
+        funding_proofs: Option<&[Proof]>,
+        context: &C,
+    ) -> Result<PaymentSuccess, BridgeError> {
+        if self
+            .validate_payment_request(channel_id, signature)?
+            .is_none()
+        {
+            let validated = self.validate_new_channel_funding(
+                channel_id,
+                params.ok_or(BridgeError::UnknownChannel)?,
+                funding_proofs.ok_or(BridgeError::UnknownChannel)?,
+                balance,
+                signature,
+            )?;
+            self.record_validated_new_channel(&validated);
+        }
+        let val = self.validate_payment(channel_id, balance, signature, context)?;
+        self.host.record_payment(
+            &val.channel_id,
+            PaymentProof {
+                balance: val.balance,
+                signature: val.sender_signature.clone(),
+            },
+            context,
+        );
+        Ok(PaymentSuccess {
+            channel_id: val.channel_id,
+            balance: val.balance,
+            amount_due: val.amount_due,
+            capacity: val.capacity,
+        })
+    }
+
+    pub fn process_payment_via_json(
+        &self,
+        payment_json: &str,
+        context: &C,
+    ) -> Result<PaymentSuccess, BridgeError> {
+        let p: Payment = serde_json::from_str(payment_json)
+            .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+        self.process_payment(
+            &p.channel_id,
+            p.balance,
+            &p.signature,
+            p.params.as_ref(),
+            p.funding_proofs.as_deref(),
+            context,
+        )
+    }
+
+    pub fn process_payment_via_base64_header(
+        &self,
+        base64_header: &str,
+        context: &C,
+    ) -> Result<PaymentSuccess, BridgeError> {
+        let p = Self::decode_payment_header(base64_header)?;
+        self.process_payment(
+            &p.channel_id,
+            p.balance,
+            &p.signature,
+            p.params.as_ref(),
+            p.funding_proofs.as_deref(),
+            context,
+        )
+    }
+
+    pub fn validate_payment(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        signature: &str,
+        context: &C,
+    ) -> Result<PaymentValidationResult, BridgeError> {
+        if self
+            .validate_payment_request(channel_id, signature)?
+            .is_none()
+        {
+            return Err(BridgeError::UnknownChannel);
+        }
+        let funding = self
+            .host
+            .get_funding(channel_id)
+            .ok_or(BridgeError::UnknownChannel)?;
+        let params_val: serde_json::Value = serde_json::from_str(&funding.params_json)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let capacity = params_val["capacity"].as_u64().unwrap_or(0);
+        if balance > capacity {
+            return Err(BridgeError::BalanceExceedsCapacity { balance, capacity });
+        }
+        self.verify_signature(
+            &funding.params_json,
+            &funding.funding_proofs_json,
+            &funding.channel_secret_hex,
+            &funding.keyset_info_json,
+            channel_id,
+            balance,
+            signature,
+        )
+        .map_err(BridgeError::InvalidSignature)?;
+        let amount_due = self.host.get_amount_due(channel_id, Some(context));
+        if balance < amount_due {
+            return Err(BridgeError::InsufficientBalance {
+                balance,
+                amount_due,
+            });
+        }
+        Ok(PaymentValidationResult {
+            channel_id: channel_id.to_string(),
+            balance,
+            amount_due,
+            capacity,
+            sender_signature: signature.to_string(),
+        })
+    }
+
+    pub fn validate_payment_via_json(
+        &self,
+        payment_json: &str,
+        context: &C,
+    ) -> Result<PaymentValidationResult, BridgeError> {
+        let p: Payment = serde_json::from_str(payment_json)
+            .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+        self.validate_payment(&p.channel_id, p.balance, &p.signature, context)
+    }
+
+    pub fn validate_payment_via_base64_header(
+        &self,
+        base64_header: &str,
+        context: &C,
+    ) -> Result<PaymentValidationResult, BridgeError> {
+        let p = Self::decode_payment_header(base64_header)?;
+        self.validate_payment(&p.channel_id, p.balance, &p.signature, context)
+    }
+
+    /// Verify that a payment covers the current amount due.
+    ///
+    /// This performs full validation (including signature checks) and returns the
+    /// computed amount_due on success. It does not record usage or save funding.
+    pub fn verify_payment_covers_amount_due(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        signature: &str,
+        context: &C,
+    ) -> Result<u64, BridgeError> {
+        let val = self.validate_payment(channel_id, balance, signature, context)?;
+        Ok(val.amount_due)
+    }
+
+    pub fn verify_payment_covers_amount_due_via_json(
+        &self,
+        payment_json: &str,
+        context: &C,
+    ) -> Result<u64, BridgeError> {
+        let p: Payment = serde_json::from_str(payment_json)
+            .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+        self.verify_payment_covers_amount_due(&p.channel_id, p.balance, &p.signature, context)
+    }
+
+    pub fn verify_payment_covers_amount_due_via_base64_header(
+        &self,
+        base64_header: &str,
+        context: &C,
+    ) -> Result<u64, BridgeError> {
+        let p = Self::decode_payment_header(base64_header)?;
+        self.verify_payment_covers_amount_due(&p.channel_id, p.balance, &p.signature, context)
+    }
+
+    /// Return true if the payment covers the amount due.
+    ///
+    /// Returns Ok(false) only for insufficient balance. Other validation errors
+    /// are returned as Err.
+    pub fn payment_covers_amount_due(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        signature: &str,
+        context: &C,
+    ) -> Result<bool, BridgeError> {
+        match self.verify_payment_covers_amount_due(channel_id, balance, signature, context) {
+            Ok(_) => Ok(true),
+            Err(BridgeError::InsufficientBalance { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn payment_covers_amount_due_via_json(
+        &self,
+        payment_json: &str,
+        context: &C,
+    ) -> Result<bool, BridgeError> {
+        let p: Payment = serde_json::from_str(payment_json)
+            .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+        self.payment_covers_amount_due(&p.channel_id, p.balance, &p.signature, context)
+    }
+
+    pub fn payment_covers_amount_due_via_base64_header(
+        &self,
+        base64_header: &str,
+        context: &C,
+    ) -> Result<bool, BridgeError> {
+        let p = Self::decode_payment_header(base64_header)?;
+        self.payment_covers_amount_due(&p.channel_id, p.balance, &p.signature, context)
+    }
+
+    fn validate_payment_request(
+        &self,
+        channel_id: &str,
+        signature: &str,
+    ) -> Result<Option<ChannelState>, BridgeError> {
+        if channel_id.is_empty() {
+            return Err(BridgeError::InvalidRequest("missing channel_id".into()));
+        }
+        if signature.is_empty() {
+            return Err(BridgeError::InvalidRequest("missing signature".into()));
+        }
+        match self
+            .host
+            .get_channel_state(channel_id)
+            .map_err(BridgeError::Internal)?
+        {
+            Some(ChannelState::Closed | ChannelState::SenderRefundedAfterExpiry) => {
+                Err(BridgeError::ChannelClosed)
+            }
+            Some(ChannelState::Closing) => Err(BridgeError::ChannelClosing),
+            Some(ChannelState::Open) => Ok(Some(ChannelState::Open)),
+            None => Ok(None),
+        }
+    }
+
+    /// Validate a payment/registration signature for an already-known channel.
+    ///
+    /// This reads stored funding data and verifies the supplied signature, but
+    /// does not record a payment or mutate channel state.
+    pub fn validate_existing_channel_funding(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        signature: &str,
+    ) -> Result<FundChannelResult, BridgeError> {
+        if channel_id.is_empty() {
+            return Err(BridgeError::InvalidRequest("missing channel_id".into()));
+        }
+        if signature.is_empty() {
+            return Err(BridgeError::InvalidRequest("missing signature".into()));
+        }
+        match self
+            .host
+            .get_channel_state(channel_id)
+            .map_err(BridgeError::Internal)?
+        {
+            Some(ChannelState::Closed | ChannelState::SenderRefundedAfterExpiry) => {
+                return Err(BridgeError::ChannelClosed)
+            }
+            Some(ChannelState::Closing) => return Err(BridgeError::ChannelClosing),
+            Some(ChannelState::Open) => {}
+            None => return Err(BridgeError::UnknownChannel),
+        }
+        let funding = self
+            .host
+            .get_funding(channel_id)
+            .ok_or(BridgeError::UnknownChannel)?;
+        let params_val: serde_json::Value = serde_json::from_str(&funding.params_json)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let capacity = params_val["capacity"].as_u64().unwrap_or(0);
+        self.verify_signature(
+            &funding.params_json,
+            &funding.funding_proofs_json,
+            &funding.channel_secret_hex,
+            &funding.keyset_info_json,
+            channel_id,
+            balance,
+            signature,
+        )
+        .map_err(BridgeError::InvalidSignature)?;
+        Ok(FundChannelResult {
+            channel_id: channel_id.to_string(),
+            capacity,
+            already_known: true,
+        })
+    }
+
+    /// Validate channel funding and return channel capacity.
+    ///
+    /// This is a convenience wrapper. For new channels it validates and records
+    /// funding; for known channels it validates the supplied signature without
+    /// mutating stored payment state. Durable integrations that need explicit
+    /// persistence boundaries should call
+    /// [`validate_new_channel_funding`](Self::validate_new_channel_funding) plus
+    /// [`record_validated_new_channel`](Self::record_validated_new_channel), or
+    /// [`validate_existing_channel_funding`](Self::validate_existing_channel_funding),
+    /// directly.
+    pub fn fund_channel(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        signature: &str,
+        params: Option<&serde_json::Value>,
+        funding_proofs: Option<&[Proof]>,
+    ) -> Result<FundChannelResult, BridgeError> {
+        if channel_id.is_empty() {
+            return Err(BridgeError::InvalidRequest("missing channel_id".into()));
+        }
+        if signature.is_empty() {
+            return Err(BridgeError::InvalidRequest("missing signature".into()));
+        }
+        match self
+            .host
+            .get_channel_state(channel_id)
+            .map_err(BridgeError::Internal)?
+        {
+            Some(ChannelState::Closed | ChannelState::SenderRefundedAfterExpiry) => {
+                return Err(BridgeError::ChannelClosed)
+            }
+            Some(ChannelState::Closing) => return Err(BridgeError::ChannelClosing),
+            Some(ChannelState::Open) => {
+                return self.validate_existing_channel_funding(channel_id, balance, signature);
+            }
+            None => {} // First-time registration validates the supplied funding below.
+        }
+        let validated = self.validate_new_channel_funding(
+            channel_id,
+            params.ok_or(BridgeError::InvalidRequest("Missing params".into()))?,
+            funding_proofs.ok_or(BridgeError::InvalidRequest("Missing proofs".into()))?,
+            balance,
+            signature,
+        )?;
+        let funding = validated.funding.clone();
+        self.record_validated_new_channel(&validated);
+        let params_val: serde_json::Value = serde_json::from_str(&funding.params_json)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let capacity = params_val["capacity"].as_u64().unwrap_or(0);
+        Ok(FundChannelResult {
+            channel_id: channel_id.to_string(),
+            capacity,
+            already_known: false,
+        })
+    }
+
+    pub fn fund_channel_via_json(&self, json: &str) -> Result<FundChannelResult, BridgeError> {
+        let p: Payment =
+            serde_json::from_str(json).map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+        self.fund_channel(
+            &p.channel_id,
+            p.balance,
+            &p.signature,
+            p.params.as_ref(),
+            p.funding_proofs.as_deref(),
+        )
+    }
+
+    pub fn fund_channel_via_base64_header(
+        &self,
+        base64_header: &str,
+    ) -> Result<FundChannelResult, BridgeError> {
+        let p = Self::decode_payment_header(base64_header)?;
+        self.fund_channel(
+            &p.channel_id,
+            p.balance,
+            &p.signature,
+            p.params.as_ref(),
+            p.funding_proofs.as_deref(),
+        )
+    }
+
+    /// Validate a first-use funding payment without recording it.
+    ///
+    /// This performs protocol and policy validation only. Call
+    /// [`record_validated_new_channel`](Self::record_validated_new_channel) to
+    /// persist the funding and initial payment proof after the caller has chosen
+    /// the surrounding persistence/retry behavior.
+    pub fn validate_new_channel_funding(
+        &self,
+        channel_id: &str,
+        params_val: &serde_json::Value,
+        proofs: &[Proof],
+        balance: u64,
+        signature: &str,
+    ) -> Result<ValidatedNewChannel, BridgeError> {
+        let unit = params_val["unit"]
+            .as_str()
+            .ok_or(BridgeError::InvalidRequest("Missing unit".into()))?;
+        let capacity = params_val["capacity"]
+            .as_u64()
+            .ok_or(BridgeError::InvalidRequest("Missing capacity".into()))?;
+        let expiry_timestamp =
+            params_val["expiry_timestamp"]
+                .as_u64()
+                .ok_or(BridgeError::InvalidRequest(
+                    "Missing expiry_timestamp".into(),
+                ))?;
+        let maximum_amount = params_val["maximum_amount"]
+            .as_u64()
+            .ok_or(BridgeError::InvalidRequest("Missing maximum_amount".into()))?;
+        let receiver_pubkey_hex =
+            params_val["receiver_pubkey"]
+                .as_str()
+                .ok_or(BridgeError::InvalidRequest(
+                    "Missing receiver_pubkey".into(),
+                ))?;
+        let receiver_pubkey = PublicKey::from_hex(receiver_pubkey_hex)
+            .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+        if !self.host.receiver_key_is_acceptable(&receiver_pubkey) {
+            return Err(BridgeError::ReceiverKeyNotAcceptable);
+        }
+        let sender_pubkey_hex = params_val["sender_pubkey"]
+            .as_str()
+            .ok_or(BridgeError::InvalidRequest("Missing sender_pubkey".into()))?;
+        let keyset_id = Id::from_str(
+            params_val["keyset_id"]
+                .as_str()
+                .ok_or(BridgeError::InvalidRequest("Missing keyset_id".into()))?,
+        )
+        .map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+        let mint = params_val["mint"]
+            .as_str()
+            .ok_or(BridgeError::InvalidRequest("Missing mint".into()))?;
+        if !self.host.mint_and_keyset_is_acceptable(mint, &keyset_id) {
+            return Err(BridgeError::MintOrKeysetNotAcceptable);
+        }
+        let keyset_info_json = self
+            .host
+            .get_keyset_info(mint, &keyset_id)
+            .ok_or(BridgeError::MintOrKeysetNotAcceptable)?;
+        let policy = self
+            .host
+            .get_channel_policy(unit)
+            .ok_or(BridgeError::UnsupportedUnit(unit.to_string()))?;
+        if capacity < policy.min_capacity {
+            return Err(BridgeError::CapacityTooSmall {
+                capacity,
+                min_capacity: policy.min_capacity,
+            });
+        }
+        if let Some(max) = policy.max_amount_per_output {
+            if max > 0 && maximum_amount > max {
+                return Err(BridgeError::MaxAmountExceeded {
+                    amount: maximum_amount,
+                    max_allowed: max,
+                });
+            }
+        }
+        let now = self.host.now_seconds();
+        if expiry_timestamp < now + policy.min_expiry_in_seconds {
+            return Err(BridgeError::ExpiryTooSoon {
+                expiry_timestamp,
+                min_expiry: now + policy.min_expiry_in_seconds,
+                now,
+            });
+        }
+        if balance > capacity {
+            return Err(BridgeError::BalanceExceedsCapacity { balance, capacity });
+        }
+        let channel_secret_hex = self
+            .host
+            .compute_channel_secret(receiver_pubkey_hex, sender_pubkey_hex)
+            .map_err(BridgeError::ServerMisconfigured)?;
+        let channel_secret: [u8; 32] = hex::decode(&channel_secret_hex)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?
+            .try_into()
+            .map_err(|_| BridgeError::Internal("Invalid secret length".into()))?;
+        let params = ChannelParameters::from_json_with_channel_secret(
+            &params_val.to_string(),
+            super::parse_keyset_info_from_json(&keyset_info_json)
+                .map_err(BridgeError::InvalidRequest)?,
+            channel_secret,
+        )
+        .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        if params.get_channel_id() != channel_id {
+            return Err(BridgeError::ChannelIdMismatch);
+        }
+        let verif = verify_valid_channel(proofs, &params);
+        if !verif.valid {
+            let errors_json =
+                serde_json::to_string(&verif.errors).unwrap_or_else(|_| "[]".to_string());
+            return Err(BridgeError::ValidationFailed(errors_json));
+        }
+        let proofs_json =
+            serde_json::to_string(proofs).map_err(|e| BridgeError::Internal(e.to_string()))?;
+        self.verify_signature(
+            &params_val.to_string(),
+            &proofs_json,
+            &channel_secret_hex,
+            &keyset_info_json,
+            channel_id,
+            balance,
+            signature,
+        )
+        .map_err(BridgeError::InvalidSignature)?;
+        let funding = ChannelFunding {
+            params_json: params_val.to_string(),
+            funding_proofs_json: proofs_json,
+            channel_secret_hex,
+            keyset_info_json,
+        };
+        Ok(ValidatedNewChannel {
+            channel_id: channel_id.to_string(),
+            balance,
+            capacity,
+            sender_signature: signature.to_string(),
+            funding,
+        })
+    }
+
+    /// Persist a previously validated first-use channel funding record.
+    pub fn record_validated_new_channel(&self, validated: &ValidatedNewChannel) {
+        self.host.save_funding(
+            &validated.channel_id,
+            validated.funding.clone(),
+            PaymentProof {
+                balance: validated.balance,
+                signature: validated.sender_signature.clone(),
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_signature(
+        &self,
+        params_json: &str,
+        proofs_json: &str,
+        secret_hex: &str,
+        keyset_json: &str,
+        channel_id: &str,
+        balance: u64,
+        signature: &str,
+    ) -> Result<(), String> {
+        let secret: [u8; 32] = hex::decode(secret_hex)
+            .map_err(|e| e.to_string())?
+            .try_into()
+            .map_err(|_| "Invalid secret length")?;
+        let params = ChannelParameters::from_json_with_channel_secret(
+            params_json,
+            super::parse_keyset_info_from_json(keyset_json).map_err(|e| e.to_string())?,
+            secret,
+        )
+        .map_err(|e| e.to_string())?;
+        let channel = EstablishedChannel::new(
+            params,
+            serde_json::from_str(proofs_json).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let sig: bitcoin::secp256k1::schnorr::Signature = signature
+            .parse()
+            .map_err(|e: <bitcoin::secp256k1::schnorr::Signature as FromStr>::Err| e.to_string())?;
+        BalanceUpdateMessage {
+            channel_id: channel_id.to_string(),
+            amount: balance,
+            signature: sig,
+        }
+        .verify_sender_signature(&channel)
+        .map_err(|e| e.to_string())
+    }
+
+    fn prepare_close_data_impl(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        signature: &str,
+        funding: ChannelFunding,
+        out_keyset: KeysetInfo,
+        validate_due: bool,
+    ) -> Result<CloseData, BridgeError> {
+        let secret: [u8; 32] = hex::decode(&funding.channel_secret_hex)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?
+            .try_into()
+            .map_err(|_| BridgeError::Internal("Invalid secret length".into()))?;
+        let params = ChannelParameters::from_json_with_channel_secret(
+            &funding.params_json,
+            super::parse_keyset_info_from_json(&funding.keyset_info_json)
+                .map_err(|e| BridgeError::Internal(e.to_string()))?,
+            secret,
+        )
+        .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let proofs: Vec<Proof> = serde_json::from_str(&funding.funding_proofs_json)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        if balance > params.capacity {
+            return Err(BridgeError::BalanceExceedsCapacity {
+                balance,
+                capacity: params.capacity,
+            });
+        }
+        if validate_due && balance != self.host.get_amount_due(channel_id, None) {
+            return Err(BridgeError::BalanceMismatch {
+                expected: self.host.get_amount_due(channel_id, None),
+                actual: balance,
+            });
+        }
+        let sig: bitcoin::secp256k1::schnorr::Signature = signature.parse().map_err(
+            |e: <bitcoin::secp256k1::schnorr::Signature as FromStr>::Err| {
+                BridgeError::InvalidSignature(e.to_string())
+            },
+        )?;
+        let commitment = CommitmentOutputs::for_balance(balance, &params)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let mut swap = commitment
+            .create_swap_request(proofs.clone(), Some(out_keyset.keyset_id))
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        super::balance_update::attach_signature_to_first_input(&mut swap, &sig.to_string())
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let channel = EstablishedChannel::new(params.clone(), proofs)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        BalanceUpdateMessage {
+            channel_id: channel_id.to_string(),
+            amount: balance,
+            signature: sig,
+        }
+        .verify_sender_signature(&channel)
+        .map_err(|e| BridgeError::InvalidSignature(e.to_string()))?;
+        let tweak = hex::encode(
+            params
+                .derive_receiver_blinding_scalar_for_stage1()
+                .map_err(|e| BridgeError::Internal(e.to_string()))?
+                .to_be_bytes(),
+        );
+        let sig_all_message_hash = super::balance_update::sig_all_message_hash_hex(&swap);
+        let blinded_receiver_pubkey = params
+            .get_receiver_blinded_pubkey_for_stage1()
+            .map_err(|e| BridgeError::Internal(e.to_string()))?
+            .to_hex();
+        let server_sig = self
+            .host
+            .sign_with_tweaked_key(
+                &params.receiver_pubkey.to_hex(),
+                &sig_all_message_hash,
+                &tweak,
+            )
+            .map_err(BridgeError::ServerMisconfigured)?;
+        super::balance_update::attach_signature_to_first_input(&mut swap, &server_sig)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let expected_total = params
+            .get_value_after_stage1_with_keyset(&out_keyset)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let mut swb: Vec<_> = commitment
+            .receiver_outputs
+            .get_secrets_with_blinding()
+            .map_err(|e| BridgeError::Internal(e.to_string()))?
+            .into_iter()
+            .map(|s| (s, true))
+            .chain(
+                commitment
+                    .sender_outputs
+                    .get_secrets_with_blinding()
+                    .map_err(|e| BridgeError::Internal(e.to_string()))?
+                    .into_iter()
+                    .map(|s| (s, false)),
+            )
+            .collect();
+        swb.sort_by_key(|(s, _)| s.amount);
+        Ok(CloseData {
+            swap_request: swap,
+            sig_all_message_hash,
+            blinded_receiver_pubkey,
+            expected_total,
+            secrets_with_blinding: swb,
+            output_keyset_info: out_keyset,
+        })
+    }
+
+    fn prepare_close_data(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        signature: &str,
+        validate_due: bool,
+    ) -> Result<CloseData, BridgeError> {
+        match self
+            .host
+            .get_channel_state(channel_id)
+            .map_err(BridgeError::Internal)?
+        {
+            Some(ChannelState::Closed | ChannelState::SenderRefundedAfterExpiry) => {
+                return Err(BridgeError::ChannelClosed);
+            }
+            None => return Err(BridgeError::UnknownChannel),
+            Some(ChannelState::Open | ChannelState::Closing) => {}
+        }
+        let funding = self
+            .host
+            .get_funding(channel_id)
+            .ok_or(BridgeError::UnknownChannel)?;
+        let out_keyset = self.select_close_output_keyset_from_funding(&funding)?;
+        self.prepare_close_data_impl(
+            channel_id,
+            balance,
+            signature,
+            funding,
+            out_keyset,
+            validate_due,
+        )
+    }
+
+    fn select_close_output_keyset_from_funding(
+        &self,
+        funding: &ChannelFunding,
+    ) -> Result<KeysetInfo, BridgeError> {
+        let secret: [u8; 32] = hex::decode(&funding.channel_secret_hex)
+            .map_err(|e| BridgeError::Internal(e.to_string()))?
+            .try_into()
+            .map_err(|_| BridgeError::Internal("Invalid secret length".into()))?;
+        let params = ChannelParameters::from_json_with_channel_secret(
+            &funding.params_json,
+            super::parse_keyset_info_from_json(&funding.keyset_info_json)
+                .map_err(|e| BridgeError::Internal(e.to_string()))?,
+            secret,
+        )
+        .map_err(|e| BridgeError::Internal(e.to_string()))?;
+        let active = self.host.get_active_keyset_ids(&params.mint, &params.unit);
+        active
+            .iter()
+            .filter_map(|id| {
+                let json = self.host.get_keyset_info(&params.mint, id)?;
+                let info = super::parse_keyset_info_from_json(&json).ok()?;
+                (info.keyset_id == *id
+                    && info.unit == params.unit
+                    && info.is_unexpired_at(self.host.now_seconds()))
+                .then_some(info)
+            })
+            .next()
+            .ok_or_else(|| BridgeError::Internal("No usable active close keysets".into()))
+    }
+
+    fn close_mint_unit_for_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<(String, CurrencyUnit), ClosePreparationError> {
+        let funding = self
+            .host
+            .get_funding(channel_id)
+            .ok_or_else(|| ClosePreparationError::internal("Missing funding"))?;
+        let secret: [u8; 32] = hex::decode(&funding.channel_secret_hex)
+            .map_err(|e| ClosePreparationError::internal(e.to_string()))?
+            .try_into()
+            .map_err(|_| ClosePreparationError::internal("Invalid secret length"))?;
+        let params = ChannelParameters::from_json_with_channel_secret(
+            &funding.params_json,
+            super::parse_keyset_info_from_json(&funding.keyset_info_json)
+                .map_err(|e| ClosePreparationError::internal(e.to_string()))?,
+            secret,
+        )
+        .map_err(|e| ClosePreparationError::internal(e.to_string()))?;
+        Ok((params.mint, params.unit))
+    }
+
+    fn ensure_close_keysets_cached<R: SpilmanKeysetRefresher>(
+        &self,
+        channel_id: &str,
+        keyset_refresher: &R,
+    ) -> Result<(), CloseError> {
+        let (mint, _unit) = self
+            .close_mint_unit_for_channel(channel_id)
+            .map_err(CloseError::from_preparation_error)?;
+        if self
+            .select_close_output_keyset_for_channel(channel_id)
+            .is_err()
+        {
+            keyset_refresher.refresh(&mint).map_err(|e| {
+                CloseError::storage_failed(format!("refresh keysets before close: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_close_keysets_cached_async<R: SpilmanAsyncKeysetRefresher>(
+        &self,
+        channel_id: &str,
+        keyset_refresher: &R,
+    ) -> Result<(), CloseError> {
+        let (mint, _unit) = self
+            .close_mint_unit_for_channel(channel_id)
+            .map_err(CloseError::from_preparation_error)?;
+        if self
+            .select_close_output_keyset_for_channel(channel_id)
+            .is_err()
+        {
+            keyset_refresher.refresh(&mint).await.map_err(|e| {
+                CloseError::storage_failed(format!("refresh keysets before close: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn select_close_output_keyset_for_channel(
+        &self,
+        channel_id: &str,
+    ) -> Result<SelectedOutputKeyset, ClosePreparationError> {
+        let funding = self
+            .host
+            .get_funding(channel_id)
+            .ok_or_else(|| ClosePreparationError::internal("Missing funding"))?;
+        let keyset = self
+            .select_close_output_keyset_from_funding(&funding)
+            .map_err(ClosePreparationError::from_bridge_error)?;
+        let info_json = serde_json::to_string(&keyset)
+            .map_err(|e| ClosePreparationError::internal(e.to_string()))?;
+        Ok(SelectedOutputKeyset {
+            id: keyset.keyset_id.to_string(),
+            info_json,
+        })
+    }
+
+    fn selected_output_keyset_info(
+        selected: SelectedOutputKeyset,
+    ) -> Result<KeysetInfo, ClosePreparationError> {
+        super::parse_keyset_info_from_json(&selected.info_json)
+            .map_err(|e| ClosePreparationError::internal(e.to_string()))
+    }
+
+    pub fn validate_and_prepare_cooperative_close(
+        &self,
+        json: &str,
+    ) -> Result<CloseData, BridgeError> {
+        let p: Payment =
+            serde_json::from_str(json).map_err(|e| BridgeError::InvalidRequest(e.to_string()))?;
+        if p.channel_id.is_empty() {
+            return Err(BridgeError::InvalidRequest("missing channel_id".into()));
+        }
+        if p.signature.is_empty() {
+            return Err(BridgeError::InvalidRequest("missing signature".into()));
+        }
+        self.prepare_close_data(&p.channel_id, p.balance, &p.signature, true)
+    }
+
+    pub fn create_unilateral_close_data(&self, channel_id: &str) -> Result<CloseData, BridgeError> {
+        if self.host.get_funding(channel_id).is_none() {
+            return Err(BridgeError::UnknownChannel);
+        }
+        let p = self
+            .host
+            .get_balance_and_signature_for_unilateral_exit(channel_id)
+            .ok_or_else(|| BridgeError::InvalidRequest("No payment proof".into()))?;
+        self.prepare_close_data(channel_id, p.balance, &p.signature, false)
+    }
+
+    pub fn prepare_cooperative_close_for_execution(
+        &self,
+        json: &str,
+    ) -> Result<PreparedClose, ClosePreparationError> {
+        let p: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| ClosePreparationError::bad_request(e.to_string()))?;
+        let channel_id = p["channel_id"]
+            .as_str()
+            .ok_or_else(|| ClosePreparationError::bad_request("Missing ID"))?
+            .to_string();
+        let close_data = self
+            .validate_and_prepare_cooperative_close(json)
+            .map_err(ClosePreparationError::from_bridge_error)?;
+        let balance = p["balance"].as_u64().unwrap_or(0);
+        let funding = self
+            .host
+            .get_funding(&channel_id)
+            .ok_or_else(|| ClosePreparationError::internal("Missing funding"))?;
+        Self::wrap_close_data(close_data, &channel_id, balance, funding)
+    }
+
+    pub fn prepare_unilateral_close_for_execution(
+        &self,
+        channel_id: &str,
+    ) -> Result<PreparedClose, ClosePreparationError> {
+        let close_data = self
+            .create_unilateral_close_data(channel_id)
+            .map_err(ClosePreparationError::from_bridge_error)?;
+        let funding = self
+            .host
+            .get_funding(channel_id)
+            .ok_or_else(|| ClosePreparationError::internal("Missing funding"))?;
+        let p = self
+            .host
+            .get_balance_and_signature_for_unilateral_exit(channel_id)
+            .ok_or_else(|| ClosePreparationError::internal("Missing payment"))?;
+        Self::wrap_close_data(close_data, channel_id, p.balance, funding)
+    }
+
+    pub fn prepare_cooperative_close_transition(
+        &self,
+        json: &str,
+    ) -> Result<PreparedCloseTransition, ClosePreparationError> {
+        let prepared_close = self.prepare_cooperative_close_for_execution(json)?;
+        let expiry_timestamp = close_expiry_timestamp(&prepared_close);
+        let sig = serde_json::from_str::<serde_json::Value>(json).unwrap_or_default()["signature"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        Ok(PreparedCloseTransition {
+            payment: PaymentProof {
+                balance: prepared_close.balance,
+                signature: sig,
+            },
+            expiry_timestamp,
+            prepared_close,
+        })
+    }
+
+    pub fn prepare_unilateral_close_transition(
+        &self,
+        channel_id: &str,
+    ) -> Result<PreparedCloseTransition, ClosePreparationError> {
+        let prepared_close = self.prepare_unilateral_close_for_execution(channel_id)?;
+        let expiry_timestamp = close_expiry_timestamp(&prepared_close);
+        let payment = self
+            .host
+            .get_balance_and_signature_for_unilateral_exit(channel_id)
+            .ok_or_else(|| ClosePreparationError::bad_request("No payment"))?;
+        Ok(PreparedCloseTransition {
+            prepared_close,
+            expiry_timestamp,
+            payment,
+        })
+    }
+
+    /// Persist the durable pre-swap `Closing` transition for a prepared close.
+    ///
+    /// Call this before submitting the mint swap so a crash can replay close
+    /// execution from stored closing data.
+    pub fn mark_prepared_close_closing(
+        &self,
+        transition: &PreparedCloseTransition,
+    ) -> Result<(), CloseError> {
+        self.host
+            .mark_channel_closing(
+                &transition.prepared_close.channel_id,
+                transition.expiry_timestamp,
+                transition.payment.clone(),
+            )
+            .map_err(CloseError::storage_failed)
+    }
+
+    /// Prepare the mint swap for a channel already marked `Closing`.
+    ///
+    /// This performs no mint I/O and does not mutate storage. The caller should
+    /// submit [`PreparedClose::swap_request`] to the mint, then pass the response
+    /// to [`complete_prepared_close`](Self::complete_prepared_close).
+    pub fn prepare_close_for_closing_channel_with_output_keyset(
+        &self,
+        channel_id: &str,
+        selected: SelectedOutputKeyset,
+    ) -> Result<PreparedClose, ClosePreparationError> {
+        if self
+            .host
+            .get_channel_state(channel_id)
+            .map_err(ClosePreparationError::internal)?
+            != Some(ChannelState::Closing)
+        {
+            return Err(ClosePreparationError::bad_request("Not closing"));
+        }
+        let cd = self
+            .host
+            .get_closing_data(channel_id)
+            .ok_or_else(|| ClosePreparationError::internal("Missing closing data"))?;
+        self.prepare_close_for_closing_channel_with_keyset(
+            channel_id,
+            cd.balance,
+            &cd.signature,
+            selected,
+        )
+    }
+
+    fn prepare_close_for_closing_channel_with_keyset(
+        &self,
+        channel_id: &str,
+        balance: u64,
+        signature: &str,
+        selected: SelectedOutputKeyset,
+    ) -> Result<PreparedClose, ClosePreparationError> {
+        let close_data = self
+            .prepare_close_data_impl(
+                channel_id,
+                balance,
+                signature,
+                self.host
+                    .get_funding(channel_id)
+                    .ok_or_else(|| ClosePreparationError::internal("Missing funding"))?,
+                Self::selected_output_keyset_info(selected)?,
+                false,
+            )
+            .map_err(ClosePreparationError::from_bridge_error)?;
+        let funding = self
+            .host
+            .get_funding(channel_id)
+            .ok_or_else(|| ClosePreparationError::internal("Missing funding"))?;
+        Self::wrap_close_data(close_data, channel_id, balance, funding)
+    }
+
+    /// Wrap a CloseData + funding into a PreparedClose struct.
+    fn wrap_close_data(
+        close_data: CloseData,
+        channel_id: &str,
+        balance: u64,
+        funding: ChannelFunding,
+    ) -> Result<PreparedClose, ClosePreparationError> {
+        let mint_url = serde_json::from_str::<serde_json::Value>(&funding.params_json)
+            .map_err(|e| ClosePreparationError::internal(e.to_string()))?["mint"]
+            .as_str()
+            .ok_or_else(|| ClosePreparationError::internal("Missing mint"))?
+            .to_string();
+        Ok(PreparedClose {
+            channel_id: channel_id.to_string(),
+            balance,
+            mint_url,
+            swap_request: serde_json::to_value(&close_data.swap_request)
+                .unwrap_or(serde_json::Value::Null),
+            sig_all_message_hash: close_data.sig_all_message_hash,
+            blinded_receiver_pubkey: close_data.blinded_receiver_pubkey,
+            secrets_with_blinding: close_data
+                .secrets_with_blinding
+                .iter()
+                .map(|(s, is_r)| {
+                    serde_json::json!({
+                        "secret": s.secret.to_string(),
+                        "blinding_factor": hex::encode(s.blinding_factor.secret_bytes()),
+                        "amount": s.amount,
+                        "index": s.index,
+                        "is_receiver": is_r
+                    })
+                })
+                .collect(),
+            output_keyset_info: serde_json::to_value(&close_data.output_keyset_info)
+                .unwrap_or(serde_json::Value::Null),
+            params_json: funding.params_json,
+            keyset_info_json: funding.keyset_info_json,
+            channel_secret: funding.channel_secret_hex,
+        })
+    }
+
+    fn sign_receiver_close_proof(
+        &self,
+        params: &ChannelParameters,
+        proof_meta: &ProofWithMeta,
+    ) -> Result<Proof, CloseError> {
+        use bitcoin::hashes::{sha256::Hash as Sha256Hash, Hash};
+
+        let mut proof = proof_meta.proof.clone();
+        params
+            .attach_stage2_p2pk_e(
+                &mut proof,
+                Stage2Role::Receiver,
+                proof_meta.amount,
+                proof_meta.index,
+            )
+            .map_err(|e| {
+                CloseError::unblind_failed(format!("Failed to attach stage2 metadata: {}", e))
+            })?;
+        let tweak_info = params
+            .stage2_tweak_info_for_role(Stage2Role::Receiver, proof_meta.amount, proof_meta.index)
+            .map_err(|e| {
+                CloseError::unblind_failed(format!("Failed to derive stage2 tweak: {}", e))
+            })?;
+        let tweak_hex = hex::encode(tweak_info.stage2_tweak_scalar.to_be_bytes());
+        let msg_hash = Sha256Hash::hash(&proof.secret.to_bytes());
+        let msg_hex = hex::encode(msg_hash.as_byte_array());
+        let sig = self
+            .host
+            .sign_with_tweaked_key(&params.receiver_pubkey.to_hex(), &msg_hex, &tweak_hex)
+            .map_err(|e| {
+                CloseError::unblind_failed(format!("Failed to sign receiver proof: {}", e))
+            })?;
+        proof.witness = Some(cashu::nuts::Witness::P2PKWitness(
+            cashu::nuts::P2PKWitness {
+                signatures: vec![sig],
+            },
+        ));
+
+        Ok(proof)
+    }
+
+    /// Complete an exact NUT-09 restore without mutating storage or selecting keys.
+    /// Only two empty arrays mean absence, not successful close or spent funding.
+    /// The caller must authenticate the persisted preparation against its journal.
+    pub fn complete_prepared_close_restore(
+        &self,
+        resp_json: &str,
+        prep: &PreparedClose,
+    ) -> Result<Option<CompletedClose>, CloseError> {
+        let response: cashu::nuts::RestoreResponse = serde_json::from_str(resp_json)
+            .map_err(|_| CloseError::unblind_failed("Invalid close restore response"))?;
+        let request: SwapRequest = serde_json::from_value(prep.swap_request.clone())
+            .map_err(|_| CloseError::unblind_failed("Invalid prepared close request"))?;
+        if response.outputs.is_empty() && response.signatures.is_empty() {
+            return Ok(None);
+        }
+        let signatures =
+            crate::bindings::match_restore_response(response, request.outputs(), "close")
+                .map_err(CloseError::unblind_failed)?;
+        self.complete_prepared_close(
+            &serde_json::json!({ "signatures": signatures }).to_string(),
+            prep,
+        )
+        .map(Some)
+    }
+
+    /// Complete a prepared close from a mint swap response without mutating storage.
+    pub fn complete_prepared_close(
+        &self,
+        resp_json: &str,
+        prep: &PreparedClose,
+    ) -> Result<CompletedClose, CloseError> {
+        use super::parse_keyset_info_from_json;
+        use cashu::nuts::SecretKey;
+        use cashu::secret::Secret;
+
+        let resp: serde_json::Value = serde_json::from_str(resp_json)
+            .map_err(|_| CloseError::unblind_failed("Invalid close swap response"))?;
+        let sigs_value = resp
+            .get("signatures")
+            .ok_or_else(|| CloseError::UnblindFailed {
+                reason: "Missing signatures".into(),
+                status: 500,
+            })?;
+
+        // Parse inputs for the internal unblind function
+        let keyset_info = parse_keyset_info_from_json(&prep.keyset_info_json)
+            .map_err(CloseError::unblind_failed)?;
+        let output_keyset_info = parse_keyset_info_from_json(&prep.output_keyset_info.to_string())
+            .map_err(CloseError::unblind_failed)?;
+        let channel_secret_bytes =
+            hex::decode(&prep.channel_secret).map_err(|e| CloseError::UnblindFailed {
+                reason: e.to_string(),
+                status: 500,
+            })?;
+        let channel_secret: [u8; 32] =
+            channel_secret_bytes
+                .try_into()
+                .map_err(|_| CloseError::UnblindFailed {
+                    reason: "Invalid channel secret length".into(),
+                    status: 500,
+                })?;
+        let params = ChannelParameters::from_json_with_channel_secret(
+            &prep.params_json,
+            keyset_info,
+            channel_secret,
+        )
+        .map_err(|e| CloseError::UnblindFailed {
+            reason: e.to_string(),
+            status: 500,
+        })?;
+
+        let blind_signatures: Vec<BlindSignature> = serde_json::from_value(sigs_value.clone())
+            .map_err(|_| CloseError::unblind_failed("Invalid close signatures"))?;
+        let swb_raw: Vec<serde_json::Value> =
+            serde_json::from_str(&prep.secrets_with_blinding.to_string()).map_err(|e| {
+                CloseError::UnblindFailed {
+                    reason: e.to_string(),
+                    status: 500,
+                }
+            })?;
+
+        let mut secrets_with_blinding = Vec::new();
+        for swb in swb_raw {
+            let secret = Secret::new(
+                swb["secret"]
+                    .as_str()
+                    .ok_or_else(|| CloseError::UnblindFailed {
+                        reason: "Missing secret".into(),
+                        status: 500,
+                    })?
+                    .to_string(),
+            );
+            let blinding_factor = SecretKey::from_slice(
+                &hex::decode(swb["blinding_factor"].as_str().ok_or_else(|| {
+                    CloseError::UnblindFailed {
+                        reason: "Missing blinding".into(),
+                        status: 500,
+                    }
+                })?)
+                .map_err(|e| CloseError::UnblindFailed {
+                    reason: e.to_string(),
+                    status: 500,
+                })?,
+            )
+            .map_err(|e| CloseError::UnblindFailed {
+                reason: e.to_string(),
+                status: 500,
+            })?;
+            let amount = swb["amount"]
+                .as_u64()
+                .ok_or_else(|| CloseError::UnblindFailed {
+                    reason: "Missing amount".into(),
+                    status: 500,
+                })?;
+            let index = swb["index"]
+                .as_u64()
+                .ok_or_else(|| CloseError::UnblindFailed {
+                    reason: "Missing index".into(),
+                    status: 500,
+                })? as usize;
+            let is_receiver =
+                swb["is_receiver"]
+                    .as_bool()
+                    .ok_or_else(|| CloseError::UnblindFailed {
+                        reason: "Missing is_receiver".into(),
+                        status: 500,
+                    })?;
+            secrets_with_blinding.push((
+                DeterministicSecretWithBlinding {
+                    secret,
+                    blinding_factor,
+                    amount,
+                    index,
+                },
+                is_receiver,
+            ));
+        }
+
+        if params.get_channel_id() != prep.channel_id
+            || params.mint != prep.mint_url
+            || params.unit != output_keyset_info.unit
+            || prep.balance > params.capacity
+        {
+            return Err(CloseError::unblind_failed(
+                "Prepared close binding mismatch",
+            ));
+        }
+        let commitment = CommitmentOutputs::for_balance(prep.balance, &params)
+            .map_err(|_| CloseError::unblind_failed("Invalid close commitment"))?;
+        let mut expected_secrets: Vec<_> = commitment
+            .receiver_outputs
+            .get_secrets_with_blinding()
+            .map_err(|_| CloseError::unblind_failed("Invalid receiver close secrets"))?
+            .into_iter()
+            .map(|secret| (secret, true))
+            .chain(
+                commitment
+                    .sender_outputs
+                    .get_secrets_with_blinding()
+                    .map_err(|_| CloseError::unblind_failed("Invalid sender close secrets"))?
+                    .into_iter()
+                    .map(|secret| (secret, false)),
+            )
+            .collect();
+        expected_secrets.sort_by_key(|(secret, _)| secret.amount);
+        if expected_secrets.len() != secrets_with_blinding.len()
+            || expected_secrets.iter().zip(&secrets_with_blinding).any(
+                |((expected, role), (actual, actual_role))| {
+                    role != actual_role
+                        || expected.secret != actual.secret
+                        || expected.blinding_factor != actual.blinding_factor
+                        || expected.amount != actual.amount
+                        || expected.index != actual.index
+                },
+            )
+        {
+            return Err(CloseError::unblind_failed(
+                "Prepared close secrets do not match commitment",
+            ));
+        }
+        let request: SwapRequest = serde_json::from_value(prep.swap_request.clone())
+            .map_err(|_| CloseError::unblind_failed("Invalid prepared close request"))?;
+        if request.outputs().len() != secrets_with_blinding.len() {
+            return Err(CloseError::unblind_failed(
+                "Prepared close output count mismatch",
+            ));
+        }
+        for (output, (secret, _)) in request.outputs().iter().zip(&secrets_with_blinding) {
+            let (blinded_secret, _) = cashu::dhke::blind_message(
+                secret.secret.to_bytes().as_ref(),
+                Some(secret.blinding_factor.clone()),
+            )
+            .map_err(|_| CloseError::unblind_failed("Invalid prepared close output"))?;
+            let expected = cashu::nuts::BlindedMessage::new(
+                secret.amount.into(),
+                output_keyset_info.keyset_id,
+                blinded_secret,
+            );
+            if output != &expected {
+                return Err(CloseError::unblind_failed(
+                    "Prepared close outputs do not match secrets",
+                ));
+            }
+        }
+
+        // Unblind and verify (returns enriched proofs with amount/index metadata)
+        let result = unblind_and_verify_stage1_response(
+            blind_signatures,
+            secrets_with_blinding,
+            &params,
+            &output_keyset_info,
+            prep.balance,
+        )
+        .map_err(|e| CloseError::UnblindFailed {
+            reason: e.to_string(),
+            status: 500,
+        })?;
+
+        // Sign each receiver proof with P2PK witness using the host's tweaked signing
+        let mut signed_receiver_proofs: Vec<Proof> =
+            Vec::with_capacity(result.receiver_proofs.len());
+        for pm in &result.receiver_proofs {
+            signed_receiver_proofs.push(self.sign_receiver_close_proof(&params, pm)?);
+        }
+
+        let sender_proofs: Vec<&Proof> = result.sender_proofs.iter().map(|pm| &pm.proof).collect();
+        let r_sum = result.receiver_sum;
+        let s_sum = result.sender_sum;
+
+        let receiver_proofs_json =
+            serde_json::to_string(&signed_receiver_proofs).unwrap_or_default();
+        let sender_proofs_json = serde_json::to_string(&sender_proofs).unwrap_or_default();
+
+        let expiry_timestamp = close_expiry_timestamp(prep);
+
+        Ok(CompletedClose {
+            channel_id: prep.channel_id.clone(),
+            expiry_timestamp,
+            balance: prep.balance,
+            receiver_proofs_json,
+            sender_proofs_json,
+            receiver_sum: r_sum,
+            sender_sum: s_sum,
+        })
+    }
+
+    /// Persist a completed close and return the close summary.
+    ///
+    /// This is the storage mutation step after
+    /// [`complete_prepared_close`](Self::complete_prepared_close).
+    pub fn mark_completed_close(
+        &self,
+        completed: &CompletedClose,
+    ) -> Result<CloseSuccess, CloseError> {
+        if self
+            .host
+            .get_channel_state(&completed.channel_id)
+            .map_err(CloseError::storage_failed)?
+            != Some(ChannelState::Closing)
+        {
+            return Err(CloseError::ValidationFailed {
+                reason: "Not closing".into(),
+                status: 400,
+                expected_balance: None,
+                actual_balance: None,
+            });
+        }
+        self.host
+            .mark_channel_closed(
+                &completed.channel_id,
+                completed.expiry_timestamp,
+                completed.balance,
+                &completed.receiver_proofs_json,
+                &completed.sender_proofs_json,
+                completed.receiver_sum,
+                completed.sender_sum,
+            )
+            .map_err(CloseError::storage_failed)?;
+        Ok(CloseSuccess {
+            channel_id: completed.channel_id.clone(),
+            total_value: completed.receiver_sum + completed.sender_sum,
+            receiver_sum: completed.receiver_sum,
+            sender_sum: completed.sender_sum,
+            sender_proofs: completed.sender_proofs_json.clone(),
+            already_closed: false,
+        })
+    }
+
+    fn finalize_close(
+        &self,
+        resp_json: &str,
+        prep: &PreparedClose,
+    ) -> Result<CloseSuccess, CloseError> {
+        let completed = self.complete_prepared_close(resp_json, prep)?;
+        self.mark_completed_close(&completed)
+    }
+
+    fn close_retry_result(
+        result: Result<
+            crate::KeysetRetrySuccess<PreparedClose, String>,
+            KeysetRetryError<PreparedClose, CloseError, String>,
+        >,
+        first_rejection: Option<String>,
+    ) -> Result<crate::KeysetRetrySuccess<PreparedClose, String>, CloseError> {
+        match result {
+            Ok(success) => Ok(success),
+            Err(KeysetRetryError::Select { error, .. })
+            | Err(KeysetRetryError::Prepare { error, .. })
+            | Err(KeysetRetryError::Refresh { error })
+            | Err(KeysetRetryError::Cleanup { error }) => Err(error),
+            Err(KeysetRetryError::Submit {
+                error,
+                retried: false,
+                ..
+            }) => Err(CloseError::mint_rejected(parse_mint_error_value(&error))),
+            Err(KeysetRetryError::Submit {
+                error,
+                retried: true,
+                ..
+            }) => {
+                let first = first_rejection.as_deref().unwrap_or(&error);
+                Err(CloseError::mint_rejected_after_retry(
+                    parse_mint_error_value(first),
+                    parse_mint_error_value(&error),
+                ))
+            }
+            Err(KeysetRetryError::RetryKeysetUnchanged { error, .. }) => {
+                Err(CloseError::mint_rejected(parse_mint_error_value(&error)))
+            }
+        }
+    }
+
+    /// Execute a close for a channel already marked `Closing`.
+    ///
+    /// This is a convenience wrapper around close preparation, mint swap
+    /// submission, retry, completion, and marking closed. Durable integrations
+    /// should use the explicit prepare/complete/mark methods and own mint I/O.
+    pub fn execute_close_for_closing_channel<M: SpilmanMintClient, R: SpilmanKeysetRefresher>(
+        &self,
+        channel_id: &str,
+        mint_client: &M,
+        keyset_refresher: &R,
+    ) -> Result<CloseSuccess, CloseError> {
+        if self
+            .host
+            .get_channel_state(channel_id)
+            .map_err(CloseError::storage_failed)?
+            != Some(ChannelState::Closing)
+        {
+            return Err(CloseError::ValidationFailed {
+                reason: "Not closing".into(),
+                status: 400,
+                expected_balance: None,
+                actual_balance: None,
+            });
+        }
+        let cd =
+            self.host
+                .get_closing_data(channel_id)
+                .ok_or_else(|| CloseError::ValidationFailed {
+                    reason: "Missing closing data".into(),
+                    status: 500,
+                    expected_balance: None,
+                    actual_balance: None,
+                })?;
+        let first_rejection = std::sync::Mutex::new(None::<String>);
+        let retry_mint_url = std::sync::Mutex::new(None::<String>);
+        self.ensure_close_keysets_cached(channel_id, keyset_refresher)?;
+        // Closing a channel spends the stored channel funding proofs through a
+        // mint swap, splitting value between receiver and sender outputs.  The
+        // close outputs must be created for an active mint keyset.  Hosts cache
+        // keyset metadata because building the deterministic outputs requires
+        // full keyset info.  Before entering the retry helper, ensure that cache
+        // has at least one keyset for the channel's mint/unit; inside the helper
+        // selection is cache-only.  If the cached active output keyset is stale,
+        // the helper refreshes after a retryable keyset rejection, reselects, and
+        // retries once only if the selected keyset id changed.  If refresh still
+        // chooses the same keyset, retrying would submit the same stale swap
+        // again, so the helper returns the first mint rejection.
+        let result: Result<
+            crate::KeysetRetrySuccess<PreparedClose, String>,
+            KeysetRetryError<PreparedClose, CloseError, String>,
+        > = with_active_keyset_retry(
+            // Select the output keyset from the host's cached mint keyset data.
+            // Close intentionally uses the first active keyset for the channel's
+            // mint/unit instead of preferring the original funding keyset.
+            || {
+                self.select_close_output_keyset_for_channel(channel_id)
+                    .map_err(CloseError::from_preparation_error)
+            },
+            // Build the signed close swap for the selected output keyset. This
+            // step is side-effect free: Closing is already durable, and
+            // finalization later persists the Closed transition.
+            |selected| {
+                self.prepare_close_for_closing_channel_with_keyset(
+                    channel_id,
+                    cd.balance,
+                    &cd.signature,
+                    selected,
+                )
+                .map_err(CloseError::from_preparation_error)
+            },
+            // Submit the prepared swap request to the mint.
+            |prep| mint_client.call_mint_swap(&prep.mint_url, &prep.swap_request.to_string()),
+            // Retry only keyset-class mint errors and remember the original
+            // rejection so error mapping can distinguish first vs retry failure.
+            |error| {
+                if should_retry_swap_error(error) {
+                    let Ok(mut first_rejection) = first_rejection.lock() else {
+                        return false;
+                    };
+                    *first_rejection = Some(error.clone());
+                    true
+                } else {
+                    false
+                }
+            },
+            // Preserve historical close behavior: ask the keyset refresher to
+            // refresh all keysets for the mint, but ignore refresh errors. If
+            // refresh fails or still yields the same keyset, the helper skips
+            // the retry and the original mint rejection is returned.
+            || {
+                let mint_url = retry_mint_url.lock().ok().and_then(|guard| guard.clone());
+                if let Some(mint_url) = mint_url.as_deref() {
+                    let _ = keyset_refresher.refresh(mint_url);
+                }
+                Ok(())
+            },
+            // Cleanup runs after the first retryable rejection and before the
+            // refresh.  Close has no reservation to release, but the refresh
+            // closure needs to know which mint was used by the failed attempt.
+            |attempt, _error| {
+                *retry_mint_url
+                    .lock()
+                    .map_err(|_| CloseError::storage_failed("close retry lock poisoned"))? =
+                    Some(attempt.mint_url.clone());
+                Ok(())
+            },
+        );
+        let success =
+            Self::close_retry_result(result, first_rejection.into_inner().unwrap_or_default())?;
+        self.finalize_close(&success.value, &success.attempt)
+    }
+
+    pub async fn execute_close_for_closing_channel_async<
+        M: SpilmanAsyncMintClient,
+        R: SpilmanAsyncKeysetRefresher,
+    >(
+        &self,
+        channel_id: &str,
+        mint_client: &M,
+        keyset_refresher: &R,
+    ) -> Result<CloseSuccess, CloseError> {
+        if self
+            .host
+            .get_channel_state(channel_id)
+            .map_err(CloseError::storage_failed)?
+            != Some(ChannelState::Closing)
+        {
+            return Err(CloseError::ValidationFailed {
+                reason: "Not closing".into(),
+                status: 400,
+                expected_balance: None,
+                actual_balance: None,
+            });
+        }
+        let cd =
+            self.host
+                .get_closing_data(channel_id)
+                .ok_or_else(|| CloseError::ValidationFailed {
+                    reason: "Missing closing data".into(),
+                    status: 500,
+                    expected_balance: None,
+                    actual_balance: None,
+                })?;
+        let first_rejection = std::sync::Mutex::new(None::<String>);
+        let retry_mint_url = std::sync::Mutex::new(None::<String>);
+        self.ensure_close_keysets_cached_async(channel_id, keyset_refresher)
+            .await?;
+        // Async variant of the same close-swap retry policy used above.  The
+        // cache is pre-warmed if empty, then selection stays cache-only until a
+        // retryable keyset rejection causes the helper to refresh and reselect.
+        let result: Result<
+            crate::KeysetRetrySuccess<PreparedClose, String>,
+            KeysetRetryError<PreparedClose, CloseError, String>,
+        > = with_active_keyset_retry_async(
+            // Select active close output keyset from host cache.
+            || {
+                self.select_close_output_keyset_for_channel(channel_id)
+                    .map_err(CloseError::from_preparation_error)
+            },
+            // Prepare a close swap for that selected output keyset.
+            |selected| {
+                self.prepare_close_for_closing_channel_with_keyset(
+                    channel_id,
+                    cd.balance,
+                    &cd.signature,
+                    selected,
+                )
+                .map_err(CloseError::from_preparation_error)
+            },
+            // Submit via async networking.
+            |prep| async move {
+                mint_client
+                    .call_mint_swap(&prep.mint_url, &prep.swap_request.to_string())
+                    .await
+            },
+            // Restrict retries to safe keyset rejections and remember the first
+            // rejection for final error mapping.
+            |error| {
+                if should_retry_swap_error(error) {
+                    let Ok(mut first_rejection) = first_rejection.lock() else {
+                        return false;
+                    };
+                    *first_rejection = Some(error.clone());
+                    true
+                } else {
+                    false
+                }
+            },
+            // Delegate keyset refresh to the refresher. As in the sync path,
+            // refresh failures are intentionally ignored and will normally
+            // surface as unchanged-keyset/original-rejection behavior.
+            || {
+                let mint_url = retry_mint_url.lock().ok().and_then(|guard| guard.clone());
+                async move {
+                    if let Some(mint_url) = mint_url {
+                        let _ = keyset_refresher.refresh(&mint_url).await;
+                    }
+                    Ok(())
+                }
+            },
+            // No close reservation is released here; this just records the mint
+            // URL needed by the refresh closure.
+            |attempt, _error| {
+                *retry_mint_url
+                    .lock()
+                    .map_err(|_| CloseError::storage_failed("close retry lock poisoned"))? =
+                    Some(attempt.mint_url.clone());
+                Ok(())
+            },
+        )
+        .await;
+        let success =
+            Self::close_retry_result(result, first_rejection.into_inner().unwrap_or_default())?;
+        self.finalize_close(&success.value, &success.attempt)
+    }
+
+    /// Execute cooperative close as an all-in-one convenience wrapper.
+    ///
+    /// This may record first-use funding, mark the channel `Closing`, submit the
+    /// mint swap with retry, complete the response, and mark the channel closed.
+    /// Durable integrations should drive those phases explicitly.
+    pub fn execute_cooperative_close<M: SpilmanMintClient, R: SpilmanKeysetRefresher>(
+        &self,
+        json: &str,
+        mint_client: &M,
+        keyset_refresher: &R,
+    ) -> Result<CloseSuccess, CloseError> {
+        self.record_cooperative_close_first_use_funding(json)?;
+        let transition = self
+            .prepare_cooperative_close_transition(json)
+            .map_err(CloseError::from_preparation_error)?;
+        self.mark_prepared_close_closing(&transition)?;
+        self.execute_close_for_closing_channel(
+            &transition.prepared_close.channel_id,
+            mint_client,
+            keyset_refresher,
+        )
+    }
+
+    pub async fn execute_cooperative_close_async<
+        M: SpilmanAsyncMintClient,
+        R: SpilmanAsyncKeysetRefresher,
+    >(
+        &self,
+        json: &str,
+        mint_client: &M,
+        keyset_refresher: &R,
+    ) -> Result<CloseSuccess, CloseError> {
+        self.record_cooperative_close_first_use_funding(json)?;
+        let transition = self
+            .prepare_cooperative_close_transition(json)
+            .map_err(CloseError::from_preparation_error)?;
+        self.mark_prepared_close_closing(&transition)?;
+        self.execute_close_for_closing_channel_async(
+            &transition.prepared_close.channel_id,
+            mint_client,
+            keyset_refresher,
+        )
+        .await
+    }
+
+    /// Execute unilateral close as an all-in-one convenience wrapper.
+    ///
+    /// This marks the channel `Closing`, submits the mint swap with retry,
+    /// completes the response, and marks the channel closed. Durable integrations
+    /// should drive those phases explicitly.
+    pub fn execute_unilateral_close<M: SpilmanMintClient, R: SpilmanKeysetRefresher>(
+        &self,
+        channel_id: &str,
+        mint_client: &M,
+        keyset_refresher: &R,
+    ) -> Result<CloseSuccess, CloseError> {
+        let transition = self
+            .prepare_unilateral_close_transition(channel_id)
+            .map_err(CloseError::from_preparation_error)?;
+        self.mark_prepared_close_closing(&transition)?;
+        self.execute_close_for_closing_channel(channel_id, mint_client, keyset_refresher)
+    }
+
+    pub async fn execute_unilateral_close_async<
+        M: SpilmanAsyncMintClient,
+        R: SpilmanAsyncKeysetRefresher,
+    >(
+        &self,
+        channel_id: &str,
+        mint_client: &M,
+        keyset_refresher: &R,
+    ) -> Result<CloseSuccess, CloseError> {
+        let transition = self
+            .prepare_unilateral_close_transition(channel_id)
+            .map_err(CloseError::from_preparation_error)?;
+        self.mark_prepared_close_closing(&transition)?;
+        self.execute_close_for_closing_channel_async(channel_id, mint_client, keyset_refresher)
+            .await
+    }
+
+    fn record_cooperative_close_first_use_funding(&self, json: &str) -> Result<(), CloseError> {
+        let p: Payment = serde_json::from_str(json).map_err(|e| {
+            CloseError::from_preparation_error(ClosePreparationError::bad_request(e.to_string()))
+        })?;
+        if p.channel_id.is_empty() || p.signature.is_empty() {
+            return Ok(());
+        }
+        if self
+            .host
+            .get_channel_state(&p.channel_id)
+            .map_err(CloseError::storage_failed)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let Some(params) = p.params.as_ref() else {
+            return Ok(());
+        };
+        let Some(funding_proofs) = p.funding_proofs.as_deref() else {
+            return Ok(());
+        };
+        let validated = self
+            .validate_new_channel_funding(
+                &p.channel_id,
+                params,
+                funding_proofs,
+                p.balance,
+                &p.signature,
+            )
+            .map_err(|e| {
+                CloseError::from_preparation_error(ClosePreparationError::from_bridge_error(e))
+            })?;
+        self.record_validated_new_channel(&validated);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cashu::nuts::{Id, PublicKey, SecretKey};
+    struct MockHost {
+        ra: bool,
+        ma: bool,
+        state: Result<Option<ChannelState>, String>,
+    }
+    impl SpilmanHost<String> for MockHost {
+        fn receiver_key_is_acceptable(&self, _: &PublicKey) -> bool {
+            self.ra
+        }
+        fn mint_and_keyset_is_acceptable(&self, _: &str, _: &Id) -> bool {
+            self.ma
+        }
+        fn get_funding(&self, _: &str) -> Option<ChannelFunding> {
+            None
+        }
+        fn save_funding(&self, _: &str, _: ChannelFunding, _: PaymentProof) {}
+        fn get_amount_due(&self, _: &str, _: Option<&String>) -> u64 {
+            0
+        }
+        fn record_payment(&self, _: &str, _: PaymentProof, _: &String) {}
+        fn get_channel_state(&self, _: &str) -> Result<Option<ChannelState>, String> {
+            self.state.clone()
+        }
+        fn mark_channel_closing(&self, _: &str, _: u64, _: PaymentProof) -> Result<(), String> {
+            Ok(())
+        }
+        fn get_closing_data(&self, _: &str) -> Option<ClosingData> {
+            None
+        }
+        fn get_channel_policy(&self, _unit: &str) -> Option<ChannelPolicy> {
+            Some(ChannelPolicy {
+                min_expiry_in_seconds: 3600,
+                min_capacity: 100,
+                max_amount_per_output: None,
+            })
+        }
+        fn now_seconds(&self) -> u64 {
+            1700000000
+        }
+        fn get_balance_and_signature_for_unilateral_exit(&self, _: &str) -> Option<PaymentProof> {
+            None
+        }
+        fn get_active_keyset_ids(&self, _: &str, _: &CurrencyUnit) -> Vec<Id> {
+            Vec::new()
+        }
+        fn has_keysets_for_unit(&self, _: &str, _: &CurrencyUnit) -> bool {
+            false
+        }
+        fn get_keyset_info(&self, _: &str, _: &Id) -> Option<String> {
+            None
+        }
+        fn mark_channel_closed(
+            &self,
+            _: &str,
+            _: u64,
+            _: u64,
+            _: &str,
+            _: &str,
+            _: u64,
+            _: u64,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn compute_channel_secret(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("N/A".into())
+        }
+        fn sign_with_tweaked_key(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
+            Err("N/A".into())
+        }
+    }
+    impl SpilmanMintClient for MockHost {
+        fn call_mint_swap(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("N/A".into())
+        }
+    }
+
+    impl SpilmanKeysetRefresher for MockHost {
+        fn refresh(&self, _: &str) -> Result<(), String> {
+            Err("N/A".into())
+        }
+    }
+
+    #[test]
+    fn close_retry_unchanged_keyset_returns_first_mint_rejection() {
+        let error = r#"{"code":12001,"detail":"keyset stale"}"#.to_string();
+        let result: Result<crate::KeysetRetrySuccess<PreparedClose, String>, _> =
+            Err(KeysetRetryError::RetryKeysetUnchanged {
+                attempt: PreparedClose {
+                    channel_id: "channel".to_string(),
+                    balance: 0,
+                    mint_url: "https://mint.example".to_string(),
+                    swap_request: serde_json::json!({}),
+                    sig_all_message_hash: "00".repeat(32),
+                    blinded_receiver_pubkey: cashu::nuts::SecretKey::generate()
+                        .public_key()
+                        .to_hex(),
+                    secrets_with_blinding: serde_json::json!([]),
+                    output_keyset_info: serde_json::json!({}),
+                    params_json: "{}".to_string(),
+                    keyset_info_json: "{}".to_string(),
+                    channel_secret: "00".repeat(32),
+                },
+                error: error.clone(),
+                keyset_id: "00abcdef".to_string(),
+            });
+
+        let err =
+            SpilmanBridge::<MockHost, String>::close_retry_result(result, Some(error)).unwrap_err();
+        match err {
+            CloseError::MintRejected { mint_error, .. } => {
+                assert_eq!(mint_error["detail"].as_str(), Some("keyset stale"));
+            }
+            other => panic!("expected first mint rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_bridge_rejects_unacceptable_receiver() {
+        let b = SpilmanBridge::new(MockHost {
+            ra: false,
+            ma: true,
+            state: Ok(None),
+        });
+        let p = serde_json::json!({ "sender_pubkey": SecretKey::generate().public_key().to_hex(), "receiver_pubkey": SecretKey::generate().public_key().to_hex(), "mint": "https://m", "unit": "sat", "capacity": 1000, "funding_token_amount": 1000, "maximum_amount": 64, "expiry_timestamp": 1700007200, "setup_timestamp": 1700000000, "keyset_id": "00" });
+        let pay = serde_json::json!({ "channel_id": "i", "balance": 100, "signature": "s", "params": p, "funding_proofs": [] });
+        assert!(b
+            .process_payment_via_json(&pay.to_string(), &"{}".to_string())
+            .unwrap_err()
+            .to_string()
+            .contains("receiver key not acceptable"));
+    }
+
+    #[test]
+    fn receiver_lookup_errors_stop_registration_and_payment_validation() {
+        let bridge = SpilmanBridge::new(MockHost {
+            ra: true,
+            ma: true,
+            state: Err("storage unavailable".to_string()),
+        });
+        let params = serde_json::json!({});
+        for error in [
+            bridge
+                .process_payment("id", 0, "sig", Some(&params), Some(&[]), &String::new())
+                .unwrap_err(),
+            bridge
+                .fund_channel("id", 0, "sig", Some(&params), Some(&[]))
+                .unwrap_err(),
+            bridge
+                .validate_existing_channel_funding("id", 0, "sig")
+                .unwrap_err(),
+            bridge
+                .validate_payment("id", 0, "sig", &String::new())
+                .unwrap_err(),
+        ] {
+            assert!(matches!(error, BridgeError::Internal(_)));
+        }
+        assert!(matches!(
+            bridge.prepare_close_data("id", 0, "sig", false),
+            Err(BridgeError::Internal(_))
+        ));
+        let payment = serde_json::json!({"channel_id":"id", "balance":0, "signature":"sig", "params":{}, "funding_proofs":[]});
+        assert!(matches!(
+            bridge.record_cooperative_close_first_use_funding(&payment.to_string()),
+            Err(CloseError::StorageFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_channel_requires_funding_and_cannot_validate_as_existing() {
+        let bridge = SpilmanBridge::new(MockHost {
+            ra: true,
+            ma: true,
+            state: Ok(None),
+        });
+        assert!(matches!(
+            bridge.process_payment("id", 0, "sig", None, None, &String::new()),
+            Err(BridgeError::UnknownChannel)
+        ));
+        assert!(matches!(
+            bridge.validate_existing_channel_funding("id", 0, "sig"),
+            Err(BridgeError::UnknownChannel)
+        ));
+        assert!(matches!(
+            bridge.validate_payment("id", 0, "sig", &String::new()),
+            Err(BridgeError::UnknownChannel)
+        ));
+    }
+
+    #[test]
+    fn receiver_callback_states_are_strict_and_include_refund_terminal() {
+        assert_eq!(ChannelState::from_host_value(None), Ok(None));
+        for (value, expected) in [
+            ("open", ChannelState::Open),
+            ("closing", ChannelState::Closing),
+            ("closed", ChannelState::Closed),
+            (
+                "sender_refunded_after_expiry",
+                ChannelState::SenderRefundedAfterExpiry,
+            ),
+        ] {
+            assert_eq!(
+                ChannelState::from_host_value(Some(value)),
+                Ok(Some(expected))
+            );
+        }
+        for invalid in ["", "unknown", "Open", "broken"] {
+            assert!(ChannelState::from_host_value(Some(invalid)).is_err());
+        }
+    }
+}
