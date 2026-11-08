@@ -39,7 +39,9 @@ use crate::status::{
     string_to_box, CdkReceiveResult, CdkSpilmanCloseResult, CdkSpilmanKeypairResult, CdkStatus,
     CdkStatusResult, CdkStringResult,
 };
-use crate::wallet::{runtime, CdkWallet, FfiErr, FfiResult, MAX_TOKEN_BYTES};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::wallet::runtime;
+use crate::wallet::{CdkWallet, FfiErr, FfiResult, MAX_TOKEN_BYTES};
 
 /// Maximum accepted length, in bytes, for a single hex-encoded value.
 ///
@@ -584,6 +586,7 @@ fn verify_balance_update_result(
 
 /// Return the mint's active Sat keyset as Spilman `KeysetInfo` JSON.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_get_active_keyset_info_json(
     handle: Option<&CdkWallet>,
     mint_url: Option<char_p::Ref<'_>>,
@@ -614,6 +617,7 @@ pub fn cdk_wallet_get_active_keyset_info_json(
 
 /// Return a single Sat keyset, by id, as Spilman `KeysetInfo` JSON.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_get_keyset_info_json(
     handle: Option<&CdkWallet>,
     mint_url: Option<char_p::Ref<'_>>,
@@ -649,6 +653,7 @@ pub fn cdk_wallet_get_keyset_info_json(
 
 /// Post a raw NUT-03 swap request to a mint, returning the raw response JSON.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_post_swap(
     handle: Option<&CdkWallet>,
     mint_url: Option<char_p::Ref<'_>>,
@@ -684,6 +689,7 @@ pub fn cdk_wallet_post_swap(
 
 /// Receive a token, optionally supplying comma-separated P2PK signing keys.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_receive_with_keys(
     handle: Option<&mut CdkWallet>,
     token: Option<char_p::Ref<'_>>,
@@ -719,6 +725,7 @@ pub fn cdk_wallet_receive_with_keys(
 
 /// Receive raw proofs from a mint, optionally supplying P2PK signing keys.
 #[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_receive_proofs(
     handle: Option<&mut CdkWallet>,
     mint_url: Option<char_p::Ref<'_>>,

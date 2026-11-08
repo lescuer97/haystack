@@ -32,6 +32,10 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        .emsdk = .{
+            .url = "git+https://github.com/emscripten-core/emsdk#4.0.9",
+            .hash = "N-V-__8AAJl1DwBezhYo_VE6f53mPVm00R-Fk28NPW7P14EQ",
+        },
         .raylib_zig = .{
             .url = "git+https://github.com/raylib-zig/raylib-zig?ref=devel#28bbe30112f605da918db00eff53a75ce1aa9180",
             .hash = "raylib_zig-6.2.0-KE8RELGmBQDX1v1DqBN57pNxJ-b-MIa1S-M7NXT9Eplr",
@@ -44,14 +48,31 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "build",
+        "build-support/bootstrap.py",
+        "build-support/ensure-emsdk.py",
+        "build-support/test-browser.py",
+        "build-support/test_bootstrap.py",
+        "build-support/test_graphs.py",
+        "README.md",
         "src",
         "assets",
         "docs",
+        "browser/index.html",
+        "browser/app.js",
+        "browser/smoke.js",
+        "browser/test.mjs",
+        "browser/wallet/Cargo.toml",
+        "browser/wallet/Cargo.lock",
+        "browser/wallet/platform.js",
+        "browser/wallet/src",
+        "browser/wallet/tests",
         "vendor/cdk-wallet-ffi/Cargo.toml",
         "vendor/cdk-wallet-ffi/Cargo.lock",
         "vendor/cdk-wallet-ffi/README.md",
         "vendor/cdk-wallet-ffi/include",
         "vendor/cdk-wallet-ffi/src",
+        "vendor/cdk-wallet-ffi/examples",
         "vendor/cdk-spilman",
     },
 }

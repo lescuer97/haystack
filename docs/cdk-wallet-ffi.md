@@ -10,7 +10,7 @@ recovery semantics.
 
 ## Importing
 
-`build.zig` exposes a public module named `cdk`:
+The desktop build graph exposes a public module named `cdk`:
 
 ```zig
 const cdk = @import("cdk");
@@ -31,6 +31,12 @@ C-ABI consumer test (`src/wallet_test.zig`) is a complete, runnable example.
 
 ## Build steps
 
+For the working experimental browser wallet, see
+[browser build, runtime tests, and limitations](browser-wallet.md). It shares the
+wallet/Spilman implementation but exposes an async JS API, not this native C ABI.
+The [initial WebAssembly investigation](webassembly.md) documents the separate
+native-crate cross-compilation probe, which is still expected to fail.
+
 | Command | What it does |
 | --- | --- |
 | `zig build` | Builds the app, the Rust staticlib, and links both. |
@@ -39,9 +45,10 @@ C-ABI consumer test (`src/wallet_test.zig`) is a complete, runnable example.
 | `zig build test-wallet` | Runs the Rust suite **and** the Zig C-ABI consumer test. |
 | `zig build header-check` | Fails if the committed C header is stale. |
 
-The Rust build is a `cargo +stable build --release --locked` system command that
-runs before the Zig compilation, and `header-check` runs
-`generate-headers -- --check`.
+The desktop graph provisions pinned Rust 1.99.0, builds the native archive for an
+explicit matching host target, and selects Cargo's debug/release profile from
+`-Doptimize`. `header-check` runs `generate-headers -- --check`. Desktop artifacts
+go under `zig-out/desktop`, independently of the Wasm graph. See [build.md](build.md).
 
 ---
 

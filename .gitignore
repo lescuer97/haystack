@@ -6,3 +6,5 @@ zig-pkg
 # Rust build artifacts for the vendored wallet FFI crate (Cargo.lock is tracked).
 vendor/cdk-wallet-ffi/target
 vendor/cdk-spilman/target
+browser/wallet/target
+build-support/__pycache__/
