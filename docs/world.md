@@ -4,6 +4,36 @@ Bare-bones reference for how the world is addressed, generated, and changed.
 
 ---
 
+## 0. Status: implemented vs planned
+
+Implemented today in `src/world.zig`:
+
+- 32×32 px tiles, 16×16-tile chunks (512×512 px).
+- A `Tile` enum (`grass`, `dirt`, `rock`) generated deterministically from tile
+  coordinates by a coordinate hash.
+- Resident chunks in a fixed-size memory pool plus a chunk-key map. Streaming
+  unloads everything outside a 2-chunk prefetch ring, then loads visible chunks
+  first and the rest of the ring second.
+- Memory stats, allocation-free eviction scratch, and retry-after-OOM support.
+- No seed parameter, no tile deltas, no dirty flags, no characters, no network,
+  and no gameplay mutation yet.
+
+Sections 2–6 below are **planned**. The client/server split, private key, delta
+storage, and action flow are design notes, not current code.
+
+Future gameplay edits must survive chunk eviction: resident `Chunk`s are a cache
+and may be regenerated at any time, so changes cannot live only inside a
+resident chunk. They need an authoritative state/delta layer keyed by world
+coordinates with a resync path. That layer is **not implemented**, and no wire
+format should be invented until it is.
+
+The unused starter draft also mentioned a `TileEntity` union
+(`Tree`/`Grass`/`Character` with `CutStatus`), per-chunk `dirty` flags, and a
+`Character{ yourself: bool }` entity. Those ideas are not implemented; today a
+tile is only the generated grass/dirt/rock `Tile` enum above.
+
+---
+
 ## 1. Layout
 
 Three spaces, all integers:
@@ -22,13 +52,15 @@ local  (lx, ly)      lx = x - cx*16,       ly = y - cy*16   (0..15)
 
 - Tiles are the only thing gameplay touches.
 - Chunks are the unit of generation, storage, and rendering.
-- Sectors exist only for the network (who receives which updates).
+- Sectors exist only in the planned network design (who receives which updates).
 
-Nothing is stored for "empty" space. A chunk that was never touched does not exist.
+Nothing is stored for untouched space. An untouched chunk is not resident; the
+deterministic generator recreates it on demand. The resident chunk map is a
+cache, not the world itself.
 
 ---
 
-## 2. The two keys
+## 2. The two keys (**planned**)
 
 | Key             | Who has it        | Used for                                  |
 |-----------------|-------------------|-------------------------------------------|
@@ -46,6 +78,9 @@ tile_state = generate(public_seed, x, y)
 The client generates the world itself. The server never sends terrain.
 It is fine that anyone can compute the whole map — that is the design.
 
+The current demo has no seed parameter: `world.zig` uses a fixed coordinate
+hash as a stand-in for this generator.
+
 ### Private key
 
 Lives only on the server (env var or file, never in git, never in the client build).
@@ -62,7 +97,10 @@ loot = PRF(private_key, x, y, attempt)
 
 ---
 
-## 3. What the client knows
+## 3. What the client knows (**planned split**)
+
+Today the client only knows the generated terrain, computed locally. It does not
+predict gameplay changes because no gameplay mutation exists yet.
 
 | Known up front            | Only after the server says so |
 |---------------------------|-------------------------------|
@@ -74,7 +112,7 @@ It must **never** predict loot.
 
 ---
 
-## 4. How changes are stored (server)
+## 4. How changes are stored on the server (**planned**)
 
 ```
 real_tile = generate(public_seed, x, y)   default
@@ -105,7 +143,12 @@ ChunkRecord {
 
 ---
 
-## 5. Action flow
+## 5. Action flow (**planned**)
+
+Not implemented. When networking is added, incoming messages are collected
+without blocking and applied at the frame update boundary, before the local
+action for that frame; callbacks only enqueue. See `game-loop.md` for the loop
+ordering. No wire protocol exists yet.
 
 ```
 client                          server
@@ -120,7 +163,7 @@ client                          server
 
 ---
 
-## 6. Rules
+## 6. Rules for the planned server design
 
 1. The client is hostile. Validate every action server-side.
 2. Never send hidden data ahead of the action, and never add a "preview yield" endpoint.
