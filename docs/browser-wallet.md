@@ -7,16 +7,30 @@ not a production-security or full fault-recovery certification.
 
 ## Build
 
-Host prerequisites: Zig 0.17.0, Python 3 and Rustup/Cargo. Zig automatically
-provisions Rust **1.99.0**, its Wasm target, local wasm-bindgen CLI **0.2.130**,
-and Emscripten **4.0.19**. For browser tests, Node 22+ and Chromium are required.
-See [separate platform build graphs and options](build.md) for the full contract.
+Host prerequisites: Zig 0.17.0, Python 3 and Rustup/Cargo. For browser tests,
+Node 22+ and Chromium are also required. See
+[separate platform build graphs and options](build.md) for the full contract.
+
+Provision the browser tools once. This is the only step that installs the Rust
+**1.99.0** Wasm target, local wasm-bindgen CLI **0.2.130** and Emscripten
+**4.0.19**:
+
+```sh
+zig build setup -Dplatform=wasm
+```
+
+Then build normally:
 
 ```sh
 zig build -Dplatform=wasm
 ```
 
-An existing matching CLI can optionally override the automatically managed one:
+Ordinary builds, tests, `run`, `wallet` and `renderer` only check installed
+tools; they never install or update Rust components, wasm-bindgen or Emscripten.
+A missing item fails with the setup command above. `zig build setup
+-Dplatform=wasm -Doffline` only checks and reports what is missing.
+
+An existing matching CLI can optionally override the managed one:
 
 ```sh
 zig build -Dplatform=wasm -Dwasm-bindgen=/absolute/path/to/wasm-bindgen
@@ -24,9 +38,11 @@ zig build -Dplatform=wasm -Dwasm-bindgen=/absolute/path/to/wasm-bindgen
 
 Output: **`zig-out/wasm/index.html`** plus two independent Wasm modules and
 their JavaScript loaders. The Rust wallet uses wasm-bindgen; the renderer uses
-Emscripten. The first renderer build downloads SDK 4.0.19. Subsequent builds
-check the installed version instead of executing upstream's unconditional
-`emsdk update` (which caused a 502 failure and a hung build during testing).
+Emscripten. Subsequent builds check the installed SDK version instead of running
+upstream's unconditional `emsdk update` (which caused a 502 failure and a hung
+build during testing). The pinned upstream activation step is detached and
+verified at configuration time; if that upstream graph changes, configuration
+fails instead of running an installer.
 
 Serve the entire directory, not just a `.wasm` file:
 

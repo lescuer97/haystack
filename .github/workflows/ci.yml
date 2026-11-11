@@ -11,9 +11,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  RUST_TOOLCHAIN: "1.99.0"
-
 jobs:
   linux-desktop:
     name: Linux desktop (x86_64)
@@ -36,12 +33,10 @@ jobs:
       - name: Install pinned Zig
         run: python3 build-support/install-zig.py
 
-      - name: Install pinned Rust
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
-          rustup target add x86_64-unknown-linux-gnu --toolchain "$RUST_TOOLCHAIN"
+      - name: Provision selected desktop toolchain
+        run: zig build setup
 
-      - name: Graph isolation and provisioning tests
+      - name: Graph isolation and setup/check contract tests
         run: zig build test-build
 
       - name: Debug desktop build
@@ -140,15 +135,13 @@ jobs:
       - name: Install pinned Zig
         run: python3 build-support/install-zig.py
 
-      - name: Install pinned Rust for Apple Silicon
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
-          rustup target add aarch64-apple-darwin --toolchain "$RUST_TOOLCHAIN"
+      - name: Provision selected desktop toolchain and run native preflight
+        run: zig build setup
 
       - name: Debug desktop build
         run: zig build
 
-      - name: Graph isolation and provisioning tests
+      - name: Graph isolation and setup/check contract tests
         run: zig build test-build
 
       - name: Debug application tests
@@ -239,10 +232,8 @@ jobs:
       - name: Install pinned Zig
         run: python3 build-support/install-zig.py
 
-      - name: Install pinned Rust and the Wasm target
-        run: |
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
-          rustup target add wasm32-unknown-unknown --toolchain "$RUST_TOOLCHAIN"
+      - name: Provision Wasm toolchain, wasm-bindgen and Emscripten
+        run: zig build setup -Dplatform=wasm
 
       - name: Build the complete browser application
         run: zig build -Dplatform=wasm

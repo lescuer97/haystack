@@ -9,6 +9,8 @@
 > context, not a statement that the new browser crate fails to compile.
 > Build orchestration has since been separated further: use `zig build` for
 > desktop or `zig build -Dplatform=wasm` for the complete browser application.
+> Tool installation is now explicit: run `zig build setup -Dplatform=wasm` once;
+> ordinary builds only check installed Rust/Cargo, wasm-bindgen and Emscripten.
 > See [current build instructions](build.md), not the historical commands below.
 
 ## Initial verdict (before the browser adapter)
