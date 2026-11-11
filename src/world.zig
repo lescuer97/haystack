@@ -116,15 +116,18 @@ pub fn validateChunkRange(range: ChunkRange, margin: i32) CoordinateError!void {
 /// public world seed. Both a client and a future server can compute the same
 /// chunk from the same inputs because the result is platform-independent.
 ///
-/// `public_seed` is the shareable layout seed. `privateYield` uses a separate,
-/// independently generated server-only secret; never reuse `public_seed` as
-/// `private_seed`.
+/// `public_seed` is the shareable layout seed, exactly 32 bytes. `privateYield`
+/// uses a separate, independently generated server-only secret; never reuse
+/// `public_seed` as `private_seed`.
 ///
-/// The seed is consumed as eight explicit 32-bit words in little-endian order
-/// (bits 0–31 first, 224–255 last); each word is XORed into the state and
-/// mixed, so every seed bit participates. This is a public layout hash, not a
-/// secure PRF: do not use it for private data or to derive gameplay yields.
-fn hash2(public_seed: u256, x: i32, y: i32) u32 {
+/// The seed is consumed as eight consecutive four-byte words in array order:
+/// `public_seed[0..4]` is the first word and `public_seed[28..32]` the last,
+/// and each word is read little-endian. Each word is XORed into the state and
+/// mixed, so every seed bit participates. The seed array itself is never
+/// endian-converted; only those word reads and the byte order above matter.
+/// This is a public layout hash, not a secure PRF: do not use it for private
+/// data or to derive gameplay yields.
+fn hash2(public_seed: [32]u8, x: i32, y: i32) u32 {
     // Mix the coordinate contributions in order rather than folding them
     // together first: folding before mixing makes sign-mirrored coordinate
     // pairs collide.
@@ -134,7 +137,7 @@ fn hash2(public_seed: u256, x: i32, y: i32) u32 {
     h = mix32(h);
 
     inline for (0..8) |i| {
-        h ^= @truncate(public_seed >> (32 * i));
+        h ^= std.mem.readInt(u32, public_seed[4 * i ..][0..4], .little);
         h = mix32(h);
     }
     return h;
@@ -154,6 +157,10 @@ fn mix32(value: u32) u32 {
 
 // ── private yield ────────────────────────────────────────────────────────────
 
+// Keyed BLAKE3-256 is the standard PRF for private yields: 32-byte secret key,
+// versioned domain tag, 8-byte little-endian coordinate payload, u64
+// truncation. The public layout hash stays non-cryptographic (`hash2`); the two
+// are deliberately separate functions with separate seeds.
 const Blake3 = std.crypto.hash.Blake3;
 
 /// Domain/version tag hashed before every private-yield payload. Changing the
@@ -182,18 +189,16 @@ const private_yield_domain = "haystack.private-yield.v1";
 ///
 /// The input is the domain tag followed by 8 payload bytes: `x` and `y` as
 /// bit-preserving little-endian 32-bit fields, so negative coordinates hash
-/// distinctly. The key is all 32 `private_seed` bytes in little-endian order.
-/// The first 8 output bytes, read little endian, are returned. Allocation-free
-/// and platform-independent.
-pub fn privateYield(private_seed: u256, x: i32, y: i32) u64 {
-    var key: [Blake3.key_length]u8 = undefined;
-    std.mem.writeInt(u256, &key, private_seed, .little);
-
+/// distinctly. The BLAKE3 key is `private_seed` itself: all 32 bytes in array
+/// order, `private_seed[0]` first, with no integer or endian conversion applied
+/// to the seed. The first 8 output bytes, read little endian, are returned.
+/// Allocation-free and platform-independent.
+pub fn privateYield(private_seed: [32]u8, x: i32, y: i32) u64 {
     var payload: [8]u8 = undefined;
     std.mem.writeInt(u32, payload[0..4], @bitCast(x), .little);
     std.mem.writeInt(u32, payload[4..8], @bitCast(y), .little);
 
-    var hasher = Blake3.init(.{ .key = key });
+    var hasher = Blake3.init(.{ .key = private_seed });
     hasher.update(private_yield_domain);
     hasher.update(&payload);
 
@@ -204,8 +209,8 @@ pub fn privateYield(private_seed: u256, x: i32, y: i32) u64 {
 
 fn generate(chunk: *Chunk) void {
     // Placeholder public world seed. Seed plumbing belongs to the world
-    // configuration; zero keeps generation deterministic for now.
-    const public_seed: u256 = 0;
+    // configuration; all zeros keeps generation deterministic for now.
+    const public_seed: [32]u8 = @splat(0);
     for (0..CT) |ly| {
         for (0..CT) |lx| {
             const x = chunk.cx * CHUNK_TILES + @as(i32, @intCast(lx));
@@ -607,7 +612,29 @@ test "stream rejects malformed and oversized ranges before mutating the world" {
     try std.testing.expect(!stats.memory_pressure);
 }
 
-const hash_seed: u256 = 0x0123456789ABCDEF_FEDCBA9876543210_0F1E2D3C4B5A6978_8877665544332211;
+// Test seeds are explicit 32-byte arrays; index 0 is the first seed byte and
+// index 31 the last. Each replaces a former 256-bit integer constant holding
+// the same little-endian bytes, so all expected vectors below are unchanged.
+const zero_seed: [32]u8 = @splat(0);
+
+const one_seed: [32]u8 = blk: {
+    var seed: [32]u8 = @splat(0);
+    seed[0] = 1;
+    break :blk seed;
+};
+
+const top_bit_seed: [32]u8 = blk: {
+    var seed: [32]u8 = @splat(0);
+    seed[31] = 0x80;
+    break :blk seed;
+};
+
+const hash_seed = [32]u8{
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+    0x78, 0x69, 0x5A, 0x4B, 0x3C, 0x2D, 0x1E, 0x0F,
+    0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE,
+    0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,
+};
 
 test "hash2 is repeatable including negative and extreme coordinates" {
     const coords = [_]struct { x: i32, y: i32 }{
@@ -624,10 +651,10 @@ test "hash2 is repeatable including negative and extreme coordinates" {
 }
 
 test "hash2 fixed vectors stay stable" {
-    try std.testing.expectEqual(@as(u32, 0x00000000), hash2(0, 0, 0));
-    try std.testing.expectEqual(@as(u32, 0x4419CA0F), hash2(0, 7, -3));
-    try std.testing.expectEqual(@as(u32, 0x799AA099), hash2(1, 7, -3));
-    try std.testing.expectEqual(@as(u32, 0xDA013E35), hash2(0, std.math.minInt(i32), std.math.maxInt(i32)));
+    try std.testing.expectEqual(@as(u32, 0x00000000), hash2(zero_seed, 0, 0));
+    try std.testing.expectEqual(@as(u32, 0x4419CA0F), hash2(zero_seed, 7, -3));
+    try std.testing.expectEqual(@as(u32, 0x799AA099), hash2(one_seed, 7, -3));
+    try std.testing.expectEqual(@as(u32, 0xDA013E35), hash2(zero_seed, std.math.minInt(i32), std.math.maxInt(i32)));
     try std.testing.expectEqual(@as(u32, 0xEA89E056), hash2(hash_seed, 37, -91));
 }
 
@@ -647,7 +674,7 @@ test "mirrored coordinates do not collide" {
         .{ 0, 1 },
         .{ 4194302, -4194304 },
     };
-    for ([_]u256{ 0, hash_seed }) |seed| {
+    for ([_][32]u8{ zero_seed, hash_seed }) |seed| {
         for (pairs) |p| {
             try std.testing.expect(hash2(seed, p[0], p[1]) != hash2(seed, -p[0], -p[1]));
         }
@@ -657,36 +684,43 @@ test "mirrored coordinates do not collide" {
 test "every seed bit participates in hash2" {
     const x: i32 = 37;
     const y: i32 = -91;
-    const bases = [_]u256{ 0, hash_seed };
+    const bases = [_][32]u8{ zero_seed, hash_seed };
     for (bases) |base| {
         const expected = hash2(base, x, y);
         var bit: usize = 0;
         while (bit < 256) : (bit += 1) {
-            const mask = @as(u256, 1) << @intCast(bit);
-            try std.testing.expect(hash2(base ^ mask, x, y) != expected);
+            var mutated = base;
+            mutated[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
+            try std.testing.expect(hash2(mutated, x, y) != expected);
         }
     }
 }
 
 test "seed limb order is not a plain xor fold" {
-    var reversed: u256 = 0;
+    // Reverse the eight four-byte words, leaving bytes within each word in
+    // place: a limb reorder, not a byte reversal.
+    var reversed: [32]u8 = undefined;
     inline for (0..8) |i| {
-        const word: u32 = @truncate(hash_seed >> (32 * i));
-        reversed |= @as(u256, word) << (32 * (7 - i));
+        @memcpy(reversed[4 * (7 - i) ..][0..4], hash_seed[4 * i ..][0..4]);
     }
     try std.testing.expect(hash2(hash_seed, 5, 9) != hash2(reversed, 5, 9));
 }
 
 // Test-only secret seeds; production code must never embed a private seed.
-const yield_seed: u256 = 0xDEADBEEFCAFEBABE_0123456789ABCDEF_F0E1D2C3B4A59687_1122334455667788;
+const yield_seed = [32]u8{
+    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+    0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0,
+    0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,
+    0xBE, 0xBA, 0xFE, 0xCA, 0xEF, 0xBE, 0xAD, 0xDE,
+};
 
 test "private yield fixed vectors stay stable" {
     // Negative coordinates, extreme coordinates, a zero seed, and a seed with
-    // only the highest bit set (locks the top byte of the little-endian key).
-    try std.testing.expectEqual(@as(u64, 0x5C3880ED335E415A), privateYield(0, 0, 0));
+    // only the highest bit set (locks the top seed byte).
+    try std.testing.expectEqual(@as(u64, 0x5C3880ED335E415A), privateYield(zero_seed, 0, 0));
     try std.testing.expectEqual(@as(u64, 0x2129415C1B31CC5D), privateYield(yield_seed, 7, -3));
-    try std.testing.expectEqual(@as(u64, 0x7CEBD6C5494E30E6), privateYield(0, std.math.minInt(i32), std.math.maxInt(i32)));
-    try std.testing.expectEqual(@as(u64, 0xC2385D8455021523), privateYield(@as(u256, 1) << 255, 0, 0));
+    try std.testing.expectEqual(@as(u64, 0x7CEBD6C5494E30E6), privateYield(zero_seed, std.math.minInt(i32), std.math.maxInt(i32)));
+    try std.testing.expectEqual(@as(u64, 0xC2385D8455021523), privateYield(top_bit_seed, 0, 0));
     try std.testing.expectEqual(@as(u64, 0x8D8D4FA2F22750AF), privateYield(yield_seed, -1, -1));
     try std.testing.expectEqual(@as(u64, 0xA49CD34EB7022A53), privateYield(yield_seed, 37, -91));
 }
@@ -701,7 +735,7 @@ test "private yield is repeatable including negative and extreme coordinates" {
         .{ .x = std.math.maxInt(i32), .y = std.math.minInt(i32) },
         .{ .x = std.math.maxInt(i32), .y = std.math.maxInt(i32) },
     };
-    for ([_]u256{ 0, yield_seed, @as(u256, 1) << 255 }) |seed| {
+    for ([_][32]u8{ zero_seed, yield_seed, top_bit_seed }) |seed| {
         for (coords) |c| {
             try std.testing.expectEqual(privateYield(seed, c.x, c.y), privateYield(seed, c.x, c.y));
         }
@@ -714,26 +748,31 @@ test "private yield changes when the seed or a coordinate changes" {
     try std.testing.expect(base != privateYield(yield_seed, 7, -2));
     try std.testing.expect(base != privateYield(yield_seed, 7, 3));
     try std.testing.expect(base != privateYield(yield_seed, -7, -3));
-    try std.testing.expect(base != privateYield(yield_seed + 1, 7, -3));
+    var next_seed = yield_seed;
+    next_seed[0] ^= 1;
+    try std.testing.expect(base != privateYield(next_seed, 7, -3));
     // Only the highest seed bit differs: the whole 32-byte key is hashed.
-    try std.testing.expect(base != privateYield(yield_seed ^ (@as(u256, 1) << 255), 7, -3));
+    var high_bit_seed = yield_seed;
+    high_bit_seed[31] ^= 0x80;
+    try std.testing.expect(base != privateYield(high_bit_seed, 7, -3));
 }
 
 test "every private yield seed bit participates" {
     const x: i32 = 37;
     const y: i32 = -91;
-    for ([_]u256{ 0, yield_seed }) |base| {
+    for ([_][32]u8{ zero_seed, yield_seed }) |base| {
         const expected = privateYield(base, x, y);
         var bit: usize = 0;
         while (bit < 256) : (bit += 1) {
-            const mask = @as(u256, 1) << @intCast(bit);
-            try std.testing.expect(privateYield(base ^ mask, x, y) != expected);
+            var mutated = base;
+            mutated[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
+            try std.testing.expect(privateYield(mutated, x, y) != expected);
         }
     }
 }
 
 test "private yield matches an independently encoded keyed BLAKE3 input" {
-    // Hand-written key bytes for yield_seed, little endian.
+    // Hand-written key bytes matching yield_seed, in array order.
     const key = [32]u8{
         0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
         0x87, 0x96, 0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0,

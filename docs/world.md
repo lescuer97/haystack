@@ -10,16 +10,22 @@ Implemented today in `src/world.zig`:
 
 - 32×32 px tiles, 16×16-tile chunks (512×512 px).
 - A `Tile` enum (`grass`, `dirt`, `rock`) generated deterministically from tile
-  coordinates by a coordinate hash.
+  coordinates by a coordinate hash. The hash takes an explicit `[32]u8` public
+  seed; the demo passes a fixed all-zero placeholder, and there is no
+  world-seed configuration plumbing yet.
+- `privateYield(private_seed: [32]u8, x: i32, y: i32) u64`, a keyed BLAKE3-256
+  roll. It is implemented and tested but **unused**: not wired into gameplay,
+  chunk generation, or any server.
 - Resident chunks in a fixed-size memory pool plus a chunk-key map. Streaming
   unloads everything outside a 2-chunk prefetch ring, then loads visible chunks
   first and the rest of the ring second.
 - Memory stats, allocation-free eviction scratch, and retry-after-OOM support.
-- No seed parameter, no tile deltas, no dirty flags, no characters, no network,
-  and no gameplay mutation yet.
+- No tile deltas, no dirty flags, no characters, no network, and no gameplay
+  mutation yet.
 
-Sections 2–6 below are **planned**. The client/server split, private key, delta
-storage, and action flow are design notes, not current code.
+Sections 2–6 below are **planned**. The seed types and both hash helpers exist
+in `world.zig`, but the client/server split, server-side private-seed handling,
+delta storage, and action flow are design notes, not current code.
 
 Future gameplay edits must survive chunk eviction: resident `Chunk`s are a cache
 and may be regenerated at any time, so changes cannot live only inside a
@@ -60,12 +66,14 @@ cache, not the world itself.
 
 ---
 
-## 2. The two keys (**planned**)
+## 2. The two seeds (**server integration planned**)
 
-| Key             | Who has it        | Used for                                  |
-|-----------------|-------------------|-------------------------------------------|
-| **public seed** | client + server   | terrain, grass, trees, rocks (layout)     |
-| **private key** | **server only**   | loot / yield / what a tile contains       |
+Both seeds are 32 bytes and independent. Never derive one from the other.
+
+| Seed             | Who has it        | Used for                                  |
+|------------------|-------------------|-------------------------------------------|
+| **public seed**  | client + server   | terrain, grass, trees, rocks (layout)     |
+| **private seed** | **server only**   | loot / yield / what a tile contains       |
 
 ### Public seed
 
@@ -78,22 +86,38 @@ tile_state = generate(public_seed, x, y)
 The client generates the world itself. The server never sends terrain.
 It is fine that anyone can compute the whole map — that is the design.
 
-The current demo has no seed parameter: `world.zig` uses a fixed coordinate
-hash as a stand-in for this generator.
+`hash2` accepts a `[32]u8` public seed. `generate` currently supplies a fixed
+all-zero placeholder internally; world-seed configuration and plumbing do not
+exist yet. This is a public layout hash, not a PRF.
 
-### Private key
+### Private seed
 
-Lives only on the server (env var or file, never in git, never in the client build).
+The server-only secret key for the keyed PRF. It lives only on the server (env
+var or file, never in git, never in the client build) and is separate from the
+public seed.
+
+Implemented primitive:
 
 ```
-loot = PRF(private_key, x, y, attempt)
+roll = privateYield(private_seed, x, y)   // u64, keyed BLAKE3-256
 ```
 
-- `attempt` is assigned by the server, never by the client.
-- Uses a keyed hash (e.g. SipHash / BLAKE3 keyed / HMAC).
-- No storage needed: the result is recomputed on demand.
+- Input is the domain tag `haystack.private-yield.v1` plus `x` and `y` as
+  little-endian 32-bit fields; the first 8 output bytes, read little endian,
+  become the u64 roll.
+- The whole 32-byte `private_seed` is the BLAKE3 key, in array order.
+- Keyed BLAKE3-256 is the standard for private yields. No alternative algorithm
+  is implemented.
+- It is unused today: not wired into gameplay, chunk generation, or a server.
+  No private seed constant lives in production code.
+- Planned server call: `loot = PRF(private_seed, x, y, attempt)`. `attempt` is a
+  server-assigned respawn/action identifier for the future protocol; it is
+  **not** part of the implemented primitive, which rolls from coordinates only.
+- The roll itself needs no per-tile storage: it is recomputed on demand. What a
+  player actually harvested (state, owner) must still be stored authoritatively
+  as deltas (section 4).
 - The client cannot compute it, so it cannot pre-map the world's yields.
-- Never derive the private key from the public seed.
+- Never derive the private seed from the public seed.
 
 ---
 
@@ -154,7 +178,7 @@ ordering. No wire protocol exists yet.
 client                          server
   │ predict: grass -> cut         │
   ├── Action{seq, x, y, tool} ───►│ validate (range, tool, cooldown, state)
-  │                               │ loot = PRF(key, x, y, attempt)
+  │                               │ loot = PRF(private_seed, x, y, attempt)
   │                               │ store delta {state, owner, tick}
   │◄── Result{seq, state, loot} ──┤
   │ apply state, show loot        │
@@ -170,4 +194,4 @@ client                          server
 3. Anything derivable from the public seed is public — do not put secrets there.
 4. Deltas are absolute state, not toggles, so retries are safe.
 5. Duplicate `(player, seq)` returns the stored result; it never rolls again.
-6. The server starts only if the private key is present.
+6. The server starts only if the private seed is present.
