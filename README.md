@@ -29,18 +29,27 @@ an actionable preflight and never uses sudo or installs system packages. macOS
 Intel, universal binaries, packaging, signing and `.app`/DMG output are not
 supported.
 
-Zig provisions the selected platform's pinned Rust/toolchain components and
-validates that the selected Rust compiler's host OS/architecture matches Zig's
-detected host; desktop builds additionally validate the native C compiler/linker
-needed by Cargo's C dependencies. Wasm additionally gets a locally cached
-wasm-bindgen and Emscripten. The macOS desktop graph fixes the deployment target
-at macOS 15.0 for Zig, raylib and Rust, requires the running OS to be 15.0+ and
-rejects conflicting `SDKROOT`, CC-family compiler or effective `CFLAGS` sysroot
-overrides. The macOS path is implemented but has not
-been executed on real macOS hardware or in CI; `.github/workflows/ci.yml` contains
-the Apple Silicon job that must provide that validation. This Linux checkout
-verifies only the source/unit contracts. See [build.md](docs/build.md) for the
-exact scope and remaining validation limits.
+Provision the selected platform once. This is the only path that installs Rust
+components, wasm-bindgen or Emscripten:
+
+```sh
+zig build setup                  # desktop Rust toolchain/target + native checks
+zig build setup -Dplatform=wasm  # Wasm target, local wasm-bindgen, Emscripten
+```
+
+Normal builds, tests, `run`, `header-check`, `wallet` and `renderer` only
+**check** the selected installed tools, then build. They never install or update
+Rust toolchains/targets, wasm-bindgen or Emscripten; a missing tool fails with
+the required setup command. `zig build setup -Doffline` only checks and explains
+what is missing. Online dependency fetching by Cargo or Zig is separate from
+tool installation. The macOS desktop graph fixes the deployment target at macOS
+15.0 for Zig, raylib and Rust, requires the running OS to be 15.0+ and rejects
+conflicting `SDKROOT`, CC-family compiler or effective `CFLAGS` sysroot
+overrides. The macOS path is implemented but has not been executed on real macOS
+hardware or in CI; `.github/workflows/ci.yml` contains the Apple Silicon job that
+must provide that validation. This Linux checkout verifies only the source/unit
+contracts. See [build.md](docs/build.md) for the exact scope and remaining
+validation limits.
 
 ```sh
 zig build run -Dplatform=wasm    # build and serve at localhost:8000

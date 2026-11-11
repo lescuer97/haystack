@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) !void {
     const options: common.Options = .{
         .target = target,
         .optimize = optimize,
-        .toolchain = b.option([]const u8, "rust-toolchain", "Rustup toolchain (default: pinned 1.99.0)") orelse "1.99.0",
+        .toolchain = b.option([]const u8, "rust-toolchain", b.fmt("Rustup toolchain (default: pinned {s})", .{common.default_toolchain})) orelse common.default_toolchain,
         .offline = b.option(bool, "offline", "Forbid tool downloads and Cargo network access") orelse false,
     };
     const build_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "build-support", "-p", "test_*.py" });
@@ -44,7 +44,15 @@ pub fn build(b: *std.Build) !void {
         }),
     });
     build_tests.step.dependOn(&b.addRunArtifact(platform_tests).step);
-    b.step("test-build", "Test platform graph isolation, the native target matrix and cached/offline tool provisioning").dependOn(&build_tests.step);
+    const emsdk_compat_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build/emsdk_compat.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    build_tests.step.dependOn(&b.addRunArtifact(emsdk_compat_tests).step);
+    b.step("test-build", "Test platform graph isolation, explicit setup/check contracts, the upstream Emscripten adapter and the native target matrix").dependOn(&build_tests.step);
 
     // Deliberately configure ONE graph. Desktop never initializes browser
     // toolchains; Wasm never translates/links the native C ABI or desktop raylib.

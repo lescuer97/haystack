@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Idempotent tool provisioning only. Zig owns the actual application graph."""
+"""Check or explicitly provision the selected Rust toolchain and wasm-bindgen.
+
+Normal builds pass ``--check`` and may only inspect installed tools. Only
+``zig build setup`` passes ``--provision``, which installs a missing pinned
+toolchain/target or local wasm-bindgen CLI. Zig owns the application graph.
+"""
 import argparse
 import importlib.util
 import os
@@ -31,6 +36,24 @@ def capture(*command):
 def require_tool(name):
     if not shutil.which(name):
         raise RuntimeError(f"{name} is required on PATH; install Rustup before running zig build")
+
+def missing_tool_error(what, provision, offline, setup_command):
+    """Return an actionable error for a missing tool, or None if setup may install.
+
+    The caller raises before executing any installer. Normal builds never fall
+    through to an installation path, even when the tool happens to be absent.
+    """
+    if not provision:
+        return RuntimeError(
+            f"{what}; normal builds never install tools. Run `{setup_command}` "
+            "to provision missing tools."
+        )
+    if offline:
+        return RuntimeError(
+            f"{what}; -Doffline forbids downloading it. Run `{setup_command}` "
+            "without -Doffline."
+        )
+    return None
 
 def parse_rustc_host(output):
     """Return (arch, os, host triple) from `rustc -vV` output."""
@@ -160,12 +183,28 @@ def check_native_c_compiler(host_os, host_arch, rust_host, rust_target, env=None
 
     return cc_path
 
-def ensure_rust(toolchain, target, offline, host_os=None, host_arch=None, require_native_c=False):
+def ensure_rust(
+    toolchain,
+    target,
+    offline,
+    *,
+    provision,
+    setup_command,
+    host_os=None,
+    host_arch=None,
+    require_native_c=False,
+):
     require_tool("rustup")
     probe = capture("rustup", "run", toolchain, "rustc", "--version")
     if probe.returncode:
-        if offline:
-            raise RuntimeError(f"Rust {toolchain} is not installed; -Doffline forbids downloading it")
+        error = missing_tool_error(
+            f"Rust toolchain {toolchain!r} is missing or cannot run `rustc`",
+            provision,
+            offline,
+            setup_command,
+        )
+        if error:
+            raise error
         run("rustup", "toolchain", "install", toolchain, "--profile", "minimal", "--no-self-update")
 
     version = capture("rustup", "run", toolchain, "rustc", "-vV")
@@ -183,8 +222,14 @@ def ensure_rust(toolchain, target, offline, host_os=None, host_arch=None, requir
 
     installed = subprocess.check_output(["rustup", "target", "list", "--installed", "--toolchain", toolchain], text=True).splitlines()
     if target not in installed:
-        if offline:
-            raise RuntimeError(f"Rust target {target} is missing; -Doffline forbids downloading it")
+        error = missing_tool_error(
+            f"Rust target {target} is missing for toolchain {toolchain!r}",
+            provision,
+            offline,
+            setup_command,
+        )
+        if error:
+            raise error
         run("rustup", "target", "add", target, "--toolchain", toolchain)
 
 def valid_bindgen(path):
@@ -196,7 +241,15 @@ def valid_bindgen(path):
     except (OSError, subprocess.CalledProcessError):
         return False
 
-def ensure_bindgen(toolchain, root, override, offline):
+def ensure_bindgen(
+    toolchain,
+    root,
+    override,
+    offline,
+    *,
+    provision,
+    setup_command,
+):
     if override:
         if not valid_bindgen(shutil.which(override)):
             raise RuntimeError(f"-Dwasm-bindgen must point to wasm-bindgen {BINDGEN_VERSION}")
@@ -204,10 +257,19 @@ def ensure_bindgen(toolchain, root, override, offline):
     binary = root / "bin" / ("wasm-bindgen.exe" if sys.platform == "win32" else "wasm-bindgen")
     if valid_bindgen(binary):
         return
-    if offline:
-        raise RuntimeError(f"managed wasm-bindgen {BINDGEN_VERSION} is missing; run once without -Doffline")
+    error = missing_tool_error(
+        f"managed wasm-bindgen {BINDGEN_VERSION} is missing or incompatible at {binary}",
+        provision,
+        offline,
+        setup_command,
+    )
+    if error:
+        raise error
     root.mkdir(parents=True, exist_ok=True)
-    run("cargo", f"+{toolchain}", "install", "wasm-bindgen-cli", "--version", f"={BINDGEN_VERSION}", "--locked", "--root", str(root))
+    # Use the pinned toolchain through `rustup run`, not `cargo +toolchain`:
+    # the latter is equivalent to `rustup run --install` and could install a
+    # toolchain implicitly.
+    run("rustup", "run", toolchain, "cargo", "install", "wasm-bindgen-cli", "--version", f"={BINDGEN_VERSION}", "--locked", "--root", str(root))
     if not valid_bindgen(binary):
         raise RuntimeError("wasm-bindgen installation did not produce the expected version")
 
@@ -222,7 +284,12 @@ def main():
     parser.add_argument("--host-arch")
     parser.add_argument("--require-native-c", action="store_true")
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--setup-command", default="zig build setup")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", action="store_true", help="Only verify installed tools; never install")
+    mode.add_argument("--provision", action="store_true", help="Install missing tools (explicit setup only)")
     args = parser.parse_args()
+    provision = bool(args.provision)
     if args.kind == "rust":
         if not args.target:
             parser.error("rust provisioning requires --target")
@@ -230,6 +297,8 @@ def main():
             args.toolchain,
             args.target,
             args.offline,
+            provision=provision,
+            setup_command=args.setup_command,
             host_os=args.host_os,
             host_arch=args.host_arch,
             require_native_c=args.require_native_c,
@@ -237,7 +306,14 @@ def main():
     else:
         if not args.root:
             parser.error("bindgen provisioning requires --root")
-        ensure_bindgen(args.toolchain, args.root.resolve(), args.override, args.offline)
+        ensure_bindgen(
+            args.toolchain,
+            args.root.resolve(),
+            args.override,
+            args.offline,
+            provision=provision,
+            setup_command=args.setup_command,
+        )
 
 if __name__ == "__main__":
     try:

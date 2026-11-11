@@ -18,27 +18,76 @@ pub const Options = struct {
     }
 };
 
-pub fn bootstrap(b: *std.Build, options: Options, rust_target: []const u8, host: ?std.Target, require_native_c: bool) *std.Build.Step.Run {
-    const run = b.addSystemCommand(&.{ "python3", "build-support/bootstrap.py", "rust", "--toolchain", options.toolchain, "--target", rust_target });
-    run.setName(b.fmt("ensure Rust {s} and target {s}", .{ options.toolchain, rust_target }));
+/// Single source of truth for the pinned default Rust toolchain.
+pub const default_toolchain = "1.99.0";
+
+/// Build the exact setup command printed for missing-tool guidance.
+///
+/// The default hint stays unchanged. A selected non-default
+/// `-Drust-toolchain=...` is appended so following the advice provisions the
+/// toolchain the build actually checks; the platform flag supplied by `base` is
+/// preserved.
+pub fn setupCommand(b: *std.Build, base: []const u8, toolchain: []const u8) []const u8 {
+    if (std.mem.eql(u8, toolchain, default_toolchain)) return base;
+    return b.fmt("{s} -Drust-toolchain={s}", .{ base, toolchain });
+}
+
+/// Ordinary builds only CHECK the selected toolchain. The explicit `setup`
+/// step is the sole path that may install missing Rust components.
+pub const ToolMode = enum { check, provision };
+
+/// Build and describe the Rust toolchain step for the selected platform graph.
+///
+/// `setup_command` is the exact command printed when a normal build finds a
+/// missing or incompatible tool. The setup command itself is supplied by the
+/// graph because its platform flag differs between desktop and Wasm.
+pub fn rustTools(
+    b: *std.Build,
+    options: Options,
+    rust_target: []const u8,
+    host: ?std.Target,
+    require_native_c: bool,
+    mode: ToolMode,
+    setup_command: []const u8,
+) *std.Build.Step.Run {
+    const run = b.addSystemCommand(&.{ "python3", "build-support/bootstrap.py", "rust", "--toolchain", options.toolchain, "--target", rust_target, "--setup-command", setup_command });
+    run.setName(switch (mode) {
+        .check => b.fmt("check installed Rust {s} and target {s}", .{ options.toolchain, rust_target }),
+        .provision => b.fmt("provision Rust {s} and target {s}", .{ options.toolchain, rust_target }),
+    });
+    run.addArg(switch (mode) {
+        .check => "--check",
+        .provision => "--provision",
+    });
     run.setCwd(b.path("."));
     if (host) |target| {
         run.addArgs(&.{ "--host-os", @tagName(target.os.tag), "--host-arch", @tagName(target.cpu.arch) });
     }
     if (require_native_c) run.addArg("--require-native-c");
     if (options.offline) run.addArg("--offline");
+    // `rustup run` itself is non-installing; this also disables rustup's
+    // deprecated implicit auto-install for Rustup invocations made by the
+    // build (including the Cargo child and its rustc/rustdoc calls).
+    run.setEnvironmentVariable("RUSTUP_AUTO_INSTALL", "0");
     run.has_side_effects = true;
     return run;
 }
 
 /// Cargo owns Rust dependency/incremental caching. Running it each build avoids
 /// a stale archive when shared Rust sources change outside a crate directory.
+///
+/// `rustup run` (not `cargo +toolchain`) is deliberately used: `+toolchain` is
+/// equivalent to `rustup run --install`, so it could install a missing
+/// toolchain even after the check step. `rustup run` never installs unless
+/// `--install` is passed, and it pins the nested rustc/rustdoc invocations via
+/// RUSTUP_TOOLCHAIN.
 pub fn cargo(b: *std.Build, options: Options, manifest: []const u8, args: []const []const u8) *std.Build.Step.Run {
-    const run = b.addSystemCommand(&.{ "cargo", b.fmt("+{s}", .{options.toolchain}) });
+    const run = b.addSystemCommand(&.{ "rustup", "run", options.toolchain, "cargo" });
     run.addArgs(args);
     run.addArgs(&.{ "--locked", "--manifest-path", manifest });
     if (options.offline) run.addArg("--offline");
     run.setCwd(b.path("."));
+    run.setEnvironmentVariable("RUSTUP_AUTO_INSTALL", "0");
     run.has_side_effects = true;
     return run;
 }

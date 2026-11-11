@@ -1,6 +1,8 @@
 """Query configuration only: these tests never build either application."""
 from pathlib import Path
+import os
 import platform
+import shutil
 import subprocess
 import unittest
 
@@ -109,6 +111,85 @@ class GraphIsolationTests(unittest.TestCase):
         result = configure("-Dplatform=wasm", "-Dtarget=aarch64-macos")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("UnsupportedBrowserTarget", result.stderr)
+
+    def test_help_and_setup_graph_configure_without_the_selected_toolchain(self):
+        missing = "9.99.0-missing-configure-only"
+        for args in ((), ("-Dplatform=wasm",)):
+            with self.subTest(platform=args):
+                result = configure(f"-Drust-toolchain={missing}", *args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("setup", result.stdout)
+                if args:
+                    self.assertIn("Provision pinned Rust, Wasm target", result.stdout)
+                else:
+                    self.assertIn("Provision the pinned desktop Rust toolchain", result.stdout)
+
+    def test_cargo_launcher_never_uses_the_implicit_installing_plus_toolchain_form(self):
+        source = (ROOT / "build" / "common.zig").read_text(encoding="utf-8")
+        self.assertIn('"rustup", "run", options.toolchain, "cargo"', source)
+        self.assertNotIn('b.fmt("+{s}"', source)
+
+    @unittest.skipUnless(shutil.which("rustup"), "rustup is required for misspelled-toolchain checks")
+    def test_normal_desktop_missing_toolchain_fails_with_setup_hint_and_does_not_install(self):
+        missing = f"9.99.0-missing-normal-{os.getpid()}"
+        result = subprocess.run(
+            ["zig", "build", "wallet", f"-Drust-toolchain={missing}"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("zig build setup", output)
+        self.assertIn(f"-Drust-toolchain={missing}", output)
+        self.assertNotIn("toolchain install", output)
+        self.assertNotIn("downloading", output.lower())
+        installed = subprocess.run(
+            ["rustup", "toolchain", "list"], capture_output=True, text=True, timeout=30
+        )
+        self.assertNotIn(missing, installed.stdout + installed.stderr)
+
+    @unittest.skipUnless(shutil.which("rustup"), "rustup is required for misspelled-toolchain checks")
+    def test_normal_wasm_missing_toolchain_points_to_the_wasm_setup_command(self):
+        missing = f"9.99.0-missing-wasm-{os.getpid()}"
+        result = subprocess.run(
+            ["zig", "build", "wallet", "-Dplatform=wasm", f"-Drust-toolchain={missing}"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("zig build setup -Dplatform=wasm", output)
+        self.assertIn(f"-Drust-toolchain={missing}", output)
+        self.assertNotIn("toolchain install", output)
+        installed = subprocess.run(
+            ["rustup", "toolchain", "list"], capture_output=True, text=True, timeout=30
+        )
+        self.assertNotIn(missing, installed.stdout + installed.stderr)
+
+    @unittest.skipUnless(shutil.which("rustup"), "rustup is required for misspelled-toolchain checks")
+    def test_offline_setup_missing_toolchain_fails_without_installing(self):
+        missing = f"9.99.0-missing-setup-{os.getpid()}"
+        result = subprocess.run(
+            ["zig", "build", "setup", "-Doffline", f"-Drust-toolchain={missing}"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("-Doffline", output)
+        self.assertIn("zig build setup", output)
+        self.assertIn(f"-Drust-toolchain={missing}", output)
+        self.assertNotIn("toolchain install", output)
+        installed = subprocess.run(
+            ["rustup", "toolchain", "list"], capture_output=True, text=True, timeout=30
+        )
+        self.assertNotIn(missing, installed.stdout + installed.stderr)
 
 if __name__ == "__main__":
     unittest.main()

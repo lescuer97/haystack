@@ -38,9 +38,13 @@ pub fn build(b: *std.Build, options_in: common.Options) !void {
         break :blk run;
     } else null;
 
-    const setup = common.bootstrap(b, options, policy.rust_target, host, true);
+    const setup_command = common.setupCommand(b, "zig build setup", options.toolchain);
+    const setup = common.rustTools(b, options, policy.rust_target, host, true, .provision, setup_command);
     if (preflight) |step| setup.step.dependOn(&step.step);
-    b.step("setup", "Ensure the pinned desktop Rust toolchain (no Wasm tools)").dependOn(&setup.step);
+    b.step("setup", "Provision the pinned desktop Rust toolchain and validate native prerequisites (no application build)").dependOn(&setup.step);
+
+    const check = common.rustTools(b, options, policy.rust_target, host, true, .check, setup_command);
+    if (preflight) |step| check.step.dependOn(&step.step);
 
     const manifest = "vendor/cdk-wallet-ffi/Cargo.toml";
     const rust = common.cargo(b, options, manifest, &.{ "build", "--lib", "--target", policy.rust_target, "--target-dir", "vendor/cdk-wallet-ffi/target" });
@@ -48,7 +52,7 @@ pub fn build(b: *std.Build, options_in: common.Options) !void {
     common.applyDeploymentTarget(rust, target);
     common.unwindPanic(rust);
     rust.setName("build desktop wallet C ABI");
-    rust.step.dependOn(&setup.step);
+    rust.step.dependOn(&check.step);
     const archive = b.path(b.fmt("vendor/cdk-wallet-ffi/target/{s}/{s}/libcdk_wallet_ffi.a", .{ policy.rust_target, options.profile() }));
 
     const translate = b.addTranslateC(.{
@@ -121,13 +125,13 @@ pub fn build(b: *std.Build, options_in: common.Options) !void {
 
     const headers = common.cargo(b, options, manifest, &.{ "run", "--features", "headers", "--bin", "generate-headers", "--target", policy.rust_target, "--target-dir", "vendor/cdk-wallet-ffi/target" });
     headers.addArgs(&.{ "--", "--check" });
-    headers.step.dependOn(&setup.step);
+    headers.step.dependOn(&check.step);
     common.applyDeploymentTarget(headers, target);
     // Header rendering is independent of Cargo's optimization profile; keep
     // this check in the dev profile and do not add release/panic overrides.
     b.step("header-check", "Verify the committed native C header").dependOn(&headers.step);
     const rust_tests = common.cargo(b, options, manifest, &.{ "test", "--target", policy.rust_target, "--target-dir", "vendor/cdk-wallet-ffi/target" });
-    rust_tests.step.dependOn(&setup.step);
+    rust_tests.step.dependOn(&check.step);
     common.applyDeploymentTarget(rust_tests, target);
     // Native tests must use the same release profile, overflow checks and
     // unwind panics as the artifact/staticlib selected by -Doptimize.
