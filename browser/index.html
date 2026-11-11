@@ -1,25 +1,17 @@
 <!doctype html>
 <html lang="en">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CDK browser wallet — experimental</title>
-<style>
-body{font:16px system-ui;max-width:960px;margin:2rem auto;padding:0 1rem;background:#111827;color:#f3f4f6}h1{font-size:1.8rem}.warning{color:#fbbf24}label{display:block;margin-top:1rem}input,textarea,button{font:inherit;padding:.6rem;box-sizing:border-box}input,textarea{width:100%;background:#1f2937;color:white;border:1px solid #64748b}button{margin:.5rem .4rem .5rem 0;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}iframe{width:100%;height:550px;border:0;background:white}#status{padding:1rem;background:#1f2937}details{margin:1rem 0}
-</style>
-<h1>CDK browser wallet</h1>
-<p class="warning">Experimental browser port. Use test funds only. The mnemonic is not saved by this page; back it up yourself. Browser-origin scripts can access wallet data.</p>
-<p id="status">Loading Rust WebAssembly…</p>
-<label>Wallet name <input id="name" value="browser-demo" autocomplete="off"></label>
-<label>English BIP-39 mnemonic <input id="mnemonic" type="password" autocomplete="off" placeholder="Enter your test mnemonic or generate one"></label>
-<button id="generate">Generate test mnemonic (shown once)</button><button id="open">Open wallet</button><button id="close">Close</button>
-<label>Mint URL (HTTPS, or localhost HTTP) <input id="mint" placeholder="http://127.0.0.1:8787" autocomplete="off"></label>
-<button id="approve">Approve mint</button><button id="balance">Refresh balances</button><button id="recover">Recover all mints</button>
-<label>Cashu token <textarea id="token" rows="3" autocomplete="off"></textarea></label>
-<button id="receive">Receive token</button>
-<label>Send sats <input id="amount" value="1" inputmode="numeric"></label>
-<label>Maximum sender fee sats <input id="fee" value="0" inputmode="numeric"></label>
-<button id="send">Send (token appears above)</button><button id="pending">List pending operation IDs</button>
-<pre id="result" aria-live="polite"></pre>
-<details><summary>Zig/raylib WebAssembly renderer (independent module)</summary><iframe src="renderer/index.html" title="Zig WebAssembly renderer"></iframe></details>
-<script type="module" src="app.js"></script>
+<title>haystack</title>
+<script>
+  // The default application is the game only. Preserve query/hash so deep
+  // links such as ?smoke still reach the renderer.
+  location.replace("renderer/index.html" + location.search + location.hash);
+</script>
+<noscript><meta http-equiv="refresh" content="0; url=renderer/index.html"></noscript>
+</head>
+<body>
+<p><a href="renderer/index.html">Open the game</a></p>
+</body>
 </html>

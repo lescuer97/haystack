@@ -21,6 +21,19 @@ build installs `zig-out/desktop/bin/haystack_game` and a shared raylib library
 `$ORIGIN/../lib` (Linux) or `@loader_path/../lib` (macOS) lookup, so the
 installed `desktop` directory can be moved outside the repository.
 
+On Linux, the desktop binary runs a disposable startup wallet check before
+creating its window: it generates a fresh mnemonic, derives the 64-byte seed,
+opens and closes an owner-only SQLite wallet in a private temporary directory,
+verifies that balances and recovery are empty, then deletes the directory. It
+makes no mint or network request and never logs the mnemonic or seed. This is a
+compile/runtime smoke test only — not a backup, production wallet or key store.
+The browser application is the game only: `/` redirects to `renderer/index.html`,
+and the same disposable wallet check runs *before* any game window or frame loop
+is created. Only a verified success starts the game; a missing or failing wallet
+module leaves a generic `Unable to start game.` message and no game loop. The
+browser wallet regression suites use a separate non-interactive test fixture at
+`wallet-test.html`, installed only for `test`/`test-mint`.
+
 Host prerequisites are Zig 0.17.0, Python 3, Rustup/Cargo and a native C
 toolchain. Linux additionally needs the normal raylib/X11/OpenGL development
 libraries and libunwind. macOS requires **native Apple Silicon (arm64)**,

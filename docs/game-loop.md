@@ -82,24 +82,53 @@ Why this order:
    dim backdrop covers them.
 
 Screenshot mode (`HAYSTACK_SHOT=/path.png`) runs a few frames, then captures
-**after** `endDrawing` has presented the frame, so the HUD is included.
+**inside the drawing pass before `endDrawing` presents**, so the rendered world
+and HUD are included rather than a cleared black back buffer.
 
 ## Browser loop
 
 The five stages are factored into one `stepFrame` helper and run unchanged on
 both platforms. Native `main` calls it from the blocking `while` loop above. The
-browser build exports a C `main` instead: it creates a heap-owned
+browser build exports a C `main` instead. It does **not** create a window or a
+main loop: it starts an async disposable-wallet gate and returns immediately.
+Only when the JS bridge has generated a mnemonic, opened and verified an empty
+wallet, closed/freed it and removed its storage key does it invoke one
+single-shot Zig C continuation. That continuation creates the heap-owned
 `BrowserContext` (the `GameState` plus the persistent `input.Reader`) and hands
-an Emscripten callback to `emscripten_set_main_loop`, so the page is never
-blocked. The context outlives the entry function; Emscripten never receives a
-pointer to a returned stack frame.
+an Emscripten callback to `emscripten_set_main_loop(browserFrame, 0, 0)`, so the
+page is never blocked. The context outlives the entry function; Emscripten never
+receives a pointer to a returned stack frame. A wallet import, initialization,
+storage or cleanup failure shows the generic `Unable to start game.` message and
+creates no game context or frame loop.
+
+`browser/game-shell.html` is the game-only shell: one full-viewport canvas with
+no border, margin or scroll, a temporary non-interactive startup line, and
+`Module.canvas` before the Emscripten script. It has no wallet form, iframe,
+Emscripten logo, controls or log textarea. Raylib's web backend already resizes
+the canvas and renderbuffer from `window.innerWidth`/`innerHeight`; the Zig side
+also initializes using the current canvas CSS size instead of a fixed
+`1000x640`. There is no competing JS resize code. The shell focuses the canvas
+after startup and on pointer interaction, scopes its key listener to the focused
+canvas, and cancels only non-printable navigation/scroll keys (arrows,
+Backspace, Tab, Enter, Escape). Printable WASD/G/B/space keys are never
+cancelled, so GLFW's keypress path can still type into menu fields; Ctrl/Meta/Alt
+shortcuts are left alone.
+
+The browser callback deliberately does **not** call `rl.windowShouldClose()`.
+The pinned web backend implements it with a blocking `emscripten_sleep`, which
+is forbidden inside `emscripten_set_main_loop` and aborts when asyncify is
+disabled. The browser page/main loop owns lifetime instead, and `EndDrawing`
+still polls input and timing normally. The browser also sets raylib's target FPS
+to zero so `requestAnimationFrame`, not a raylib sleep, controls pacing.
 
 Browser teardown is explicit and idempotent: `stopBrowser` clears the global
 context first, cancels the main loop, deinitializes `GameState`, destroys the
 context, and closes the window. A callback that finds no context returns
 immediately, so no stage touches freed state after cleanup. Initialization
-failures log, run the same cleanup, and return a non-zero C `main` result. Both
-entry points disable Raylib's Escape quit key so Escape toggles the menu.
+failures log, run the same cleanup, call the generic error UI and never register
+a loop. Both entry points disable Raylib's Escape quit key so Escape toggles the
+menu. The browser exposes no game snapshot or test-only `Module` status API;
+startup state is internal to the single-shot wallet gate.
 
 ## Four kinds of data
 

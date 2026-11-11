@@ -57,19 +57,24 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     const renderer = b.addLibrary(.{ .name = "haystack_renderer", .linkage = .static, .root_module = root });
     var flags = rlz.emsdk.emccDefaultFlags(b.allocator, .{ .optimize = options.optimize, .asyncify = false, .fsanitize = false });
     if (options.optimize.runtimeSafety()) try flags.put("-fsanitize=undefined", {});
+    var settings = rlz.emsdk.emccDefaultSettings(b.allocator, .{ .optimize = options.optimize });
+    try settings.put("EXIT_RUNTIME", "0");
     const linked = try rlz.emsdk.emccStep(b, &.{}, &.{renderer}, .{
         .optimize = options.optimize,
         .flags = flags,
-        .settings = rlz.emsdk.emccDefaultSettings(b.allocator, .{ .optimize = options.optimize }),
+        .settings = settings,
+        .shell_file_path = b.path("browser/game-shell.html"),
         .install_dir = .{ .custom = "wasm/renderer" },
         .out_file_name = "index.html",
+        .js_library_path = b.path("browser/game-wallet.js"),
     });
     b.getInstallStep().dependOn(linked);
     b.step("renderer", "Build the browser renderer without the wallet").dependOn(linked);
-    for ([_][]const u8{ "index.html", "app.js", "smoke.js", "spilman-negative.js", "live-channels.js", "test-faults.js", "fault-scenarios.js", "recovery.js" }) |file| {
-        b.getInstallStep().dependOn(&b.addInstallFile(b.path(b.fmt("browser/{s}", .{file})), b.fmt("wasm/{s}", .{file})).step);
-    }
-    b.getInstallStep().dependOn(&b.addInstallFile(b.path("src/testdata/spilman_vectors.json"), "wasm/spilman_vectors.json").step);
+    // The normal installed application is runtime-only: the root redirect, the
+    // renderer (shell, JS and Wasm installed by `linked`) and the wallet module.
+    // Wallet regression JS, the test fixture and deterministic vectors are
+    // installed only by the test/test-mint targets through `test-assets`.
+    b.getInstallStep().dependOn(&b.addInstallFile(b.path("browser/index.html"), "wasm/index.html").step);
     b.step("wasm", "Build and install the complete Wasm application").dependOn(b.getInstallStep());
     b.step("browser", "Alias for the complete Wasm application in this platform graph").dependOn(b.getInstallStep());
     const setup = b.step("setup", "Provision pinned Rust, Wasm target, local wasm-bindgen and Emscripten (no application build)");
@@ -84,6 +89,13 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     // Native helper compilation is EXPLICITLY test-only. A normal Wasm build
     // never builds this crate or links the desktop archive/system libraries.
     if (b.graph.host.result.os.tag == .linux) {
+        // Shared by `test` and `test-mint`. These files are regression-test
+        // inputs only, so a normal browser build never installs them.
+        const test_assets = b.step("test-assets", "Install browser regression test fixtures (test/test-mint only)");
+        for ([_][]const u8{ "app.js", "smoke.js", "spilman-negative.js", "live-channels.js", "test-faults.js", "fault-scenarios.js", "recovery.js", "wallet-test.html" }) |file| {
+            test_assets.dependOn(&b.addInstallFile(b.path(b.fmt("browser/{s}", .{file})), b.fmt("wasm/{s}", .{file})).step);
+        }
+        test_assets.dependOn(&b.addInstallFile(b.path("src/testdata/spilman_vectors.json"), "wasm/spilman_vectors.json").step);
         const host = try common.hostRustTarget(b);
         const database = common.cargo(b, options, "browser/wallet/Cargo.toml", &.{ "test", "--target", host, "--target-dir", "browser/wallet/target" });
         database.step.dependOn(&rust_check.step);
@@ -97,6 +109,9 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         browser_tests.addDirectoryArg(b.graph.path(.install_prefix, "wasm"));
         browser_tests.addArg("--runner");
         browser_tests.addFileArg(b.path("browser/test.mjs"));
+        // The non-interactive wallet host is a test fixture only. It is not part
+        // of the normal installed application, whose default is the game.
+        browser_tests.step.dependOn(test_assets);
         browser_tests.step.dependOn(&mint.step);
         browser_tests.step.dependOn(b.getInstallStep());
         const test_step = b.step("test", "Build, start an ephemeral fake mint, run Chromium and stop the mint");
@@ -104,6 +119,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         test_step.dependOn(&database.step);
         const run_mint = b.addRunFile(mint_exe);
         run_mint.addDirectoryArg(b.graph.path(.install_prefix, "wasm"));
+        run_mint.step.dependOn(test_assets);
         run_mint.step.dependOn(&mint.step);
         run_mint.step.dependOn(b.getInstallStep());
         b.step("test-mint", "Build and serve the application with a localhost-only fake mint").dependOn(&run_mint.step);
