@@ -16,6 +16,18 @@ const directory=await mkdtemp(join(base,"cdk-browser-test-"));
 const artifacts=await mkdtemp(join(base,"cdk-browser-test-artifacts-"));
 const browser=spawn(process.env.CHROMIUM || "chromium",["--headless","--no-sandbox","--use-gl=angle","--use-angle=swiftshader","--enable-unsafe-swiftshader",`--user-data-dir=${directory}`,"--remote-debugging-port=0","about:blank"],{stdio:["ignore","ignore","pipe"]});
 
+// The Python wrapper prints the fake mint's normal application URL (`/?smoke`).
+// Wallet checks run on the explicit non-interactive test fixture, while `/` is
+// only a redirect to the game. Normalize the input once and reuse the origin.
+const inputUrl=process.argv[2] || "http://127.0.0.1:18787/?smoke";
+const parsedInput=new URL(inputUrl);
+const baseOrigin=parsedInput.origin;
+const fixtureUrl=search => {
+  const url=new URL("/wallet-test.html",baseOrigin);
+  url.search=search===undefined? (parsedInput.search || "?smoke") : `?${search}`;
+  return url.href;
+};
+
 const result={ok:false,completed:false,checks:[],failures:[],count:0,failureCount:0,uncaughtExceptions:[]};
 const addFailure=failure => {
   if(result.failures.some(existing => existing.scenario === failure.scenario && existing.message === failure.message)) return;
@@ -120,7 +132,7 @@ const work=(async () => {
   await send("Runtime.enable",{},sessionId);
   await send("Page.enable",{},sessionId);
   await send("Runtime.addBinding",{name:"reportBrowserTests"},sessionId);
-  await send("Page.navigate",{url:process.argv[2] || "http://127.0.0.1:18787/?smoke"},sessionId);
+  await send("Page.navigate",{url:fixtureUrl()},sessionId);
 
   const smoke=await report;
   Object.assign(result,smoke);
@@ -145,7 +157,7 @@ const work=(async () => {
   await send("Runtime.enable",{},second.sessionId);
   await send("Page.enable",{},second.sessionId);
   const loaded=once("Page.loadEventFired",second.sessionId);
-  await send("Page.navigate",{url:new URL("/?lifecycle",process.argv[2] || "http://127.0.0.1:18787").href},second.sessionId);
+  await send("Page.navigate",{url:fixtureUrl("lifecycle")},second.sessionId);
   await loaded;
   const rejected=await evaluate(second.sessionId,`(async()=>{await (await import("./app.js")).ready;try{${open};await walletApp.close();return false;}catch{return true;}})()`);
   if(!rejected) throw new Error("Cross-tab exclusive lock failed");
@@ -155,19 +167,19 @@ const work=(async () => {
   if(!handoff) throw new Error("Cross-tab persistent handoff failed");
   result.checks.push("Wallet state survives handoff to a separate browser tab");
   const reloaded=once("Page.loadEventFired",sessionId);
-  await send("Page.navigate",{url:new URL("/?reload-check",process.argv[2] || "http://127.0.0.1:18787").href},sessionId);
+  await send("Page.navigate",{url:fixtureUrl("reload-check")},sessionId);
   await reloaded;
   const persisted=await evaluate(sessionId,`(async()=>{await (await import("./app.js")).ready;${open};const r=await walletApp.call("list_mints");await walletApp.close();localStorage.removeItem(${JSON.stringify(`cdk_wallet_browser_v1_${name}`)});return r.status===0 && r.mints.includes(location.origin);})()`);
   if(!persisted) throw new Error("Wallet persistence across page reload failed");
   result.checks.push("Wallet storage survives destruction and reload of the Wasm instance");
 
   // --- Actual document destruction after interrupted operations ----------
-  const origin=new URL(process.argv[2] || "http://127.0.0.1:18787").origin;
+  const origin=baseOrigin;
   const q=value => JSON.stringify(value);
   const recoveryName=label => `rec-${label.replace(/[^a-z0-9]/gi,"").slice(0,12)}-${crypto.randomUUID().replaceAll("-","")}`;
   async function openRecoveryPage(suffix) {
     const pageLoaded=once("Page.loadEventFired",sessionId);
-    await send("Page.navigate",{url:new URL(`/?${suffix}`,origin).href},sessionId);
+    await send("Page.navigate",{url:fixtureUrl(suffix)},sessionId);
     await pageLoaded;
     await evaluate(sessionId,`(async()=>{await (await import("./app.js")).ready;window.recoveryScenarios=await import("./recovery.js");return true;})()`);
   }
@@ -395,7 +407,7 @@ const work=(async () => {
   result.ok=result.failures.length === 0;
   try { await send("Target.closeTarget",{targetId:extra.targetId}); } catch {}
   try {
-    await evaluate(sessionId,`document.getElementById("status").textContent=${JSON.stringify(result.ok?"BROWSER TESTS PASSED":`BROWSER TESTS: ${result.failureCount} KNOWN FAILURE(S)`) };document.getElementById("result").textContent=${JSON.stringify(JSON.stringify(result,null,2))};document.querySelector("details").open=true;`);
+    await evaluate(sessionId,`document.getElementById("status").textContent=${JSON.stringify(result.ok?"BROWSER TESTS PASSED":`BROWSER TESTS: ${result.failureCount} KNOWN FAILURE(S)`) };document.getElementById("result").textContent=${JSON.stringify(JSON.stringify(result,null,2))};`);
   } catch {}
   return result;
 })();

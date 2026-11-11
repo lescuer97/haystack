@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CDK browser wallet — test fixture</title>
+<!--
+  Test-only, non-interactive host for the browser wallet regression suites.
+  Installed only by the test/test-mint targets; the normal application never
+  ships it. The status and result nodes are the only UI app.js and the test
+  runner need; there are no wallet inputs, buttons, forms or iframes here.
+-->
+<style>
+body{font:16px system-ui;max-width:960px;margin:2rem auto;padding:0 1rem;background:#111827;color:#f3f4f6}
+#status{padding:1rem;background:#1f2937}
+pre{white-space:pre-wrap;overflow-wrap:anywhere}
+</style>
+</head>
+<body>
+<h1>CDK browser wallet — test fixture</h1>
+<p id="status">Loading Rust WebAssembly…</p>
+<pre id="result" aria-live="polite"></pre>
+<script type="module" src="app.js"></script>
+</body>
+</html>

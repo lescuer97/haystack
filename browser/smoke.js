@@ -160,9 +160,6 @@ export async function runSmoke(app) {
     await runLiveChannels({app, pure, text, assert});
     await runFaultScenarios({assert, faults, recordFailure});
 
-    const frame=document.querySelector("iframe");
-    const canvas=frame?.contentDocument?.querySelector("canvas");
-    assert(canvas?.width === 1000 && canvas?.height === 640, "Zig/raylib chunk-streaming renderer initializes alongside wallet");
     completed = true;
     return {ok: completed && failures.length === 0, completed, checks, failures, count: checks.length, failureCount: failures.length};
   } catch (error) {

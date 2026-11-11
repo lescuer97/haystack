@@ -9,7 +9,7 @@ menu, without building the other application.
 | --- | --- |
 | `zig build setup` | Provision the selected desktop Rust toolchain/target and validate native prerequisites; no application compilation |
 | `zig build` | Desktop application: `zig-out/desktop/bin/haystack_game`, assets in `zig-out/desktop/bin/assets`, shared raylib in `zig-out/desktop/lib` (Linux or macOS Apple Silicon) |
-| `zig build -Dplatform=wasm` | Complete browser bundle: `zig-out/wasm/index.html`, Rust wallet, JS bindings and Zig renderer |
+| `zig build -Dplatform=wasm` | Complete browser bundle: game shell at `zig-out/wasm/renderer/index.html` (root `zig-out/wasm/index.html` redirects), Rust wallet, JS bindings and Zig renderer |
 | `zig build run` | Build, install, then run the installed desktop binary next to its installed raylib |
 | `zig build run -Dplatform=wasm` | Build/serve the browser application at `http://127.0.0.1:8000` |
 | `zig build test` | Desktop application tests |
@@ -369,7 +369,7 @@ Verified on this Linux machine (Zig 0.17.0, Rust 1.99.0):
 - `zig build test-wallet -Dplatform=wasm -Doffline`: **55** browser database
   tests passed.
 - `zig build test -Dplatform=wasm -Doffline` reproduced the known CDK recovery
-  defects: **221** checks ran and **3** failed (dropped send after mint commit
+  defects: **220** checks ran and **3** failed (dropped send after mint commit
   restored 130 instead of 96 sats; send interrupted before request reported a
   failed mint; send interrupted after mint commit restored 130 instead of 96).
   The command exits nonzero as intended, and the fake mint's ephemeral port was

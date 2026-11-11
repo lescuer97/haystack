@@ -36,13 +36,15 @@ An existing matching CLI can optionally override the managed one:
 zig build -Dplatform=wasm -Dwasm-bindgen=/absolute/path/to/wasm-bindgen
 ```
 
-Output: **`zig-out/wasm/index.html`** plus two independent Wasm modules and
-their JavaScript loaders. The Rust wallet uses wasm-bindgen; the renderer uses
-Emscripten. Subsequent builds check the installed SDK version instead of running
-upstream's unconditional `emsdk update` (which caused a 502 failure and a hung
-build during testing). The pinned upstream activation step is detached and
-verified at configuration time; if that upstream graph changes, configuration
-fails instead of running an installer.
+Output: **`zig-out/wasm/renderer/index.html`** (the game), **`zig-out/wasm/index.html`**
+(a minimal redirect to the game that preserves query/hash), the Rust wallet under
+`zig-out/wasm/wallet`, and the renderer's JS/Wasm. The Rust wallet uses
+wasm-bindgen; the renderer uses Emscripten and a game-only full-viewport shell.
+Subsequent builds check the installed SDK version instead of running upstream's
+unconditional `emsdk update` (which caused a 502 failure and a hung build during
+testing). The pinned upstream activation step is detached and verified at
+configuration time; if that upstream graph changes, configuration fails instead
+of running an installer.
 
 Serve the entire directory, not just a `.wasm` file:
 
@@ -50,9 +52,11 @@ Serve the entire directory, not just a `.wasm` file:
 zig build run -Dplatform=wasm
 ```
 
-Open <http://127.0.0.1:8000>. Use HTTPS for deployment; localhost HTTP is sufficient
-for local testing. Web Crypto, WebAssembly, localStorage, and Web Locks are
-required. Opening is refused when locking/storage cannot be established.
+Open <http://127.0.0.1:8000>. The default page is the game. A non-interactive
+wallet test fixture is only installed for test targets, at `/wallet-test.html`.
+Use HTTPS for deployment; localhost HTTP is sufficient for local testing. Web
+Crypto, WebAssembly, localStorage, and Web Locks are required. Opening is
+refused when locking/storage cannot be established.
 
 The browser graph is selected only by `-Dplatform=wasm`. A Wasm `-Dtarget` alone
 (including `wasm32-emscripten`, `wasm64-*` or WASI) is rejected; use the explicit
@@ -88,14 +92,17 @@ For a different port/browser:
 CHROMIUM=/path/to/chromium node browser/test.mjs http://127.0.0.1:PORT/?smoke
 ```
 
-You can also visit <http://127.0.0.1:18787/?smoke> manually. The page reports its
-browser checks; the Node runner additionally tests actual separate tabs, document
-reload, and document destruction after interrupted send/receive operations. It
-uses a fresh Chromium profile and removes only generated test-wallet keys.
-Deterministic cryptographic vectors are public fixtures, and network test seeds
-are random so repeated runs do not reuse mint outputs. Fault injection is a
-test-only wrapper around `fetch` that matches one armed same-origin `POST
-/v1/swap` at a time and never logs request bodies.
+You can also visit <http://127.0.0.1:18787/wallet-test.html?smoke> manually. The
+default `/` is the game, so the Node runner rewrites the fake mint's `/?smoke`
+URL to the non-interactive `/wallet-test.html?smoke` fixture and leaves the
+Python mint URL detection unchanged. The fixture reports its browser checks; the
+Node runner additionally tests actual separate tabs, document reload, and
+document destruction after interrupted send/receive operations. It uses a fresh
+Chromium profile and removes only generated test-wallet keys. Deterministic
+cryptographic vectors are public fixtures, and network test seeds are random so
+repeated runs do not reuse mint outputs. Fault injection is a test-only wrapper
+around `fetch` that matches one armed same-origin `POST /v1/swap` at a time and
+never logs request bodies.
 
 Native browser-database conformance and original bridge regression suites:
 
@@ -110,7 +117,7 @@ zig build test
 | Check | Result |
 | --- | --- |
 | Complete Wasm bundle with managed pinned tooling | PASS |
-| Chromium end-to-end runner | **221 passing checks; 3 failed known scenarios**; zero uncaught exceptions, command exits nonzero |
+| Chromium end-to-end runner | **220 passing checks; 3 failed known wallet-recovery scenarios**; zero uncaught exceptions, command exits nonzero |
 | Browser database against pinned CDK conformance suite | **55 tests passed** |
 | Original Rust bridge suite | **60 tests passed** |
 | Original Zig wallet/Spilman integration suites (`zig build test-wallet`) | **26 tests passed**, header check passed |
@@ -167,7 +174,6 @@ Browser checks include:
   and confirm the claimed token leaves the pending list.
 - Balance/mint persistence across reopen, exclusive locking across separate tabs,
   handoff between tabs, and persistence across Wasm-instance destruction/reload.
-- The independent Zig/raylib Wasm renderer initializes in the same browser page.
 
 The runner writes `cdk-browser-test.json` and `cdk-browser-test.png` into a
 unique `mkdtemp` directory under the operating system's temporary directory and
@@ -255,9 +261,19 @@ field is secret material; never log it. Generated TypeScript declarations expose
   running fake mint and their proofs are redeemed. Wallet network helpers are
   compiled; not every signing-key/raw-swap combination has browser end-to-end
   coverage.
-- The renderer and wallet are separate modules. The supplied browser page connects
-  wallet controls alongside the renderer; Zig itself does not call the async JS
-  wallet or share its linear memory yet.
+- The renderer and wallet remain separate Wasm modules with separate linear
+  memories. The game itself starts a disposable wallet bridge through
+  `browser/game-wallet.js` *before* creating its window or main loop: an
+  Emscripten JS library dynamically imports the async wallet adapter, generates
+  a fresh mnemonic, derives its 64-byte seed, opens a fresh uniquely named
+  browser wallet, verifies empty startup reports and balances, closes/frees it,
+  and removes only the storage key it created. No mint or network call is
+  involved. A single-shot Zig continuation starts the game only on success; any
+  import, initialization, storage or cleanup failure shows `Unable to start
+  game.` and never creates a game context or frame loop. The game exposes no
+  public `Module` snapshot or status API; startup state is internal. Wallet
+  controls remain in the wallet module and are exercised only by the
+  non-interactive `/wallet-test.html` test fixture.
 - LocalStorage rewrites the whole record and blocks briefly while serializing.
   An IndexedDB backend may be appropriate for larger wallets. Do not silently
   swap to a weaker locking or persistence model when platform features are absent.
