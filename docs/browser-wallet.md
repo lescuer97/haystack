@@ -38,9 +38,11 @@ Open <http://127.0.0.1:8000>. Use HTTPS for deployment; localhost HTTP is suffic
 for local testing. Web Crypto, WebAssembly, localStorage, and Web Locks are
 required. Opening is refused when locking/storage cannot be established.
 
-`zig build -Dtarget=wasm32-emscripten` also builds the **complete** browser bundle.
-Renderer-only work is explicit: `zig build renderer -Dplatform=wasm`.
-The native-crate Wasm probe is no longer a project build step.
+The browser graph is selected only by `-Dplatform=wasm`. A Wasm `-Dtarget` alone
+(including `wasm32-emscripten`, `wasm64-*` or WASI) is rejected; use the explicit
+platform flag, optionally with `-Dtarget=wasm32-emscripten`. Renderer-only work is
+explicit: `zig build renderer -Dplatform=wasm`. The native-crate Wasm probe is no
+longer a project build step.
 
 ## Run the local end-to-end tests
 
@@ -71,10 +73,13 @@ CHROMIUM=/path/to/chromium node browser/test.mjs http://127.0.0.1:PORT/?smoke
 ```
 
 You can also visit <http://127.0.0.1:18787/?smoke> manually. The page reports its
-browser checks; the Node runner additionally tests actual separate tabs and
-document reload. It uses a fresh Chromium profile and removes only generated
-test-wallet keys. Deterministic cryptographic vectors are public fixtures, and
-network test seeds are random so repeated runs do not reuse mint outputs.
+browser checks; the Node runner additionally tests actual separate tabs, document
+reload, and document destruction after interrupted send/receive operations. It
+uses a fresh Chromium profile and removes only generated test-wallet keys.
+Deterministic cryptographic vectors are public fixtures, and network test seeds
+are random so repeated runs do not reuse mint outputs. Fault injection is a
+test-only wrapper around `fetch` that matches one armed same-origin `POST
+/v1/swap` at a time and never logs request bodies.
 
 Native browser-database conformance and original bridge regression suites:
 
@@ -89,10 +94,13 @@ zig build test
 | Check | Result |
 | --- | --- |
 | Complete Wasm bundle with managed pinned tooling | PASS |
-| Chromium end-to-end runner | **42 checks passed**, zero uncaught exceptions |
-| Browser database against pinned CDK conformance suite | **51 tests passed** |
-| Original Rust bridge suite | **51 tests passed** |
+| Chromium end-to-end runner | **221 passing checks; 3 failed known scenarios**; zero uncaught exceptions, command exits nonzero |
+| Browser database against pinned CDK conformance suite | **55 tests passed** |
+| Original Rust bridge suite | **60 tests passed** |
 | Original Zig wallet/Spilman integration suites (`zig build test-wallet`) | **26 tests passed**, header check passed |
+
+The macOS CI job additionally compiles and runs four macOS-only extended-ACL
+regression tests; they are compiled out on Linux and were not executed here.
 
 Browser checks include:
 
@@ -100,8 +108,44 @@ Browser checks include:
 - Cashu token encoding/decoding and native Spilman vectors: deterministic funding,
   DLEQ verification, signed and unsigned balance updates, 70/30 close, and expiry
   refund. These execute the existing native binding implementations, not JS crypto.
+- Native negative Spilman coverage: changed signatures, valid-length wrong channel
+  ids, balances above capacity, close with a wrong sender signature/unrelated
+  receiver key/over-capacity, and cloned close responses with a corrupted `C_`,
+  missing signature, changed amount, or flipped DLEQ challenge. Malformed hex,
+  JSON, junk tokens, wrong digest/tweak lengths, the exact-expiry refund boundary,
+  and unrelated sender keys are rejected with the expected status codes. Required
+  `null` arguments return `NullArgument`; adapter-level missing/non-string/NUL
+  arguments throw separately. Error bodies are checked not to echo secrets.
+- Live Spilman channels against the running fake mint: active and by-id keyset
+  agreement, a real `/test-token` funding swap (the token is never received before
+  funding), 70/30 cooperative close, redemption into both wallets with live
+  balances, and a separate post-expiry refund channel whose 100 sats are redeemed,
+  survive reopen, and remain unchanged across two explicit recoveries.
+- Test-only `/v1/swap` fault injection (same-origin POST only, one armed request,
+  no request-body logging): malformed response after mint commit, generic network
+  rejection after commit, and a held response that exercises the real 60-second
+  network deadline. Receive cases assert `NetworkError`/nonzero, no premature
+  balance, `RecoveryPending` gating for send/receive/post_swap, exactly-once
+  recovery, clean reports, repeated-recovery stability, and full-balance
+  spendability (the entire recovered amount is sent and redeemed into a fresh
+  wallet, with source/recipient totals and repeated recovery checked). The
+  send-after-commit case asserts `SendUncertain`, no success token, gating, and
+  fault-once; its failing balance invariant is recorded as a structured failure
+  (see known defects below), not as a passing check, and spendability is only
+  attempted if the balance invariant holds.
+- Actual document destruction without a graceful close: send and receive held
+  before any mint request, send and receive held after mint commit, and a successful
+  local send whose JS result is never delivered. The last case verifies the pending
+  bearer token survives reload, is redeemable exactly once, and disappears from the
+  pending list after recovery. Reloaded receive scenarios prove the full recovered
+  balance is spendable. Send-interruption scenarios with failing invariants are
+  collected in `failures` while the independent receive/pending scenarios continue
+  and clean up.
 - Wrong-seed rejection without changing storage, quota-write failure propagation,
   mint URL/approval checks, and opening the shared core offline.
+- Partial, truncated or incompatible v1 storage is rejected without rewriting the
+  raw record (missing `proofs`, `counters`, `sagas`, etc.), while a complete
+  record still loads; the same strictness is tested natively and in Chromium.
 - Browser Fetch to a real local CDK fake-mint HTTP server: receive 100 fake sats,
   send 40, persist/retrieve the outgoing token, redeem in another wallet, recover,
   and confirm the claimed token leaves the pending list.
@@ -109,8 +153,16 @@ Browser checks include:
   handoff between tabs, and persistence across Wasm-instance destruction/reload.
 - The independent Zig/raylib Wasm renderer initializes in the same browser page.
 
-The runner writes `/tmp/opencode/cdk-browser-test.json` and
-`/tmp/opencode/cdk-browser-test.png` with the result and rendered screenshot.
+The runner writes `cdk-browser-test.json` and `cdk-browser-test.png` into a
+unique `mkdtemp` directory under the operating system's temporary directory and
+prints that directory in its output. The JSON carries passing `checks`, a
+structured `failures` array, and separate `count`/`failureCount` values. Recorded
+known defects set `ok=false` and make the command exit nonzero even though the
+remaining independent scenarios finished. Progress/screenshot diagnostics and
+Chromium shutdown are bounded (SIGTERM then SIGKILL escalation); CDP disconnect
+rejects pending requests, and the JSON artifact is written even when the
+screenshot or connection fails. A test-only `BROWSER_TEST_KILL_MS` hook kills the
+browser mid-run to verify this bounded path.
 Conformance tests use an in-memory substitute for the browser storage calls;
 actual localStorage, locking and injected quota failures run in Chromium.
 
@@ -178,20 +230,57 @@ field is secret material; never log it. Generated TypeScript declarations expose
   panics can abort the Wasm instance. The page rejects further queued operations
   on a runtime trap and requires reload/recovery; this is not proven equivalent
   to native panic containment. Full injected-panic/crash recovery is still needed.
-- Fault cases such as reload exactly after mint commit, hung requests, CORS denial,
-  dropped responses, and every browser send/cancel/receive boundary are not all
-  exercised here. Native fault-injection tests pass and the browser reuses that
-  policy, but that is not a substitute for a browser-specific fault matrix.
-- Pure Spilman flows replay signed fixture responses; they are not live
-  cooperative-close/refund transactions against the running fake mint. Wallet
-  network helpers are compiled; not every signing-key/raw-swap combination has
-  browser end-to-end coverage.
+- Fault injection covers one faulted `/v1/swap` request at a time: malformed,
+  rejected, and held responses after a real mint commit, plus before-request holds
+  destroyed by navigation. It does not claim a complete crash/cancellation matrix:
+  CORS denial, page-process crashes, panics, other endpoints, concurrent faults,
+  and browser-specific timing permutations remain unexercised.
+- Live Spilman cooperative close and post-expiry refund now run against the
+  running fake mint and their proofs are redeemed. Wallet network helpers are
+  compiled; not every signing-key/raw-swap combination has browser end-to-end
+  coverage.
 - The renderer and wallet are separate modules. The supplied browser page connects
   wallet controls alongside the renderer; Zig itself does not call the async JS
   wallet or share its linear memory yet.
 - LocalStorage rewrites the whole record and blocks briefly while serializing.
   An IndexedDB backend may be appropriate for larger wallets. Do not silently
   swap to a weaker locking or persistence model when platform features are absent.
+
+### Known recovery defects reported by browser tests
+
+These are real limitations of the pinned CDK recovery path reached through the
+wrapper. The browser tests do **not** assert them as correct behavior: the runner
+records structured `failures` entries (`scenario`, `expected`, `actual`,
+`message`), continues the remaining independent scenarios, emits the JSON and
+screenshot artifacts, sets `ok=false`, and exits nonzero. They are not
+production-safety claims.
+
+- **Nested send-swap recovery over-counts value.** When a send requires an online
+  swap, CDK persists that swap as a separate `Swap` saga with
+  `ProofReservation::Skip`; the swap saga owns no input proofs. If the mint commits
+  the swap and the response is lost, recovery restores the swap outputs but cannot
+  mark the swap inputs spent. The parent `Send(ProofsReserved)` saga is then
+  compensated and releases those same already-spent inputs as unspent.
+  Reproduction in `browser/fault-scenarios.js` and `browser/recovery.js`: fund
+  100 sats, spend the four 1-sat refill proofs locally so a 37-sat send cannot be
+  composed from the remaining even denominations, then drop the committed
+  `/v1/swap` response. The required post-recovery balance is 96 sats; the observed
+  value is 130 sats (the in-page and document-destruction scenarios each record a
+  failure). The 34-sat difference is an observation of the stale inputs, not an
+  expected contract. The tests do not assert that the over-counted proofs are
+  spendable. No production fix is applied yet.
+- **A send interrupted before its swap request leaves the mint gated.** The send
+  reservation is compensated (the 96-sat balance is preserved), but the orphaned
+  nested `Swap` saga owns no input proofs, so recovery tries `/restore`; an empty
+  restore response is treated as an incomplete response and reported as `failed`,
+  leaving the mint blocked. The expected invariants are clean startup/explicit
+  recovery and send status 0; the observed startup and retry reports have
+  `failed=1`, and a subsequent send returns `RecoveryPending` (19). This is
+  recorded as one structured failure.
+
+Run `zig build test -Dplatform=wasm -Doffline` to reproduce. It writes
+`cdk-browser-test.json` and `cdk-browser-test.png`, reports the three failed
+scenarios in `failures`, and exits nonzero because of these defects.
 
 The earlier [WebAssembly investigation](webassembly.md) is retained as historical
 context and a remaining-hardening plan; its initial compilation verdict is now

@@ -121,6 +121,9 @@ fn open_rejects_unmarked_preexisting_database_without_modifying_it() {
     // Create a *valid* CDK wallet database that the wrapper did not create.
     let db = block_on(cdk_sqlite::WalletSqliteDatabase::new(path.clone())).unwrap();
     drop(db);
+    // The wrapper now rejects broad permissions before marker validation; make
+    // this test exercise the marker path rather than the permission gate.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     let before = sqlite_master(&path);
     assert!(!before.is_empty(), "the foreign database has a schema");
@@ -136,6 +139,7 @@ fn open_rejects_unmarked_preexisting_database_without_modifying_it() {
 fn open_rejects_empty_preexisting_file() {
     let (_dir, path) = temp_db();
     std::fs::File::create(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 
     let err = block_on(CdkWallet::open(&[9u8; 64], path.to_str().unwrap())).unwrap_err();
@@ -143,6 +147,24 @@ fn open_rejects_empty_preexisting_file() {
 
     // The empty file is left untouched.
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+}
+
+#[test]
+fn insecure_permissions_are_rejected_before_marker_inspection() {
+    let (_dir, path) = temp_db();
+    let raw = b"not a sqlite database";
+    std::fs::write(&path, raw).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Permission rejection takes precedence over "not a SQLite database", so the
+    // file is not opened/read by SQLite first.
+    let err = block_on(CdkWallet::open(&[9u8; 64], path.to_str().unwrap())).unwrap_err();
+    assert_eq!(err.status, CdkStatus::InsecureDatabasePermissions);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), raw);
 }
 
 #[test]
@@ -221,6 +243,96 @@ fn open_rejects_insecure_permissions() {
     drop(handle);
 }
 
+#[cfg(target_os = "macos")]
+fn chmod(path: &Path, args: &[&str]) {
+    let status = std::process::Command::new("/bin/chmod")
+        .args(args)
+        .arg(path)
+        .status()
+        .expect("run /bin/chmod");
+    assert!(status.success(), "chmod {args:?} failed for {path:?}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn open_rejects_macos_acl_grant_even_with_owner_only_mode() {
+    let (_dir, path) = temp_db();
+    let path_str = path.to_str().unwrap().to_string();
+    let (handle, _reports) = block_on(CdkWallet::open(&[41u8; 64], &path_str)).unwrap();
+    drop(handle);
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let before = std::fs::read(&path).unwrap();
+    chmod(&path, &["+a", "everyone allow read"]);
+
+    let err = block_on(CdkWallet::open(&[41u8; 64], &path_str)).unwrap_err();
+    assert_eq!(err.status, CdkStatus::InsecureDatabasePermissions);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "a rejected ACL open must not mutate the database"
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the wrapper must not rewrite mode bits to compensate for an ACL"
+    );
+
+    // Removing the ACL also proves the failed open released its lock.
+    chmod(&path, &["-N"]);
+    let (reopened, _reports) = block_on(CdkWallet::open(&[41u8; 64], &path_str)).unwrap();
+    drop(reopened);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn open_rejects_macos_inherited_acl_before_writing_a_new_database() {
+    let dir = tempfile::tempdir().unwrap();
+    chmod(
+        dir.path(),
+        &["+a", "everyone allow read,file_inherit,directory_inherit"],
+    );
+    let path = dir.path().join("wallet.sqlite");
+    let path_str = path.to_str().unwrap();
+
+    let err = block_on(CdkWallet::open(&[42u8; 64], path_str)).unwrap_err();
+    assert_eq!(err.status, CdkStatus::InsecureDatabasePermissions);
+
+    // The validation open may create an empty file, but SQLite must not have
+    // written a schema or any data before the ACL gate rejected it.
+    let meta = std::fs::metadata(&path).expect("validation open creates an empty file");
+    assert_eq!(meta.len(), 0, "database was written before ACL validation");
+
+    chmod(dir.path(), &["-N"]);
+    if path.exists() {
+        chmod(&path, &["-N"]);
+    }
+
+    // Removing ACLs does not create the wrapper marker. The zero-length,
+    // unmarked file must still be rejected by normal marker validation, and
+    // that rejection must not write to it.
+    let err = block_on(CdkWallet::open(&[42u8; 64], path_str)).unwrap_err();
+    assert_eq!(err.status, CdkStatus::UnsupportedDatabase);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        0,
+        "marker validation must not write to an unmarked file"
+    );
+    assert!(
+        std::fs::read(&path).unwrap().is_empty(),
+        "the rejected file must remain byte-for-byte empty"
+    );
+
+    // This file is test-owned and inside the TempDir. Remove only this empty
+    // path so the next open exercises fresh creation instead of marker failure.
+    std::fs::remove_file(&path).unwrap();
+    let (created, _reports) = block_on(CdkWallet::open(&[42u8; 64], path_str)).unwrap();
+    drop(created);
+}
+
 #[test]
 fn open_rejects_symlink_database_path() {
     let (dir, path) = temp_db();
@@ -248,6 +360,95 @@ fn open_rejects_a_second_live_handle() {
     // Once the first handle is gone the lock is released.
     let (second, _reports) = block_on(CdkWallet::open(&[3u8; 64], &path)).unwrap();
     drop(second);
+}
+
+#[test]
+fn open_rejects_a_hard_link_alias_of_a_live_database() {
+    let (dir, path) = temp_db();
+    let path = path.to_str().unwrap().to_string();
+
+    // The lock is tied to the database inode, not to one path spelling.
+    let (first, _reports) = block_on(CdkWallet::open(&[10u8; 64], &path)).unwrap();
+    let alias = dir.path().join("alias.sqlite");
+    std::fs::hard_link(dir.path().join("wallet.sqlite"), &alias).unwrap();
+    let alias_str = alias.to_str().unwrap();
+
+    let err = block_on(CdkWallet::open(&[10u8; 64], alias_str)).unwrap_err();
+    assert_eq!(err.status, CdkStatus::AlreadyOpen);
+    drop(first);
+
+    // With the first handle closed, the alias is a valid path to the same DB.
+    let (second, _reports) = block_on(CdkWallet::open(&[10u8; 64], alias_str)).unwrap();
+    drop(second);
+}
+
+#[test]
+fn handle_lock_coexists_with_sqlite_connections() {
+    let (_dir, path) = temp_db();
+    let handle = open_handle([11u8; 64], &path);
+
+    // The wrapper's advisory lock must not block SQLite's own byte-range locks
+    // on the same file. A separate connection reads the schema and performs a
+    // real write transaction while the wallet handle stays open.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let tables: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .unwrap();
+    assert!(tables > 0, "the wallet schema is visible to SQLite");
+    conn.execute_batch(
+        "CREATE TABLE wrapper_lock_coexistence_probe (value INTEGER);\n\
+         INSERT INTO wrapper_lock_coexistence_probe VALUES (1);",
+    )
+    .unwrap();
+    drop(conn);
+
+    drop(handle);
+}
+
+const LOCK_PROBE_ENV: &str = "CDK_WALLET_FFI_LOCK_PROBE_PATH";
+
+/// Child-process entry point used by `open_rejects_a_second_process`.
+///
+/// Without the probe environment variable this is a no-op, so an ordinary test
+/// run only records it as a pass. The parent spawns the test binary with a
+/// filter that selects this test and the probe variable set.
+#[test]
+fn lock_probe_child() {
+    let Some(path) = std::env::var_os(LOCK_PROBE_ENV) else {
+        return;
+    };
+    let path = path.to_str().expect("probe path must be UTF-8");
+    let err = block_on(CdkWallet::open(&[12u8; 64], path)).unwrap_err();
+    assert_eq!(
+        err.status,
+        CdkStatus::AlreadyOpen,
+        "a second process must be rejected: {}",
+        err.message
+    );
+}
+
+#[test]
+fn open_rejects_a_second_process() {
+    let (_dir, path) = temp_db();
+    let seed = [12u8; 64];
+    let first = open_handle(seed, &path);
+    let path_str = path.to_str().unwrap();
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--nocapture")
+        .arg("lock_probe_child")
+        .env(LOCK_PROBE_ENV, path_str)
+        .output()
+        .expect("spawn the lock probe child");
+    assert!(
+        output.status.success(),
+        "child process did not observe AlreadyOpen.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    drop(first);
 }
 
 #[test]

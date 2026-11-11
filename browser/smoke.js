@@ -1,15 +1,28 @@
 // Browser-only tests. Deterministic public fixtures and a local fake mint only.
 import {open_wallet} from "./wallet/cdk_wallet_browser.js";
+import {installSwapFaults} from "./test-faults.js";
+import {runSpilmanNegatives} from "./spilman-negative.js";
+import {runLiveChannels} from "./live-channels.js";
+import {runFaultScenarios} from "./fault-scenarios.js";
 
 export async function runSmoke(app) {
   await app.ready;
   const checks = [];
+  const failures = [];
+  let completed = false;
   window.browserTestProgress = checks;
+  const recordFailure = failure => {
+    // One entry per scenario+invariant; known defects are reported, never
+    // turned into passing labels and never asserted as correct behavior.
+    if (failures.some(existing => existing.scenario === failure.scenario && existing.message === failure.message)) return;
+    failures.push(failure);
+  };
   const assert = (condition, label) => { if (!condition) throw new Error(label); checks.push(label); };
   const ok = response => { if (response.status !== 0) throw new Error(response.error || `status ${response.status}`); return response; };
   const pure = async (name, args = []) => ok(await app.pure(name,args));
   const text = async (name, args) => (await pure(name,args)).value;
   const call = async (name, args = []) => ok(await app.call(name,args));
+  const faults = installSwapFaults();
   const v = await fetch("spilman_vectors.json").then(r => r.json());
   // Fresh identities let the suite run repeatedly against the same fake mint
   // without reusing deterministic blinded outputs from an earlier test run.
@@ -69,6 +82,7 @@ export async function runSmoke(app) {
     const refund=await text("spilman_prepare_sender_refund",[v.params_expired_json,v.channel_secret,keyset,keyset,expiredFunding,v.alice_secret,String(v.refund_now),null]);
     const refunded=JSON.parse(await text("spilman_complete_sender_refund",[v.params_expired_json,v.channel_secret,keyset,expiredFunding,v.alice_secret,refund,JSON.stringify(v.responses.refund)]));
     assert(refunded.reduce((sum,p) => sum+p.amount,0) === 100, "Expired sender refund matches native fixture");
+    await runSpilmanNegatives({app, pure, text, assert, v});
 
     await app.open(seed,name);
     assert((await call("list_mints")).mints.length === 0, "Shared wallet core opens browser database offline");
@@ -112,13 +126,49 @@ export async function runSmoke(app) {
     const recovery=await call("recover");
     assert(recovery.reports.every(r => r.failed === 0 && r.skipped === 0), "Explicit recovery succeeds after recipient redeems token");
     assert((await call("list_pending_tokens")).pending.length === 0, "Recovered claimed token leaves pending list");
+
+    // A partial or incompatible v1 record must fail before any mutation and
+    // remain byte-for-byte unchanged. This runs while real proofs/history are
+    // present, so silently filling missing collections would lose data.
+    const intact=localStorage.getItem(key);
+    if (intact === null) throw new Error("wallet storage missing before integrity checks");
+    await app.close();
+    const corruptions=[
+      ["missing proofs", value => { delete value.proofs; }],
+      ["missing counters", value => { delete value.counters; }],
+      ["missing sagas", value => { delete value.sagas; }],
+      ["incompatible version", value => { value.version=2; }],
+    ];
+    for (const [label,mutate] of corruptions) {
+      const value=JSON.parse(intact);
+      mutate(value);
+      const raw=JSON.stringify(value);
+      localStorage.setItem(key,raw);
+      let rejected=false;
+      try { await app.open(seed,name); } catch { rejected=true; }
+      assert(rejected && localStorage.getItem(key) === raw, `Corrupt v1 storage is rejected without overwrite (${label})`);
+    }
+    const truncated=intact.slice(0,Math.floor(intact.length/2));
+    localStorage.setItem(key,truncated);
+    let truncatedRejected=false;
+    try { await app.open(seed,name); } catch { truncatedRejected=true; }
+    assert(truncatedRejected && localStorage.getItem(key) === truncated, "Truncated v1 storage is rejected without overwrite");
+    localStorage.setItem(key,intact);
+    await app.open(seed,name);
+    assert((await call("list_mints")).mints.includes(mint), "A complete valid v1 record remains loadable with its data");
+
+    await runLiveChannels({app, pure, text, assert});
+    await runFaultScenarios({assert, faults, recordFailure});
+
     const frame=document.querySelector("iframe");
     const canvas=frame?.contentDocument?.querySelector("canvas");
     assert(canvas?.width === 800 && canvas?.height === 450, "Independent Zig/raylib Wasm renderer initializes alongside wallet");
-    return {ok:true,checks,count:checks.length};
+    completed = true;
+    return {ok: completed && failures.length === 0, completed, checks, failures, count: checks.length, failureCount: failures.length};
   } catch (error) {
-    return {ok:false,checks,count:checks.length,error:String(error.message || error)};
+    return {ok:false, completed:false, checks, failures, count:checks.length, failureCount:failures.length, error:String(error.message || error)};
   } finally {
+    faults.restore();
     if (second) { await second.close(); second.free(); }
     await app.close();
     // Only generated test names, never user wallet keys.
