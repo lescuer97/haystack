@@ -8,8 +8,8 @@ menu, without building the other application.
 | Command | Output / action |
 | --- | --- |
 | `zig build setup` | Provision the selected desktop Rust toolchain/target and validate native prerequisites; no application compilation |
-| `zig build` | Desktop application: `zig-out/desktop/bin/haystack_game`, shared raylib in `zig-out/desktop/lib` (Linux or macOS Apple Silicon) |
-| `zig build -Dplatform=wasm` | Complete browser bundle: `zig-out/wasm/index.html`, Rust wallet, JS bindings, Zig renderer and assets |
+| `zig build` | Desktop application: `zig-out/desktop/bin/haystack_game`, assets in `zig-out/desktop/bin/assets`, shared raylib in `zig-out/desktop/lib` (Linux or macOS Apple Silicon) |
+| `zig build -Dplatform=wasm` | Complete browser bundle: `zig-out/wasm/index.html`, Rust wallet, JS bindings and Zig renderer |
 | `zig build run` | Build, install, then run the installed desktop binary next to its installed raylib |
 | `zig build run -Dplatform=wasm` | Build/serve the browser application at `http://127.0.0.1:8000` |
 | `zig build test` | Desktop application tests |
@@ -284,6 +284,14 @@ Outputs remain separated under `<prefix>/desktop` and `<prefix>/wasm`.
 Changing the install prefix does not force a second renderer build or copy a
 whole nested build directory into the result. Old `zig-out/bin`, `zig-out/browser`
 and `zig-out/web` products from the previous build layout are not deleted.
+
+The desktop graph installs the checkout-level `assets` directory into
+`<prefix>/desktop/bin/assets`, next to the executable. That directory is
+deliberately gitignored and is not part of a clean checkout; a desktop install
+therefore requires the asset source to be present locally. A missing `assets`
+directory fails the install step rather than silently skipping the assets. The
+browser renderer currently loads no assets; assets are not installed into the
+Wasm bundle.
 
 Default optimization is **Debug for desktop**, **ReleaseSmall for Wasm**.
 An unqualified `--release` selects ReleaseSafe on desktop and ReleaseSmall on Wasm.

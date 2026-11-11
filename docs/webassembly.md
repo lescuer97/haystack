@@ -76,7 +76,7 @@ and Chromium 155:
 | Browser Debug compilation | PASS |
 | Browser ReleaseSafe compilation | PASS |
 | Browser ReleaseSmall compilation | PASS |
-| Debug and ReleaseSmall browser execution | PASS: 800×450 WebGL canvas renders demo and wallet warning |
+| Debug and ReleaseSmall browser execution (pre-integration renderer) | PASS: 800×450 WebGL canvas rendered the then-current demo |
 | `zig build` (native) | PASS |
 | `zig build test` (native) | PASS: one application test; executable test runner also succeeds |
 | `zig build wallet-wasm-check` | FAIL: `mio` rejects the browser target |
