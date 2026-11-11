@@ -109,12 +109,13 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
     rl.drawRectangleLinesEx(.{ .x = -5, .y = -5, .width = 10, .height = 10 }, 2.0, .yellow);
 }
 
-/// Yellow X marking the camera target, drawn in world space.
-fn drawCameraMarker(cam: *const camera.Camera) void {
+/// Yellow X marking the camera target, drawn in world space from the view's
+/// calculated pixel target.
+fn drawCameraMarker(target: rl.Vector2) void {
     const s: f32 = 14;
     const yellow = rl.Color.init(255, 220, 0, 255);
-    const x = cam.x;
-    const y = cam.y;
+    const x = target.x;
+    const y = target.y;
 
     // Dark under-stroke so the X stays readable on light grass.
     rl.drawLineEx(.{ .x = x - s, .y = y - s }, .{ .x = x + s, .y = y + s }, 5, .black);
@@ -205,7 +206,9 @@ fn drawHud(
     rl.drawText(fps_text, fps_x, 16, 20, fps_color);
 
     const stats = w.stats();
-    hudLine(&buf, 40, "camera chunk ({d},{d})   visible {d} ({d}x{d})", .{
+    hudLine(&buf, 40, "tile {d},{d} chunk {d},{d} vis {d} ({d}x{d})", .{
+        cam.tile_x,
+        cam.tile_y,
         cam.chunkX(),
         cam.chunkY(),
         vis.count(),
@@ -220,7 +223,7 @@ fn drawHud(
         stats.unloaded,
     });
 
-    hudLine(&buf, 80, "prefetch margin: {d} chunks   |   drag mouse or WASD to pan", .{
+    hudLine(&buf, 80, "WASD/arrows/pad+stick: hold steps 1 tile   drag pans   prefetch {d} chunks", .{
         world.PREFETCH_MARGIN_CHUNKS,
     });
 
@@ -258,7 +261,7 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View) void {
 
     rl.beginMode2D(view.transform);
     drawWorld(&game.world, view.chunks, game.debug);
-    drawCameraMarker(&game.camera);
+    drawCameraMarker(view.transform.target);
     rl.endMode2D();
 
     drawHud(&game.world, view.chunks, &game.camera, game.debug);

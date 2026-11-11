@@ -50,9 +50,10 @@ pub const GameState = struct {
 
     /// Apply one frame of already-collected input to persistent state.
     /// Camera movement is in `camera.zig`; debug toggles are edge-triggered
-    /// requests carried by `FrameInput`.
-    pub fn update(self: *GameState, frame: input.FrameInput, dt: f32) void {
-        self.camera.applyInput(frame, dt);
+    /// requests carried by `FrameInput`. A coordinate error propagates without
+    /// applying the toggles.
+    pub fn update(self: *GameState, frame: input.FrameInput) world.CoordinateError!void {
+        try self.camera.applyInput(frame);
 
         if (frame.toggle_grid) self.debug.tile_grid = !self.debug.tile_grid;
         if (frame.toggle_borders) self.debug.chunk_borders = !self.debug.chunk_borders;
@@ -80,40 +81,38 @@ pub const GameState = struct {
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
-test "supplied input moves the camera, drag wins, and toggles flip" {
+test "supplied input moves the camera by tiles, drag wins, and toggles flip" {
     var game_state = try GameState.init(std.testing.allocator, 1000, 640);
     defer game_state.deinit();
 
-    // Keyboard speed is 420 px/s. 420 * 0.01 = 4.2, snapped to 4.
-    game_state.update(.{ .pan_right = true }, 0.01);
-    try std.testing.expectEqual(@as(f32, 4), game_state.camera.x);
-    try std.testing.expectEqual(@as(f32, 0), game_state.camera.y);
+    try game_state.update(.{ .pan_right = true });
+    try std.testing.expectEqual(@as(i32, 1), game_state.camera.tile_x);
+    try std.testing.expectEqual(@as(i32, 0), game_state.camera.tile_y);
 
-    game_state.update(.{ .pan_up = true }, 0.01);
-    try std.testing.expectEqual(@as(f32, 4), game_state.camera.x);
-    try std.testing.expectEqual(@as(f32, -4), game_state.camera.y);
+    try game_state.update(.{ .pan_up = true });
+    try std.testing.expectEqual(@as(i32, 1), game_state.camera.tile_x);
+    try std.testing.expectEqual(@as(i32, -1), game_state.camera.tile_y);
 
-    // Holding the mouse overrides the keyboard for this frame. Raw deltas are
-    // subtracted, then the result is snapped: 4 - 3.5 = 0.5 -> 1,
-    // -4 - (-2.2) = -1.8 -> -2.
-    game_state.update(.{
+    // Holding the mouse overrides the direction sources for this frame. A 32 px
+    // left drag moves the camera one tile right; the pan request is ignored.
+    try game_state.update(.{
         .pan_right = true,
         .pan_down = true,
         .dragging = true,
-        .drag_x = 3.5,
-        .drag_y = -2.2,
-    }, 0.01);
-    try std.testing.expectEqual(@as(f32, 1), game_state.camera.x);
-    try std.testing.expectEqual(@as(f32, -2), game_state.camera.y);
+        .drag_x = -32,
+        .drag_y = 0,
+    });
+    try std.testing.expectEqual(@as(i32, 2), game_state.camera.tile_x);
+    try std.testing.expectEqual(@as(i32, -1), game_state.camera.tile_y);
 
-    // No input still rounds and leaves the camera in place.
-    game_state.update(.{}, 0.01);
-    try std.testing.expectEqual(@as(f32, 1), game_state.camera.x);
-    try std.testing.expectEqual(@as(f32, -2), game_state.camera.y);
+    // No input leaves the camera in place.
+    try game_state.update(.{});
+    try std.testing.expectEqual(@as(i32, 2), game_state.camera.tile_x);
+    try std.testing.expectEqual(@as(i32, -1), game_state.camera.tile_y);
 
     const grid_before = game_state.debug.tile_grid;
     const borders_before = game_state.debug.chunk_borders;
-    game_state.update(.{ .toggle_grid = true, .toggle_borders = true }, 0);
+    try game_state.update(.{ .toggle_grid = true, .toggle_borders = true });
     try std.testing.expectEqual(!grid_before, game_state.debug.tile_grid);
     try std.testing.expectEqual(!borders_before, game_state.debug.chunk_borders);
 }

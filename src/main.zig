@@ -69,15 +69,21 @@ pub fn main() anyerror!void {
     var shot_pending = false;
 
     // ── frame loop ───────────────────────────────────────────────────────────
+    // The reader owns the held-direction cadence across frames. It is not
+    // global; this loop is its only owner.
+    var input_reader = input.Reader{};
+
     while (!rl.windowShouldClose()) {
         const vw: f32 = @floatFromInt(rl.getScreenWidth());
         const vh: f32 = @floatFromInt(rl.getScreenHeight());
 
-        // 1. collect input: this is the only stage that touches devices.
-        const frame_input = input.read();
+        // 1. collect input: this is the only stage that touches devices. dt
+        //    only paces held directions; the camera still takes whole-tile
+        //    requests.
+        const frame_input = input_reader.read(rl.getFrameTime());
 
         // 2. update persistent state from that input.
-        game_state.update(frame_input, rl.getFrameTime());
+        try game_state.update(frame_input);
 
         // 3. calculate this frame's view. It is temporary; persistent state
         //    does not store a view.

@@ -12,7 +12,7 @@ kept in memory. It does not simulate characters or talk to a server yet.
 | File | Job | Talks to Raylib? |
 |---|---|---|
 | `src/main.zig` | allocator, window, the explicit per-frame loop, teardown, screenshot hook | yes |
-| `src/input.zig` | reads devices once per frame into a plain `FrameInput` value | yes |
+| `src/input.zig` | polls keyboard/mouse/gamepad 0 and paces held directions into a plain `FrameInput` value | yes |
 | `src/game.zig` | `GameState` owns the world, camera, and debug settings; applies input | indirectly |
 | `src/camera.zig` | camera movement, world→screen transform, visible chunk range, bounds checks | yes |
 | `src/world.zig` | tiles, chunks, deterministic generation, residency, streaming, stats | **no** |
@@ -31,10 +31,10 @@ while (!rl.windowShouldClose()) {
     const vh = screen height;
 
     // 1. collect input
-    const frame = input.read();
+    const frame = input_reader.read(rl.getFrameTime());
 
     // 2. update persistent state
-    game_state.update(frame, rl.getFrameTime());
+    try game_state.update(frame);
 
     // 3. calculate a temporary view
     const view = try camera.calculate(game_state.camera, vw, vh);
@@ -52,11 +52,15 @@ while (!rl.windowShouldClose()) {
 Why this order:
 
 1. **Input first.** `input.zig` is the only place that calls `isKeyDown`,
-   `isMouseButtonDown`, `getMouseDelta`, or `isKeyPressed`. It turns devices into
-   data; it does not change the game.
+   `isKeyPressed`, `isMouseButtonDown`, `getMouseDelta`, or the gamepad
+   functions. `main` owns one `input.Reader` outside the loop; it polls the
+   devices and turns held directions into at most one one-tile request per axis
+   on a shared 10 steps/s cadence. It does not change the game.
 2. **Update second.** `GameState.update` applies that one input value to the
-   persistent camera and debug settings. This is one of only two places that
-   mutate persistent state.
+   persistent camera and debug settings. Camera moves are whole-tile and
+   validated; an unrepresentable move returns `error.CoordinateOutOfBounds`
+   before any toggle is applied. This is one of only two places that mutate
+   persistent state.
 3. **View third.** The camera may have moved in step 2, so the view is
    calculated afterwards and therefore uses the new position this same frame.
    The view is derived data, not state.
@@ -74,7 +78,8 @@ Screenshot mode (`HAYSTACK_SHOT=/path.png`) runs a few frames, then captures
 | Kind | Example | Lifetime | Who mutates it |
 |---|---|---|---|
 | Persistent state | `GameState.world`, `.camera`, `.debug` | until shutdown | `update`, `streamChunks` |
-| Per-frame input | `FrameInput` (`pan_right`, `dragging`, `toggle_grid`, …) | one frame, then dropped | `input.read` |
+| Persistent input timing | `input.Reader` (`last_dx`, `last_dy`, `elapsed`) | until shutdown | `Reader.read` |
+| Per-frame input | `FrameInput` (`pan_right`, `dragging`, `toggle_grid`, …) | one frame, then dropped | `Reader.read` |
 | Calculated view | `camera.View` (`transform`, `chunks`) | one frame, then dropped | nobody; derived from state + window size |
 
 `GameState` does **not** store the view or the input. That separation is the
@@ -85,18 +90,21 @@ The world itself is authoritative but its *residency* is a cache. A non-resident
 chunk still exists conceptually; the deterministic generator can recreate it.
 `World.get` returns `null` only because the cache does not contain it yet.
 
-## A concrete trace: press D
+## A concrete trace: press and hold D
 
-At 120 FPS, `dt` is about 0.00833 s.
-
-1. `input.read()` sees D held and returns `FrameInput{ .pan_right = true }`.
-2. `GameState.update` calls `Camera.applyInput`. Keyboard speed is 420 px/s, so
-   `x += 420 * dt ≈ 3.5`, then the camera snaps to a whole pixel with `@round`.
-   Opposing directions are independent flags applied in the original order
-   (left subtract, right add, up subtract, down add), so simultaneous keys keep
-   the original sequential f32 rounding. If the left mouse button is also held,
-   `dragging` is true and the raw mouse delta wins; the keyboard pan is ignored
-   for that frame.
+1. `input_reader.read(dt)` sees D held (or controller 0's D-pad/left stick on
+   the same direction) and emits `FrameInput{ .pan_right = true }`. The first
+   frame of a new direction steps immediately; while it stays held the same
+   request repeats every 0.1 s, so movement is 10 steps per second during normal
+   frame rates. At most one step is emitted per frame, so below 10 FPS or after a
+   stall missed whole steps are dropped. The OS keyboard auto-repeat is not
+   used.
+2. `GameState.update` calls `Camera.applyInput`. Each request moves the camera
+   exactly one tile on that axis. Opposing inputs cancel, and a held diagonal
+   (for example D plus S) moves one tile on both axes per step. A held left
+   mouse button takes precedence over keys and controller and resets the step
+   cadence. Here `tile_x` increases by 1, and the Raylib target becomes
+   `(tile_x * 32 + 16, tile_y * 32 + 16)` pixels.
 3. `camera.calculate` builds the Raylib transform centered on the new camera
    position, converts the window corners to world pixels, floors them to chunks,
    validates the chunk range plus the 2-chunk prefetch ring, and returns a
@@ -106,8 +114,9 @@ At 120 FPS, `dt` is about 0.00833 s.
    resident chunk pool/map, never tile contents.
 5. `rendering.draw` draws grid/borders for resident visible chunks, the camera
    marker, the HUD, and the minimap. It reads `GameState` and `View` only.
-6. Next frame starts over. There is no event queue and no fixed timestep; `dt`
-   comes from Raylib and input is sampled once per frame.
+6. Next frame starts over. There is no event queue and no fixed timestep; input
+   is sampled once per frame, and `input.Reader` uses the frame delta only to
+   pace held directional steps.
 
 ## Memory ownership
 
@@ -135,7 +144,7 @@ A future WebSocket client is an independent input source alongside the local
 keyboard/mouse:
 
 ```text
-local devices ──► input.read() ───────────┐
+local devices ──► input_reader.read() ────┐
                                           ├─► update boundary ─► GameState
 server socket ──► drain messages (nonblocking) ─┘
 ```

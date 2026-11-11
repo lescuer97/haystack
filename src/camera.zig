@@ -29,52 +29,121 @@ fn pixelInI32Bounds(v: f32) bool {
 
 // ── camera state ─────────────────────────────────────────────────────────────
 
+/// True when a drag step (already in whole tiles) can be converted to `i32`.
+/// NaN fails both comparisons; infinities fail the range.
+fn deltaFitsI32(v: f64) bool {
+    const min: f64 = @floatFromInt(std.math.minInt(i32));
+    const max: f64 = @floatFromInt(std.math.maxInt(i32));
+    return v >= min and v <= max;
+}
+
+/// True when the tile's center pixel (`tile * TILE_PX + TILE_PX/2`) fits the
+/// i32 world-pixel contract. `tile` is i64 so the product cannot overflow.
+fn tileCenterFitsI32(tile: i64) bool {
+    const px = tile * @as(i64, world.TILE_PX) + world.TILE_PX / 2;
+    return px >= std.math.minInt(i32) and px <= std.math.maxInt(i32);
+}
+
 pub const Camera = struct {
-    x: f32 = 0,
-    y: f32 = 0,
-    speed: f32 = 420,
+    /// Authoritative position in whole world tiles, not pixels.
+    tile_x: i32 = 0,
+    tile_y: i32 = 0,
+
+    /// Sub-tile mouse-drag remainder in pixels. Only used while dragging and
+    /// reset on release, so one gesture cannot leak into the next.
+    drag_remainder_x: f64 = 0,
+    drag_remainder_y: f64 = 0,
 
     /// Apply one frame of already-collected input. Mouse drag overrides the
-    /// keyboard; directions are applied one at a time in the original order so
-    /// opposing keys keep the original sequential f32 rounding. There is no
-    /// diagonal speed normalisation. Snapping happens every frame so the tile
-    /// grid does not shimmer.
-    pub fn applyInput(self: *Camera, frame: input.FrameInput, dt: f32) void {
+    /// keyboard and controller. Each emitted direction request moves exactly
+    /// one tile on its axis; opposing requests cancel, so a diagonal request
+    /// moves one tile on both axes. Drag pixels accumulate until they make
+    /// whole `TILE_PX` steps, and a large drag can move several tiles. Both
+    /// axes are validated and committed together or not at all.
+    pub fn applyInput(self: *Camera, frame: input.FrameInput) world.CoordinateError!void {
+        var dx: i32 = 0;
+        var dy: i32 = 0;
+
+        var remainder_x = self.drag_remainder_x;
+        var remainder_y = self.drag_remainder_y;
+
         if (frame.dragging) {
             // Drag to pan: the world follows the cursor, so the camera
             // moves by the negative mouse delta.
-            self.x -= frame.drag_x;
-            self.y -= frame.drag_y;
+            const delta_x: f64 = -@as(f64, frame.drag_x);
+            const delta_y: f64 = -@as(f64, frame.drag_y);
+            if (!std.math.isFinite(delta_x) or !std.math.isFinite(delta_y))
+                return error.CoordinateOutOfBounds;
+
+            remainder_x += delta_x;
+            remainder_y += delta_y;
+            if (!std.math.isFinite(remainder_x) or !std.math.isFinite(remainder_y))
+                return error.CoordinateOutOfBounds;
+
+            // Whole tiles only; the sub-tile part is kept for later frames.
+            const tile_px: f64 = @floatFromInt(world.TILE_PX);
+            const step_x = @trunc(remainder_x / tile_px);
+            const step_y = @trunc(remainder_y / tile_px);
+            if (!deltaFitsI32(step_x) or !deltaFitsI32(step_y))
+                return error.CoordinateOutOfBounds;
+
+            dx = @intFromFloat(step_x);
+            dy = @intFromFloat(step_y);
+            remainder_x -= step_x * tile_px;
+            remainder_y -= step_y * tile_px;
         } else {
-            if (frame.pan_left) self.x -= self.speed * dt;
-            if (frame.pan_right) self.x += self.speed * dt;
-            if (frame.pan_up) self.y -= self.speed * dt;
-            if (frame.pan_down) self.y += self.speed * dt;
+            // A released gesture must not leave a sub-tile remainder behind.
+            remainder_x = 0;
+            remainder_y = 0;
+
+            if (frame.pan_left) dx -= 1;
+            if (frame.pan_right) dx += 1;
+            if (frame.pan_up) dy -= 1;
+            if (frame.pan_down) dy += 1;
         }
 
-        // Pixel art: whole-pixel camera, otherwise the tile grid shimmers.
-        self.x = @round(self.x);
-        self.y = @round(self.y);
+        // Validate in i64 before committing either axis so a failed move
+        // cannot leave the camera half-updated.
+        const target_x = @as(i64, self.tile_x) + dx;
+        const target_y = @as(i64, self.tile_y) + dy;
+        if (!tileCenterFitsI32(target_x) or !tileCenterFitsI32(target_y))
+            return error.CoordinateOutOfBounds;
+
+        self.tile_x = @intCast(target_x);
+        self.tile_y = @intCast(target_y);
+        self.drag_remainder_x = remainder_x;
+        self.drag_remainder_y = remainder_y;
     }
 
-    /// Build the Raylib transform for this camera and window size.
+    /// Build the Raylib transform for this camera and window size. The target
+    /// is the tile's center pixel (`tile * TILE_PX + TILE_PX/2`), widened to
+    /// i64 before the f32 conversion.
+    ///
+    /// ponytail: tile coordinates are exact, but the Raylib target is f32, so
+    /// adjacent tile steps far from the origin can round to the same pixel. The
+    /// upgrade, if that becomes visible, is origin rebasing (render relative to
+    /// a nearby chunk while keeping absolute tile coordinates authoritative);
+    /// it is not implemented.
     pub fn raylib(self: Camera, vw: f32, vh: f32) rl.Camera2D {
         return .{
             .offset = .{ .x = vw / 2, .y = vh / 2 },
-            .target = .{ .x = self.x, .y = self.y },
+            .target = .{
+                .x = @floatFromInt(@as(i64, self.tile_x) * world.TILE_PX + world.TILE_PX / 2),
+                .y = @floatFromInt(@as(i64, self.tile_y) * world.TILE_PX + world.TILE_PX / 2),
+            },
             .rotation = 0,
             .zoom = 1,
         };
     }
 
-    /// Chunk under the camera target. `visibleRange` has already validated the
-    /// target, so this conversion is safe whenever a frame has a `View`.
+    /// Chunk under the camera target. Movement has already validated the tile
+    /// coordinate, so this division cannot overflow.
     pub fn chunkX(self: Camera) i32 {
-        return @divFloor(@as(i32, @intFromFloat(self.x)), world.CHUNK_PX);
+        return @divFloor(self.tile_x, world.CHUNK_TILES);
     }
 
     pub fn chunkY(self: Camera) i32 {
-        return @divFloor(@as(i32, @intFromFloat(self.y)), world.CHUNK_PX);
+        return @divFloor(self.tile_y, world.CHUNK_TILES);
     }
 };
 
@@ -99,8 +168,8 @@ pub fn calculate(cam: Camera, vw: f32, vh: f32) world.CoordinateError!View {
 /// `error.CoordinateOutOfBounds` before any f32→i32 conversion that would
 /// trap or before a chunk range whose prefetch ring cannot be represented.
 pub fn visibleRange(cam: rl.Camera2D, vw: f32, vh: f32) world.CoordinateError!world.ChunkRange {
-    // The camera target is converted to i32 directly by the HUD and minimap,
-    // so reject non-finite / out-of-i32 targets even before transforming.
+    // The camera target is converted to i32 by the visible-range math, so
+    // reject non-finite / out-of-i32 targets even before transforming.
     if (!pixelInI32Bounds(cam.target.x) or !pixelInI32Bounds(cam.target.y))
         return error.CoordinateOutOfBounds;
 
@@ -223,28 +292,188 @@ test "visibleRange accepts the furthest prefetch-safe chunk edges" {
     try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(0, too_far_neg, 0, 0), 0, 0));
 }
 
-test "opposing pan keys keep original sequential f32 order at large coordinates" {
-    // 2^26, where the f32 spacing is 8 px. A collapsed axis would report no
-    // movement; the original loop ran the subtract then the add separately.
-    const boundary: f32 = -67108864;
-    const dt: f32 = 1.0 / 120.0;
+test "direction requests move one tile and cancel opposites" {
+    var cam = Camera{};
 
-    var sequential = Camera{ .x = boundary, .y = boundary };
-    sequential.applyInput(.{
-        .pan_left = true,
+    // Startup target is the center of tile (0,0).
+    const start = cam.raylib(800, 600);
+    try std.testing.expectEqual(@as(f32, 16), start.target.x);
+    try std.testing.expectEqual(@as(f32, 16), start.target.y);
+
+    try cam.applyInput(.{ .pan_right = true });
+    try std.testing.expectEqual(@as(i32, 1), cam.tile_x);
+    try std.testing.expectEqual(@as(i32, 0), cam.tile_y);
+
+    // One tile right moves the target by exactly TILE_PX.
+    const stepped = cam.raylib(800, 600);
+    try std.testing.expectEqual(@as(f32, 48), stepped.target.x);
+    try std.testing.expectEqual(@as(f32, 16), stepped.target.y);
+
+    try cam.applyInput(.{ .pan_up = true });
+    try std.testing.expectEqual(@as(i32, 1), cam.tile_x);
+    try std.testing.expectEqual(@as(i32, -1), cam.tile_y);
+
+    // A diagonal request moves one tile on each axis.
+    try cam.applyInput(.{ .pan_right = true, .pan_down = true });
+    try std.testing.expectEqual(@as(i32, 2), cam.tile_x);
+    try std.testing.expectEqual(@as(i32, 0), cam.tile_y);
+
+    // Opposing requests on an axis cancel; no input is a no-op.
+    try cam.applyInput(.{ .pan_left = true, .pan_right = true, .pan_up = true, .pan_down = true });
+    try std.testing.expectEqual(@as(i32, 2), cam.tile_x);
+    try std.testing.expectEqual(@as(i32, 0), cam.tile_y);
+    try cam.applyInput(.{});
+    try std.testing.expectEqual(@as(i32, 2), cam.tile_x);
+    try std.testing.expectEqual(@as(i32, 0), cam.tile_y);
+
+    // Any non-drag frame also clears a stale drag remainder.
+    cam.drag_remainder_x = 17;
+    cam.drag_remainder_y = -9;
+    try cam.applyInput(.{ .pan_left = true });
+    try std.testing.expectEqual(@as(f64, 0), cam.drag_remainder_x);
+    try std.testing.expectEqual(@as(f64, 0), cam.drag_remainder_y);
+    try std.testing.expectEqual(@as(i32, 1), cam.tile_x);
+
+    // A held direction arrives as a one-tile request on repeated frames (the
+    // input reader paces them): each one steps a whole tile, and a frame with
+    // no request leaves the camera where it is.
+    try cam.applyInput(.{ .pan_right = true });
+    try std.testing.expectEqual(@as(i32, 2), cam.tile_x);
+    try cam.applyInput(.{ .pan_right = true });
+    try std.testing.expectEqual(@as(i32, 3), cam.tile_x);
+    try cam.applyInput(.{});
+    try std.testing.expectEqual(@as(i32, 3), cam.tile_x);
+    try std.testing.expectEqual(@as(i32, 0), cam.tile_y);
+}
+
+test "tile steps cross negative chunk boundaries with floor division" {
+    var cam = Camera{ .tile_x = -16, .tile_y = -16 };
+    try std.testing.expectEqual(@as(i32, -1), cam.chunkX());
+    try std.testing.expectEqual(@as(i32, -1), cam.chunkY());
+
+    try cam.applyInput(.{ .pan_left = true, .pan_up = true });
+    try std.testing.expectEqual(@as(i32, -2), cam.chunkX());
+    try std.testing.expectEqual(@as(i32, -2), cam.chunkY());
+
+    try cam.applyInput(.{ .pan_right = true, .pan_down = true });
+    try std.testing.expectEqual(@as(i32, -1), cam.chunkX());
+    try std.testing.expectEqual(@as(i32, -1), cam.chunkY());
+
+    // Regression: the real Camera → View path targets the tile center, not the
+    // pixel-only test helper above.
+    cam.tile_x = -17;
+    cam.tile_y = -33;
+    const view = try calculate(cam, 0, 0);
+    const expected_x: f32 = @floatFromInt(-17 * world.TILE_PX + world.TILE_PX / 2);
+    const expected_y: f32 = @floatFromInt(-33 * world.TILE_PX + world.TILE_PX / 2);
+    try std.testing.expectEqual(expected_x, view.transform.target.x);
+    try std.testing.expectEqual(expected_y, view.transform.target.y);
+    try std.testing.expectEqual(
+        world.ChunkRange{ .cx0 = -2, .cy0 = -3, .cx1 = -2, .cy1 = -3 },
+        view.chunks,
+    );
+}
+
+test "drag accumulates sub-tile pixels and moves whole tiles" {
+    var cam = Camera{};
+
+    // A 20 px right drag moves the camera 20 px left: no whole tile yet.
+    try cam.applyInput(.{ .dragging = true, .drag_x = 20 });
+    try std.testing.expectEqual(@as(i32, 0), cam.tile_x);
+    try std.testing.expectEqual(@as(f64, -20), cam.drag_remainder_x);
+
+    // Another 20 px completes a -40 px move: one tile with -8 px left over.
+    try cam.applyInput(.{ .dragging = true, .drag_x = 20 });
+    try std.testing.expectEqual(@as(i32, -1), cam.tile_x);
+    try std.testing.expectEqual(@as(f64, -8), cam.drag_remainder_x);
+
+    // Reversing 40 px cancels the remainder and steps back one tile.
+    try cam.applyInput(.{ .dragging = true, .drag_x = -40 });
+    try std.testing.expectEqual(@as(i32, 0), cam.tile_x);
+    try std.testing.expectEqual(@as(f64, 0), cam.drag_remainder_x);
+
+    // A large drag moves several tiles at once, symmetrically.
+    try cam.applyInput(.{ .dragging = true, .drag_x = -100 });
+    try std.testing.expectEqual(@as(i32, 3), cam.tile_x);
+    try std.testing.expectEqual(@as(f64, 4), cam.drag_remainder_x);
+    try cam.applyInput(.{ .dragging = true, .drag_x = 100 });
+    try std.testing.expectEqual(@as(i32, 0), cam.tile_x);
+    try std.testing.expectEqual(@as(f64, 0), cam.drag_remainder_x);
+}
+
+test "drag resets between gestures and wins over the keyboard" {
+    var cam = Camera{};
+
+    // Leave a sub-tile remainder, then release the mouse.
+    try cam.applyInput(.{ .dragging = true, .drag_x = 10 });
+    try std.testing.expectEqual(@as(f64, -10), cam.drag_remainder_x);
+    try cam.applyInput(.{});
+    try std.testing.expectEqual(@as(f64, 0), cam.drag_remainder_x);
+
+    // The next gesture starts from zero: 20 px alone is still sub-tile.
+    try cam.applyInput(.{ .dragging = true, .drag_x = 20 });
+    try std.testing.expectEqual(@as(i32, 0), cam.tile_x);
+
+    // Dragging overrides the keyboard for the same frame.
+    var override = Camera{};
+    try override.applyInput(.{
         .pan_right = true,
-        .pan_up = true,
         .pan_down = true,
-    }, dt);
+        .dragging = true,
+        .drag_x = 32,
+    });
+    try std.testing.expectEqual(@as(i32, -1), override.tile_x);
+    try std.testing.expectEqual(@as(i32, 0), override.tile_y);
+}
 
-    // Original order: x -= step; x += step; y -= step; y += step; then round.
-    // At this magnitude the pair rounds to boundary + 4 on both axes.
-    try std.testing.expectEqual(@as(f32, -67108860), sequential.x);
-    try std.testing.expectEqual(@as(f32, -67108860), sequential.y);
+test "tile coordinates stay exact for large one-tile steps" {
+    // 2^25 tiles is 2^30 px, where an f32 can no longer represent every 32 px
+    // step. The authoritative tile coordinate still advances exactly.
+    const big: i32 = 1 << 25;
+    var cam = Camera{ .tile_x = big, .tile_y = -big };
 
-    // No requests, by contrast, leave the camera at the boundary.
-    var idle = Camera{ .x = boundary, .y = boundary };
-    idle.applyInput(.{}, dt);
-    try std.testing.expectEqual(boundary, idle.x);
-    try std.testing.expectEqual(boundary, idle.y);
+    try cam.applyInput(.{ .pan_right = true, .pan_down = true });
+    try std.testing.expectEqual(big + 1, cam.tile_x);
+    try std.testing.expectEqual(-big + 1, cam.tile_y);
+
+    try cam.applyInput(.{ .pan_left = true, .pan_up = true });
+    try std.testing.expectEqual(big, cam.tile_x);
+    try std.testing.expectEqual(-big, cam.tile_y);
+}
+
+test "invalid or unrepresentable movement is rejected without partial mutation" {
+    const initial = Camera{
+        .tile_x = 5,
+        .tile_y = -7,
+        .drag_remainder_x = 3,
+        .drag_remainder_y = -4,
+    };
+    var cam = initial;
+
+    // NaN and infinity in the raw drag.
+    try std.testing.expectError(error.CoordinateOutOfBounds, cam.applyInput(.{ .dragging = true, .drag_x = std.math.nan(f32) }));
+    try std.testing.expectError(error.CoordinateOutOfBounds, cam.applyInput(.{ .dragging = true, .drag_y = std.math.inf(f32) }));
+
+    // Finite, but far more tiles than an i32 delta can hold.
+    try std.testing.expectError(error.CoordinateOutOfBounds, cam.applyInput(.{
+        .dragging = true,
+        .drag_x = -std.math.floatMax(f32),
+    }));
+
+    // Every rejection leaves both axes and both remainders untouched.
+    try std.testing.expectEqual(initial.tile_x, cam.tile_x);
+    try std.testing.expectEqual(initial.tile_y, cam.tile_y);
+    try std.testing.expectEqual(initial.drag_remainder_x, cam.drag_remainder_x);
+    try std.testing.expectEqual(initial.drag_remainder_y, cam.drag_remainder_y);
+
+    // One axis overflowing rejects the whole move: y must not advance.
+    var edge = Camera{ .tile_x = 67108863, .tile_y = 0 };
+    try std.testing.expectError(error.CoordinateOutOfBounds, edge.applyInput(.{ .pan_right = true, .pan_down = true }));
+    try std.testing.expectEqual(@as(i32, 67108863), edge.tile_x);
+    try std.testing.expectEqual(@as(i32, 0), edge.tile_y);
+
+    // i32 min tile center is exactly representable; one past it is not.
+    var low = Camera{ .tile_x = -67108864, .tile_y = 0 };
+    try std.testing.expectError(error.CoordinateOutOfBounds, low.applyInput(.{ .pan_left = true }));
+    try std.testing.expectEqual(@as(i32, -67108864), low.tile_x);
 }

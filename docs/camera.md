@@ -10,16 +10,18 @@ code yet.
 
 | Piece | Owns | Lives in |
 |---|---|---|
-| `Camera` (ours) | pan position, keyboard/drag movement, speed | `src/camera.zig` |
+| `Camera` (ours) | tile position, keyboard/pad/drag movement | `src/camera.zig` |
 | `rl.Camera2D` | the world→screen matrix | built fresh each frame |
 
 Raylib's camera is only a **transform**. It does not follow anything, does not
 cull, and is not the source of truth. We keep our own camera state so it can be
 logged, replayed, or driven by a spectator mode later.
 
-The current demo has no player; WASD/arrows and left-button dragging move the
-camera directly. A follow camera with a dead zone, zoom, or clamping is
-**planned**, not implemented.
+The current demo has no player; holding WASD/arrows, the pad D-pad, or the left
+stick steps the camera one tile on a shared 10 steps/s cadence, and left-button
+dragging pans it. Holding two directions steps diagonally, one tile on each
+axis. A follow camera with a dead zone, zoom, or clamping is **planned**, not
+implemented.
 
 ---
 
@@ -37,13 +39,15 @@ is always drawn in the middle of the window.
 Three coordinate spaces, in order:
 
 ```
-world tile (x,y)      world px (x*32, y*32)      screen px (sx, sy)
+world tile (x,y)    world px (x*32 + 16, y*32 + 16)   screen px (sx, sy)
     i32                     f32                       f32
         ─── × TILE_PX ───►        ─── Camera2D ───►
 ```
 
 Everything inside `beginMode2D` is drawn in **world px**. Everything outside is
-**screen px**.
+**screen px**. Our camera stores tile coordinates (`i32`); `Camera.raylib`
+widens `tile * TILE_PX + TILE_PX/2` to `i64` before converting the target to
+`f32` pixels. The target is the tile's center pixel.
 
 ---
 
@@ -51,29 +55,22 @@ Everything inside `beginMode2D` is drawn in **world px**. Everything outside is
 
 ```zig
 pub const Camera = struct {
-    x: f32 = 0,
-    y: f32 = 0,
-    speed: f32 = 420,
+    tile_x: i32 = 0,           // authoritative world tile
+    tile_y: i32 = 0,
+    drag_remainder_x: f64 = 0, // sub-tile drag pixels
+    drag_remainder_y: f64 = 0,
 
-    pub fn applyInput(self: *Camera, frame: input.FrameInput, dt: f32) void {
-        if (frame.dragging) {
-            self.x -= frame.drag_x;   // mouse drag wins
-            self.y -= frame.drag_y;
-        } else {
-            if (frame.pan_left) self.x -= self.speed * dt;
-            if (frame.pan_right) self.x += self.speed * dt;
-            if (frame.pan_up) self.y -= self.speed * dt;
-            if (frame.pan_down) self.y += self.speed * dt;
-        }
-
-        self.x = @round(self.x);      // pixel-art snapping
-        self.y = @round(self.y);
+    pub fn applyInput(self: *Camera, frame: input.FrameInput) world.CoordinateError!void {
+        // Drag wins; one tile per emitted direction request. See behaviour below.
     }
 
     pub fn raylib(self: Camera, vw: f32, vh: f32) rl.Camera2D {
         return .{
             .offset = .{ .x = vw / 2, .y = vh / 2 },
-            .target = .{ .x = self.x, .y = self.y },
+            .target = .{
+                .x = @floatFromInt(@as(i64, self.tile_x) * world.TILE_PX + world.TILE_PX / 2),
+                .y = @floatFromInt(@as(i64, self.tile_y) * world.TILE_PX + world.TILE_PX / 2),
+            },
             .rotation = 0,
             .zoom = 1,
         };
@@ -83,15 +80,33 @@ pub const Camera = struct {
 
 Facts about the current behaviour:
 
-- Keyboard speed is 420 px/s; there is no diagonal normalisation.
-- Directions are independent flags applied in the original order (left
-  subtract, right add, up subtract, down add). Simultaneous opposing keys
-  therefore keep the original sequential f32 rounding instead of collapsing to
-  zero movement.
-- Holding the left mouse button overrides the keyboard for that frame and
-  subtracts the raw mouse delta.
-- The position is snapped to whole pixels every frame, even when no input moves
-  it, so the tile grid does not shimmer.
+- `tile_x`/`tile_y` are the only persistent position. The camera never stores a
+  fractional or pixel camera position.
+- Keyboard, D-pad, and left-stick directions are all held flags. `input.Reader`
+  turns them into one-tile requests on a single shared 10 steps/s cadence: a new
+  direction steps immediately, and holding it steps again every 0.1 s during
+  normal frame rates. At most one step is emitted per frame, so below 10 FPS or
+  after a stall missed whole steps are discarded, not replayed. The OS keyboard
+  auto-repeat rate is not used, so holding two directions keeps both axes on the
+  same cadence.
+- Controller support is controller index 0 only, using its D-pad or left analog
+  stick. Each stick axis has an independent `0.25` deadzone (`stick_deadzone`
+  in `input.zig`, the tuning knob); non-finite axis values and a disconnected
+  controller are neutral.
+- Directions are independent flags. Opposing requests on one axis cancel, and
+  holding both axes moves one tile diagonally on each axis. Duplicate bindings
+  (say, key and D-pad both right) never multiply a step.
+- Holding the left mouse button overrides keyboard and controller for that
+  frame. Negative raw deltas accumulate in `f64`; whole `TILE_PX` steps become
+  tile moves and the sub-tile remainder carries to later frames. A large drag
+  can move several tiles at once, symmetrically in both directions.
+- Any non-drag frame resets both remainders, so one gesture cannot leak into the
+  next. A drag or a neutral frame also resets the held-direction cadence.
+- There is no movement speed or fractional camera position: movement is
+  discrete. `input.Reader` uses frame `dt` only to pace held steps. Both axes are
+  validated and committed together. Non-finite drags and moves whose tile-center
+  pixel cannot fit the `i32` world-pixel contract return
+  `error.CoordinateOutOfBounds` without changing state.
 - `input.zig` supplies the `FrameInput`; camera movement never polls devices.
 
 **Planned follow camera:** a future player-follow could replace the direct pan
@@ -99,8 +114,9 @@ with a dead zone or lerp:
 
 ```zig
 // NOT IMPLEMENTED — future idea from the original design notes.
-if (px > self.x + self.dead_zone) self.x = px - self.dead_zone;
-if (px < self.x - self.dead_zone) self.x = px + self.dead_zone;
+// `px`/`py` would be a target tile coordinate derived from a player.
+if (px > self.tile_x + self.dead_zone) self.tile_x = px - self.dead_zone;
+if (px < self.tile_x - self.dead_zone) self.tile_x = px + self.dead_zone;
 ```
 
 Keep zoom an integer for pixel art if it is added (1, 2, 3…). Fractional zoom
@@ -176,15 +192,19 @@ mouse only pans the camera, so there is no world-space cursor yet.
 Actual order in `src/main.zig`:
 
 ```zig
-const frame = input.read();                          // devices -> data
-game_state.update(frame, rl.getFrameTime());          // persistent state
+const frame = input_reader.read(rl.getFrameTime());  // devices -> data
+try game_state.update(frame);                       // persistent state
 const view = try camera.calculate(game_state.camera, vw, vh);
-try game_state.streamChunks(view.chunks);            // residency only
+try game_state.streamChunks(view.chunks);           // residency only
 
 rl.beginDrawing();
-rendering.draw(&game_state, view);                   // read-only
+rendering.draw(&game_state, view);                  // read-only
 rl.endDrawing();
 ```
+
+`input_reader` is a long-lived `input.Reader` owned by `main`, outside the loop.
+It keeps the held-direction cadence across frames; `FrameInput` itself is still
+per-frame data passed to `GameState.update`.
 
 `rendering.draw` uses `view.transform` for `beginMode2D` and `view.chunks` for
 iteration. The renderer neither reads input nor mutates the camera or world.
@@ -197,7 +217,9 @@ iteration. The renderer neither reads input nor mutates the camera or world.
    with the world.
 2. **`getMousePosition()` is screen space.** Convert with
    `getScreenToWorld2D` before comparing to world coords.
-3. **Snap the camera target and use integer zoom** or 32 px tiles shimmer.
+3. **Move in whole tiles and use integer zoom** or 32 px tiles shimmer. The
+   camera target is always `tile * TILE_PX + TILE_PX/2`; there is no fractional
+   pixel position to snap.
 4. **Culling still needs the world rect.** The camera does not cull for you; it
    only gives you the rect cheaply.
 5. **Chunks are drawn at world coordinates** (`cx * CHUNK_PX`), never in
@@ -226,6 +248,19 @@ bound. The largest `f32` below `2^31` is `2147483520`;
 `@as(f32, @floatFromInt(maxInt(i32)))` rounds to `2147483648`, so an `f32`
 comparison would accept a value that `@intFromFloat` rejects. NaN and ±Infinity
 fail the same check.
+
+`Camera.applyInput` validates a candidate move before committing either axis:
+the drag step is checked in `f64` before conversion, and the resulting tile
+coordinate is checked in `i64` so `tile * TILE_PX + TILE_PX/2` cannot overflow. A
+move whose tile-center pixel falls outside the `i32` range returns
+`error.CoordinateOutOfBounds` atomically.
+
+Tile coordinates stay exact within the supported world-pixel bounds, but the
+Raylib transform is `f32`. Far from the origin, adjacent 32 px steps can round
+to the same rendered pixel. That is the existing `f32` ceiling, not a tile-
+movement bug. Origin rebasing (render relative to a nearby chunk while keeping
+absolute tile coordinates authoritative) is the upgrade if it becomes visible;
+it is not implemented.
 
 The chunk check includes the prefetch ring: the visible range plus
 `PREFETCH_MARGIN_CHUNKS` must fit the drawable chunk extent. This keeps

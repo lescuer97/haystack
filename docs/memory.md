@@ -26,8 +26,8 @@ same storage works headlessly.
 
 ## Frame lifetime
 
-1. `input.read()` collects devices into a temporary `FrameInput`. It does not
-   touch the world.
+1. `input.Reader.read(dt)` collects devices and paces held directions into a
+   temporary `FrameInput`. It does not touch the world.
 2. `GameState.update` mutates persistent camera/debug state. It does not
    allocate.
 3. `camera.calculate` derives a temporary `View` (Raylib transform + validated
