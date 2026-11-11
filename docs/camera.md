@@ -192,7 +192,7 @@ mouse only pans the camera, so there is no world-space cursor yet.
 Actual order in `src/main.zig`:
 
 ```zig
-const frame = input_reader.read(rl.getFrameTime());  // devices -> data
+const frame = input_reader.read(rl.getFrameTime(), game_state.menu.opened); // devices -> data
 try game_state.update(frame);                       // persistent state
 const view = try camera.calculate(game_state.camera, vw, vh);
 try game_state.streamChunks(view.chunks);           // residency only

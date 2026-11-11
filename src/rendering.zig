@@ -1,4 +1,4 @@
-//! Read-only rendering of the world, camera marker, HUD, and minimap.
+//! Read-only rendering of the world, camera marker, HUD, minimap, and menu.
 //!
 //! Every function here borrows `GameState` and a calculated `View` as `const`.
 //! Nothing in this file polls input, moves the camera, streams chunks, or
@@ -10,6 +10,7 @@ const rl = @import("raylib");
 
 const camera = @import("camera.zig");
 const game_mod = @import("game.zig");
+const menu = @import("menu.zig");
 const world = @import("world.zig");
 
 /// Frame-rate target. The HUD's FPS colour thresholds are derived from it.
@@ -21,6 +22,17 @@ const grid_color = rl.Color.init(255, 255, 255, 55);
 const border_color = rl.Color.init(220, 60, 55, 255);
 const hud_bg = rl.Color.init(0, 0, 0, 170);
 const tile_letter_color = rl.Color.init(235, 235, 240, 255);
+
+const menu_backdrop = rl.Color.init(0, 0, 0, 165);
+const menu_panel_bg = rl.Color.init(28, 28, 34, 250);
+const menu_panel_border = rl.Color.init(88, 92, 106, 255);
+const menu_item_bg = rl.Color.init(44, 46, 56, 255);
+const menu_item_hover = rl.Color.init(62, 66, 80, 255);
+const menu_item_focus = rl.Color.init(48, 58, 76, 255);
+const menu_accent = rl.Color.init(110, 165, 245, 255);
+const menu_title_color = rl.Color.init(245, 245, 250, 255);
+const menu_text_color = rl.Color.init(225, 228, 235, 255);
+const menu_muted = rl.Color.init(150, 155, 170, 255);
 
 /// Default-font size for the terrain letter drawn inside each tile.
 const tile_letter_size: i32 = 20;
@@ -253,19 +265,182 @@ fn onOff(v: bool) []const u8 {
     return if (v) "on" else "off";
 }
 
+fn toRaylibRect(rect: menu.Rect) rl.Rectangle {
+    return .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = rect.height };
+}
+
+fn drawSolidRect(rect: menu.Rect, color: rl.Color) void {
+    rl.drawRectangle(
+        @intFromFloat(rect.x),
+        @intFromFloat(rect.y),
+        @max(@as(i32, @intFromFloat(rect.width)), 1),
+        @max(@as(i32, @intFromFloat(rect.height)), 1),
+        color,
+    );
+}
+
+fn drawCenteredText(text: [:0]const u8, rect: menu.Rect, font_size: i32, color: rl.Color) void {
+    const text_w = rl.measureText(text, font_size);
+    const x = rect.x + (rect.width - @as(f32, @floatFromInt(text_w))) / 2;
+    const y = rect.y + (rect.height - @as(f32, @floatFromInt(font_size))) / 2;
+    rl.drawText(text, @intFromFloat(x), @intFromFloat(y), font_size, color);
+}
+
+const input_label_size: i32 = 15;
+const input_text_size: i32 = 18;
+
+/// Draw one editable field inside its item row. Text is scrolled to keep the
+/// caret visible and scissored to the field box, so a bounded 128-byte value
+/// can never paint outside the menu. `selected` highlights the row when it is
+/// not being edited; `focused` keeps the stronger accent and caret.
+fn drawTextInput(
+    rect: menu.Rect,
+    label: [:0]const u8,
+    value: [:0]const u8,
+    focused: bool,
+    selected: bool,
+) void {
+    const pad: f32 = 10;
+    // Very short rows (tiny viewports) collapse to a single inline field.
+    const compact = rect.height < 44;
+    const label_height = @min(@as(f32, 18), @max(rect.height * 0.34, 1));
+    const field_top = if (compact) rect.y + 2 else rect.y + label_height + 6;
+    const field = menu.Rect{
+        .x = rect.x + pad,
+        .y = field_top,
+        .width = @max(rect.width - pad * 2, 1),
+        .height = if (compact)
+            @max(rect.height - 4, 1)
+        else
+            @max(rect.y + rect.height - 6 - field_top, 1),
+    };
+
+    if (!compact) {
+        rl.drawText(
+            label,
+            @intFromFloat(rect.x + pad),
+            @intFromFloat(rect.y + 6),
+            input_label_size,
+            menu_muted,
+        );
+    }
+
+    drawSolidRect(field, if (focused) menu_item_focus else menu_item_bg);
+    rl.drawRectangleLinesEx(
+        toRaylibRect(field),
+        if (focused) 2.0 else 1.0,
+        if (focused) menu_accent else if (selected) menu_item_hover else menu_panel_border,
+    );
+
+    const text_size: i32 = if (compact) 14 else input_text_size;
+    const inner_pad: f32 = 8;
+    const inner_w = @max(field.width - inner_pad * 2, 1);
+    const text_x = field.x + inner_pad;
+    const text_y = field.y + (field.height - @as(f32, @floatFromInt(text_size))) / 2;
+    const value_w: f32 = @floatFromInt(rl.measureText(value, text_size));
+    // Scroll just enough that the end of the text and the caret stay visible.
+    const scroll = @max(value_w + 2 - inner_w, 0);
+    const draw_x = text_x - scroll;
+
+    const clip_x: i32 = @intFromFloat(field.x + 1);
+    const clip_y: i32 = @intFromFloat(field.y + 1);
+    const clip_w: i32 = @max(@as(i32, @intFromFloat(field.width - 2)), 1);
+    const clip_h: i32 = @max(@as(i32, @intFromFloat(field.height - 2)), 1);
+
+    rl.beginScissorMode(clip_x, clip_y, clip_w, clip_h);
+    if (value.len == 0 and !focused) {
+        rl.drawText("click to edit", @intFromFloat(text_x), @intFromFloat(text_y), text_size, menu_muted);
+    } else {
+        rl.drawText(value, @intFromFloat(draw_x), @intFromFloat(text_y), text_size, menu_text_color);
+    }
+    if (focused) {
+        const caret_x: i32 = @intFromFloat(draw_x + value_w);
+        const caret_y: i32 = @intFromFloat(field.y + 4);
+        const caret_h: i32 = @max(@as(i32, @intFromFloat(field.height - 8)), 1);
+        rl.drawRectangle(caret_x, caret_y, 2, caret_h, menu_accent);
+    }
+    rl.endScissorMode();
+}
+
+fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, state: *const menu.Menu, selected: bool) void {
+    const text_field = menu.itemField(item);
+    const focused = if (text_field) |field| state.isFocused(field) else false;
+
+    const fill = if (focused)
+        menu_item_focus
+    else if (selected)
+        menu_item_hover
+    else
+        menu_item_bg;
+    const border = if (focused) menu_accent else if (selected) menu_item_hover else menu_panel_border;
+
+    drawSolidRect(rect, fill);
+    rl.drawRectangleLinesEx(toRaylibRect(rect), if (focused) 2.0 else 1.0, border);
+
+    switch (item) {
+        .text_input => |field| drawTextInput(
+            rect,
+            menu.itemLabel(item),
+            state.textFieldConst(field).cString(),
+            state.isFocused(field),
+            selected,
+        ),
+        .navigate, .action => drawCenteredText(
+            menu.itemLabel(item),
+            rect,
+            if (rect.height < 32) 14 else 20,
+            menu_text_color,
+        ),
+    }
+}
+
+/// Modal menu, drawn in screen space after the world, HUD, and minimap. It only
+/// reads menu state and the viewport size passed down by `main`. Pointer and
+/// direction input were already sampled by `input.Reader` and applied to
+/// `Menu.selected_index`, so the row highlight is a single piece of state
+/// rather than a separate hover that can drift from the selection.
+fn drawMenu(game: *const game_mod.GameState, viewport_w: f32, viewport_h: f32) void {
+    const state = &game.menu;
+    const layout = menu.calculateLayout(state.currentPage, viewport_w, viewport_h);
+
+    rl.drawRectangle(
+        0,
+        0,
+        @intFromFloat(@max(viewport_w, 0)),
+        @intFromFloat(@max(viewport_h, 0)),
+        menu_backdrop,
+    );
+
+    drawSolidRect(layout.panel, menu_panel_bg);
+    rl.drawRectangleLinesEx(toRaylibRect(layout.panel), 2.0, menu_panel_border);
+    drawCenteredText(menu.pageTitle(state.currentPage), layout.title, 26, menu_title_color);
+
+    const page_items = menu.pageItems(state.currentPage);
+
+    var index: usize = 0;
+    while (index < layout.item_count) : (index += 1) {
+        drawMenuItem(layout.items[index], page_items[index], state, state.isSelected(index));
+    }
+}
+
 /// Draw one complete frame using only read-only state and the calculated view.
 /// The caller owns `beginDrawing`/`endDrawing` so presentation and the optional
-/// screenshot stay visible in `main`.
-pub fn draw(game: *const game_mod.GameState, view: camera.View) void {
+/// screenshot stay visible in `main`. The menu is last so its dim backdrop sits
+/// over the HUD and minimap.
+pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32, viewport_h: f32) void {
     rl.clearBackground(rl.Color.init(24, 24, 28, 255));
 
     rl.beginMode2D(view.transform);
-    drawWorld(&game.world, view.chunks, game.debug);
+    drawWorld(&game.world, view.chunks, game.settings.debug);
     drawCameraMarker(view.transform.target);
     rl.endMode2D();
 
-    drawHud(&game.world, view.chunks, &game.camera, game.debug);
+    drawHud(&game.world, view.chunks, &game.camera, game.settings.debug);
     drawMinimap(&game.world, view.chunks, &game.camera);
+
+    if (game.menu.opened) {
+        drawMenu(game, viewport_w, viewport_h);
+    }
 }
 
 test "every terrain type has its own uppercase letter" {

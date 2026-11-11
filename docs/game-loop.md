@@ -1,25 +1,29 @@
 # The frame loop — start here
 
 This is the shortest map of the code. If you are new to the project, read this
-before `world.md`, `camera.md`, or `memory.md`.
+before `world.md`, `camera.md`, or `memory.md`. The modal menu has its own short
+guide in `menu.md`.
 
 The demo is a chunk-streaming viewer: the camera pans over an endless,
 deterministically generated tile world, and only the chunks near the view are
 kept in memory. It does not simulate characters or talk to a server yet.
+`Esc` toggles the demonstration menu; see `menu.md` for its controls and
+extension points.
 
 ## Where things live
 
 | File | Job | Talks to Raylib? |
 |---|---|---|
 | `src/main.zig` | allocator, window, the explicit per-frame loop, teardown, screenshot hook | yes |
-| `src/input.zig` | polls keyboard/mouse/gamepad 0 and paces held directions into a plain `FrameInput` value | yes |
-| `src/game.zig` | `GameState` owns the world, camera, and debug settings; applies input | indirectly |
+| `src/input.zig` | polls keyboard/mouse/gamepad 0 and paces held directions into a plain `FrameInput` value; also collects pointer, clicks, viewport size, and bounded typed text | yes |
+| `src/game.zig` | `GameState` owns the world, camera, menu, and debug settings; applies input | indirectly |
+| `src/menu.zig` | menu page/item data, pure layout, bounded text fields, and runtime menu state | **no** |
 | `src/camera.zig` | camera movement, world→screen transform, visible chunk range, bounds checks | yes |
 | `src/world.zig` | tiles, chunks, deterministic generation, residency, streaming, stats | **no** |
-| `src/rendering.zig` | draws world, marker, HUD, minimap from read-only state | yes |
+| `src/rendering.zig` | draws world, marker, HUD, minimap, and the modal menu from read-only state | yes |
 
-`world.zig` is intentionally Raylib-free. That keeps it headless-testable and
-ready for a future server or simulation.
+`world.zig` and `menu.zig` are intentionally Raylib-free. That keeps them
+headless-testable and ready for a future server or simulation.
 
 ## One frame, in order
 
@@ -31,7 +35,7 @@ while (!rl.windowShouldClose()) {
     const vh = screen height;
 
     // 1. collect input
-    const frame = input_reader.read(rl.getFrameTime());
+    const frame = input_reader.read(rl.getFrameTime(), game_state.menu.opened);
 
     // 2. update persistent state
     try game_state.update(frame);
@@ -44,7 +48,7 @@ while (!rl.windowShouldClose()) {
 
     // 5. render read-only state
     rl.beginDrawing();
-    rendering.draw(&game_state, view);
+    rendering.draw(&game_state, view, vw, vh);
     rl.endDrawing();
 }
 ```
@@ -52,39 +56,50 @@ while (!rl.windowShouldClose()) {
 Why this order:
 
 1. **Input first.** `input.zig` is the only place that calls `isKeyDown`,
-   `isKeyPressed`, `isMouseButtonDown`, `getMouseDelta`, or the gamepad
-   functions. `main` owns one `input.Reader` outside the loop; it polls the
-   devices and turns held directions into at most one one-tile request per axis
-   on a shared 10 steps/s cadence. It does not change the game.
+   `isKeyPressed`, `isMouseButtonDown`, `getMouseDelta`, `getCharPressed`, or the
+   gamepad functions. `main` owns one `input.Reader` outside the loop; it polls
+   the devices and turns held directions into at most one one-tile request per
+   axis on a shared 10 steps/s cadence used by both the camera and the menu. The
+   same value carries the screen-space pointer, click/escape/confirm/backspace
+   edges, viewport size, and a bounded array of typed codepoints. It does not
+   change the game.
 2. **Update second.** `GameState.update` applies that one input value to the
-   persistent camera and debug settings. Camera moves are whole-tile and
-   validated; an unrepresentable move returns `error.CoordinateOutOfBounds`
-   before any toggle is applied. This is one of only two places that mutate
-   persistent state.
+   persistent camera, menu, and debug settings. The menu is modal: while it is
+   open, and on the frame that opens or closes it, the update returns before the
+   camera and toggles see the frame. Camera moves are whole-tile and validated;
+   an unrepresentable move returns `error.CoordinateOutOfBounds` before any
+   toggle is applied. This is one of only two places that mutate persistent
+   state.
 3. **View third.** The camera may have moved in step 2, so the view is
    calculated afterwards and therefore uses the new position this same frame.
    The view is derived data, not state.
 4. **Stream fourth.** `streamChunks` is the other mutation site, but it only
    changes *which chunks are resident*. Generated world content is unchanged.
-5. **Render last.** Rendering receives `*const GameState` and a `View`. It
-   cannot move the camera or collect input, and its functions take read-only
-   pointers, so the compiler helps prevent accidental mutation.
+5. **Render last.** Rendering receives `*const GameState`, a `View`, and the
+   viewport size. It cannot move the camera or collect input, and its functions
+   take read-only pointers, so the compiler helps prevent accidental mutation.
+   When the menu is open it is drawn after the world, HUD, and minimap, so its
+   dim backdrop covers them.
 
 Screenshot mode (`HAYSTACK_SHOT=/path.png`) runs a few frames, then captures
 **after** `endDrawing` has presented the frame, so the HUD is included.
 
-## Three kinds of data
+## Four kinds of data
 
 | Kind | Example | Lifetime | Who mutates it |
 |---|---|---|---|
-| Persistent state | `GameState.world`, `.camera`, `.debug` | until shutdown | `update`, `streamChunks` |
-| Persistent input timing | `input.Reader` (`last_dx`, `last_dy`, `elapsed`) | until shutdown | `Reader.read` |
-| Per-frame input | `FrameInput` (`pan_right`, `dragging`, `toggle_grid`, …) | one frame, then dropped | `Reader.read` |
+| Persistent state | `GameState.world`, `.camera`, `.menu`, `.settings.debug` | until shutdown | `update`, `streamChunks` |
+| Persistent input timing | `input.Reader` (`last_dx`, `last_dy`, `elapsed` direction cadence) | until shutdown | `Reader.read` |
+| Per-frame input | `FrameInput` (`right`, `down`, `confirm`, `dragging`, `pointer_x`, `characters`, …) | one frame, then dropped | `Reader.read` |
 | Calculated view | `camera.View` (`transform`, `chunks`) | one frame, then dropped | nobody; derived from state + window size |
 
 `GameState` does **not** store the view or the input. That separation is the
 point: tests can feed a `FrameInput` directly, and a future replay or network
 source can do the same without a window.
+
+The menu's runtime UI values (open page, selected row, focused field, wallet-name
+text, last pointer position) are persistent state because they must survive
+frames. Page and item definitions are static data in `menu.zig`.
 
 The world itself is authoritative but its *residency* is a cache. A non-resident
 chunk still exists conceptually; the deterministic generator can recreate it.
@@ -92,8 +107,9 @@ chunk still exists conceptually; the deterministic generator can recreate it.
 
 ## A concrete trace: press and hold D
 
-1. `input_reader.read(dt)` sees D held (or controller 0's D-pad/left stick on
-   the same direction) and emits `FrameInput{ .pan_right = true }`. The first
+1. `input_reader.read(dt, game_state.menu.opened)` sees D held (or controller
+   0's D-pad/left stick on the same direction) and emits
+   `FrameInput{ .right = true }`. The first
    frame of a new direction steps immediately; while it stays held the same
    request repeats every 0.1 s, so movement is 10 steps per second during normal
    frame rates. At most one step is emitted per frame, so below 10 FPS or after a
@@ -113,7 +129,8 @@ chunk still exists conceptually; the deterministic generator can recreate it.
    chunks first, then loads the rest of the prefetch ring. It mutates only the
    resident chunk pool/map, never tile contents.
 5. `rendering.draw` draws grid/borders for resident visible chunks, the camera
-   marker, the HUD, and the minimap. It reads `GameState` and `View` only.
+   marker, the HUD, and the minimap. If the menu is open it draws that last, in
+   screen space. It reads `GameState`, `View`, and the viewport size only.
 6. Next frame starts over. There is no event queue and no fixed timestep; input
    is sampled once per frame, and `input.Reader` uses the frame delta only to
    pace held directional steps.
@@ -122,7 +139,10 @@ chunk still exists conceptually; the deterministic generator can recreate it.
 
 - `main` picks the allocator: `DebugAllocator` in Debug and ReleaseSafe (leak
   reporting), `c_allocator` in ReleaseFast and ReleaseSmall.
-- `main` owns `GameState`; `GameState` owns `World`, `Camera`, `DebugSettings`.
+- `main` owns `GameState`; `GameState` owns `World`, `Camera`, `Menu`, and
+  `Settings`.
+- `Menu` and its `TextField` buffers are fixed-size values: no allocation, no
+  separate teardown.
 - `World` owns its chunk pool, resident hash map, and reusable unload-key list.
   `GameState.deinit` releases all of them.
 - Teardown is defer-ordered: `GameState.deinit` runs before `closeWindow`, and

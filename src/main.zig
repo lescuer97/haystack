@@ -28,6 +28,7 @@ comptime {
     _ = @import("input.zig");
     _ = @import("camera.zig");
     _ = @import("game.zig");
+    _ = @import("menu.zig");
     _ = @import("world.zig");
     _ = @import("rendering.zig");
 }
@@ -51,6 +52,9 @@ pub fn main() anyerror!void {
     rl.initWindow(screen_w, screen_h, "haystack — chunk streaming test");
     defer rl.closeWindow();
     rl.setTargetFPS(rendering.target_fps);
+
+    // Escape toggles the menu, so it must not also be Raylib's quit key.
+    rl.setExitKey(.null);
 
     // ── persistent state ─────────────────────────────────────────────────────
     // The initial view is calculated from the window size so the chunk pool
@@ -79,8 +83,8 @@ pub fn main() anyerror!void {
 
         // 1. collect input: this is the only stage that touches devices. dt
         //    only paces held directions; the camera still takes whole-tile
-        //    requests.
-        const frame_input = input_reader.read(rl.getFrameTime());
+        //    requests. The menu's open state filters WASD out of directions.
+        const frame_input = input_reader.read(rl.getFrameTime(), game_state.menu.opened);
 
         // 2. update persistent state from that input.
         try game_state.update(frame_input);
@@ -95,7 +99,7 @@ pub fn main() anyerror!void {
         // 5. render read-only state. Screenshot capture waits until after
         //    `endDrawing` presents the frame.
         rl.beginDrawing();
-        rendering.draw(&game_state, view);
+        rendering.draw(&game_state, view, vw, vh);
         rl.endDrawing();
 
         if (shot_frames >= 0) {

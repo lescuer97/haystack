@@ -96,10 +96,10 @@ pub const Camera = struct {
             remainder_x = 0;
             remainder_y = 0;
 
-            if (frame.pan_left) dx -= 1;
-            if (frame.pan_right) dx += 1;
-            if (frame.pan_up) dy -= 1;
-            if (frame.pan_down) dy += 1;
+            if (frame.left) dx -= 1;
+            if (frame.right) dx += 1;
+            if (frame.up) dy -= 1;
+            if (frame.down) dy += 1;
         }
 
         // Validate in i64 before committing either axis so a failed move
@@ -113,6 +113,14 @@ pub const Camera = struct {
         self.tile_y = @intCast(target_y);
         self.drag_remainder_x = remainder_x;
         self.drag_remainder_y = remainder_y;
+    }
+
+    /// Forget a partially accumulated drag. A modal menu consumes the frames
+    /// that would otherwise release the gesture, so the update boundary calls
+    /// this instead of letting the remainder replay after the menu closes.
+    pub fn resetDrag(self: *Camera) void {
+        self.drag_remainder_x = 0;
+        self.drag_remainder_y = 0;
     }
 
     /// Build the Raylib transform for this camera and window size. The target
@@ -300,7 +308,7 @@ test "direction requests move one tile and cancel opposites" {
     try std.testing.expectEqual(@as(f32, 16), start.target.x);
     try std.testing.expectEqual(@as(f32, 16), start.target.y);
 
-    try cam.applyInput(.{ .pan_right = true });
+    try cam.applyInput(.{ .right = true });
     try std.testing.expectEqual(@as(i32, 1), cam.tile_x);
     try std.testing.expectEqual(@as(i32, 0), cam.tile_y);
 
@@ -309,17 +317,17 @@ test "direction requests move one tile and cancel opposites" {
     try std.testing.expectEqual(@as(f32, 48), stepped.target.x);
     try std.testing.expectEqual(@as(f32, 16), stepped.target.y);
 
-    try cam.applyInput(.{ .pan_up = true });
+    try cam.applyInput(.{ .up = true });
     try std.testing.expectEqual(@as(i32, 1), cam.tile_x);
     try std.testing.expectEqual(@as(i32, -1), cam.tile_y);
 
     // A diagonal request moves one tile on each axis.
-    try cam.applyInput(.{ .pan_right = true, .pan_down = true });
+    try cam.applyInput(.{ .right = true, .down = true });
     try std.testing.expectEqual(@as(i32, 2), cam.tile_x);
     try std.testing.expectEqual(@as(i32, 0), cam.tile_y);
 
     // Opposing requests on an axis cancel; no input is a no-op.
-    try cam.applyInput(.{ .pan_left = true, .pan_right = true, .pan_up = true, .pan_down = true });
+    try cam.applyInput(.{ .left = true, .right = true, .up = true, .down = true });
     try std.testing.expectEqual(@as(i32, 2), cam.tile_x);
     try std.testing.expectEqual(@as(i32, 0), cam.tile_y);
     try cam.applyInput(.{});
@@ -329,7 +337,7 @@ test "direction requests move one tile and cancel opposites" {
     // Any non-drag frame also clears a stale drag remainder.
     cam.drag_remainder_x = 17;
     cam.drag_remainder_y = -9;
-    try cam.applyInput(.{ .pan_left = true });
+    try cam.applyInput(.{ .left = true });
     try std.testing.expectEqual(@as(f64, 0), cam.drag_remainder_x);
     try std.testing.expectEqual(@as(f64, 0), cam.drag_remainder_y);
     try std.testing.expectEqual(@as(i32, 1), cam.tile_x);
@@ -337,9 +345,9 @@ test "direction requests move one tile and cancel opposites" {
     // A held direction arrives as a one-tile request on repeated frames (the
     // input reader paces them): each one steps a whole tile, and a frame with
     // no request leaves the camera where it is.
-    try cam.applyInput(.{ .pan_right = true });
+    try cam.applyInput(.{ .right = true });
     try std.testing.expectEqual(@as(i32, 2), cam.tile_x);
-    try cam.applyInput(.{ .pan_right = true });
+    try cam.applyInput(.{ .right = true });
     try std.testing.expectEqual(@as(i32, 3), cam.tile_x);
     try cam.applyInput(.{});
     try std.testing.expectEqual(@as(i32, 3), cam.tile_x);
@@ -351,11 +359,11 @@ test "tile steps cross negative chunk boundaries with floor division" {
     try std.testing.expectEqual(@as(i32, -1), cam.chunkX());
     try std.testing.expectEqual(@as(i32, -1), cam.chunkY());
 
-    try cam.applyInput(.{ .pan_left = true, .pan_up = true });
+    try cam.applyInput(.{ .left = true, .up = true });
     try std.testing.expectEqual(@as(i32, -2), cam.chunkX());
     try std.testing.expectEqual(@as(i32, -2), cam.chunkY());
 
-    try cam.applyInput(.{ .pan_right = true, .pan_down = true });
+    try cam.applyInput(.{ .right = true, .down = true });
     try std.testing.expectEqual(@as(i32, -1), cam.chunkX());
     try std.testing.expectEqual(@as(i32, -1), cam.chunkY());
 
@@ -417,8 +425,8 @@ test "drag resets between gestures and wins over the keyboard" {
     // Dragging overrides the keyboard for the same frame.
     var override = Camera{};
     try override.applyInput(.{
-        .pan_right = true,
-        .pan_down = true,
+        .right = true,
+        .down = true,
         .dragging = true,
         .drag_x = 32,
     });
@@ -432,11 +440,11 @@ test "tile coordinates stay exact for large one-tile steps" {
     const big: i32 = 1 << 25;
     var cam = Camera{ .tile_x = big, .tile_y = -big };
 
-    try cam.applyInput(.{ .pan_right = true, .pan_down = true });
+    try cam.applyInput(.{ .right = true, .down = true });
     try std.testing.expectEqual(big + 1, cam.tile_x);
     try std.testing.expectEqual(-big + 1, cam.tile_y);
 
-    try cam.applyInput(.{ .pan_left = true, .pan_up = true });
+    try cam.applyInput(.{ .left = true, .up = true });
     try std.testing.expectEqual(big, cam.tile_x);
     try std.testing.expectEqual(-big, cam.tile_y);
 }
@@ -468,12 +476,12 @@ test "invalid or unrepresentable movement is rejected without partial mutation" 
 
     // One axis overflowing rejects the whole move: y must not advance.
     var edge = Camera{ .tile_x = 67108863, .tile_y = 0 };
-    try std.testing.expectError(error.CoordinateOutOfBounds, edge.applyInput(.{ .pan_right = true, .pan_down = true }));
+    try std.testing.expectError(error.CoordinateOutOfBounds, edge.applyInput(.{ .right = true, .down = true }));
     try std.testing.expectEqual(@as(i32, 67108863), edge.tile_x);
     try std.testing.expectEqual(@as(i32, 0), edge.tile_y);
 
     // i32 min tile center is exactly representable; one past it is not.
     var low = Camera{ .tile_x = -67108864, .tile_y = 0 };
-    try std.testing.expectError(error.CoordinateOutOfBounds, low.applyInput(.{ .pan_left = true }));
+    try std.testing.expectError(error.CoordinateOutOfBounds, low.applyInput(.{ .left = true }));
     try std.testing.expectEqual(@as(i32, -67108864), low.tile_x);
 }
