@@ -42,8 +42,12 @@ fn write_store(key: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+// Exact v1 schema. Do not add `#[serde(default)]`: a missing field in an
+// existing record means corruption or an incompatible writer, not a fresh
+// wallet, and must be rejected before a mutation can overwrite the record.
+// Unknown fields are tolerated by serde for forward-compatible readers. Only a
+// brand-new record is built from `Store::default()` (see `Store::new`).
 #[derive(Default, Serialize, Deserialize)]
-#[serde(default)]
 struct Store {
     version: u32,
     fingerprint: String,
@@ -59,6 +63,26 @@ struct Store {
     sagas: HashMap<String, WalletSaga>,
     kv: HashMap<String, Vec<u8>>,
     p2pk_keys: Vec<P2PKSigningKey>,
+}
+
+impl Store {
+    fn new(fingerprint: String) -> Self {
+        Self {
+            version: 1,
+            fingerprint,
+            ..Self::default()
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_storage_set(key: &str, value: &str) {
+    write_store(key, value).expect("native test storage write");
+}
+
+#[cfg(test)]
+pub(crate) fn test_storage_get(key: &str) -> Option<String> {
+    read_store(key).expect("native test storage read")
 }
 
 #[derive(Debug)]
@@ -82,11 +106,7 @@ impl BrowserDatabase {
             Some(_) => {
                 db.load()?;
             }
-            None => db.save(&Store {
-                version: 1,
-                fingerprint: db.fingerprint.clone(),
-                ..Store::default()
-            })?,
+            None => db.save(&Store::new(db.fingerprint.clone()))?,
         }
         Ok(db)
     }

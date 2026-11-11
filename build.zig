@@ -11,10 +11,16 @@ pub fn build(b: *std.Build) !void {
         else
             .{},
     });
-    const platform = requested orelse if (target.result.cpu.arch == .wasm32 or target.result.cpu.arch == .wasm64)
-        Platform.wasm
-    else
-        Platform.desktop;
+    // Wasm is selected only by the explicit platform flag. A Wasm -Dtarget
+    // alone must never infer the browser graph.
+    const platform = requested orelse .desktop;
+    if (requested == null and target.result.cpu.arch.isWasm()) {
+        std.log.err(
+            "browser builds require explicit -Dplatform=wasm; -Dtarget alone does not select the Wasm graph. Run `zig build -Dplatform=wasm -Dtarget=wasm32-emscripten`.",
+            .{},
+        );
+        return error.WasmRequiresPlatform;
+    }
     const optimize: std.builtin.Optimize = b.option(std.builtin.Optimize, "optimize", "Debug, ReleaseSafe, ReleaseFast or ReleaseSmall (Wasm defaults to ReleaseSmall)") orelse switch (b.graph.release_mode) {
         .off => if (platform == .wasm) .small else .debug,
         .any => if (platform == .wasm) .small else .safe,
@@ -30,7 +36,15 @@ pub fn build(b: *std.Build) !void {
     };
     const build_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "build-support", "-p", "test_*.py" });
     build_tests.setCwd(b.path("."));
-    b.step("test-build", "Test platform graph isolation and cached/offline tool provisioning").dependOn(&build_tests.step);
+    const platform_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build/platform.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    build_tests.step.dependOn(&b.addRunArtifact(platform_tests).step);
+    b.step("test-build", "Test platform graph isolation, the native target matrix and cached/offline tool provisioning").dependOn(&build_tests.step);
 
     // Deliberately configure ONE graph. Desktop never initializes browser
     // toolchains; Wasm never translates/links the native C ABI or desktop raylib.

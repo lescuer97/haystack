@@ -7,7 +7,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         std.log.err("browser builds require wasm32-emscripten; omit -Dtarget when using -Dplatform=wasm", .{});
         return error.UnsupportedBrowserTarget;
     }
-    const rust = common.bootstrap(b, options, "wasm32-unknown-unknown");
+    const rust = common.bootstrap(b, options, "wasm32-unknown-unknown", b.graph.host.result, false);
     const override = b.option([]const u8, "wasm-bindgen", "Optional override for the automatically managed wasm-bindgen 0.2.130");
     const tools_root = b.graph.path(.local_cache, "tools/wasm-bindgen-0.2.130");
     const tools = b.addSystemCommand(&.{ "python3", "build-support/bootstrap.py", "bindgen", "--toolchain", options.toolchain, "--root" });
@@ -66,7 +66,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     });
     b.getInstallStep().dependOn(linked);
     b.step("renderer", "Build the browser renderer without the wallet").dependOn(linked);
-    for ([_][]const u8{ "index.html", "app.js", "smoke.js" }) |file| {
+    for ([_][]const u8{ "index.html", "app.js", "smoke.js", "spilman-negative.js", "live-channels.js", "test-faults.js", "fault-scenarios.js", "recovery.js" }) |file| {
         b.getInstallStep().dependOn(&b.addInstallFile(b.path(b.fmt("browser/{s}", .{file})), b.fmt("wasm/{s}", .{file})).step);
     }
     b.getInstallStep().dependOn(&b.addInstallFile(b.path("src/testdata/spilman_vectors.json"), "wasm/spilman_vectors.json").step);

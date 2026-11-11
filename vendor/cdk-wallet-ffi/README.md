@@ -323,16 +323,40 @@ ABI as sensitive and free it promptly with `cdk_string_free` /
   newly created parent directories with `0o700`. Existing directories are never
   re-permissioned.
 * A pre-existing file whose group/other permission bits are set is **rejected**
-  with `INSECURE_DATABASE_PERMISSIONS` (checked via `fstat` after locking). The
+  with `INSECURE_DATABASE_PERMISSIONS` (checked via `fstat` at open time). The
   wrapper never silently `chmod`s it.
-* A symlinked final path component is rejected at open time (`O_NOFOLLOW`, plus
-  `O_CLOEXEC` on the lock fd); the opened file must also be a regular file.
+* On macOS, **any** extended ACL on the opened database descriptor is rejected
+  with `INSECURE_DATABASE_PERMISSIONS`, including a deny-only ACL and one
+  inherited from the directory. The probe uses `acl_get_fd_np` with
+  `ACL_TYPE_EXTENDED` on the already-open fd (no path is followed), fails closed
+  if the ACL cannot be inspected, and never clears or rewrites the ACL. Mode
+  `0600` plus no ACL is the supported state; this intentionally rejects harmless
+  deny-only ACLs too.
+* Permission/ACL rejection happens before marker inspection or any SQLite
+  migration, so a foreign file with broad permissions reports
+  `INSECURE_DATABASE_PERMISSIONS` rather than being read first.
+* A symlinked database path is rejected at open time (`O_NOFOLLOW`); the opened
+  file must also be a regular file.
 * The wrapper refuses to open a **pre-existing** database that does not carry
   its marker (`UNSUPPORTED_DATABASE`), that carries a truncated marker, or that
   was written by an incompatible format version (`UNSUPPORTED_FORMAT_VERSION`).
-* Simultaneous live handles are prevented with an advisory
-  `std::fs::File::try_lock` held for the lifetime of the handle, so a second
-  `cdk_wallet_open` on the same file returns `ALREADY_OPEN`.
+* Simultaneous live handles are prevented by an exclusive advisory lock on the
+  **database file**, held for the lifetime of the handle, so a second
+  `cdk_wallet_open` on the same database (same path, another process or a
+  hard-link alias) returns `ALREADY_OPEN`.
+  * On Linux this is `flock` (`std::fs::File::try_lock`), which is independent of
+    SQLite's `fcntl` byte-range locks.
+  * On macOS, `flock` and SQLite's `fcntl` locks share one per-vnode lock
+    list; locking the database with `flock` would make SQLite report "database
+    is locked". macOS therefore takes a non-blocking open-file-description lock
+    (`F_OFD_SETLK`) on byte 0. SQLite only locks `0x40000000..=0x400001ff`, so
+    the ranges never overlap. OFD locks are tied to the open file description,
+    so same-process second handles and hard links still conflict, and closing
+    the descriptor releases the lock. macOS 14+ xnu defines this command
+    publicly; this project targets macOS 15.0. If the kernel/filesystem rejects
+    `F_OFD_SETLK`, opening fails closed instead of weakening exclusivity.
+  * Keep the database directory owner-only; the lock is advisory, so unrelated
+    processes that ignore it can still access the file.
 
 ### URL policy
 
@@ -380,21 +404,26 @@ The crate is pinned: `cdk` and `cdk-sqlite` at `=0.18.3` with
 `bip39 = "=2.2.2"` (with `rand` + `zeroize`) for the mnemonic helpers.
 `Cargo.lock` is committed and builds are expected to use `--locked`.
 
-### Native linking (Linux)
+### Native linking (Linux and macOS)
 
 The staticlib is built with `panic = "unwind"` so the ABI can `catch_unwind`, so
-its `_Unwind_*` references must resolve. Verified with:
+its `_Unwind_*` references must resolve. Verified on Linux with:
 
 ```sh
 cargo +stable rustc --release --locked --lib -- --print=native-static-libs
 # -lgcc_s -lutil -lrt -lpthread -lm -ldl -lc
 ```
 
-On hosts that ship `libunwind` but **no `libgcc_s.so` dev symlink** (e.g. Arch /
-Omarchy), link `-lunwind` instead of `-lgcc_s`; the Zig build does this via
-`native_libs = ["unwind", "pthread", "dl", "rt", "util", "m"]`. Do **not** copy
-Iroh's macOS `-lSystem` flags. The bundled SQLite from `cdk-sqlite` is used; do
-not link a second system SQLite.
+On Linux hosts that ship `libunwind` but **no `libgcc_s.so` dev symlink** (e.g.
+Arch / Omarchy), link `-lunwind` instead of `-lgcc_s`; the Zig build does this via
+`native_libs = ["unwind", "pthread", "dl", "rt", "util", "m"]`.
+
+For `aarch64-apple-darwin`, rustc's native-static-libs baseline is
+`-lSystem -lc -lm`; macOS libSystem also supplies libunwind and pthread. The Zig
+build links `System` and `m` (libc comes from Zig's libc linkage) and does **not**
+add the Linux-only `rt`, `util`, `dl` or `pthread` libraries. The pinned raylib
+build supplies its own macOS frameworks. The bundled SQLite from `cdk-sqlite` is
+used; do not link a second system SQLite.
 
 ### Testing
 

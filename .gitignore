@@ -8,3 +8,27 @@ vendor/cdk-wallet-ffi/target
 vendor/cdk-spilman/target
 browser/wallet/target
 build-support/__pycache__/
+
+# Local standalone reproduction crate (kept out of git).
+/repros/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# Python caches beyond build-support/
+__pycache__/
+*.py[cod]
+
+# Generic Rust outputs for future crates.
+target/
+
+# Local-only artifacts and secrets.
+*.log
+*.sqlite
+*.sqlite3
+.env

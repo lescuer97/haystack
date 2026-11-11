@@ -131,9 +131,10 @@ test "C ABI rejects a NULL handle and invalid arguments without panicking" {
     freeError(bad_path.@"error");
     freeReports(bad_path.reports);
 
-    // A NULL seed slice is rejected before any path handling.
+    // A NULL seed slice is rejected before any path handling. The path is a
+    // test-owned relative path and is never created.
     const null_seed: c.slice_ref_uint8_t = .{ .ptr = null, .len = 0 };
-    const bad_seed = c.cdk_wallet_open(null_seed, "/tmp/opencode/never-created.sqlite".ptr);
+    const bad_seed = c.cdk_wallet_open(null_seed, ".zig-cache/tmp/never-created.sqlite".ptr);
     try std.testing.expectEqual(@as(c.CdkStatus_t, c.CDK_STATUS_NULL_ARGUMENT), bad_seed.status);
     try std.testing.expect(bad_seed.handle == null);
     freeError(bad_seed.@"error");

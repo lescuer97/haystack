@@ -46,9 +46,11 @@ native-crate cross-compilation probe, which is still expected to fail.
 | `zig build header-check` | Fails if the committed C header is stale. |
 
 The desktop graph provisions pinned Rust 1.99.0, builds the native archive for an
-explicit matching host target, and selects Cargo's debug/release profile from
-`-Doptimize`. `header-check` runs `generate-headers -- --check`. Desktop artifacts
-go under `zig-out/desktop`, independently of the Wasm graph. See [build.md](build.md).
+explicit matching host target (Linux x86_64/aarch64 or `aarch64-apple-darwin`),
+and selects Cargo's debug/release profile from `-Doptimize`. `header-check` runs
+`generate-headers -- --check`. Desktop artifacts go under `zig-out/desktop`,
+independently of the Wasm graph. macOS builds also run an arm64/Xcode/SDK
+preflight and pin a macOS 15.0 deployment target. See [build.md](build.md).
 
 ---
 
@@ -343,8 +345,31 @@ the checked-in file cannot go stale unnoticed.
 
   This is the official replacement and keeps the same "one generated header"
   contract; `header-check` still guards freshness.
-* **`libunwind` instead of `libgcc_s`.** The Rust staticlib is built with
+* **Platform unwind linkage.** The Rust staticlib is built with
   `panic = "unwind"` (needed for `catch_unwind` across the ABI), so `_Unwind_*`
-  symbols must resolve. This host ships `libunwind.so` but no `libgcc_s.so` dev
-  symlink, so the build links `unwind` (plus `pthread`, `dl`, `rt`, `util`, `m`).
-  Do not copy Iroh's macOS `-lSystem` flags.
+  symbols must resolve. On Linux this host ships `libunwind.so` but no
+  `libgcc_s.so` dev symlink, so the build links `unwind` (plus `pthread`, `dl`,
+  `rt`, `util`, `m`). On macOS libSystem provides libc, libm, libunwind and
+  pthread, so the build links `System` and `m` (matching rustc's
+  `-lSystem -lc -lm` native-static-libs note). Never add the Linux-only `rt`,
+  `util`, `dl` or `pthread` libraries on macOS.
+* **Database advisory lock.** `cdk_wallet_open` locks the database file itself,
+  so every path to the same inode (including hard links) is excluded. Linux uses
+  `flock` (`File::try_lock`), which is independent of SQLite's `fcntl` locks.
+  macOS keeps both lock kinds in one per-vnode list, so macOS instead takes a
+  non-blocking open-file-description write lock (`F_OFD_SETLK`) on byte 0. SQLite
+  locks only `0x40000000..=0x400001ff` (pending/reserved bytes plus the 510-byte
+  shared range), so the ranges cannot overlap and SQLite still takes its own
+  locks normally. OFD locks are tied to the open file description: a second
+  handle, another process or a hard-link alias conflicts, and closing the
+  descriptor releases the lock. macOS 14+ xnu defines `F_OFD_SETLK` publicly;
+  this project targets macOS 15.0. If the kernel/filesystem rejects
+  `F_OFD_SETLK`, open fails closed instead of losing the one-live-handle
+  guarantee.
+* **macOS extended ACLs.** Mode bits alone are insufficient on macOS: an ACL can
+  grant another principal access while the file is `0600`. The permission gate
+  therefore calls `acl_get_fd_np(fd, ACL_TYPE_EXTENDED)` on the already-open
+  descriptor (no path following) and rejects **any** returned ACL, including
+  deny-only or inherited ACLs. An inspection failure also fails closed. The
+  wrapper never clears or rewrites an ACL; the user must remove it and keep the
+  file owner-only. Permission/ACL rejection runs before marker inspection.

@@ -8,7 +8,8 @@
 //!
 //! * Own a single SQLite database and a single 64-byte seed.
 //! * Enforce the "wrapper-owned database" contract (marker + seed fingerprint).
-//! * Hold an exclusive advisory lock for the lifetime of the handle.
+//! * Hold an exclusive advisory lock on the database file for the lifetime of
+//!   the handle, without colliding with SQLite's own byte-range locks.
 //! * Run startup / explicit operation recovery and report per-mint outcomes so
 //!   that mutations fail closed while reads stay available.
 //! * Never log or echo bearer tokens.
@@ -197,6 +198,8 @@ pub struct CdkWallet {
     /// Exclusive advisory lock held for the lifetime of the handle.
     ///
     /// Never read; dropped (releasing the lock) when the handle is freed.
+    /// Linux locks the database file with `flock`; macOS uses an
+    /// open-file-description byte-range lock outside SQLite's lock bytes.
     _lock: File,
     /// Mints with unresolved recovery state. Mutations against these mints are
     /// rejected with [`CdkStatus::RecoveryPending`] until recovery succeeds.
@@ -319,9 +322,14 @@ impl CdkWallet {
                 }
             };
 
-            // `O_NOFOLLOW` refuses a symlinked final component at open time;
-            // `O_CLOEXEC` keeps the lock fd out of child processes. `create(true)`
-            // plus an explicit mode keeps a brand-new file 0600.
+            // Hold the wrapper-wide exclusive lock on the database file itself,
+            // so every path to the same inode (including hard-link aliases) is
+            // excluded. The platform helper chooses a mechanism that cannot
+            // collide with SQLite's own locks on this file. `O_NOFOLLOW` refuses
+            // a symlinked final component at open time; `O_CLOEXEC` keeps the
+            // lock fd out of child processes. `create(true)` plus an explicit
+            // mode keeps a brand-new file 0600. The same fd is retained for the
+            // handle lifetime as `_lock`, which releases the lock on close.
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -334,26 +342,23 @@ impl CdkWallet {
                     FfiErr::new(CdkStatus::InvalidPath, format!("could not open file: {e}"))
                 })?;
 
-            // `try_lock` gives process-wide mutual exclusion between wrapper handles.
-            file.try_lock().map_err(|e| {
-                FfiErr::new(
-                    CdkStatus::AlreadyOpen,
-                    format!("database is already open by another handle: {e}"),
-                )
-            })?;
+            // Take the lock before validation or opening SQLite, so a second
+            // handle is rejected without touching the database.
+            acquire_database_lock(&file)?;
 
             // Validate the *opened* file (fstat): regular file, owner-only perms.
             check_regular_file(&file)?;
+
+            // Reject an inherited database whose permissions/ACL are too broad
+            // before reading SQLite metadata or allowing any migration to touch
+            // it. New files are created 0600 above, so this only fires for
+            // pre-existing files or inherited ACLs.
+            check_permissions(&file)?;
 
             // Validate an existing marker read-only, before any migration runs.
             if existed {
                 validate_existing_marker(&path, &seed)?;
             }
-
-            // Reject an inherited database whose permissions are too broad, before
-            // upstream migrations are allowed to touch it. New files are created
-            // 0600 above, so this only fires for pre-existing files.
-            check_permissions(&file)?;
 
             let db = WalletSqliteDatabase::new(path.clone()).await.map_err(|e| {
                 if existed {
@@ -1189,6 +1194,92 @@ pub(crate) fn seed_fingerprint(seed: &[u8]) -> [u8; 32] {
     sha256::Hash::from_engine(engine).to_byte_array()
 }
 
+/// Acquire the wrapper's exclusive per-database lock for the handle lifetime.
+///
+/// Linux uses `flock(2)` (`File::try_lock`). Flock locks are tied to the open
+/// file description, so a second handle - in this process, another process, or
+/// via a hard-link alias - is rejected, and dropping the file releases the lock.
+/// Linux keeps `flock` and SQLite's `fcntl` byte-range locks independent, so
+/// both can coexist on the same database file.
+#[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]
+fn acquire_database_lock(file: &File) -> FfiResult<()> {
+    file.try_lock().map_err(|e| {
+        FfiErr::new(
+            CdkStatus::AlreadyOpen,
+            format!("database is already open by another handle: {e}"),
+        )
+    })
+}
+
+/// macOS keeps `flock` and `fcntl` locks in the same per-vnode list, so
+/// flocking the database would make SQLite's own `fcntl` locks fail with
+/// "database is locked". macOS therefore takes an open-file-description lock
+/// (`F_OFD_SETLK`) instead. OFD locks are attached to the open file description,
+/// so a second handle - even in the same process or via a hard link - still
+/// conflicts, and closing the fd releases the lock. A plain POSIX `F_SETLK`
+/// would not work here: POSIX locks are per-process, so a second handle in the
+/// same process would silently succeed. SQLite's own whole-file `F_UNLCK` is
+/// POSIX-owned and does not clear this OFD lock.
+#[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
+fn acquire_database_lock(file: &File) -> FfiResult<()> {
+    ofd_try_lock(file).map_err(|e| match e.raw_os_error() {
+        Some(libc::EACCES) | Some(libc::EAGAIN) => FfiErr::new(
+            CdkStatus::AlreadyOpen,
+            format!("database is already open by another handle: {e}"),
+        ),
+        // Fail closed: an unsupported kernel/filesystem must not silently drop
+        // the one-live-handle guarantee.
+        _ => FfiErr::new(
+            CdkStatus::DatabaseError,
+            format!("could not take the required macOS database lock (F_OFD_SETLK): {e}"),
+        ),
+    })
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    not(target_os = "linux"),
+    not(target_os = "macos")
+))]
+fn acquire_database_lock(_file: &File) -> FfiResult<()> {
+    Err(FfiErr::new(
+        CdkStatus::DatabaseError,
+        "database locking is only implemented for Linux and macOS",
+    ))
+}
+
+/// Byte 0 is outside SQLite's reserved lock range. SQLite locks
+/// `PENDING_BYTE = 0x40000000` through `0x400001ff` (pending/reserved bytes plus
+/// the 510-byte shared range), so a one-byte wrapper lock at offset 0 can never
+/// overlap SQLite's own locks.
+#[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
+const WRAPPER_LOCK_BYTE: libc::off_t = 0;
+#[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
+const WRAPPER_LOCK_LEN: libc::off_t = 1;
+
+/// Take a non-blocking exclusive open-file-description lock on the database.
+#[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
+fn ofd_try_lock(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let lock = libc::flock {
+        l_start: WRAPPER_LOCK_BYTE,
+        l_len: WRAPPER_LOCK_LEN,
+        l_pid: 0,
+        l_type: libc::F_WRLCK as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+    };
+    // SAFETY: `file` owns a valid descriptor for the duration of the call, and
+    // `lock` is a fully initialized `struct flock` for `F_OFD_SETLK`. The lock
+    // is advisory and never dereferences user memory.
+    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &lock) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Create any missing parent directories of `path` with owner-only (0700)
 /// permissions. Existing directories are never re-permissioned.
 #[cfg(not(target_arch = "wasm32"))]
@@ -1246,6 +1337,10 @@ fn check_regular_file(file: &File) -> FfiResult<()> {
 /// Reject an inherited database whose group/other permissions are non-zero.
 ///
 /// The file is never chmod-ed silently; the caller must fix the permissions.
+/// On macOS, any extended ACL object returned for the opened descriptor is also
+/// rejected, including deny-only ACLs: with mode 0600 an ACL is the only way to
+/// grant another principal access, and we cannot safely reason about every
+/// inherited variant. A descriptor-based query avoids following a path.
 #[cfg(not(target_arch = "wasm32"))]
 fn check_permissions(file: &File) -> FfiResult<()> {
     let meta = file.metadata().map_err(|e| {
@@ -1264,7 +1359,135 @@ fn check_permissions(file: &File) -> FfiResult<()> {
             ),
         ));
     }
+
+    #[cfg(target_os = "macos")]
+    if macos_acl::has_extended_acl(file).map_err(|e| {
+        FfiErr::new(
+            CdkStatus::InsecureDatabasePermissions,
+            format!("could not inspect the database extended ACL: {e}"),
+        )
+    })? {
+        return Err(FfiErr::new(
+            CdkStatus::InsecureDatabasePermissions,
+            "database file has an extended ACL; remove it and keep the file owner-only (0600)",
+        ));
+    }
+
     Ok(())
+}
+
+/// Classify a NULL `acl_get_fd_np` result.
+///
+/// macOS Libc reports "no extended ACL" as `ENOENT`; only that status proves
+/// absence. A NULL result with errno 0 (or no errno) is an uninspectable
+/// outcome and must fail closed, as must any other errno.
+#[cfg(all(not(target_arch = "wasm32"), any(target_os = "macos", test)))]
+fn classify_null_acl(errno: Option<libc::c_int>) -> io::Result<bool> {
+    match errno {
+        Some(libc::ENOENT) => Ok(false),
+        Some(0) | None => Err(io::Error::new(
+            io::ErrorKind::Other,
+            "acl_get_fd_np returned NULL without a usable errno",
+        )),
+        Some(code) => Err(io::Error::from_raw_os_error(code)),
+    }
+}
+
+/// Minimal, descriptor-based macOS extended-ACL probe.
+///
+/// `acl_get_fd_np(fd, ACL_TYPE_EXTENDED)` is the documented ACL API and operates
+/// on the already-open database descriptor, so no path is followed here. Darwin
+/// returns NULL with ENOENT when no extended ACL is present. Any returned ACL
+/// object is treated as unsafe, including a deny-only ACL, to fail closed on
+/// inherited or principal-specific grants. A NULL result without ENOENT is an
+/// inspection error and also fails closed.
+#[cfg(target_os = "macos")]
+mod macos_acl {
+    use super::{classify_null_acl, io, File};
+    use std::os::unix::io::AsRawFd;
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(obj: *mut libc::c_void) -> libc::c_int;
+    }
+
+    /// Owns an ACL allocated by acl_get_fd_np for the duration of the probe.
+    struct OwnedAcl(*mut libc::c_void);
+
+    impl Drop for OwnedAcl {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is non-null and came from acl_get_fd_np; it is
+            // released exactly once, here.
+            let _ = unsafe { acl_free(self.0) };
+        }
+    }
+
+    pub(super) fn has_extended_acl(file: &File) -> io::Result<bool> {
+        has_extended_acl_fd(file.as_raw_fd())
+    }
+
+    fn has_extended_acl_fd(fd: libc::c_int) -> io::Result<bool> {
+        // SAFETY: libc's `__error()` returns the current thread's errno pointer.
+        unsafe { *libc::__error() = 0 };
+
+        // SAFETY: `fd` is passed to the kernel; acl_get_fd_np does not follow a
+        // path and returns either NULL or an allocated ACL requiring acl_free.
+        let acl = unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            return classify_null_acl(io::Error::last_os_error().raw_os_error());
+        }
+
+        let _owned = OwnedAcl(acl);
+        Ok(true)
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    mod tests {
+        use super::has_extended_acl_fd;
+        use std::os::unix::io::AsRawFd;
+
+        #[test]
+        fn ordinary_file_has_no_extended_acl() {
+            let file = tempfile::tempfile().unwrap();
+            assert!(!has_extended_acl_fd(file.as_raw_fd()).unwrap());
+        }
+
+        #[test]
+        fn invalid_descriptor_fails_closed() {
+            let error = has_extended_acl_fd(-1).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod acl_classifier_tests {
+    use super::classify_null_acl;
+
+    #[test]
+    fn enoent_is_the_only_no_acl_classification() {
+        assert!(!classify_null_acl(Some(libc::ENOENT)).unwrap());
+    }
+
+    #[test]
+    fn null_with_errno_zero_is_an_inspection_error() {
+        let error = classify_null_acl(Some(0)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("without a usable errno"));
+    }
+
+    #[test]
+    fn null_without_errno_is_an_inspection_error() {
+        assert!(classify_null_acl(None).is_err());
+    }
+
+    #[test]
+    fn real_errno_is_preserved_and_rejected() {
+        let error = classify_null_acl(Some(libc::EACCES)).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+    }
 }
 
 /// Validate an existing database's marker **read-only**, before migrations.

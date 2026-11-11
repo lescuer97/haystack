@@ -1,8 +1,10 @@
 # Browser WebAssembly: initial investigation and porting plan
 
 > **Superseded compilation status:** the repository now has an experimental full
-> browser bundle using its shared wallet and Spilman code. It compiles and passes
-> 42 Chromium checks. See [current build/run instructions and limitations](browser-wallet.md).
+> browser bundle using its shared wallet and Spilman code. The Chromium suite now
+> runs 221 passing checks and reports 3 failed known recovery scenarios; it exits
+> nonzero because of those discovered defects. See
+> [current build/run instructions and limitations](browser-wallet.md).
 > The initial verdict and staged assessment below are retained as historical
 > context, not a statement that the new browser crate fails to compile.
 > Build orchestration has since been separated further: use `zig build` for
@@ -23,6 +25,12 @@ validate our native wrapper: a working equivalent needs the changes and
 validation below; changing the compiler target alone cannot do it.
 
 ## Build and run the version available now
+
+> **Historical commands:** the `-Dtarget=wasm32-emscripten` commands below no
+> longer select the browser graph. Current builds require
+> `zig build -Dplatform=wasm`; `-Dtarget` alone now fails with an explanation.
+> The `zig-out/web` paths and `web`/`emrun` steps below are retained as historical
+> context only. See [current build instructions](build.md).
 
 Prerequisites: Zig 0.17.0, Python 3, internet access for the initial dependency and
 SDK downloads, and a browser with WebGL. Rust is **not** used by this web build.

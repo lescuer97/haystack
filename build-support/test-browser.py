@@ -38,7 +38,7 @@ def main():
             if match:
                 url = match.group(1)
                 break
-        subprocess.run(["node", str(args.runner.resolve()), url], check=True, timeout=180)
+        subprocess.run(["node", str(args.runner.resolve()), url], check=True, timeout=300)
     finally:
         mint.terminate()
         try:
