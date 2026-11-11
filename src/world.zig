@@ -16,8 +16,8 @@ const std = @import("std");
 
 // ── world constants ──────────────────────────────────────────────────────────
 
-/// One tile is 32×32 world pixels. Debug rendering draws only grid and chunk
-/// borders today, but the coordinate system is real.
+/// One tile is 32×32 world pixels. Debug rendering draws a terrain letter at
+/// each tile centre, plus optional grid lines and chunk borders in this space.
 pub const TILE_PX: i32 = 32;
 
 /// A chunk is 16×16 tiles (512×512 pixels).

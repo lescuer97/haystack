@@ -20,8 +20,32 @@ pub const target_fps: i32 = 120;
 const grid_color = rl.Color.init(255, 255, 255, 55);
 const border_color = rl.Color.init(220, 60, 55, 255);
 const hud_bg = rl.Color.init(0, 0, 0, 170);
+const tile_letter_color = rl.Color.init(235, 235, 240, 255);
+
+/// Default-font size for the terrain letter drawn inside each tile.
+const tile_letter_size: i32 = 20;
 
 // ── drawing ──────────────────────────────────────────────────────────────────
+
+/// Single uppercase letter identifying each terrain type. The switch is
+/// exhaustive so a new `world.Tile` variant forces a rendering decision.
+fn tileLetter(tile: world.Tile) u8 {
+    return switch (tile) {
+        .grass => 'G',
+        .dirt => 'D',
+        .rock => 'R',
+    };
+}
+
+/// Top-left corner that centres a `text_w`×`text_h` label inside the tile whose
+/// top-left corner is (`tx`, `ty`). Pure maths so the centring is testable
+/// without a window or a loaded font.
+fn centeredTextPos(tx: i32, ty: i32, text_w: i32, text_h: i32) struct { x: i32, y: i32 } {
+    return .{
+        .x = tx + @divTrunc(world.TILE_PX - text_w, 2),
+        .y = ty + @divTrunc(world.TILE_PX - text_h, 2),
+    };
+}
 
 fn drawChunk(chunk: *const world.Chunk, settings: game_mod.DebugSettings) void {
     const ox = chunk.cx * world.CHUNK_PX;
@@ -47,6 +71,25 @@ fn drawChunk(chunk: *const world.Chunk, settings: game_mod.DebugSettings) void {
             2.0,
             border_color,
         );
+    }
+
+    // Terrain letters always render, independent of the optional debug
+    // overlays above. `measureText` and `drawText` use the same default font
+    // and size, and the default font's glyph height matches `fontSize`.
+    var ty: usize = 0;
+    while (ty < world.CT) : (ty += 1) {
+        var tx: usize = 0;
+        while (tx < world.CT) : (tx += 1) {
+            var text: [2:0]u8 = .{ tileLetter(chunk.tiles[ty * world.CT + tx]), 0 };
+            const text_w = rl.measureText(&text, tile_letter_size);
+            const pos = centeredTextPos(
+                ox + @as(i32, @intCast(tx)) * world.TILE_PX,
+                oy + @as(i32, @intCast(ty)) * world.TILE_PX,
+                text_w,
+                tile_letter_size,
+            );
+            rl.drawText(&text, pos.x, pos.y, tile_letter_size, tile_letter_color);
+        }
     }
 }
 
@@ -220,4 +263,34 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View) void {
 
     drawHud(&game.world, view.chunks, &game.camera, game.debug);
     drawMinimap(&game.world, view.chunks, &game.camera);
+}
+
+test "every terrain type has its own uppercase letter" {
+    const cases = [_]struct { tile: world.Tile, letter: u8 }{
+        .{ .tile = .grass, .letter = 'G' },
+        .{ .tile = .dirt, .letter = 'D' },
+        .{ .tile = .rock, .letter = 'R' },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(c.letter, tileLetter(c.tile));
+        try std.testing.expect(c.letter >= 'A' and c.letter <= 'Z');
+    }
+}
+
+test "tile labels are centred on the tile in both axes" {
+    const cases = [_]struct { tx: i32, ty: i32, w: i32, h: i32 }{
+        .{ .tx = 0, .ty = 0, .w = 11, .h = 20 },
+        .{ .tx = 32, .ty = 64, .w = 20, .h = 20 },
+        .{ .tx = -96, .ty = -32, .w = 7, .h = 16 },
+    };
+    for (cases) |c| {
+        const pos = centeredTextPos(c.tx, c.ty, c.w, c.h);
+        const tile_cx = c.tx + @divTrunc(world.TILE_PX, 2);
+        const tile_cy = c.ty + @divTrunc(world.TILE_PX, 2);
+        const text_cx = pos.x + @divTrunc(c.w, 2);
+        const text_cy = pos.y + @divTrunc(c.h, 2);
+        // Integer division can leave the label one pixel off centre.
+        try std.testing.expect(@abs(tile_cx - text_cx) <= 1);
+        try std.testing.expect(@abs(tile_cy - text_cy) <= 1);
+    }
 }
