@@ -14,7 +14,7 @@ extension points.
 
 | File | Job | Talks to Raylib? |
 |---|---|---|
-| `src/main.zig` | allocator, window, the explicit per-frame loop, teardown, screenshot hook | yes |
+| `src/main.zig` | allocator, window, the explicit per-frame loop or browser callback, teardown, screenshot hook | yes |
 | `src/input.zig` | polls keyboard/mouse/gamepad 0 and paces held directions into a plain `FrameInput` value; also collects pointer, clicks, viewport size, and bounded typed text | yes |
 | `src/game.zig` | `GameState` owns the world, camera, menu, and debug settings; applies input | indirectly |
 | `src/menu.zig` | menu page/item data, pure layout, bounded text fields, and runtime menu state | **no** |
@@ -84,6 +84,23 @@ Why this order:
 Screenshot mode (`HAYSTACK_SHOT=/path.png`) runs a few frames, then captures
 **after** `endDrawing` has presented the frame, so the HUD is included.
 
+## Browser loop
+
+The five stages are factored into one `stepFrame` helper and run unchanged on
+both platforms. Native `main` calls it from the blocking `while` loop above. The
+browser build exports a C `main` instead: it creates a heap-owned
+`BrowserContext` (the `GameState` plus the persistent `input.Reader`) and hands
+an Emscripten callback to `emscripten_set_main_loop`, so the page is never
+blocked. The context outlives the entry function; Emscripten never receives a
+pointer to a returned stack frame.
+
+Browser teardown is explicit and idempotent: `stopBrowser` clears the global
+context first, cancels the main loop, deinitializes `GameState`, destroys the
+context, and closes the window. A callback that finds no context returns
+immediately, so no stage touches freed state after cleanup. Initialization
+failures log, run the same cleanup, and return a non-zero C `main` result. Both
+entry points disable Raylib's Escape quit key so Escape toggles the menu.
+
 ## Four kinds of data
 
 | Kind | Example | Lifetime | Who mutates it |
@@ -138,15 +155,19 @@ chunk still exists conceptually; the deterministic generator can recreate it.
 ## Memory ownership
 
 - `main` picks the allocator: `DebugAllocator` in Debug and ReleaseSafe (leak
-  reporting), `c_allocator` in ReleaseFast and ReleaseSmall.
+  reporting), `c_allocator` in ReleaseFast and ReleaseSmall. The browser entry
+  uses `c_allocator` for its heap-owned `BrowserContext`.
 - `main` owns `GameState`; `GameState` owns `World`, `Camera`, `Menu`, and
-  `Settings`.
+  `Settings`. In the browser, `BrowserContext` owns both `GameState` and
+  `input.Reader`.
 - `Menu` and its `TextField` buffers are fixed-size values: no allocation, no
   separate teardown.
 - `World` owns its chunk pool, resident hash map, and reusable unload-key list.
   `GameState.deinit` releases all of them.
-- Teardown is defer-ordered: `GameState.deinit` runs before `closeWindow`, and
-  the debug allocator check runs last.
+- Teardown is defer-ordered on native: `GameState.deinit` runs before
+  `closeWindow`, and the debug allocator check runs last. Browser teardown runs
+  the same order explicitly (cancel loop, deinit state, destroy context, close
+  window) and cannot run twice.
 - Steady-state panning reuses released pool slots and pre-reserved map/scratch
   capacity, so normal frames do not allocate. There is no per-frame snapshot of
   the world.

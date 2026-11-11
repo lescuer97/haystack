@@ -269,4 +269,3 @@ export async function redeemTokenResult(recipientName, seedHex, token) {
 export function removeWallet(name) {
   localStorage.removeItem(walletKey(name));
 }
-

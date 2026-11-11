@@ -61,4 +61,3 @@ pub fn build(b: *std.Build) !void {
         .wasm => try @import("build/wasm.zig").build(b, options),
     }
 }
-

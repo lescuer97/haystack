@@ -162,7 +162,7 @@ export async function runSmoke(app) {
 
     const frame=document.querySelector("iframe");
     const canvas=frame?.contentDocument?.querySelector("canvas");
-    assert(canvas?.width === 800 && canvas?.height === 450, "Independent Zig/raylib Wasm renderer initializes alongside wallet");
+    assert(canvas?.width === 1000 && canvas?.height === 640, "Zig/raylib chunk-streaming renderer initializes alongside wallet");
     completed = true;
     return {ok: completed && failures.length === 0, completed, checks, failures, count: checks.length, failureCount: failures.length};
   } catch (error) {
