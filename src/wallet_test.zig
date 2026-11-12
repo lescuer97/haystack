@@ -7,6 +7,7 @@
 //! BIP-39 mnemonic generation / entropy / seed helpers.
 const std = @import("std");
 const cdk = @import("cdk");
+const wallet = @import("wallet.zig");
 
 const c = cdk.c;
 
@@ -42,6 +43,21 @@ fn walletPath(tmp: *std.testing.TmpDir, buf: []u8) [:0]const u8 {
     return buf[0..i :0];
 }
 
+test "wallet helper opens and closes an FFI wallet" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = walletPath(&tmp, &path_buf);
+    const seed: [cdk.seed_len]u8 = @splat(7);
+    var opened = try wallet.createWallet(&seed, path);
+    defer opened.close() catch {};
+    try std.testing.expect(!opened.closed);
+    try opened.close();
+    try std.testing.expect(opened.closed);
+    try opened.close();
+}
+
 test "C ABI lifecycle: open, list, lock, close, reopen" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -51,17 +67,18 @@ test "C ABI lifecycle: open, list, lock, close, reopen" {
 
     // A seed that is not exactly 64 bytes is rejected up front.
     const short_seed: [63]u8 = @splat(0);
-    const bad = c.cdk_wallet_open(cdk.byteSlice(&short_seed), path.ptr);
+    var bad = c.cdk_wallet_open(cdk.byteSlice(&short_seed), path.ptr);
     try std.testing.expectEqual(@as(c.CdkStatus_t, c.CDK_STATUS_INVALID_SEED), bad.status);
     try std.testing.expect(bad.handle == null);
-    freeError(bad.@"error");
+    try std.testing.expectError(error.CdkFailure, wallet.check(&bad));
+    try std.testing.expect(bad.@"error" == null);
     freeReports(bad.reports);
 
     // A valid open returns an initialized handle.
     const seed: [64]u8 = @splat(7);
-    const opened = c.cdk_wallet_open(cdk.byteSlice(&seed), path.ptr);
-    try std.testing.expectEqual(@as(c.CdkStatus_t, c.CDK_STATUS_OK), opened.status);
-    freeError(opened.@"error");
+    var opened = c.cdk_wallet_open(cdk.byteSlice(&seed), path.ptr);
+    try wallet.check(&opened);
+    try std.testing.expect(opened.@"error" == null);
     // A fresh database has no approved mints, so startup recovery reports
     // nothing. The vector is owned and must be freed with the matching helper.
     try std.testing.expectEqual(@as(usize, 0), opened.reports.len);

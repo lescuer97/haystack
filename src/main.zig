@@ -35,9 +35,6 @@ comptime {
     _ = @import("menu.zig");
     _ = @import("world.zig");
     _ = @import("rendering.zig");
-    // The wallet smoke imports the native C ABI, so it participates in tests
-    // only on Linux. The browser compilation must never analyze this import.
-    if (builtin.os.tag == .linux) _ = @import("wallet_smoke.zig");
 }
 
 // ── browser lifetime ─────────────────────────────────────────────────────────
@@ -243,18 +240,6 @@ pub fn main() anyerror!void {
         if (use_debug_allocator) _ = debug_allocator.deinit();
     }
     const allocator = if (use_debug_allocator) debug_allocator.allocator() else std.heap.c_allocator;
-
-    // ── disposable wallet smoke ──────────────────────────────────────────────
-    // Prove the native C ABI and Rust archive actually link and run before
-    // spending time on window setup. Every ABI call blocks on the Rust runtime,
-    // so it runs on a worker thread and joins before the UI starts. This test
-    // wallet is random, owner-only, and temporary; it is not a backup or a
-    // production store.
-    if (builtin.os.tag == .linux) {
-        var smoke_io = std.Io.Threaded.init_single_threaded;
-        defer smoke_io.deinit();
-        try @import("wallet_smoke.zig").runOnWorker(smoke_io.io());
-    }
 
     // ── window ───────────────────────────────────────────────────────────────
     const screen_w = 1000;
