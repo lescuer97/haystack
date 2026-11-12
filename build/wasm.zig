@@ -23,6 +23,15 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     bindgen_setup.step.dependOn(&rust_setup.step);
 
     const wallet = common.cargo(b, options, "browser/wallet/Cargo.toml", &.{ "build", "--lib", "--target", "wasm32-unknown-unknown", "--target-dir", "browser/wallet/target" });
+    // Apple's ar drops Wasm objects from the C archives used by ring and secp256k1-sys.
+    const archiver = b.fmt("{s} ar", .{b.graph.zig_exe});
+    wallet.setEnvironmentVariable("AR_wasm32_unknown_unknown", archiver);
+    // ring tracks target CFLAGS but not AR, so changing archivers otherwise leaves
+    // its old (possibly empty) archive cached across Cargo optimization profiles.
+    const archiver_id = std.hash.Wyhash.hash(0, b.fmt("{s}:{s}", .{ archiver, @import("builtin").zig_version_string }));
+    const cflags_key = "CFLAGS_wasm32_unknown_unknown";
+    const previous_cflags = wallet.getEnvMap().get(cflags_key) orelse "";
+    wallet.setEnvironmentVariable(cflags_key, b.fmt("{s} -DHAYSTACK_WASM_ARCHIVER_ID=0x{x}", .{ previous_cflags, archiver_id }));
     common.optimizeRust(wallet, options);
     wallet.setName("compile browser wallet and Spilman to Wasm");
     wallet.step.dependOn(&rust_check.step);
