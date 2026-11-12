@@ -68,6 +68,30 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     if (options.optimize.runtimeSafety()) try flags.put("-fsanitize=undefined", {});
     var settings = rlz.emsdk.emccDefaultSettings(b.allocator, .{ .optimize = options.optimize });
     try settings.put("EXIT_RUNTIME", "0");
+    // Emscripten accepts a single `--js-library` path here. Combine the wallet
+    // gate and the separate storage bridge at configure time so neither file
+    // has to know about the other and the wallet JS stays untouched.
+    const wallet_js = b.root.root_dir.handle.readFileAlloc(
+        b.graph.io,
+        "browser/game-wallet.js",
+        b.allocator,
+        .limited(256 * 1024),
+    ) catch |err| {
+        std.log.err("cannot read browser/game-wallet.js: {s}", .{@errorName(err)});
+        return err;
+    };
+    const storage_js = b.root.root_dir.handle.readFileAlloc(
+        b.graph.io,
+        "browser/game-storage.js",
+        b.allocator,
+        .limited(256 * 1024),
+    ) catch |err| {
+        std.log.err("cannot read browser/game-storage.js: {s}", .{@errorName(err)});
+        return err;
+    };
+    const libraries_js = try std.mem.concat(b.allocator, u8, &.{ wallet_js, "\n", storage_js });
+    const write_files = b.addWriteFiles();
+    const combined_library = write_files.add("haystack-game-libraries.js", libraries_js);
     const linked = try rlz.emsdk.emccStep(b, &.{}, &.{renderer}, .{
         .optimize = options.optimize,
         .flags = flags,
@@ -75,7 +99,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         .shell_file_path = b.path("browser/game-shell.html"),
         .install_dir = .{ .custom = "wasm/renderer" },
         .out_file_name = "index.html",
-        .js_library_path = b.path("browser/game-wallet.js"),
+        .js_library_path = combined_library,
     });
     b.getInstallStep().dependOn(linked);
     b.step("renderer", "Build the browser renderer without the wallet").dependOn(linked);
@@ -95,13 +119,26 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     serve.step.dependOn(b.getInstallStep());
     b.step("run", "Build and serve the complete browser application (no fake mint)").dependOn(&serve.step);
 
+    // The storage bridge is exercised without Chromium against an in-memory
+    // IndexedDB. This keeps the JS contract testable in environments where the
+    // full WebAssembly bundle or browser cannot run.
+    const storage_tests = b.addSystemCommand(&.{ "node", "browser/game-storage-test.mjs" });
+    storage_tests.setCwd(b.path("."));
+    storage_tests.setName("run browser storage bridge tests in Node");
+    const wallet_storage_tests = b.addSystemCommand(&.{ "node", "browser/wallet-store-test.mjs" });
+    wallet_storage_tests.setCwd(b.path("."));
+    wallet_storage_tests.setName("run browser wallet IndexedDB tests in Node");
+    const storage_step = b.step("test-storage", "Run the Node-only browser storage tests (no Chromium)");
+    storage_step.dependOn(&storage_tests.step);
+    storage_step.dependOn(&wallet_storage_tests.step);
+
     // Native helper compilation is EXPLICITLY test-only. A normal Wasm build
     // never builds this crate or links the desktop archive/system libraries.
     if (b.graph.host.result.os.tag == .linux) {
         // Shared by `test` and `test-mint`. These files are regression-test
         // inputs only, so a normal browser build never installs them.
         const test_assets = b.step("test-assets", "Install browser regression test fixtures (test/test-mint only)");
-        for ([_][]const u8{ "app.js", "smoke.js", "spilman-negative.js", "live-channels.js", "test-faults.js", "fault-scenarios.js", "recovery.js", "wallet-test.html" }) |file| {
+        for ([_][]const u8{ "app.js", "smoke.js", "spilman-negative.js", "live-channels.js", "test-faults.js", "fault-scenarios.js", "recovery.js", "wallet-test.html", "test-wallet.js", "wallet-store.js" }) |file| {
             test_assets.dependOn(&b.addInstallFile(b.path(b.fmt("browser/{s}", .{file})), b.fmt("wasm/{s}", .{file})).step);
         }
         test_assets.dependOn(&b.addInstallFile(b.path("src/testdata/spilman_vectors.json"), "wasm/spilman_vectors.json").step);
@@ -112,12 +149,12 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         const mint = common.cargo(b, options, "vendor/cdk-wallet-ffi/Cargo.toml", &.{ "build", "--example", "browser-test-mint", "--target", host, "--target-dir", "browser/wallet/target/test-mint" });
         mint.step.dependOn(&rust_check.step);
         const mint_exe = b.path(b.fmt("browser/wallet/target/test-mint/{s}/debug/examples/browser-test-mint", .{host}));
-        const browser_tests = b.addSystemCommand(&.{ "python3", "build-support/test-browser.py", "--mint" });
+        const browser_tests = b.addSystemCommand(&.{ "python3", "build-support/run-browser-tests.py", "--mint" });
         browser_tests.addFileArg(mint_exe);
         browser_tests.addArg("--directory");
         browser_tests.addDirectoryArg(b.graph.path(.install_prefix, "wasm"));
         browser_tests.addArg("--runner");
-        browser_tests.addFileArg(b.path("browser/test.mjs"));
+        browser_tests.addFileArg(b.path("browser/wallet-browser-test.mjs"));
         // The non-interactive wallet host is a test fixture only. It is not part
         // of the normal installed application, whose default is the game.
         browser_tests.step.dependOn(test_assets);
@@ -125,6 +162,8 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         browser_tests.step.dependOn(b.getInstallStep());
         const test_step = b.step("test", "Build, start an ephemeral fake mint, run Chromium and stop the mint");
         test_step.dependOn(&browser_tests.step);
+        test_step.dependOn(&storage_tests.step);
+        test_step.dependOn(&wallet_storage_tests.step);
         test_step.dependOn(&database.step);
         const run_mint = b.addRunFile(mint_exe);
         run_mint.addDirectoryArg(b.graph.path(.install_prefix, "wasm"));

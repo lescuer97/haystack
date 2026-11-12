@@ -122,6 +122,8 @@ pub fn build(b: *std.Build, options_in: common.Options) !void {
     if (preflight) |step| app_tests.step.dependOn(&step.step);
     app_tests.step.dependOn(&rust.step);
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
+    const wallet_storage_tests = abiTests(b, options, "src/wallet_storage_test.zig", cdk, archive, &rust.step, policy);
+    test_step.dependOn(&wallet_storage_tests.step);
 
     const headers = common.cargo(b, options, manifest, &.{ "run", "--features", "headers", "--bin", "generate-headers", "--target", policy.rust_target, "--target-dir", "vendor/cdk-wallet-ffi/target" });
     headers.addArgs(&.{ "--", "--check" });
@@ -144,6 +146,7 @@ pub fn build(b: *std.Build, options_in: common.Options) !void {
     tests.dependOn(&headers.step);
     tests.dependOn(&rust_tests.step);
     tests.dependOn(&wallet_tests.step);
+    tests.dependOn(&wallet_storage_tests.step);
     tests.dependOn(&spilman_tests.step);
 }
 
@@ -222,6 +225,19 @@ fn linkWallet(module: *std.Build.Module, cdk: *std.Build.Module, archive: std.Bu
     // symbols. These are native platform libraries, never browser link inputs.
     for (policy.native_libraries) |name| {
         module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
+    }
+    // The vendored Rust crate's macOS entropy path references the Security
+    // framework. A static archive carries no link flags, so the final Zig
+    // link must name the framework explicitly.
+    if (policy.os == .macos) {
+        const b = module.owner;
+        const sdk = std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &b.graph.host.result) orelse
+            @panic("macOS SDK not found for framework linking");
+        const frameworks = b.fmt("{s}/System/Library/Frameworks", .{sdk});
+        module.addFrameworkPath(b.graph.cwdRelativePath(frameworks));
+        module.linkFramework("Security", .{});
+        module.linkFramework("CoreFoundation", .{});
+        module.linkFramework("Foundation", .{});
     }
 }
 

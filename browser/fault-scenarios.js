@@ -4,8 +4,8 @@
 // fault wrapper installed. Wallets, seeds, and tokens are fresh per scenario and
 // are kept in this function scope; only the wallet database persists anything.
 import {open_wallet} from "./wallet/cdk_wallet_browser.js";
+import {createWallet, deleteWallet, readWallet} from "./test-wallet.js";
 
-const walletKey = name => `cdk_wallet_browser_v1_${name}`;
 const sumBalances = balances => balances.reduce((total, entry) => total + Number(entry.sats), 0);
 
 export async function runFaultScenarios({assert, faults, recordFailure}) {
@@ -25,19 +25,19 @@ export async function runFaultScenarios({assert, faults, recordFailure}) {
     return response;
   };
   const open = async () => {
-    const seed = crypto.getRandomValues(new Uint8Array(64));
     const name = `fault-${++walletCount}-${suffix}`;
-    seeds.push(seed);
     names.push(name);
+    const seed = await createWallet(name);
+    seeds.push(seed);
     const wallet = await open_wallet(seed, name);
     wallet.__testName = name;
     wallets.push(wallet);
     return wallet;
   };
-  const unspentAmounts = wallet => {
-    const raw = localStorage.getItem(walletKey(wallet.__testName));
-    const state = raw ? JSON.parse(raw) : {};
-    return Object.values(state.proofs || {})
+  const unspentAmounts = async wallet => {
+    const {state} = await readWallet(wallet.__testName);
+    const record = state ? JSON.parse(state.data) : {};
+    return Object.values(record.proofs || {})
       .filter(proof => proof.state === "UNSPENT")
       .map(proof => proof.proof.amount);
   };
@@ -45,7 +45,7 @@ export async function runFaultScenarios({assert, faults, recordFailure}) {
   // an odd amount like 37 impossible to compose from the remaining even
   // denominations, so the send must perform an online swap.
   const shapeForSwap = async (wallet, label) => {
-    const ones = unspentAmounts(wallet).filter(amount => amount === 1).length;
+    const ones = (await unspentAmounts(wallet)).filter(amount => amount === 1).length;
     assert(ones === 4, `${label}: funding produces four 1-sat proofs`);
     const drained = [];
     for (let index = 0; index < ones; index += 1) {
@@ -249,7 +249,11 @@ export async function runFaultScenarios({assert, faults, recordFailure}) {
       try { await wallet.close(); } catch {}
       try { wallet.free(); } catch {}
     }
-    for (const name of names) localStorage.removeItem(walletKey(name));
+    for (const name of names) {
+      // Each disposable wallet is deleted (and its deletion verified) after all
+      // handles are closed. Only this scenario's generated names are touched.
+      await deleteWallet(name);
+    }
     for (const seed of seeds) seed.fill(0);
   }
 }

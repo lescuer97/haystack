@@ -10,18 +10,24 @@
 //
 // The task imports the real browser wallet adapter relative to this renderer
 // (`../wallet/cdk_wallet_browser.js`), generates a fresh mnemonic, derives a
-// 64-byte seed, opens a unique disposable wallet, verifies it is empty, then
-// closes/frees it and removes only the storage key this task created. No mint,
-// network, prompt, secret log, or secret global is involved. Every rejection is
-// caught and becomes a generic failure, never a raw error.
+// 64-byte seed, explicitly provisions a unique disposable wallet pair in the
+// dedicated `haystack-wallet` IndexedDB database, opens it, verifies it is
+// empty, then closes/frees it and deletes only the records this task created.
+// The deletion is verified before startup can succeed. No mint, network, prompt,
+// secret log, or secret global is involved. This gate never creates or touches
+// the persistent user wallet. Every rejection is caught and becomes a generic
+// failure, never a raw error.
 
 mergeInto(LibraryManager.library, {
   $haystackWalletSmoke: {
     started: false,
     finished: false,
     ready: 0,
-    keyPrefix: "cdk_wallet_browser_v1_",
+    database: "haystack-wallet",
+    mnemonicStore: "mnemonics",
+    stateStore: "states",
     namePrefix: "game-smoke-",
+    connection: null,
 
     notifyReady: function (ok) {
       if (!this.ready) return;
@@ -58,10 +64,78 @@ mergeInto(LibraryManager.library, {
       return parsed;
     },
 
+    openDatabase: function () {
+      var self = this;
+      if (self.connection) return self.connection;
+      if (typeof indexedDB === "undefined" || !indexedDB) throw new Error("wallet smoke unavailable");
+      self.connection = new Promise(function (resolve, reject) {
+        var request;
+        try {
+          request = indexedDB.open(self.database, 1);
+        } catch (_) {
+          reject(new Error("wallet smoke unavailable"));
+          return;
+        }
+        request.onupgradeneeded = function () {
+          var database = request.result;
+          if (!database.objectStoreNames.contains(self.mnemonicStore)) database.createObjectStore(self.mnemonicStore);
+          if (!database.objectStoreNames.contains(self.stateStore)) database.createObjectStore(self.stateStore);
+        };
+        request.onsuccess = function () { resolve(request.result); };
+        request.onerror = function () { reject(new Error("wallet smoke failed")); };
+        request.onblocked = function () { reject(new Error("wallet smoke failed")); };
+      });
+      return self.connection;
+    },
+
+    readPair: async function (name) {
+      var self = this;
+      var database = await self.openDatabase();
+      return new Promise(function (resolve, reject) {
+        var transaction;
+        try {
+          transaction = database.transaction([self.mnemonicStore, self.stateStore], "readonly");
+        } catch (_) {
+          reject(new Error("wallet smoke failed"));
+          return;
+        }
+        var mnemonic = transaction.objectStore(self.mnemonicStore).get(name);
+        var state = transaction.objectStore(self.stateStore).get(name);
+        transaction.oncomplete = function () {
+          resolve({ mnemonic: mnemonic.result, state: state.result });
+        };
+        transaction.onabort = function () { reject(new Error("wallet smoke failed")); };
+        transaction.onerror = function () {};
+      });
+    },
+
+    // Deletes exactly this disposable wallet's two records, then verifies that
+    // both are gone. Never deletes the database, clears a store, or touches any
+    // other wallet or the game's `haystack-game` database.
+    deletePair: async function (name) {
+      var self = this;
+      var database = await self.openDatabase();
+      await new Promise(function (resolve, reject) {
+        var transaction;
+        try {
+          transaction = database.transaction([self.mnemonicStore, self.stateStore], "readwrite");
+        } catch (_) {
+          reject(new Error("wallet smoke failed"));
+          return;
+        }
+        transaction.objectStore(self.mnemonicStore).delete(name);
+        transaction.objectStore(self.stateStore).delete(name);
+        transaction.oncomplete = resolve;
+        transaction.onabort = function () { reject(new Error("wallet smoke failed")); };
+        transaction.onerror = function () {};
+      });
+      var pair = await self.readPair(name);
+      if (pair.mnemonic !== undefined || pair.state !== undefined) throw new Error("wallet smoke failed");
+    },
+
     run: async function (mod) {
       var name = this.namePrefix + this.uuid();
-      var key = this.keyPrefix + name;
-      var ownsKey = false;
+      var ownsPair = false;
       var failed = false;
       var wallet = null;
       var generated = null;
@@ -71,10 +145,9 @@ mergeInto(LibraryManager.library, {
       var hex = null;
 
       try {
-        if (typeof localStorage === "undefined" || !localStorage) throw new Error("wallet smoke unavailable");
         // Never overwrite or later delete a wallet that already exists.
-        if (localStorage.getItem(key) !== null) throw new Error("wallet smoke failed");
-        ownsKey = true;
+        var existing = await this.readPair(name);
+        if (existing.mnemonic !== undefined || existing.state !== undefined) throw new Error("wallet smoke failed");
 
         generated = this.callPure(mod, "generate_mnemonic", []);
         if (typeof generated.value !== "string" || generated.value.length === 0) throw new Error("wallet smoke failed");
@@ -84,8 +157,6 @@ mergeInto(LibraryManager.library, {
         generated = null;
 
         derived = this.callPure(mod, "mnemonic_to_seed", [mnemonic]);
-        // The phrase is no longer needed once derivation returns.
-        mnemonic = null;
         if (typeof derived.hex !== "string" || !/^[0-9a-fA-F]{128}$/.test(derived.hex)) throw new Error("wallet smoke failed");
         hex = derived.hex;
         // Drop the payload object field and reference before the seed copy.
@@ -94,6 +165,14 @@ mergeInto(LibraryManager.library, {
         seed = Uint8Array.from(hex.match(/../g), function (byte) { return parseInt(byte, 16); });
         hex = null;
         if (!seed || seed.length !== 64) throw new Error("wallet smoke failed");
+
+        if (typeof mod.provision_wallet !== "function") throw new Error("wallet smoke unavailable");
+        await mod.provision_wallet(mnemonic, name);
+        // Provisioning committed both records atomically; only now does cleanup
+        // own this pair.
+        ownsPair = true;
+        // The phrase is no longer needed once the pair is provisioned.
+        mnemonic = null;
 
         try {
           wallet = await mod.open_wallet(seed, name);
@@ -131,9 +210,9 @@ mergeInto(LibraryManager.library, {
             failed = true;
           }
         }
-        if (ownsKey) {
+        if (ownsPair) {
           try {
-            localStorage.removeItem(key);
+            await this.deletePair(name);
           } catch (_) {
             failed = true;
           }
