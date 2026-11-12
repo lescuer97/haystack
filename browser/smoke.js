@@ -4,12 +4,24 @@ import {installSwapFaults} from "./test-faults.js";
 import {runSpilmanNegatives} from "./spilman-negative.js";
 import {runLiveChannels} from "./live-channels.js";
 import {runFaultScenarios} from "./fault-scenarios.js";
+import {
+  USER_WALLET_NAME,
+  createWallet,
+  deleteMnemonic,
+  deleteState,
+  deleteWallet,
+  generateMnemonic,
+  readWallet,
+  setStateData,
+  writeState,
+} from "./test-wallet.js";
 
 export async function runSmoke(app) {
   await app.ready;
   const checks = [];
   const failures = [];
   let completed = false;
+  let cleanupFailed = false;
   window.browserTestProgress = checks;
   const recordFailure = failure => {
     // One entry per scenario+invariant; known defects are reported, never
@@ -24,14 +36,21 @@ export async function runSmoke(app) {
   const call = async (name, args = []) => ok(await app.call(name,args));
   const faults = installSwapFaults();
   const v = await fetch("spilman_vectors.json").then(r => r.json());
-  // Fresh identities let the suite run repeatedly against the same fake mint
-  // without reusing deterministic blinded outputs from an earlier test run.
-  const seed = crypto.getRandomValues(new Uint8Array(64));
-  const receiverSeed = crypto.getRandomValues(new Uint8Array(64));
   const suffix = crypto.randomUUID().replaceAll("-", "");
   const name = `smoke-${suffix}`;
   const secondName = `receiver-${suffix}`;
+  const canaryName = `canary-${suffix}`;
+  const partialName = `partial-${suffix}`;
+  const missingName = `missing-${suffix}`;
+  const persistName = `persist-${suffix}`;
+  const sentinelName = `sentinel-${suffix}`;
+  const owned = [name, secondName, canaryName, partialName, missingName, persistName, sentinelName];
+  let seed = null;
+  let receiverSeed = null;
   let second = null;
+  let legacyAvailable = false;
+  let legacyKey = null;
+
   try {
     const mnemonic = (await pure("generate_mnemonic")).value;
     assert(mnemonic.split(" ").length === 12, "Browser CSPRNG generates BIP-39 mnemonic");
@@ -84,6 +103,11 @@ export async function runSmoke(app) {
     assert(refunded.reduce((sum,p) => sum+p.amount,0) === 100, "Expired sender refund matches native fixture");
     await runSpilmanNegatives({app, pure, text, assert, v});
 
+    // Disposable wallets are provisioned explicitly: a fresh mnemonic, its
+    // seed, and one atomic pair of IndexedDB records under a unique test name.
+    seed = await createWallet(name);
+    receiverSeed = await createWallet(secondName);
+
     await app.open(seed,name);
     assert((await call("list_mints")).mints.length === 0, "Shared wallet core opens browser database offline");
     let locked=false;
@@ -93,19 +117,35 @@ export async function runSmoke(app) {
     assert((await app.call("receive",[token])).status === 18, "Unknown-mint token is rejected before networking");
     assert((await app.call("get_active_keyset_info_json",[v.mint_url])).status === 11, "Wallet-backed Spilman helpers enforce mint approval");
     await app.close();
-    const key=`cdk_wallet_browser_v1_${name}`;
-    const snapshot=localStorage.getItem(key);
+
+    const snapshot = (await readWallet(name)).state;
+    if (!snapshot) throw new Error("wallet state missing before integrity checks");
     let wrongSeed=false;
     try { await app.open(new Uint8Array(64).fill(99),name); } catch { wrongSeed=true; }
-    assert(wrongSeed && localStorage.getItem(key) === snapshot, "Wrong seed is rejected without mutating storage");
+    const afterWrongSeed = (await readWallet(name)).state;
+    assert(wrongSeed && afterWrongSeed && afterWrongSeed.data === snapshot.data, "Wrong seed is rejected without mutating storage");
     await app.open(seed,name);
 
+    // A failed IndexedDB write must surface as a failure and leave the committed
+    // record (including its revision) untouched.
     const mint=location.origin;
-    const realSet=Storage.prototype.setItem;
-    Storage.prototype.setItem=function(k,value) { if (k === key) throw new DOMException("Injected quota failure","QuotaExceededError"); return realSet.call(this,k,value); };
+    const realPut=IDBObjectStore.prototype.put;
+    let injected=false;
+    IDBObjectStore.prototype.put=function(value,key) {
+      if (this.name === "states" && key === name && !injected) {
+        injected=true;
+        throw new DOMException("Injected quota failure","QuotaExceededError");
+      }
+      return realPut.call(this,value,key);
+    };
     let failedWrite;
-    try { failedWrite=await app.call("add_mint",[mint]); } finally { Storage.prototype.setItem=realSet; }
+    const beforeFailure=(await readWallet(name)).state;
+    try { failedWrite=await app.call("add_mint",[mint]); } finally { IDBObjectStore.prototype.put=realPut; }
+    const afterFailure=(await readWallet(name)).state;
     assert(failedWrite.status !== 0, "Storage write failure is reported, not silently accepted");
+    assert(beforeFailure && afterFailure
+      && afterFailure.revision === beforeFailure.revision
+      && afterFailure.data === beforeFailure.data, "Storage write failure persists nothing");
     await call("add_mint",[mint]);
     const active=await call("get_active_keyset_info_json",[mint]);
     assert(JSON.parse(active.value).keys !== undefined, "Browser Fetch retrieves approved mint keyset");
@@ -130,9 +170,9 @@ export async function runSmoke(app) {
     // A partial or incompatible v1 record must fail before any mutation and
     // remain byte-for-byte unchanged. This runs while real proofs/history are
     // present, so silently filling missing collections would lose data.
-    const intact=localStorage.getItem(key);
-    if (intact === null) throw new Error("wallet storage missing before integrity checks");
     await app.close();
+    const intact=(await readWallet(name)).state;
+    if (!intact) throw new Error("wallet storage missing before integrity checks");
     const corruptions=[
       ["missing proofs", value => { delete value.proofs; }],
       ["missing counters", value => { delete value.counters; }],
@@ -140,38 +180,144 @@ export async function runSmoke(app) {
       ["incompatible version", value => { value.version=2; }],
     ];
     for (const [label,mutate] of corruptions) {
-      const value=JSON.parse(intact);
+      const value=JSON.parse(intact.data);
       mutate(value);
       const raw=JSON.stringify(value);
-      localStorage.setItem(key,raw);
+      await setStateData(name, raw);
       let rejected=false;
       try { await app.open(seed,name); } catch { rejected=true; }
-      assert(rejected && localStorage.getItem(key) === raw, `Corrupt v1 storage is rejected without overwrite (${label})`);
+      const stored=(await readWallet(name)).state;
+      assert(rejected && stored && stored.data === raw, `Corrupt v1 storage is rejected without overwrite (${label})`);
     }
-    const truncated=intact.slice(0,Math.floor(intact.length/2));
-    localStorage.setItem(key,truncated);
+    const truncated=intact.data.slice(0,Math.floor(intact.data.length/2));
+    await setStateData(name, truncated);
     let truncatedRejected=false;
     try { await app.open(seed,name); } catch { truncatedRejected=true; }
-    assert(truncatedRejected && localStorage.getItem(key) === truncated, "Truncated v1 storage is rejected without overwrite");
-    localStorage.setItem(key,intact);
+    const afterTruncated=(await readWallet(name)).state;
+    assert(truncatedRejected && afterTruncated && afterTruncated.data === truncated, "Truncated v1 storage is rejected without overwrite");
+    await setStateData(name, intact.data);
     await app.open(seed,name);
     assert((await call("list_mints")).mints.includes(mint), "A complete valid v1 record remains loadable with its data");
+    await app.close();
+
+    // A stale compare-and-swap revision must be rejected, and the committed
+    // record must keep both its data and its revision.
+    const current=(await readWallet(name)).state;
+    if (!current) throw new Error("wallet storage missing before revision check");
+    let conflicted=false;
+    try { await writeState(name, current.revision + 1, current.data); } catch (error) { conflicted=/conflict/i.test(String(error.message || error)); }
+    const afterConflict=(await readWallet(name)).state;
+    assert(conflicted && afterConflict && afterConflict.revision === current.revision && afterConflict.data === current.data,
+      "A stale revision write is rejected without changing state");
+
+    // Ordinary open never provisions. Both records absent is NotInitialized;
+    // exactly one record is Incomplete.
+    let missingRejected=false;
+    try { await app.open(new Uint8Array(64).fill(7),missingName); } catch (error) { missingRejected=/not initialized/i.test(String(error.message || error)); }
+    const missingPair=await readWallet(missingName);
+    assert(missingRejected && missingPair.mnemonic === null && missingPair.state === null,
+      "Opening an unprovisioned wallet fails without creating records");
+    const partialSeed=await createWallet(partialName);
+    await deleteMnemonic(partialName);
+    let partialRejected=false;
+    try { await app.open(partialSeed,partialName); } catch (error) { partialRejected=/incomplete/i.test(String(error.message || error)); }
+    partialSeed.fill(0);
+    assert(partialRejected, "A wallet with only one of its two records is rejected as incomplete");
+
+    // Provisioning is explicit, atomic and never replaces a wallet.
+    const canarySeed=await createWallet(canaryName);
+    const beforeReplacement=await readWallet(canaryName);
+    assert(typeof beforeReplacement.mnemonic === "string" && beforeReplacement.mnemonic.split(" ").length === 12,
+      "Wallet mnemonic is stored as plaintext English words");
+    let replaced=false;
+    try { await app.provision(generateMnemonic(),canaryName); } catch { replaced=true; }
+    const afterReplacement=await readWallet(canaryName);
+    assert(replaced
+      && afterReplacement.mnemonic === beforeReplacement.mnemonic
+      && afterReplacement.state && beforeReplacement.state
+      && afterReplacement.state.data === beforeReplacement.state.data,
+      "Provisioning never replaces an existing wallet");
+    await app.open(canarySeed,canaryName);
+    assert((await call("list_mints")).mints.length === 0, "Provisioned canary wallet opens empty");
+    await app.close();
+    canarySeed.fill(0);
+
+    // Durable storage is requested only for the fixed user wallet. This fixture
+    // never creates, rewrites or deletes the real user wallet: a test-only probe
+    // exercises the production policy and its denial path without touching any
+    // wallet record, and disposable provisioning proves the negative path.
+    const userBefore=await readWallet(USER_WALLET_NAME);
+    try {
+      legacyAvailable=typeof localStorage !== "undefined" && localStorage !== null;
+      legacyKey=`cdk_wallet_browser_v1_canary-${suffix}`;
+      if (legacyAvailable) localStorage.setItem(legacyKey,"fixture-canary");
+    } catch { legacyAvailable=false; }
+    const storagePrototype=Object.getPrototypeOf(navigator.storage);
+    assert(typeof storagePrototype.persist === "function", "StorageManager.persist is available");
+    const originalPersist=storagePrototype.persist;
+    let persistCalls=0;
+    storagePrototype.persist=function() { persistCalls+=1; return Promise.resolve(false); };
+    try {
+      assert((await app.persistentStorageProbe(USER_WALLET_NAME)) === false,
+        "User wallet provisioning requests persistence and tolerates denial");
+      assert(persistCalls === 1, "The user wallet policy requests persistent storage once");
+      assert((await app.persistentStorageProbe(persistName)) === true,
+        "Disposable wallet names never request persistent storage");
+      assert(persistCalls === 1, "The disposable policy probe never calls persist");
+      await app.provision(generateMnemonic(),persistName);
+      assert(persistCalls === 1, "Disposable provisioning never requests persistent storage");
+    } finally {
+      storagePrototype.persist=originalPersist;
+    }
+    const userAfter=await readWallet(USER_WALLET_NAME);
+    assert(userAfter.mnemonic === userBefore.mnemonic
+      && (userAfter.state === null
+        ? userBefore.state === null
+        : userBefore.state !== null
+          && userAfter.state.revision === userBefore.state.revision
+          && userAfter.state.data === userBefore.state.data),
+      "The storage-policy fixture never creates, rewrites or deletes the user wallet");
+    if (legacyAvailable) {
+      assert(localStorage.getItem(legacyKey) === "fixture-canary",
+        "Legacy localStorage canary survives wallet storage tests");
+    }
+
+    // A mnemonic-only wallet is never treated as absent: provisioning it must be
+    // rejected and leave the phrase untouched. The test-only cleanup helper
+    // refuses the fixed user wallet for the same reason.
+    const sentinelSeed=await createWallet(sentinelName);
+    await deleteState(sentinelName);
+    sentinelSeed.fill(0);
+    const sentinel=await readWallet(sentinelName);
+    assert(typeof sentinel.mnemonic === "string"
+      && sentinel.mnemonic.split(" ").length === 12
+      && sentinel.state === null,
+      "A mnemonic-only wallet is visible as initialized and is not treated as absent");
+    let sentinelProvisioned=false;
+    try { await app.provision(generateMnemonic(),sentinelName); } catch { sentinelProvisioned=true; }
+    const sentinelAfter=await readWallet(sentinelName);
+    assert(sentinelProvisioned && sentinelAfter.mnemonic === sentinel.mnemonic && sentinelAfter.state === null,
+      "Provisioning a mnemonic-only wallet is rejected without replacing its mnemonic");
 
     await runLiveChannels({app, pure, text, assert});
     await runFaultScenarios({assert, faults, recordFailure});
 
     completed = true;
-    return {ok: completed && failures.length === 0, completed, checks, failures, count: checks.length, failureCount: failures.length};
   } catch (error) {
     return {ok:false, completed:false, checks, failures, count:checks.length, failureCount:failures.length, error:String(error.message || error)};
   } finally {
     faults.restore();
-    if (second) { await second.close(); second.free(); }
-    await app.close();
-    // Only generated test names, never user wallet keys.
-    localStorage.removeItem(`cdk_wallet_browser_v1_${name}`);
-    localStorage.removeItem(`cdk_wallet_browser_v1_${secondName}`);
-    seed.fill(0);
-    receiverSeed.fill(0);
+    if (second) { try { await second.close(); } catch {} try { second.free(); } catch {} }
+    try { await app.close(); } catch {}
+    // Only generated test names, never a real wallet. Each deletion targets
+    // exactly one wallet's two records and verifies that both are gone.
+    for (const ownedName of owned) {
+      try { await deleteWallet(ownedName); } catch { cleanupFailed=true; }
+    }
+    if (seed) seed.fill(0);
+    if (receiverSeed) receiverSeed.fill(0);
+    if (legacyAvailable && legacyKey) { try { localStorage.removeItem(legacyKey); } catch {} }
   }
+
+  return {ok: completed && failures.length === 0 && !cleanupFailed, completed, cleanupFailed, checks, failures, count: checks.length, failureCount: failures.length};
 }

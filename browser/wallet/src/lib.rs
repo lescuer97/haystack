@@ -318,6 +318,27 @@ pub async fn open_wallet(seed: &[u8], name: &str) -> Result<BrowserWallet, JsVal
     })
 }
 
+/// Provision an existing empty wallet name with a plaintext English BIP-39
+/// mnemonic. Both records are written atomically, or nothing is written at all.
+/// This is never called automatically: the game does not create a persistent
+/// wallet on startup.
+#[wasm_bindgen]
+pub async fn provision_wallet(mnemonic: &str, name: &str) -> Result<(), JsValue> {
+    browser_platform::provision_wallet(mnemonic, name)
+        .await
+        .map_err(|e| js_error(&failure(e).to_string()))
+}
+
+/// Test-only: exercises the real persistent-storage policy and denial path for
+/// a wallet name without reading, writing or creating any wallet record. The
+/// browser fixture uses it so it never touches the real user wallet.
+#[wasm_bindgen]
+pub async fn probe_persistent_storage(name: &str) -> Result<bool, JsValue> {
+    browser_platform::probe_persistent_storage(name)
+        .await
+        .map_err(|e| js_error(&failure(e).to_string()))
+}
+
 #[wasm_bindgen]
 impl BrowserWallet {
     pub fn startup_reports(&self) -> String {

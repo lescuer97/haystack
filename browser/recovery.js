@@ -1,4 +1,4 @@
-// Document-destruction recovery scenarios driven by browser/test.mjs.
+// Document-destruction recovery scenarios driven by browser/wallet-browser-test.mjs.
 //
 // Every function runs in the current document. The Node runner starts an
 // operation, waits for the requested fault boundary, then navigates away
@@ -6,10 +6,10 @@
 // inspects the persisted wallet after startup recovery.
 import {open_wallet} from "./wallet/cdk_wallet_browser.js";
 import {installSwapFaults} from "./test-faults.js";
+import {createWallet, deleteWallet, readWallet} from "./test-wallet.js";
 
 const faults = installSwapFaults();
 const MINT = location.origin;
-const walletKey = name => `cdk_wallet_browser_v1_${name}`;
 const sumBalances = balances => balances.reduce((total, entry) => total + Number(entry.sats), 0);
 
 const json = async (operation, args = []) => {
@@ -48,24 +48,23 @@ const currentBalance = async () => {
   const balances = await must("list_balances");
   return balances.balances.reduce((total, entry) => total + Number(entry.sats), 0);
 };
-const unspentOneCount = name => {
-  const raw = localStorage.getItem(walletKey(name));
-  const state = raw ? JSON.parse(raw) : {};
-  return Object.values(state.proofs || {})
+const unspentOneCount = async name => {
+  const {state} = await readWallet(name);
+  const record = state ? JSON.parse(state.data) : {};
+  return Object.values(record.proofs || {})
     .filter(proof => proof.state === "UNSPENT" && proof.proof.amount === 1).length;
 };
 // Move the four 1-sat refill proofs to a sink wallet so an odd 37-sat send
 // cannot be composed directly and must perform an online /v1/swap.
-async function shapeForSwap(name, seedHex) {
-  const ones = unspentOneCount(name);
+async function shapeForSwap(name) {
+  const ones = await unspentOneCount(name);
   if (ones !== 4) throw new Error(`expected four 1-sat proofs for shaping, found ${ones}`);
   const drained = [];
   for (let index = 0; index < ones; index += 1) {
     drained.push(await must("send", [MINT, "1", "0"]));
   }
-  const sinkName = `${name.slice(0, name.lastIndexOf("-"))}-sink`;
-  const sinkSeed = parseSeed(seedHex);
-  for (let index = 0; index < sinkSeed.length; index += 1) sinkSeed[index] ^= 0x5a;
+  const sinkName = `${name}-sink`;
+  const sinkSeed = await createWallet(sinkName);
   let sink;
   try {
     sink = await open_wallet(sinkSeed, sinkName);
@@ -102,7 +101,7 @@ async function waitForFault(armed, boundary) {
 export async function startSendBeforeRequest(name, seedHex) {
   await openApp(name, seedHex);
   await fund();
-  const shaped = await shapeForSwap(name, seedHex);
+  const shaped = await shapeForSwap(name);
   const armed = faults.arm("before");
   const pending = walletApp.call("send", [MINT, "37", "0"]);
   pending.catch(() => {});
@@ -124,7 +123,7 @@ export async function startReceiveBeforeRequest(name, seedHex) {
 export async function startSendAfterCommitHold(name, seedHex) {
   await openApp(name, seedHex);
   await fund();
-  const shaped = await shapeForSwap(name, seedHex);
+  const shaped = await shapeForSwap(name);
   const armed = faults.arm("hold");
   const pending = walletApp.call("send", [MINT, "37", "0"]);
   pending.catch(() => {});
@@ -266,6 +265,6 @@ export async function redeemTokenResult(recipientName, seedHex, token) {
   }
 }
 
-export function removeWallet(name) {
-  localStorage.removeItem(walletKey(name));
+export async function removeWallet(name) {
+  await deleteWallet(name);
 }

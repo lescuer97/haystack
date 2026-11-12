@@ -380,7 +380,8 @@ temporary secret buffers where possible. JS strings/GC cannot offer the same
 zeroization guarantees as owned native byte buffers; state that limitation.
 
 Define seed import/backup/storage policy. Do not place seed material or bearer
-tokens in URLs, analytics, console output, or unprotected localStorage. Treat XSS
+tokens in URLs, analytics, console output, or unprotected origin storage (IndexedDB
+or localStorage). Treat XSS
 and third-party scripts as wallet compromise; restrict deployed scripts/CSP and
 review origin, HTTPS, and supply-chain requirements. A worker is not a security
 boundary against malicious same-origin application code.

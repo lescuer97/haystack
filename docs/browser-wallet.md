@@ -46,6 +46,11 @@ testing). The pinned upstream activation step is detached and verified at
 configuration time; if that upstream graph changes, configuration fails instead
 of running an installer.
 
+Settings and flat content entries are stored in IndexedDB through
+`browser/game-storage.js`. The C bridge, memory ownership rules, validation
+limits and current limitations are documented in
+[browser storage](browser-storage.md).
+
 Serve the entire directory, not just a `.wasm` file:
 
 ```sh
@@ -55,8 +60,8 @@ zig build run -Dplatform=wasm
 Open <http://127.0.0.1:8000>. The default page is the game. A non-interactive
 wallet test fixture is only installed for test targets, at `/wallet-test.html`.
 Use HTTPS for deployment; localhost HTTP is sufficient for local testing. Web
-Crypto, WebAssembly, localStorage, and Web Locks are required. Opening is
-refused when locking/storage cannot be established.
+Crypto, WebAssembly, IndexedDB, and Web Locks are required. Opening is refused
+when locking/storage cannot be established.
 
 The browser graph is selected only by `-Dplatform=wasm`. A Wasm `-Dtarget` alone
 (including `wasm32-emscripten`, `wasm64-*` or WASI) is rejected; use the explicit
@@ -83,13 +88,13 @@ from its finite in-memory test setup. Do not deploy this test server publicly.
 With that manually started server, the Node runner can also run independently:
 
 ```sh
-node browser/test.mjs
+node browser/wallet-browser-test.mjs
 ```
 
 For a different port/browser:
 
 ```sh
-CHROMIUM=/path/to/chromium node browser/test.mjs http://127.0.0.1:PORT/?smoke
+CHROMIUM=/path/to/chromium node browser/wallet-browser-test.mjs http://127.0.0.1:PORT/?smoke
 ```
 
 You can also visit <http://127.0.0.1:18787/wallet-test.html?smoke> manually. The
@@ -98,9 +103,10 @@ URL to the non-interactive `/wallet-test.html?smoke` fixture and leaves the
 Python mint URL detection unchanged. The fixture reports its browser checks; the
 Node runner additionally tests actual separate tabs, document reload, and
 document destruction after interrupted send/receive operations. It uses a fresh
-Chromium profile and removes only generated test-wallet keys. Deterministic
-cryptographic vectors are public fixtures, and network test seeds are random so
-repeated runs do not reuse mint outputs. Fault injection is a test-only wrapper
+Chromium profile and deletes only generated test-wallet records (after closing
+their handles, with the deletion verified). Deterministic cryptographic vectors
+are public fixtures, and each test wallet is provisioned from a fresh random
+mnemonic so repeated runs do not reuse mint outputs. Fault injection is a test-only wrapper
 around `fetch` that matches one armed same-origin `POST /v1/swap` at a time and
 never logs request bodies.
 
@@ -113,6 +119,10 @@ zig build test
 ```
 
 ### Results verified on this machine
+
+These figures were recorded before the wallet storage moved from localStorage to
+the dedicated IndexedDB database. Re-run the Chromium suite with
+`zig build test -Dplatform=wasm` to refresh them.
 
 | Check | Result |
 | --- | --- |
@@ -185,8 +195,15 @@ Chromium shutdown are bounded (SIGTERM then SIGKILL escalation); CDP disconnect
 rejects pending requests, and the JSON artifact is written even when the
 screenshot or connection fails. A test-only `BROWSER_TEST_KILL_MS` hook kills the
 browser mid-run to verify this bounded path.
-Conformance tests use an in-memory substitute for the browser storage calls;
-actual localStorage, locking and injected quota failures run in Chromium.
+Conformance tests use an in-memory substitute for the browser IndexedDB calls;
+actual IndexedDB, locking and injected quota failures run in Chromium. The
+IndexedDB layer also has a Node-only harness that needs neither Chromium nor the
+Wasm bundle:
+
+```sh
+node browser/wallet-store-test.mjs
+zig build test-storage -Dplatform=wasm
+```
 
 ## Implementation and API
 
@@ -200,9 +217,12 @@ actual localStorage, locking and injected quota failures run in Chromium.
 
 The original synchronous wallet C exports remain native-only. All **41 functional
 operations** (15 wallet lifecycle/network helpers, 3 mnemonic helpers, and 23 pure
-Spilman/token helpers) have browser adapters. The 6 C deallocation functions are
-internal ownership details, not JavaScript operations. This is **not a binary-
-compatible C ABI**: callers use async JS methods and owned JSON results.
+Spilman/token helpers) have browser adapters. The browser adapter adds one
+browser-only operation, `provision_wallet(mnemonic, name)`, which has no native C
+counterpart because desktop storage is created by the SQLite open path. The 6 C
+deallocation functions are internal ownership details, not JavaScript operations.
+This is **not a binary-compatible C ABI**: callers use async JS methods and owned
+JSON results.
 
 The most important runtime adaptation discovered by actually running the app:
 CDK's persistent rate limiter uses `tokio::task::spawn_local`, which traps without
@@ -211,20 +231,72 @@ owns a **`LocalSet`**, cooperatively polled through the browser's future executo
 This preserves the limiter without a multithreaded runtime, Tokio networking,
 Mio, an upstream CDK fork, or blocking the browser with `block_on`.
 
-The database implements the complete pinned `WalletDatabase` trait over one
-versioned localStorage record per named wallet. It persists seed identity (a
-domain-separated fingerprint, **not the seed**), counters, quotes, proofs,
-operation ownership, sagas, KV entries, and P2PK metadata. A lifetime Web Lock
-protects each wallet. Errors are propagated, corrupt state is not replaced with
-an empty wallet, and all mutations read/check/save the current record. CDK's
-conformance suite caught a derivation-index upsert issue; the implementation now
-preserves the old index when reconstructed proof metadata omits it.
+The database implements the complete pinned `WalletDatabase` trait over the
+dedicated `haystack-wallet` IndexedDB database, separate from the game's
+`haystack-game` database. Each wallet name has exactly two records (see
+[Wallet storage and provisioning](#wallet-storage-and-provisioning)). It
+persists seed identity (a domain-separated fingerprint, **not the seed**),
+counters, quotes, proofs, operation ownership, sagas, KV entries, and P2PK
+metadata. Every read opens a fresh transaction; a write resolves only when its
+transaction completes. Mutations are compare-and-swap on a record revision and
+are serialized per handle, while a lifetime Web Lock excludes other tabs.
+Errors are propagated, corrupt or partial state is not replaced with an empty
+wallet, and a stale writer is rejected instead of overwriting committed state.
+CDK's conformance suite caught a derivation-index upsert issue; the implementation
+now preserves the old index when reconstructed proof metadata omits it.
+
+## Wallet storage and provisioning
+
+**Use test funds only.** The records live in origin storage, are readable by any
+same-origin script, and are not encrypted.
+
+| Database | Object store | Key | Value |
+| --- | --- | --- | --- |
+| `haystack-wallet` | `mnemonics` | wallet name | plaintext English BIP-39 words |
+| `haystack-wallet` | `states` | wallet name | `{"revision": n, "data": "<Store v1 JSON>"}` |
+
+Opening never creates records. Both records absent reports that the wallet is
+not initialized, exactly one reports incomplete storage, and both present are
+validated: the stored words must be a valid English BIP-39 phrase whose derived
+seed matches the supplied seed, and the state fingerprint must match that seed.
+A wrong seed, unsupported version, truncated JSON, a partial `Store`, or an
+unknown `Store` field is rejected before anything is written. Unknown fields are
+rejected rather than tolerated because this writer cannot preserve them: serde
+would drop them on the next mutation. A write whose expected revision is stale is
+rejected with a concurrent-update error.
+
+`provision_wallet(mnemonic, name)` is the only creation path. It validates the
+phrase, holds the wallet's Web Lock, confirms both records are absent, and writes
+both in one IndexedDB transaction that uses `add` for each key. It never replaces
+an existing wallet, and nothing provisions automatically at game startup. The
+single persistent user wallet is named `haystack-user`; only provisioning that
+name calls `navigator.storage.persist()`, and a denial is a warning while the
+wallet is still stored. There is no player-facing or production deletion API.
+
+The mandatory startup smoke is still disposable: it provisions a unique
+`game-smoke-*` wallet, opens it, verifies it is empty, closes and frees it, then
+deletes exactly its own two records and verifies both are gone before reporting
+success. Browser test fixtures use the test-only `browser/wallet-store.js`
+helper for the same scoped deletion. Neither path deletes the database, clears an
+object store, or touches the game's database or pre-existing localStorage
+entries. The fixed
+`haystack-user` wallet is never provisioned, opened, rewritten or deleted by the
+general browser fixture: the persistence policy and its denial path are exercised
+through a test-only probe that does not touch any wallet record, and the cleanup
+helper refuses `haystack-user` even if a fixture passes it by mistake. A
+mnemonic-only record is treated as initialized, never as absent, and is preserved
+in regression coverage. A unique localStorage canary is checked where the origin
+allows localStorage. There is no migration from the previous localStorage
+layout; a fresh `haystack-wallet` pair must be provisioned explicitly.
 
 For programmatic usage, import `walletApp` from `app.js`, or the low-level
-generated `wallet/cdk_wallet_browser.js` module. The UI uses a serialized queue:
+generated `wallet/cdk_wallet_browser.js` module. A wallet must be provisioned
+once with `provision_wallet(mnemonic, name)` before `open_wallet` accepts it. The
+UI uses a serialized queue:
 
 ```js
 await walletApp.ready;
+await walletApp.provision(mnemonic, "my-wallet"); // explicit; test adapter only
 await walletApp.open(seed64Uint8Array, "my-wallet");
 const approved = await walletApp.call("add_mint", ["https://mint.example"]);
 const balances = await walletApp.call("list_balances");
@@ -265,18 +337,21 @@ field is secret material; never log it. Generated TypeScript declarations expose
   memories. The game itself starts a disposable wallet bridge through
   `browser/game-wallet.js` *before* creating its window or main loop: an
   Emscripten JS library dynamically imports the async wallet adapter, generates
-  a fresh mnemonic, derives its 64-byte seed, opens a fresh uniquely named
-  browser wallet, verifies empty startup reports and balances, closes/frees it,
-  and removes only the storage key it created. No mint or network call is
-  involved. A single-shot Zig continuation starts the game only on success; any
-  import, initialization, storage or cleanup failure shows `Unable to start
-  game.` and never creates a game context or frame loop. The game exposes no
-  public `Module` snapshot or status API; startup state is internal. Wallet
-  controls remain in the wallet module and are exercised only by the
-  non-interactive `/wallet-test.html` test fixture.
-- LocalStorage rewrites the whole record and blocks briefly while serializing.
-  An IndexedDB backend may be appropriate for larger wallets. Do not silently
-  swap to a weaker locking or persistence model when platform features are absent.
+  a fresh mnemonic, derives its 64-byte seed, provisions a uniquely named
+  disposable pair in `haystack-wallet`, opens it, verifies empty startup reports
+  and balances, closes/frees it, and deletes only its own two records (verifying
+  both are gone). It never creates, opens or deletes the persistent user wallet,
+  and it never requests durable storage. No mint or network call is involved. A
+  single-shot Zig continuation starts the game only on success; any import,
+  initialization, storage or cleanup failure shows `Unable to start game.` and
+  never creates a game context or frame loop. The game exposes no public
+  `Module` snapshot or status API; startup state is internal. Wallet controls
+  remain in the wallet module and are exercised only by the non-interactive
+  `/wallet-test.html` test fixture.
+- IndexedDB writes commit per transaction and are asynchronous, but the whole
+  serialized `Store` is still rewritten on every mutation. Do not silently swap
+  to a weaker locking, compare-and-swap or persistence model when platform
+  features are absent; opening fails closed instead.
 
 ### Known recovery defects reported by browser tests
 

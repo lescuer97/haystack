@@ -7,9 +7,9 @@
 // wallets. All secrets stay in this function scope; nothing is persisted except
 // by the wallet database itself.
 import {open_wallet} from "./wallet/cdk_wallet_browser.js";
+import {createWallet, deleteWallet} from "./test-wallet.js";
 
 const nowSeconds = () => Math.floor(Date.now() / 1000);
-const walletKey = name => `cdk_wallet_browser_v1_${name}`;
 
 export async function runLiveChannels({app, pure, text, assert}) {
   const mint = location.origin;
@@ -19,11 +19,8 @@ export async function runLiveChannels({app, pure, text, assert}) {
     charlie: `channel-charlie-${suffix}`,
     refund: `channel-refund-${suffix}`,
   };
-  const seeds = {
-    alice: crypto.getRandomValues(new Uint8Array(64)),
-    charlie: crypto.getRandomValues(new Uint8Array(64)),
-    refund: crypto.getRandomValues(new Uint8Array(64)),
-  };
+  // Each wallet is provisioned explicitly with its own mnemonic before opening.
+  const seeds = {};
   const wallets = {};
   const json = async (wallet, operation, args = []) =>
     JSON.parse(await wallet.call(operation, JSON.stringify(args)));
@@ -41,6 +38,8 @@ export async function runLiveChannels({app, pure, text, assert}) {
   const sumAmounts = proofs => proofs.reduce((total, proof) => total + proof.amount, 0);
 
   try {
+    seeds.alice = await createWallet(names.alice);
+    seeds.charlie = await createWallet(names.charlie);
     wallets.alice = await open_wallet(seeds.alice, names.alice);
     wallets.charlie = await open_wallet(seeds.charlie, names.charlie);
     for (const wallet of [wallets.alice, wallets.charlie]) await must(wallet, "add_mint", [mint]);
@@ -115,6 +114,7 @@ export async function runLiveChannels({app, pure, text, assert}) {
     assert(aliceBalance.some(entry => entry.sats === "30"), "Live close leaves the sender wallet with 30 sats");
 
     // --- Live post-expiry refund -----------------------------------------
+    seeds.refund = await createWallet(names.refund);
     wallets.refund = await open_wallet(seeds.refund, names.refund);
     await must(wallets.refund, "add_mint", [mint]);
 
@@ -188,7 +188,7 @@ export async function runLiveChannels({app, pure, text, assert}) {
       try { await wallet.close(); } catch {}
       try { wallet.free(); } catch {}
     }
-    for (const name of Object.values(names)) localStorage.removeItem(walletKey(name));
-    for (const seed of Object.values(seeds)) seed.fill(0);
+    for (const name of Object.values(names)) await deleteWallet(name);
+    for (const seed of Object.values(seeds)) if (seed) seed.fill(0);
   }
 }

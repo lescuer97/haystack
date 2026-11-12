@@ -12,16 +12,10 @@ const camera = @import("camera.zig");
 const input = @import("input.zig");
 const world = @import("world.zig");
 const menu = @import("menu.zig");
+const settings_mod = @import("settings.zig");
 
-/// Debug view toggles. Tiles are never filled with colour; only the grid lines
-/// and chunk borders are drawn. On by default in Debug builds.
-pub const DebugSettings = struct {
-    tile_grid: bool = builtin.mode == .debug,
-    chunk_borders: bool = builtin.mode == .debug,
-};
-
-/// Player-configurable settings. Debug view toggles live under `.debug`.
-pub const Settings = struct { debug: DebugSettings = .{} };
+pub const DebugSettings = settings_mod.DebugSettings;
+pub const Settings = settings_mod.Settings;
 
 pub const GameState = struct {
     world: world.World,
@@ -33,6 +27,18 @@ pub const GameState = struct {
     /// window. The view is calculated from the starting camera, then discarded;
     /// only its chunk count is needed here.
     pub fn init(alloc: std.mem.Allocator, initial_vw: f32, initial_vh: f32) !GameState {
+        return initWithSettings(alloc, initial_vw, initial_vh, .{});
+    }
+
+    /// Build persistent state with settings loaded from disk or browser
+    /// storage. `init` is the all-defaults convenience wrapper used by tests
+    /// and by callers that have no configuration source.
+    pub fn initWithSettings(
+        alloc: std.mem.Allocator,
+        initial_vw: f32,
+        initial_vh: f32,
+        settings: Settings,
+    ) !GameState {
         const cam = camera.Camera{};
         const initial_view = try camera.calculate(cam, initial_vw, initial_vh);
         const initial_ring = initial_view.chunks.expanded(world.PREFETCH_MARGIN_CHUNKS);
@@ -45,7 +51,7 @@ pub const GameState = struct {
             .world = try world.World.init(alloc, initial_capacity),
             .camera = cam,
             .menu = .{ .opened = false, .currentPage = .Main },
-            .settings = .{ .debug = .{} },
+            .settings = settings,
         };
     }
 

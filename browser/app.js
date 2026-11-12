@@ -1,7 +1,7 @@
-import init, {open_wallet, call_pure} from "./wallet/cdk_wallet_browser.js";
+import init, {open_wallet, call_pure, probe_persistent_storage, provision_wallet} from "./wallet/cdk_wallet_browser.js";
 
 // Test-only DOM adapter for the non-interactive wallet fixture. It exposes the
-// serialized wallet API used by browser/smoke.js and browser/test.mjs; the game
+// serialized wallet API used by browser/smoke.js and browser/wallet-browser-test.mjs; the game
 // never loads this file.
 let rawWallet = null;
 let queue = Promise.resolve();
@@ -40,6 +40,13 @@ function serialize(action) {
 export const walletApp = {
   ready,
   pure: (operation, args = []) => serialize(() => JSON.parse(call_pure(operation, JSON.stringify(args)))),
+  // Test-only explicit provisioning. Nothing provisions automatically.
+  provision: (mnemonic, name) => serialize(async () => {
+    await provision_wallet(mnemonic, name);
+    return true;
+  }),
+  // Test-only storage-policy probe: no wallet record is read or written.
+  persistentStorageProbe: name => serialize(() => probe_persistent_storage(name)),
   open: (seed, name) => serialize(async () => {
     if (rawWallet) throw new Error("Close the current wallet first");
     rawWallet = await open_wallet(seed, name);
