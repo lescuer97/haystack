@@ -499,17 +499,12 @@ fn drawOnboarding(model: *const onboarding.Onboarding, vw: f32, vh: f32) void {
         .choice => {
             drawCenteredText("Set up your wallet", onboardingRect(layout.title), size, menu_title_color);
             if (!model.recover_enabled) drawCenteredText("Release recovery unavailable until a mint is configured (TODO)", onboardingRect(layout.seed), @max(1, @divTrunc(size * 2, 3)), menu_muted);
-            drawOnboardingButton(layout.copy, "Create new", model.selected == .copy, true, size);
-            drawOnboardingButton(layout.checkbox, "Recover wallet", model.selected == .checkbox, model.recover_enabled, size);
         },
         .phrase_entry => {
             drawCenteredText("Enter recovery words", onboardingRect(layout.title), size, menu_title_color);
             drawSolidRect(onboardingRect(layout.seed), menu_item_bg);
             drawSeed(model.recoveryPhrase(), layout.seed, size);
-            drawOnboardingButton(layout.copy, "Paste", model.selected == .copy, true, size);
-            drawOnboardingButton(layout.checkbox, "Restore", model.selected == .checkbox, model.phrase_len > 0, size);
             drawCenteredText(if (model.retry_message) "Invalid phrase. Check your words." else "BIP39 passphrases are not supported.", onboardingRect(layout.message), @max(1, @divTrunc(size * 3, 4)), menu_muted);
-            drawOnboardingButton(layout.continue_button, "Back", model.selected == .continue_button, !model.recovery_preparation_pending, size);
         },
         .restore_failed, .restore_result => {
             const r = model.report;
@@ -524,8 +519,6 @@ fn drawOnboarding(model: *const onboarding.Onboarding, vw: f32, vh: f32) void {
                 drawCenteredText(buf[0..text.len :0], onboardingRect(layout.seed), @max(1, @divTrunc(size * 3, 4)), menu_text_color);
                 if (v.spendable_sats == 0 and has_history) drawCenteredText("No spendable sats; pending or spent history exists.", onboardingRect(layout.message), @max(1, @divTrunc(size * 3, 4)), menu_muted);
             }
-            drawOnboardingButton(layout.copy, if (has_history and model.phase == .restore_result) "Continue" else "Retry", model.selected == .copy, true, size);
-            drawOnboardingButton(layout.checkbox, if (has_history and model.phase == .restore_result) "Retry" else "Generate new", model.selected == .checkbox, (has_history and model.phase == .restore_result) or model.can_generate_new, size);
         },
         .blocked => {
             drawCenteredText("Wallet setup blocked", onboardingRect(layout.title), size, menu_title_color);
@@ -535,22 +528,37 @@ fn drawOnboarding(model: *const onboarding.Onboarding, vw: f32, vh: f32) void {
             drawCenteredText("Wallet created - save your recovery words", onboardingRect(layout.title), size, menu_title_color);
             drawSolidRect(onboardingRect(layout.seed), menu_item_bg);
             var explanation = onboardingRect(layout.seed);
-            explanation.height = @as(f32, @floatFromInt(size)) * 1.5;
+            explanation.height = layout.seed_words.y - layout.seed.y;
             drawCenteredText("Anyone with these recovery words controls your wallet.", explanation, @max(1, @divTrunc(size * 3, 4)), menu_muted);
-            var seed = layout.seed;
-            seed.y += explanation.height;
-            seed.height = @max(seed.height - explanation.height, 0);
-            if (model.mnemonic()) |secret| drawSeed(secret, seed, size);
-            drawOnboardingButton(layout.copy, if (model.copy_requested) "Copy requested" else "Copy (optional)", model.selected == .copy, true, size);
-            drawOnboardingButton(layout.checkbox, if (model.saved) "[x] I have saved my recovery words" else "[ ] I have saved my recovery words", model.selected == .checkbox, true, size);
             var message = onboardingRect(layout.message);
             message.height /= 2;
             drawCenteredText("Copy exposes words to apps and clipboard history.", message, @max(1, @divTrunc(size * 3, 4)), menu_muted);
             message.y += message.height;
             drawCenteredText(if (model.retry_message) "Setup failed. Please try again." else "Clipboard is not cleared automatically.", message, @max(1, @divTrunc(size * 3, 4)), menu_muted);
-            drawOnboardingButton(layout.continue_button, "Continue", model.selected == .continue_button, model.saved, size);
         },
         .inactive => {},
+    }
+    const controls = model.controls(layout);
+    for (controls.items[0..controls.len]) |control| {
+        if (control.kind == .word) {
+            const index = control.action.copy_word;
+            const rect = control.rect;
+            const r = onboardingRect(rect);
+            drawSolidRect(r, if (model.copied_word != null and model.copied_word.? == index) rl.Color.init(44, 78, 130, 255) else menu_item_hover);
+            rl.drawRectangleLinesEx(toRaylibRect(r), 1, if (std.meta.eql(model.selected, @as(?onboarding.Action, control.action))) menu_accent else menu_panel_border);
+            if (rect.width < 2 or rect.height < 2) continue;
+            const word = model.mnemonicWord(index) orelse continue;
+            var buf: [1040:0]u8 = @splat(0);
+            defer std.crypto.secureZero(u8, &buf);
+            const text = if (std.meta.eql(model.feedback_target, @as(?onboarding.Action, control.action)))
+                std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}", .{onboarding.Onboarding.copy_feedback}) catch continue
+            else
+                std.fmt.bufPrint(buf[0 .. buf.len - 1], "{d}- {s}", .{ @as(usize, index) + 1, word }) catch continue;
+            buf[text.len] = 0;
+            rl.beginScissorMode(@intFromFloat(rect.x), @intFromFloat(rect.y), @intFromFloat(rect.width), @intFromFloat(rect.height));
+            drawCenteredText(buf[0..text.len :0], r, size, menu_text_color);
+            rl.endScissorMode();
+        } else drawOnboardingButton(control.rect, control.label, std.meta.eql(model.selected, @as(?onboarding.Action, control.action)), control.enabled, size);
     }
 }
 

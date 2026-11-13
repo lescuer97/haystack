@@ -402,7 +402,7 @@ test "onboarding consumes game input including the completion transition" {
     const settings_before = game.settings;
     const frame = input.FrameInput{ .right = true, .dragging = true, .drag_x = -64, .toggle_grid = true, .toggle_borders = true, .escape_clicked = true, .confirm = true };
     model.saved = true;
-    model.selected = .continue_button;
+    model.selected = .complete_backup;
     try std.testing.expectEqual(@as(?onboarding.Effect, .complete_requested), try routeFrame(&game, &model, frame));
     try std.testing.expectEqual(onboarding.Phase.completing, model.phase);
     try std.testing.expect(std.meta.eql(camera_before, game.camera));
@@ -422,7 +422,7 @@ test "paste shortcut routes only in phrase entry and consumes its character" {
     var frame = input.FrameInput{ .paste_shortcut = true, .character_count = 1, .right = true };
     frame.characters[0] = 'v';
     try std.testing.expectEqual(@as(?onboarding.Effect, null), try routeFrame(&game, &model, frame));
-    model.selected = .checkbox;
+    model.selected = .enter_recovery;
     _ = try routeFrame(&game, &model, .{ .confirm = true });
     try std.testing.expectEqual(@as(?onboarding.Effect, .paste_requested), try routeFrame(&game, &model, frame));
     try std.testing.expectEqualStrings("", model.recoveryPhrase());
@@ -611,8 +611,10 @@ pub fn main() anyerror!void {
     // The reader owns the held-direction cadence across frames. It is not
     // global; this loop is its only owner.
     var input_reader = input.Reader{};
+    var onboarding_hand_cursor = false;
 
     while (!rl.windowShouldClose()) {
+        model.expire(rl.getTime());
         if (scan_job) |job| if (job.done.load(.acquire)) {
             job.thread.join();
             model.receive(job.result);
@@ -643,9 +645,21 @@ pub fn main() anyerror!void {
                     defer std.crypto.secureZero(u8, copy.ptr[0 .. copy.len + 1]);
                     @memcpy(copy, secret);
                     rl.setClipboardText(copy);
+                    model.markCopyHandedOff(.copy_seed, rl.getTime());
                 } else |_| {
                     std.log.warn("wallet: clipboard request unavailable", .{});
                 }
+            },
+            .copy_word_requested => |index| if (model.mnemonicWord(index)) |word| {
+                if (word.len <= 1024) if (allocator.allocSentinel(u8, word.len, 0)) |copy| {
+                    defer allocator.free(copy);
+                    defer std.crypto.secureZero(u8, copy.ptr[0 .. copy.len + 1]);
+                    @memcpy(copy, word);
+                    rl.setClipboardText(copy);
+                    model.markCopyHandedOff(.{ .copy_word = index }, rl.getTime());
+                } else |_| {
+                    std.log.warn("wallet: clipboard request unavailable", .{});
+                };
             },
             .complete_requested => {
                 if (native.complete()) |_| {
@@ -659,7 +673,7 @@ pub fn main() anyerror!void {
             .paste_requested => pasteRecovery(&model, allocator),
             .restore_requested, .retry_requested => {
                 if (scan_job == null) {
-                    scan_job = startScan(native, &model, action == .retry_requested) catch blk: {
+                    scan_job = startScan(native, &model, std.meta.activeTag(action) == .retry_requested) catch blk: {
                         model.receive(.blocked);
                         break :blk null;
                     };
@@ -670,6 +684,14 @@ pub fn main() anyerror!void {
                 if (native.finishRestore()) |_| model.receive(.complete_success) else |_| model.receive(.complete_fail);
             },
         };
+
+        const pointer = rl.getMousePosition();
+        const layout = onboarding.calculateLayout(@floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()));
+        const hand = model.hoverEnabled(layout, pointer.x, pointer.y);
+        if (hand != onboarding_hand_cursor) {
+            rl.setMouseCursor(if (hand) .pointing_hand else .default);
+            onboarding_hand_cursor = hand;
+        }
 
         if (shot_frames >= 0) {
             if (shot_frames == 0) break;
