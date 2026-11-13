@@ -1,0 +1,252 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-desktop:
+    name: Linux desktop (x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install native desktop prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libunwind-dev \
+            libasound2-dev libgl1-mesa-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxi-dev \
+            libxcursor-dev libxext-dev
+
+      - name: Install pinned Zig
+        run: python3 build-support/install-zig.py
+
+      - name: Provision selected desktop toolchain
+        run: zig build setup
+
+      - name: Graph isolation and setup/check contract tests
+        run: zig build test-build
+
+      - name: Debug desktop build
+        run: zig build
+
+      - name: Debug application tests
+        run: zig build test
+
+      - name: Debug native Rust, header and C-ABI suites
+        run: zig build test-wallet
+
+      - name: ReleaseSafe desktop build
+        run: zig build -Doptimize=ReleaseSafe --prefix zig-out-release
+
+      - name: ReleaseSafe application tests
+        run: zig build -Doptimize=ReleaseSafe test
+
+      - name: ReleaseSafe native Rust, header and C-ABI suites
+        run: |
+          set -euo pipefail
+          zig build test-wallet -Doptimize=ReleaseSafe --verbose 2>&1 | tee "$RUNNER_TEMP/release-wallet.log"
+          grep -q -e '--release' "$RUNNER_TEMP/release-wallet.log"
+          grep -q 'CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true' "$RUNNER_TEMP/release-wallet.log"
+
+      - name: Verify installed Linux artifacts for both profiles
+        run: |
+          set -euo pipefail
+          for prefix in zig-out zig-out-release; do
+            bin="$prefix/desktop/bin/haystack_game"
+            lib="$prefix/desktop/lib/libraylib.so"
+            test -x "$bin"
+            test -f "$lib"
+            [ "$(find "$prefix" -mindepth 1 -maxdepth 1 -printf '%f\n')" = desktop ]
+            readelf -h "$bin" | grep -q 'X86-64'
+            runpath="$(readelf -d "$bin")"
+            grep -q '\$ORIGIN/../lib' <<<"$runpath"
+            if grep -q '.zig-cache' <<<"$runpath"; then
+              echo "unexpected build-cache runpath in $prefix" >&2
+              exit 1
+            fi
+            ldd "$bin" | grep -q 'libraylib.so =>'
+            if ldd "$bin" | grep -q 'not found'; then
+              echo "installed binary in $prefix has unresolved libraries" >&2
+              exit 1
+            fi
+          done
+
+      - name: Warmed-cache offline build with fresh prefix
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/desktop-offline"
+          zig build -Doffline --prefix "$RUNNER_TEMP/desktop-offline"
+          test -x "$RUNNER_TEMP/desktop-offline/desktop/bin/haystack_game"
+          test -f "$RUNNER_TEMP/desktop-offline/desktop/lib/libraylib.so"
+
+      - name: Verify relocated offline artifact
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/relocated"
+          mkdir -p "$RUNNER_TEMP/relocated"
+          cp -R "$RUNNER_TEMP/desktop-offline/desktop" "$RUNNER_TEMP/relocated/desktop"
+          bin="$RUNNER_TEMP/relocated/desktop/bin/haystack_game"
+          test -x "$bin"
+          test -f "$RUNNER_TEMP/relocated/desktop/lib/libraylib.so"
+          runpath="$(readelf -d "$bin")"
+          grep -q '\$ORIGIN/../lib' <<<"$runpath"
+          ldd "$bin" | grep -q 'libraylib.so =>'
+          if ldd "$bin" | grep -q 'not found'; then
+            echo "relocated binary has unresolved libraries" >&2
+            exit 1
+          fi
+
+  macos-arm64-desktop:
+    name: macOS Apple Silicon desktop
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify native arm64 host
+        run: |
+          test "$(uname -m)" = arm64
+          if [ "$(sysctl -n -i sysctl.proc_translated 2>/dev/null || echo 0)" = 1 ]; then
+            echo "Rosetta-translated x86_64 macOS builds are not supported" >&2
+            exit 1
+          fi
+
+      - name: Verify Xcode Command Line Tools and macOS SDK
+        run: |
+          xcode-select -p
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Install pinned Zig
+        run: python3 build-support/install-zig.py
+
+      - name: Provision selected desktop toolchain and run native preflight
+        run: zig build setup
+
+      - name: Debug desktop build
+        run: zig build
+
+      - name: Graph isolation and setup/check contract tests
+        run: zig build test-build
+
+      - name: Debug application tests
+        run: zig build test
+
+      - name: Debug native Rust, header and C-ABI suites
+        run: zig build test-wallet
+
+      - name: ReleaseSafe desktop build
+        run: zig build -Doptimize=ReleaseSafe --prefix zig-out-release
+
+      - name: ReleaseSafe application tests
+        run: zig build -Doptimize=ReleaseSafe test
+
+      - name: ReleaseSafe native Rust, header and C-ABI suites
+        run: |
+          set -euo pipefail
+          zig build test-wallet -Doptimize=ReleaseSafe --verbose 2>&1 | tee "$RUNNER_TEMP/release-wallet.log"
+          grep -q -e '--release' "$RUNNER_TEMP/release-wallet.log"
+          grep -q 'CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true' "$RUNNER_TEMP/release-wallet.log"
+
+      - name: Verify installed Mach-O artifacts for both profiles
+        run: |
+          set -euo pipefail
+          for prefix in zig-out zig-out-release; do
+            bin="$prefix/desktop/bin/haystack_game"
+            dylib="$prefix/desktop/lib/libraylib.dylib"
+            test -x "$bin"
+            test -f "$dylib"
+            file "$bin" | grep -q arm64
+            file "$dylib" | grep -q arm64
+
+            install_name="$(otool -D "$dylib" | tail -n 1 | tr -d '[:space:]')"
+            test "$install_name" = "@rpath/libraylib.dylib"
+            otool -L "$bin" | grep -q '@rpath/libraylib.dylib'
+            rpaths="$(otool -l "$bin")"
+            grep -q '@loader_path/../lib' <<<"$rpaths"
+            if grep -q '.zig-cache' <<<"$rpaths"; then
+              echo "unexpected build-cache rpath in $prefix" >&2
+              exit 1
+            fi
+            xcrun vtool -show-build "$bin" | grep -q 'minos 15.0'
+            xcrun vtool -show-build "$dylib" | grep -q 'minos 15.0'
+          done
+
+      - name: Warmed-cache offline build with fresh prefix
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/desktop-offline"
+          zig build -Doffline --prefix "$RUNNER_TEMP/desktop-offline"
+          test -x "$RUNNER_TEMP/desktop-offline/desktop/bin/haystack_game"
+          test -f "$RUNNER_TEMP/desktop-offline/desktop/lib/libraylib.dylib"
+
+      - name: Verify relocated offline artifact
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/relocated"
+          mkdir -p "$RUNNER_TEMP/relocated"
+          cp -R "$RUNNER_TEMP/desktop-offline/desktop" "$RUNNER_TEMP/relocated/desktop"
+          bin="$RUNNER_TEMP/relocated/desktop/bin/haystack_game"
+          dylib="$RUNNER_TEMP/relocated/desktop/lib/libraylib.dylib"
+          test -x "$bin"
+          test -f "$dylib"
+          otool -L "$bin" | grep -q '@rpath/libraylib.dylib'
+          otool -l "$bin" | grep -q '@loader_path/../lib'
+          test "$(otool -D "$dylib" | tail -n 1 | tr -d '[:space:]')" = "@rpath/libraylib.dylib"
+          xcrun vtool -show-build "$bin" | grep -q 'minos 15.0'
+          xcrun vtool -show-build "$dylib" | grep -q 'minos 15.0'
+
+  linux-browser-wasm:
+    name: Linux browser (Wasm)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "22"
+
+      - uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2
+        id: setup-chrome
+        with:
+          install-dependencies: true
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - name: Install pinned Zig
+        run: python3 build-support/install-zig.py
+
+      - name: Provision Wasm toolchain, wasm-bindgen and Emscripten
+        run: zig build setup -Dplatform=wasm
+
+      - name: Build the complete browser application
+        run: zig build -Dplatform=wasm
+
+      - name: Browser database conformance tests
+        run: zig build test-wallet -Dplatform=wasm
+
+      - name: Browser and fake-mint integration tests
+        env:
+          CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: zig build test -Dplatform=wasm

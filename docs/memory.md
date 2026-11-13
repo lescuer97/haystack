@@ -7,13 +7,19 @@ as part of `GameState`. Read `game-loop.md` first for the frame order.
 
 - `main` picks the allocator: `std.heap.DebugAllocator` in Debug and
   ReleaseSafe (so leaks are reported), `std.heap.c_allocator` in ReleaseFast and
-  ReleaseSmall. There is no outer scene arena retaining old hash-map and
-  scratch-list buffers.
-- `GameState` owns `World`, `Camera`, and `DebugSettings`. `main` defers
-  `game_state.deinit()`; `World.deinit` releases the chunk pool, resident hash
-  map, and reusable unload-key list.
-- Defers run in reverse order: the world is released before `closeWindow`, and
-  the debug allocator's leak check runs last.
+  ReleaseSmall. The browser entry allocates its `BrowserContext` and game state
+  with `c_allocator` because there is no native `main` stack frame to own them.
+  There is no outer scene arena retaining old hash-map and scratch-list buffers.
+- `GameState` owns `World`, `Camera`, `Menu`, and `Settings`. Native `main`
+  defers `game_state.deinit()`; the browser `BrowserContext` owns `GameState`
+  and the persistent `input.Reader`, and `stopBrowser` deinitializes them.
+  `World.deinit` releases the chunk pool, resident hash map, and reusable
+  unload-key list. `Menu` and its text-field buffers are fixed-size values with
+  no allocation or separate teardown.
+- Native defers run in reverse order: the world is released before
+  `closeWindow`, and the debug allocator's leak check runs last. Browser cleanup
+  runs explicitly in the same ownership order: cancel the loop, deinit the
+  world, destroy the context, then close the window.
 - The pool starts with at least 64 slots, or the initial viewport's prefetch
   ring if larger. The map and unload list are reserved alongside it.
 - Unloading returns slots to the pool. Pool, map, and scratch capacity retain
@@ -27,9 +33,11 @@ same storage works headlessly.
 ## Frame lifetime
 
 1. `input.Reader.read(dt, menu_opened)` collects devices and paces held
-   directions into a temporary `FrameInput`. It does not touch the world.
-2. `GameState.update` mutates persistent camera/debug state. It does not
-   allocate.
+   directions into a temporary `FrameInput`. It does not touch the world. The
+   same helper is used by the native loop and the browser callback; only its
+   owner differs.
+2. `GameState.update` mutates persistent camera, menu, and debug state. It does
+   not allocate.
 3. `camera.calculate` derives a temporary `View` (Raylib transform + validated
    chunk range). It does not allocate.
 4. `GameState.streamChunks` -> `World.stream` unloads chunks outside the
@@ -38,11 +46,13 @@ same storage works headlessly.
    enough capacity for all residents, so eviction cannot fail to allocate.
    Normal steady-state frames reuse existing capacity; allocation can occur
    only when the world grows.
-5. `rendering.draw` borrows `*const GameState` and a `View` and draws into
-   Raylib's own CPU batch buffers. Raylib does not retain chunk pointers or HUD
-   text pointers. Rendering never collects input or mutates game state.
+5. `rendering.draw` borrows `*const GameState`, a `View`, and the viewport size,
+   and draws into Raylib's own CPU batch buffers. Raylib does not retain chunk
+   pointers or HUD text pointers. Rendering never collects input or mutates game
+   state.
 6. `endMode2D` flushes world geometry; `endDrawing` flushes the UI and presents.
-   The optional screenshot is taken after that presentation.
+   The optional screenshot is taken after that presentation. The browser has no
+   screenshot hook; it cancels the next callback after cleanup instead.
 
 Allocation failures from streaming are handled in `GameState.streamChunks`: it
 logs once per pressure episode, marks the HUD as incomplete, draws the chunks

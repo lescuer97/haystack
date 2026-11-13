@@ -11,6 +11,7 @@ const rl = @import("raylib");
 const camera = @import("camera.zig");
 const game_mod = @import("game.zig");
 const menu = @import("menu.zig");
+const onboarding = @import("onboarding.zig");
 const world = @import("world.zig");
 
 /// Frame-rate target. The HUD's FPS colour thresholds are derived from it.
@@ -427,7 +428,7 @@ fn drawMenu(game: *const game_mod.GameState, viewport_w: f32, viewport_h: f32) v
 /// The caller owns `beginDrawing`/`endDrawing` so presentation and the optional
 /// screenshot stay visible in `main`. The menu is last so its dim backdrop sits
 /// over the HUD and minimap.
-pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32, viewport_h: f32) void {
+pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32, viewport_h: f32, model: ?*const onboarding.Onboarding) void {
     rl.clearBackground(rl.Color.init(24, 24, 28, 255));
 
     rl.beginMode2D(view.transform);
@@ -440,6 +441,124 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
 
     if (game.menu.opened) {
         drawMenu(game, viewport_w, viewport_h);
+    }
+    if (model) |m| if (m.isBlocking()) {
+        drawOnboarding(m, viewport_w, viewport_h);
+    };
+}
+
+fn onboardingRect(r: onboarding.Rect) menu.Rect {
+    return .{ .x = r.x, .y = r.y, .width = r.width, .height = r.height };
+}
+
+// Render word by word, wrapping within the seed box. The scratch copy is
+// bounded, never retained, and scrubbed even when the viewport clips text.
+fn drawSeed(secret: []const u8, rect: onboarding.Rect, size: i32) void {
+    if (rect.width < 2 or rect.height < 2) return;
+    rl.beginScissorMode(@intFromFloat(rect.x), @intFromFloat(rect.y), @intFromFloat(rect.width), @intFromFloat(rect.height));
+    defer rl.endScissorMode();
+    var word: [1025:0]u8 = @splat(0);
+    defer std.crypto.secureZero(u8, &word);
+    var it = std.mem.tokenizeScalar(u8, secret, ' ');
+    var x = rect.x + 4;
+    var y = rect.y + 4;
+    const gap: f32 = @floatFromInt(@max(@divTrunc(size, 3), 1));
+    while (it.next()) |part| {
+        if (part.len > 1024) break;
+        @memcpy(word[0..part.len], part);
+        word[part.len] = 0;
+        const text: [:0]const u8 = word[0..part.len :0];
+        const width: f32 = @floatFromInt(rl.measureText(text, size));
+        if (x > rect.x + 4 and x + width > rect.x + rect.width - 4) {
+            x = rect.x + 4;
+            y += @as(f32, @floatFromInt(size)) + gap;
+        }
+        rl.drawText(text, @intFromFloat(x), @intFromFloat(y), size, menu_text_color);
+        x += width + gap;
+    }
+}
+
+fn drawOnboardingButton(rect: onboarding.Rect, text: [:0]const u8, selected: bool, enabled: bool, size: i32) void {
+    const r = onboardingRect(rect);
+    drawSolidRect(r, if (selected and enabled) menu_item_hover else menu_item_bg);
+    rl.drawRectangleLinesEx(toRaylibRect(r), 1, if (selected and enabled) menu_accent else menu_panel_border);
+    drawCenteredText(text, r, size, if (enabled) menu_text_color else menu_muted);
+}
+
+fn drawOnboarding(model: *const onboarding.Onboarding, vw: f32, vh: f32) void {
+    const layout = onboarding.calculateLayout(vw, vh);
+    const scale = @min(layout.panel.width / 560, layout.panel.height / 500);
+    const size: i32 = @max(1, @as(i32, @intFromFloat(18 * scale)));
+    rl.drawRectangle(0, 0, @intFromFloat(@max(vw, 0)), @intFromFloat(@max(vh, 0)), menu_backdrop);
+    drawSolidRect(onboardingRect(layout.panel), menu_panel_bg);
+    rl.drawRectangleLinesEx(toRaylibRect(onboardingRect(layout.panel)), 2, menu_panel_border);
+    switch (model.phase) {
+        .loading => drawCenteredText("Loading wallet...", onboardingRect(layout.title), size, menu_title_color),
+        .completing => drawCenteredText("Completing setup...", onboardingRect(layout.title), size, menu_title_color),
+        .restoring => drawCenteredText("Restoring wallet...", onboardingRect(layout.title), size, menu_title_color),
+        .choice => {
+            drawCenteredText("Set up your wallet", onboardingRect(layout.title), size, menu_title_color);
+            if (!model.recover_enabled) drawCenteredText("Recovery unavailable", onboardingRect(layout.seed), @max(1, @divTrunc(size * 2, 3)), menu_muted);
+        },
+        .phrase_entry => {
+            drawCenteredText("Enter recovery words", onboardingRect(layout.title), size, menu_title_color);
+            drawSolidRect(onboardingRect(layout.seed), menu_item_bg);
+            drawSeed(model.recoveryPhrase(), layout.seed, size);
+            drawCenteredText(if (model.retry_message) "Invalid phrase. Check your words." else "BIP39 passphrases are not supported.", onboardingRect(layout.message), @max(1, @divTrunc(size * 3, 4)), menu_muted);
+        },
+        .restore_failed, .restore_result => {
+            const r = model.report;
+            const has_history = if (r) |v| v.spendable_sats != 0 or v.pending_sats != 0 or v.spent_sats != 0 else false;
+            drawCenteredText(if (model.phase == .restore_failed) "Restore failed" else "Recovery result", onboardingRect(layout.title), size, menu_title_color);
+            if (model.phase == .restore_failed) {
+                drawCenteredText("Restore failed. Retry to check again.", onboardingRect(layout.seed), size, menu_text_color);
+            } else if (r) |v| {
+                var buf: [192]u8 = undefined;
+                const text = std.fmt.bufPrint(buf[0 .. buf.len - 1], "Spendable: {d} sats  Pending: {d}  Spent: {d}", .{ v.spendable_sats, v.pending_sats, v.spent_sats }) catch unreachable;
+                buf[text.len] = 0;
+                drawCenteredText(buf[0..text.len :0], onboardingRect(layout.seed), @max(1, @divTrunc(size * 3, 4)), menu_text_color);
+                if (v.spendable_sats == 0 and has_history) drawCenteredText("No spendable sats; pending or spent history exists.", onboardingRect(layout.message), @max(1, @divTrunc(size * 3, 4)), menu_muted);
+            }
+        },
+        .blocked => {
+            drawCenteredText("Wallet setup blocked", onboardingRect(layout.title), size, menu_title_color);
+            drawCenteredText("Close the game and check wallet storage.", onboardingRect(layout.seed), size, menu_text_color);
+        },
+        .backup => {
+            drawCenteredText("Wallet created - save your recovery words", onboardingRect(layout.title), size, menu_title_color);
+            drawSolidRect(onboardingRect(layout.seed), menu_item_bg);
+            var explanation = onboardingRect(layout.seed);
+            explanation.height = layout.seed_words.y - layout.seed.y;
+            drawCenteredText("Anyone with these recovery words controls your wallet.", explanation, @max(1, @divTrunc(size * 3, 4)), menu_muted);
+            var message = onboardingRect(layout.message);
+            message.height /= 2;
+            drawCenteredText("Copy exposes words to apps and clipboard history.", message, @max(1, @divTrunc(size * 3, 4)), menu_muted);
+            message.y += message.height;
+            drawCenteredText(if (model.retry_message) "Setup failed. Please try again." else "Clipboard is not cleared automatically.", message, @max(1, @divTrunc(size * 3, 4)), menu_muted);
+        },
+        .inactive => {},
+    }
+    const controls = model.controls(layout);
+    for (controls.items[0..controls.len]) |control| {
+        if (control.kind == .word) {
+            const index = control.action.copy_word;
+            const rect = control.rect;
+            const r = onboardingRect(rect);
+            drawSolidRect(r, if (model.copied_word != null and model.copied_word.? == index) rl.Color.init(44, 78, 130, 255) else menu_item_hover);
+            rl.drawRectangleLinesEx(toRaylibRect(r), 1, if (std.meta.eql(model.selected, @as(?onboarding.Action, control.action))) menu_accent else menu_panel_border);
+            if (rect.width < 2 or rect.height < 2) continue;
+            const word = model.mnemonicWord(index) orelse continue;
+            var buf: [1040:0]u8 = @splat(0);
+            defer std.crypto.secureZero(u8, &buf);
+            const text = if (std.meta.eql(model.feedback_target, @as(?onboarding.Action, control.action)))
+                std.fmt.bufPrint(buf[0 .. buf.len - 1], "{s}", .{onboarding.Onboarding.copy_feedback}) catch continue
+            else
+                std.fmt.bufPrint(buf[0 .. buf.len - 1], "{d}- {s}", .{ @as(usize, index) + 1, word }) catch continue;
+            buf[text.len] = 0;
+            rl.beginScissorMode(@intFromFloat(rect.x), @intFromFloat(rect.y), @intFromFloat(rect.width), @intFromFloat(rect.height));
+            drawCenteredText(buf[0..text.len :0], r, size, menu_text_color);
+            rl.endScissorMode();
+        } else drawOnboardingButton(control.rect, control.label, std.meta.eql(model.selected, @as(?onboarding.Action, control.action)), control.enabled, size);
     }
 }
 

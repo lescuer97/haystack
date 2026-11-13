@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>haystack</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
+  /* The canvas owns the viewport. No border, margin, padding or scrollbar is
+     allowed, because they would offset Raylib's mouse coordinates and make
+     keyboard navigation scroll the page. Raylib's web backend sets the canvas
+     backing-store size from window.innerWidth/innerHeight. */
+  #canvas { display: block; width: 100%; height: 100%; border: 0; outline: none; background: #000; }
+  /* Temporary, non-interactive startup text. It is removed before the game
+     loop starts and replaced with a fixed generic failure message. */
+  #startup { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    margin: 0; color: #f3f4f6; background: #000; font: 16px system-ui, sans-serif; text-align: center;
+    pointer-events: none; }
+  #startup[hidden] { display: none; }
+</style>
+</head>
+<body>
+<canvas id="canvas" tabindex="0" aria-label="haystack game" oncontextmenu="event.preventDefault()"></canvas>
+<p id="startup" role="status" aria-live="polite">Starting&hellip;</p>
+<script>
+  var canvas = document.getElementById("canvas");
+  var startup = document.getElementById("startup");
+  var Module = {
+    canvas: canvas,
+    print: function () { console.log.apply(console, arguments); },
+    printErr: function () { console.error.apply(console, arguments); },
+    // After the settings guard, the renderer draws the in-game onboarding modal
+    // while wallet inspection runs asynchronously. "ready" hides the startup
+    // text and focuses the canvas; "error" shows a generic startup message.
+    onHaystackStartup: function (state) {
+      if (state === "ready") {
+        startup.hidden = true;
+        try { canvas.focus({ preventScroll: true }); } catch (_) { canvas.focus(); }
+      } else if (state === "error") {
+        startup.hidden = false;
+        startup.textContent = "Unable to start game.";
+      }
+    },
+    onAbort: function () {
+      startup.hidden = false;
+      startup.textContent = "Unable to start game.";
+    },
+  };
+
+  function focusCanvas() {
+    try { canvas.focus({ preventScroll: true }); } catch (_) { canvas.focus(); }
+  }
+  canvas.addEventListener("pointerdown", focusCanvas);
+
+  // Scope key handling to the game canvas. Only non-printable keys that can
+  // navigate or scroll are cancelled. Printable keys (WASD, G, B, space, ...)
+  // must still reach GLFW's keypress path so in-game text fields keep working,
+  // and Ctrl/Meta/Alt browser shortcuts are never swallowed.
+  window.addEventListener("keydown", function (event) {
+    if (document.activeElement !== canvas) return;
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    switch (event.key) {
+      case "ArrowUp":
+      case "ArrowDown":
+      case "ArrowLeft":
+      case "ArrowRight":
+      case "Backspace":
+      case "Tab":
+      case "Enter":
+      case "Escape":
+        event.preventDefault();
+        break;
+    }
+  }, { passive: false });
+
+  // Keep the generic error text if the runtime itself fails while the startup
+  // layer is still visible.
+  function showStartupError() {
+    if (!startup.hidden) startup.textContent = "Unable to start game.";
+  }
+  window.addEventListener("error", showStartupError);
+  window.addEventListener("unhandledrejection", showStartupError);
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

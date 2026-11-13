@@ -1,0 +1,323 @@
+// Browser-only tests. Deterministic public fixtures and a local fake mint only.
+import {open_wallet} from "./wallet/cdk_wallet_browser.js";
+import {installSwapFaults} from "./test-faults.js";
+import {runSpilmanNegatives} from "./spilman-negative.js";
+import {runLiveChannels} from "./live-channels.js";
+import {runFaultScenarios} from "./fault-scenarios.js";
+import {
+  USER_WALLET_NAME,
+  createWallet,
+  deleteMnemonic,
+  deleteState,
+  deleteWallet,
+  generateMnemonic,
+  readWallet,
+  setStateData,
+  writeState,
+} from "./test-wallet.js";
+
+export async function runSmoke(app) {
+  await app.ready;
+  const checks = [];
+  const failures = [];
+  let completed = false;
+  let cleanupFailed = false;
+  window.browserTestProgress = checks;
+  const recordFailure = failure => {
+    // One entry per scenario+invariant; known defects are reported, never
+    // turned into passing labels and never asserted as correct behavior.
+    if (failures.some(existing => existing.scenario === failure.scenario && existing.message === failure.message)) return;
+    failures.push(failure);
+  };
+  const assert = (condition, label) => { if (!condition) throw new Error(label); checks.push(label); };
+  const ok = response => { if (response.status !== 0) throw new Error(response.error || `status ${response.status}`); return response; };
+  const pure = async (name, args = []) => ok(await app.pure(name,args));
+  const text = async (name, args) => (await pure(name,args)).value;
+  const call = async (name, args = []) => ok(await app.call(name,args));
+  const faults = installSwapFaults();
+  const v = await fetch("spilman_vectors.json").then(r => r.json());
+  const suffix = crypto.randomUUID().replaceAll("-", "");
+  const name = `smoke-${suffix}`;
+  const secondName = `receiver-${suffix}`;
+  const canaryName = `canary-${suffix}`;
+  const partialName = `partial-${suffix}`;
+  const missingName = `missing-${suffix}`;
+  const persistName = `persist-${suffix}`;
+  const sentinelName = `sentinel-${suffix}`;
+  const owned = [name, secondName, canaryName, partialName, missingName, persistName, sentinelName];
+  let seed = null;
+  let receiverSeed = null;
+  let second = null;
+  let legacyAvailable = false;
+  let legacyKey = null;
+
+  try {
+    const mnemonic = (await pure("generate_mnemonic")).value;
+    assert(mnemonic.split(" ").length === 12, "Browser CSPRNG generates BIP-39 mnemonic");
+    const known = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    assert((await pure("mnemonic_to_entropy",[known])).hex === "00".repeat(16), "BIP-39 entropy matches known vector");
+    assert((await pure("mnemonic_to_seed",[known])).hex.length === 128, "BIP-39 seed derivation runs");
+    assert((await app.pure("mnemonic_to_seed",["invalid"])).status !== 0, "Invalid mnemonic is rejected");
+
+    const keypair = await pure("spilman_generate_keypair");
+    assert((await text("spilman_secret_key_to_pubkey",[keypair.secret_key_hex])) === keypair.pubkey_hex, "Spilman key generation and public-key derivation run");
+    assert((await text("spilman_compute_channel_secret",[v.alice_secret,v.charlie_pubkey])) === v.channel_secret, "Channel secret matches native fixture");
+    const keyset = v.keyset_json;
+    const synth = JSON.stringify([64,32,4].map(amount => ({amount,id:v.keyset_id,secret:`fixture-input-${amount}`,C:JSON.parse(keyset).keys["1"]})));
+    const token = await text("spilman_build_cashu_b_token",[v.mint_url,"sat",synth]);
+    assert(token.startsWith("cashuB"), "Cashu B token encoding runs");
+    assert((await text("spilman_build_cashu_a_token",[v.mint_url,synth])).startsWith("cashuA"), "Cashu A token encoding runs");
+    assert(JSON.parse(await text("token_to_proofs_json",[token,keyset])).length === 3, "Cashu token decoding runs");
+    const channel = JSON.parse(await text("spilman_compute_channel_from_token",[token,v.charlie_pubkey,v.alice_pubkey,v.channel_secret,String(v.expiry_timestamp),keyset,"64"]));
+    assert(channel.params_json !== undefined, "Channel reconstruction runs in browser");
+    assert((await pure("spilman_compute_funding_token_amount",["100",keyset,"64"])).net_sats === "100", "Funding amount matches native vector");
+    const id = await text("spilman_channel_parameters_get_channel_id",[v.params_json,v.channel_secret,keyset]);
+    assert(id.length === 64, "Deterministic channel ID runs");
+    const outputs = await text("spilman_create_funding_outputs",[v.params_json,v.alice_secret,keyset]);
+    assert(outputs === await text("spilman_create_funding_outputs",[v.params_json,v.alice_secret,keyset]), "Funding outputs are deterministic");
+    async function fund(params, response) {
+      const prepared=JSON.parse(await text("spilman_create_funding_swap",[params,v.channel_secret,keyset,synth]));
+      const completed=JSON.parse(await text("spilman_complete_funding_swap",[JSON.stringify(response),prepared.funding_secrets_json,keyset]));
+      const constructed=await text("spilman_construct_proofs",[JSON.stringify(response.signatures),prepared.funding_secrets_json,keyset]);
+      assert(constructed === completed.funding_proofs_json, "Raw proof construction matches completed funding swap");
+      return completed.funding_proofs_json;
+    }
+    const funding = await fund(v.params_json,v.responses.funding);
+    assert(funding === v.funding_proofs_json, "Funding response unblinds byte-identically to native fixture");
+    await pure("spilman_verify_valid_channel",[v.params_json,v.channel_secret,keyset,funding]);
+    checks.push("Channel DLEQ and proofs verify");
+    const signed=JSON.parse(await text("spilman_create_signed_balance_update",[v.params_json,keyset,v.alice_secret,funding,"70"]));
+    await pure("spilman_verify_balance_update",[v.params_json,v.channel_secret,keyset,funding,id,"70",signed.signature]);
+    checks.push("Signed balance update verifies");
+    const unsigned=JSON.parse(await text("spilman_create_unsigned_balance_update",[v.params_json,keyset,v.channel_secret,funding,"70"]));
+    const signature=await text("spilman_sign_with_tweaked_key_util",[v.alice_secret,unsigned.message_hex,unsigned.tweak_scalar_hex]);
+    const attached=JSON.parse(await text("spilman_attach_signature_to_balance_update",[unsigned.unsigned_swap_request_json,signature,unsigned.channel_id,"70"]));
+    await pure("spilman_verify_balance_update",[v.params_json,v.channel_secret,keyset,funding,id,"70",attached.signature]);
+    checks.push("Unsigned/sign/attach balance-update flow verifies");
+    const close=JSON.parse(await text("spilman_prepare_close_swap",[v.params_json,v.channel_secret,keyset,keyset,funding,"70",signed.signature,v.charlie_secret]));
+    const closed=await pure("spilman_unblind_close_swap",[v.params_json,v.channel_secret,keyset,keyset,JSON.stringify(close.secrets_with_blinding),JSON.stringify(v.responses.close),"70",v.charlie_secret]);
+    assert(closed.receiver_sum === "70" && closed.sender_sum === "30", "Cooperative close unblinds into native 70/30 split");
+    const expiredFunding=await fund(v.params_expired_json,v.responses.funding_expired);
+    const refund=await text("spilman_prepare_sender_refund",[v.params_expired_json,v.channel_secret,keyset,keyset,expiredFunding,v.alice_secret,String(v.refund_now),null]);
+    const refunded=JSON.parse(await text("spilman_complete_sender_refund",[v.params_expired_json,v.channel_secret,keyset,expiredFunding,v.alice_secret,refund,JSON.stringify(v.responses.refund)]));
+    assert(refunded.reduce((sum,p) => sum+p.amount,0) === 100, "Expired sender refund matches native fixture");
+    await runSpilmanNegatives({app, pure, text, assert, v});
+
+    // Disposable wallets are provisioned explicitly: a fresh mnemonic, its
+    // seed, and one atomic pair of IndexedDB records under a unique test name.
+    seed = await createWallet(name);
+    receiverSeed = await createWallet(secondName);
+
+    await app.open(seed,name);
+    assert((await call("list_mints")).mints.length === 0, "Shared wallet core opens browser database offline");
+    let locked=false;
+    try { const duplicate=await open_wallet(seed,name); await duplicate.close(); duplicate.free(); } catch { locked=true; }
+    assert(locked, "Second wallet handle is rejected by Web Locks");
+    assert((await app.call("add_mint",["https://mint.example.com?secret=invalid"])).status === 9, "Mint URL policy rejects query before networking");
+    assert((await app.call("receive",[token])).status === 18, "Unknown-mint token is rejected before networking");
+    assert((await app.call("get_active_keyset_info_json",[v.mint_url])).status === 11, "Wallet-backed Spilman helpers enforce mint approval");
+    await app.close();
+
+    const snapshot = (await readWallet(name)).state;
+    if (!snapshot) throw new Error("wallet state missing before integrity checks");
+    let wrongSeed=false;
+    try { await app.open(new Uint8Array(64).fill(99),name); } catch { wrongSeed=true; }
+    const afterWrongSeed = (await readWallet(name)).state;
+    assert(wrongSeed && afterWrongSeed && afterWrongSeed.data === snapshot.data, "Wrong seed is rejected without mutating storage");
+    await app.open(seed,name);
+
+    // A failed IndexedDB write must surface as a failure and leave the committed
+    // record (including its revision) untouched.
+    const mint=location.origin;
+    const realPut=IDBObjectStore.prototype.put;
+    let injected=false;
+    IDBObjectStore.prototype.put=function(value,key) {
+      if (this.name === "states" && key === name && !injected) {
+        injected=true;
+        throw new DOMException("Injected quota failure","QuotaExceededError");
+      }
+      return realPut.call(this,value,key);
+    };
+    let failedWrite;
+    const beforeFailure=(await readWallet(name)).state;
+    try { failedWrite=await app.call("add_mint",[mint]); } finally { IDBObjectStore.prototype.put=realPut; }
+    const afterFailure=(await readWallet(name)).state;
+    assert(failedWrite.status !== 0, "Storage write failure is reported, not silently accepted");
+    assert(beforeFailure && afterFailure
+      && afterFailure.revision === beforeFailure.revision
+      && afterFailure.data === beforeFailure.data, "Storage write failure persists nothing");
+    await call("add_mint",[mint]);
+    const active=await call("get_active_keyset_info_json",[mint]);
+    assert(JSON.parse(active.value).keys !== undefined, "Browser Fetch retrieves approved mint keyset");
+    const issued=await fetch("/test-token").then(r => { if(!r.ok) throw new Error("Local fake mint is required for network tests"); return r.json(); });
+    assert((await call("receive",[issued.token])).net_sats === "100", "Browser receives 100 test sats through real Cashu HTTP protocol");
+    const sent=await call("send",[mint,"40","0"]);
+    assert(sent.token.startsWith("cashu"), "Browser sends a real 40-sat test token");
+    assert((await call("list_pending_tokens")).pending.some(p => p.operation_id === sent.operation_id), "Outgoing token is persisted and retrievable");
+    assert((await call("get_pending_token",[sent.operation_id])).token === sent.token, "Pending token retrieval preserves bearer payload");
+    await app.close();
+    await app.open(seed,name);
+    assert((await call("list_mints")).mints.includes(mint), "Mint approval survives close/reopen");
+    assert((await call("list_balances")).balances.some(b => b.sats === "60"), "60-sat balance survives persisted reopen and startup recovery");
+    second=await open_wallet(receiverSeed,secondName);
+    const secondCall=async (op,args=[]) => ok(JSON.parse(await second.call(op,JSON.stringify(args))));
+    await secondCall("add_mint",[mint]);
+    assert((await secondCall("receive",[sent.token])).net_sats === "40", "Second browser wallet receives sender token");
+    const recovery=await call("recover");
+    assert(recovery.reports.every(r => r.failed === 0 && r.skipped === 0), "Explicit recovery succeeds after recipient redeems token");
+    assert((await call("list_pending_tokens")).pending.length === 0, "Recovered claimed token leaves pending list");
+
+    // A partial or incompatible v1 record must fail before any mutation and
+    // remain byte-for-byte unchanged. This runs while real proofs/history are
+    // present, so silently filling missing collections would lose data.
+    await app.close();
+    const intact=(await readWallet(name)).state;
+    if (!intact) throw new Error("wallet storage missing before integrity checks");
+    const corruptions=[
+      ["missing proofs", value => { delete value.proofs; }],
+      ["missing counters", value => { delete value.counters; }],
+      ["missing sagas", value => { delete value.sagas; }],
+      ["incompatible version", value => { value.version=2; }],
+    ];
+    for (const [label,mutate] of corruptions) {
+      const value=JSON.parse(intact.data);
+      mutate(value);
+      const raw=JSON.stringify(value);
+      await setStateData(name, raw);
+      let rejected=false;
+      try { await app.open(seed,name); } catch { rejected=true; }
+      const stored=(await readWallet(name)).state;
+      assert(rejected && stored && stored.data === raw, `Corrupt v1 storage is rejected without overwrite (${label})`);
+    }
+    const truncated=intact.data.slice(0,Math.floor(intact.data.length/2));
+    await setStateData(name, truncated);
+    let truncatedRejected=false;
+    try { await app.open(seed,name); } catch { truncatedRejected=true; }
+    const afterTruncated=(await readWallet(name)).state;
+    assert(truncatedRejected && afterTruncated && afterTruncated.data === truncated, "Truncated v1 storage is rejected without overwrite");
+    await setStateData(name, intact.data);
+    await app.open(seed,name);
+    assert((await call("list_mints")).mints.includes(mint), "A complete valid v1 record remains loadable with its data");
+    await app.close();
+
+    // A stale compare-and-swap revision must be rejected, and the committed
+    // record must keep both its data and its revision.
+    const current=(await readWallet(name)).state;
+    if (!current) throw new Error("wallet storage missing before revision check");
+    let conflicted=false;
+    try { await writeState(name, current.revision + 1, current.data); } catch (error) { conflicted=/conflict/i.test(String(error.message || error)); }
+    const afterConflict=(await readWallet(name)).state;
+    assert(conflicted && afterConflict && afterConflict.revision === current.revision && afterConflict.data === current.data,
+      "A stale revision write is rejected without changing state");
+
+    // Ordinary open never provisions. Both records absent is NotInitialized;
+    // exactly one record is Incomplete.
+    let missingRejected=false;
+    try { await app.open(new Uint8Array(64).fill(7),missingName); } catch (error) { missingRejected=/not initialized/i.test(String(error.message || error)); }
+    const missingPair=await readWallet(missingName);
+    assert(missingRejected && missingPair.mnemonic === null && missingPair.state === null,
+      "Opening an unprovisioned wallet fails without creating records");
+    const partialSeed=await createWallet(partialName);
+    await deleteMnemonic(partialName);
+    let partialRejected=false;
+    try { await app.open(partialSeed,partialName); } catch (error) { partialRejected=/incomplete/i.test(String(error.message || error)); }
+    partialSeed.fill(0);
+    assert(partialRejected, "A wallet with only one of its two records is rejected as incomplete");
+
+    // Provisioning is explicit, atomic and never replaces a wallet.
+    const canarySeed=await createWallet(canaryName);
+    const beforeReplacement=await readWallet(canaryName);
+    assert(typeof beforeReplacement.mnemonic === "string" && beforeReplacement.mnemonic.split(" ").length === 12,
+      "Wallet mnemonic is stored as plaintext English words");
+    let replaced=false;
+    try { await app.provision(generateMnemonic(),canaryName); } catch { replaced=true; }
+    const afterReplacement=await readWallet(canaryName);
+    assert(replaced
+      && afterReplacement.mnemonic === beforeReplacement.mnemonic
+      && afterReplacement.state && beforeReplacement.state
+      && afterReplacement.state.data === beforeReplacement.state.data,
+      "Provisioning never replaces an existing wallet");
+    await app.open(canarySeed,canaryName);
+    assert((await call("list_mints")).mints.length === 0, "Provisioned canary wallet opens empty");
+    await app.close();
+    canarySeed.fill(0);
+
+    // Durable storage is requested only for the fixed user wallet. This fixture
+    // never creates, rewrites or deletes the real user wallet: a test-only probe
+    // exercises the production policy and its denial path without touching any
+    // wallet record, and disposable provisioning proves the negative path.
+    const userBefore=await readWallet(USER_WALLET_NAME);
+    try {
+      legacyAvailable=typeof localStorage !== "undefined" && localStorage !== null;
+      legacyKey=`cdk_wallet_browser_v1_canary-${suffix}`;
+      if (legacyAvailable) localStorage.setItem(legacyKey,"fixture-canary");
+    } catch { legacyAvailable=false; }
+    const storagePrototype=Object.getPrototypeOf(navigator.storage);
+    assert(typeof storagePrototype.persist === "function", "StorageManager.persist is available");
+    const originalPersist=storagePrototype.persist;
+    let persistCalls=0;
+    storagePrototype.persist=function() { persistCalls+=1; return Promise.resolve(false); };
+    try {
+      assert((await app.persistentStorageProbe(USER_WALLET_NAME)) === false,
+        "User wallet provisioning requests persistence and tolerates denial");
+      assert(persistCalls === 1, "The user wallet policy requests persistent storage once");
+      assert((await app.persistentStorageProbe(persistName)) === true,
+        "Disposable wallet names never request persistent storage");
+      assert(persistCalls === 1, "The disposable policy probe never calls persist");
+      await app.provision(generateMnemonic(),persistName);
+      assert(persistCalls === 1, "Disposable provisioning never requests persistent storage");
+    } finally {
+      storagePrototype.persist=originalPersist;
+    }
+    const userAfter=await readWallet(USER_WALLET_NAME);
+    assert(userAfter.mnemonic === userBefore.mnemonic
+      && (userAfter.state === null
+        ? userBefore.state === null
+        : userBefore.state !== null
+          && userAfter.state.revision === userBefore.state.revision
+          && userAfter.state.data === userBefore.state.data),
+      "The storage-policy fixture never creates, rewrites or deletes the user wallet");
+    if (legacyAvailable) {
+      assert(localStorage.getItem(legacyKey) === "fixture-canary",
+        "Legacy localStorage canary survives wallet storage tests");
+    }
+
+    // A mnemonic-only wallet is never treated as absent: provisioning it must be
+    // rejected and leave the phrase untouched. The test-only cleanup helper
+    // refuses the fixed user wallet for the same reason.
+    const sentinelSeed=await createWallet(sentinelName);
+    await deleteState(sentinelName);
+    sentinelSeed.fill(0);
+    const sentinel=await readWallet(sentinelName);
+    assert(typeof sentinel.mnemonic === "string"
+      && sentinel.mnemonic.split(" ").length === 12
+      && sentinel.state === null,
+      "A mnemonic-only wallet is visible as initialized and is not treated as absent");
+    let sentinelProvisioned=false;
+    try { await app.provision(generateMnemonic(),sentinelName); } catch { sentinelProvisioned=true; }
+    const sentinelAfter=await readWallet(sentinelName);
+    assert(sentinelProvisioned && sentinelAfter.mnemonic === sentinel.mnemonic && sentinelAfter.state === null,
+      "Provisioning a mnemonic-only wallet is rejected without replacing its mnemonic");
+
+    await runLiveChannels({app, pure, text, assert});
+    await runFaultScenarios({assert, faults, recordFailure});
+
+    completed = true;
+  } catch (error) {
+    return {ok:false, completed:false, checks, failures, count:checks.length, failureCount:failures.length, error:String(error.message || error)};
+  } finally {
+    faults.restore();
+    if (second) { try { await second.close(); } catch {} try { second.free(); } catch {} }
+    try { await app.close(); } catch {}
+    // Only generated test names, never a real wallet. Each deletion targets
+    // exactly one wallet's two records and verifies that both are gone.
+    for (const ownedName of owned) {
+      try { await deleteWallet(ownedName); } catch { cleanupFailed=true; }
+    }
+    if (seed) seed.fill(0);
+    if (receiverSeed) receiverSeed.fill(0);
+    if (legacyAvailable && legacyKey) { try { localStorage.removeItem(legacyKey); } catch {} }
+  }
+
+  return {ok: completed && failures.length === 0 && !cleanupFailed, completed, cleanupFailed, checks, failures, count: checks.length, failureCount: failures.length};
+}

@@ -14,13 +14,15 @@ extension points.
 
 | File | Job | Talks to Raylib? |
 |---|---|---|
-| `src/main.zig` | allocator, window, the explicit per-frame loop, teardown, screenshot hook | yes |
+| `src/main.zig` | allocator, window, the explicit per-frame loop or browser callback, teardown, screenshot hook | yes |
 | `src/input.zig` | polls keyboard/mouse/gamepad 0 and paces held directions into a plain `FrameInput` value; also collects pointer, clicks, viewport size, and bounded typed text | yes |
 | `src/game.zig` | `GameState` owns the world, camera, menu, and debug settings; applies input | indirectly |
 | `src/menu.zig` | menu page/item data, pure layout, bounded text fields, and runtime menu state | **no** |
+| `src/onboarding.zig` | platform-neutral onboarding model, modal input, effects, and layout | **no** |
+| `src/onboarding_native.zig` | native wallet startup and completion adapter | **no** |
 | `src/camera.zig` | camera movement, world→screen transform, visible chunk range, bounds checks | yes |
 | `src/world.zig` | tiles, chunks, deterministic generation, residency, streaming, stats | **no** |
-| `src/rendering.zig` | draws world, marker, HUD, minimap, and the modal menu from read-only state | yes |
+| `src/rendering.zig` | draws world, marker, HUD, minimap, menu, and optional onboarding overlay from read-only state | yes |
 
 `world.zig` and `menu.zig` are intentionally Raylib-free. That keeps them
 headless-testable and ready for a future server or simulation.
@@ -35,10 +37,13 @@ while (!rl.windowShouldClose()) {
     const vh = screen height;
 
     // 1. collect input
-    const frame = input_reader.read(rl.getFrameTime(), game_state.menu.opened);
+    const blocking = if (model) |m| m.isBlocking() else false;
+    const frame = input_reader.read(rl.getFrameTime(), game_state.menu.opened or blocking);
 
     // 2. update persistent state
-    try game_state.update(frame);
+    const effect = try routeFrame(&game_state, model, frame);
+    // routeFrame gives onboarding first refusal; otherwise GameState updates.
+    // Persist settings if they changed.
 
     // 3. calculate a temporary view
     const view = try camera.calculate(game_state.camera, vw, vh);
@@ -48,8 +53,10 @@ while (!rl.windowShouldClose()) {
 
     // 5. render read-only state
     rl.beginDrawing();
-    rendering.draw(&game_state, view, vw, vh);
+    rendering.draw(&game_state, view, vw, vh, model);
+    // Capture a requested screenshot only if onboarding did not block this frame.
     rl.endDrawing();
+    // Native loop handles onboarding effects and adapter events after the frame.
 }
 ```
 
@@ -63,7 +70,9 @@ Why this order:
    same value carries the screen-space pointer, click/escape/confirm/backspace
    edges, viewport size, and a bounded array of typed codepoints. It does not
    change the game.
-2. **Update second.** `GameState.update` applies that one input value to the
+2. **Update second.** An optional onboarding model receives input first and
+   consumes it while blocking, including transition frames. Otherwise
+   `GameState.update` applies that one input value to the
    persistent camera, menu, and debug settings. The menu is modal: while it is
    open, and on the frame that opens or closes it, the update returns before the
    camera and toggles see the frame. Camera moves are whole-tile and validated;
@@ -75,14 +84,77 @@ Why this order:
    The view is derived data, not state.
 4. **Stream fourth.** `streamChunks` is the other mutation site, but it only
    changes *which chunks are resident*. Generated world content is unchanged.
-5. **Render last.** Rendering receives `*const GameState`, a `View`, and the
-   viewport size. It cannot move the camera or collect input, and its functions
+5. **Render last.** Rendering receives `*const GameState`, a `View`, the
+   viewport size, and an optional read-only onboarding model. It cannot move the camera or collect input, and its functions
    take read-only pointers, so the compiler helps prevent accidental mutation.
    When the menu is open it is drawn after the world, HUD, and minimap, so its
-   dim backdrop covers them.
+   dim backdrop covers them. A blocking onboarding overlay is drawn last.
 
 Screenshot mode (`HAYSTACK_SHOT=/path.png`) runs a few frames, then captures
-**after** `endDrawing` has presented the frame, so the HUD is included.
+**inside the drawing pass before `endDrawing` presents**, so the rendered world
+and HUD are included rather than a cleared black back buffer.
+If native onboarding is blocking at the start of the capture frame, the capture
+is skipped and the screenshot budget is consumed; no PNG is written. A model
+that is blocking at capture time also prevents capture. This also
+protects completion-transition frames that started with recovery words visible.
+
+## Native wallet startup
+
+After the window and world are initialized, the first frame displays a blocking
+loading overlay. Native wallet inspection and, when needed, provisioning run
+synchronously after that frame. A valid legacy wallet proceeds directly to the
+game. A newly provisioned or pending wallet displays its recovery words and
+requires the player to acknowledge saving them before continuing. Completion
+must be persisted successfully; otherwise the player can retry. Invalid or
+unavailable wallet storage blocks startup without repairing existing data.
+Copying is optional and exposes the words to other applications and clipboard
+history; the clipboard is not automatically cleared. Browser startup and its
+separate wallet provisioning policy are unchanged.
+
+## Browser loop
+
+The five stages are factored into one `stepFrame` helper and run unchanged on
+both platforms. Native `main` calls it from the blocking `while` loop above. The
+browser build exports a C `main` instead. It does **not** create a window or a
+main loop: it starts an async disposable-wallet gate and returns immediately.
+Only when the JS bridge has generated a mnemonic, opened and verified an empty
+wallet, closed/freed it and removed its storage key does it invoke one
+single-shot Zig C continuation. That continuation creates the heap-owned
+`BrowserContext` (the `GameState` plus the persistent `input.Reader`) and hands
+an Emscripten callback to `emscripten_set_main_loop(browserFrame, 0, 0)`, so the
+page is never blocked. The context outlives the entry function; Emscripten never
+receives a pointer to a returned stack frame. A wallet import, initialization,
+storage or cleanup failure shows the generic `Unable to start game.` message and
+creates no game context or frame loop.
+
+`browser/game-shell.html` is the game-only shell: one full-viewport canvas with
+no border, margin or scroll, a temporary non-interactive startup line, and
+`Module.canvas` before the Emscripten script. It has no wallet form, iframe,
+Emscripten logo, controls or log textarea. Raylib's web backend already resizes
+the canvas and renderbuffer from `window.innerWidth`/`innerHeight`; the Zig side
+also initializes using the current canvas CSS size instead of a fixed
+`1000x640`. There is no competing JS resize code. The shell focuses the canvas
+after startup and on pointer interaction, scopes its key listener to the focused
+canvas, and cancels only non-printable navigation/scroll keys (arrows,
+Backspace, Tab, Enter, Escape). Printable WASD/G/B/space keys are never
+cancelled, so GLFW's keypress path can still type into menu fields; Ctrl/Meta/Alt
+shortcuts are left alone.
+
+The browser callback deliberately does **not** call `rl.windowShouldClose()`.
+The pinned web backend implements it with a blocking `emscripten_sleep`, which
+is forbidden inside `emscripten_set_main_loop` and aborts when asyncify is
+disabled. The browser page/main loop owns lifetime instead, and `EndDrawing`
+still polls input and timing normally. The browser also sets raylib's target FPS
+to zero so `requestAnimationFrame`, not a raylib sleep, controls pacing.
+
+Browser teardown is explicit and idempotent: `stopBrowser` clears the global
+context first, cancels the main loop, deinitializes `GameState`, destroys the
+context, and closes the window. A callback that finds no context returns
+immediately, so no stage touches freed state after cleanup. Initialization
+failures log, run the same cleanup, call the generic error UI and never register
+a loop. Both entry points disable Raylib's Escape quit key so Escape toggles the
+menu. The browser exposes no game snapshot or test-only `Module` status API;
+startup state is internal to the single-shot wallet gate.
 
 ## Four kinds of data
 
@@ -130,7 +202,8 @@ chunk still exists conceptually; the deterministic generator can recreate it.
    resident chunk pool/map, never tile contents.
 5. `rendering.draw` draws grid/borders for resident visible chunks, the camera
    marker, the HUD, and the minimap. If the menu is open it draws that last, in
-   screen space. It reads `GameState`, `View`, and the viewport size only.
+   screen space, followed by any blocking onboarding overlay. It reads
+   `GameState`, `View`, the viewport size, and the optional model only.
 6. Next frame starts over. There is no event queue and no fixed timestep; input
    is sampled once per frame, and `input.Reader` uses the frame delta only to
    pace held directional steps.
@@ -138,15 +211,19 @@ chunk still exists conceptually; the deterministic generator can recreate it.
 ## Memory ownership
 
 - `main` picks the allocator: `DebugAllocator` in Debug and ReleaseSafe (leak
-  reporting), `c_allocator` in ReleaseFast and ReleaseSmall.
+  reporting), `c_allocator` in ReleaseFast and ReleaseSmall. The browser entry
+  uses `c_allocator` for its heap-owned `BrowserContext`.
 - `main` owns `GameState`; `GameState` owns `World`, `Camera`, `Menu`, and
-  `Settings`.
+  `Settings`. In the browser, `BrowserContext` owns both `GameState` and
+  `input.Reader`.
 - `Menu` and its `TextField` buffers are fixed-size values: no allocation, no
   separate teardown.
 - `World` owns its chunk pool, resident hash map, and reusable unload-key list.
   `GameState.deinit` releases all of them.
-- Teardown is defer-ordered: `GameState.deinit` runs before `closeWindow`, and
-  the debug allocator check runs last.
+- Teardown is defer-ordered on native: `GameState.deinit` runs before
+  `closeWindow`, and the debug allocator check runs last. Browser teardown runs
+  the same order explicitly (cancel loop, deinit state, destroy context, close
+  window) and cannot run twice.
 - Steady-state panning reuses released pool slots and pre-reserved map/scratch
   capacity, so normal frames do not allocate. There is no per-frame snapshot of
   the world.

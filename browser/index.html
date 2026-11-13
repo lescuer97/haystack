@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>haystack</title>
+<script>
+  // The default application is the game only. Preserve query/hash so deep
+  // links such as ?smoke still reach the renderer.
+  location.replace("renderer/index.html" + location.search + location.hash);
+</script>
+<noscript><meta http-equiv="refresh" content="0; url=renderer/index.html"></noscript>
+</head>
+<body>
+<p><a href="renderer/index.html">Open the game</a></p>
+</body>
+</html>
