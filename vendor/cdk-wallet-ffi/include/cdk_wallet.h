@@ -1112,6 +1112,81 @@ cdk_wallet_recover (
     char const * mint_url);
 
 /** \brief
+ *  Advisory local-state audit for a recovery-owned staged wallet.
+ */
+typedef struct CdkRestoreCanAbandonResult {
+    /** \brief
+     *  Call status.
+     */
+    CdkStatus_t status;
+
+    /** \brief
+     *  Owned diagnostic on failure; free with `cdk_string_free`.
+     */
+    char * error;
+
+    /** \brief
+     *  1 only when the local audit succeeds and finds no financial artifacts.
+     */
+    uint8_t safe_to_abandon;
+} CdkRestoreCanAbandonResult_t;
+
+/** \brief
+ *  Audit local artifacts in a staged wallet. Advisory only: the caller must
+ *  independently prove recovery ownership. This does not delete anything or
+ *  prove that the seed has no funds at a mint. Free error with `cdk_string_free`.
+ */
+CdkRestoreCanAbandonResult_t
+cdk_wallet_restore_can_abandon (
+    CdkWallet_t const * handle);
+
+/** \brief
+ *  Result of a NUT-13 seed scan, distinct from unfinished-saga recovery.
+ */
+typedef struct CdkSeedRestoreResult {
+    /** \brief
+     *  Call status; only Ok means the scan completed.
+     */
+    CdkStatus_t status;
+
+    /** \brief
+     *  Diagnostic on failure; free with `cdk_string_free`.
+     */
+    char * error;
+
+    /** \brief
+     *  1 if the scan did not complete, otherwise 0. Partial proofs may persist.
+     */
+    uint8_t incomplete;
+
+    /** \brief
+     *  Scanned proof totals in sats, valid only when incomplete is 0.
+     */
+    uint64_t unspent_sats;
+
+    /** \brief
+     *  Scanned pending proof total in sats, valid only when incomplete is 0.
+     */
+    uint64_t pending_sats;
+
+    /** \brief
+     *  Scanned spent proof total in sats, valid only when incomplete is 0.
+     */
+    uint64_t spent_sats;
+} CdkSeedRestoreResult_t;
+
+/** \brief
+ *  Scan a Sat mint for deterministic seed-derived proofs using NUT-13.
+ *  This is not saga recovery. Failure may leave previously restored proofs in
+ *  the database; totals are valid only when the scan completed. Free `error`
+ *  with `cdk_string_free`.
+ */
+CdkSeedRestoreResult_t
+cdk_wallet_restore_seed (
+    CdkWallet_t * handle,
+    char const * mint_url);
+
+/** \brief
  *  Result of sending a token.
  *
  *  Carries a bearer token on success, so [`Debug`] is redacted.

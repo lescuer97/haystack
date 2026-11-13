@@ -9,8 +9,8 @@
 //! * `open`/`close`, `add_mint`, `list_mints`, `list_balances`, `receive`,
 //!   `send`, pending-token listing/retrieval, and explicit recovery;
 //! * BIP-39 mnemonic generation plus entropy / 64-byte seed derivation, using
-//!   the same dependency and semantics as upstream CDK (the application still
-//!   owns backup and secure storage; there is no restore engine).
+//!   the same dependency and semantics as upstream CDK; the application owns
+//!   backup and secure storage.
 //!
 //! # Blocking API
 //!
@@ -62,7 +62,7 @@ pub fn header_contents() -> String {
     // Referencing every exported symbol forces the linker to keep the `api`
     // object file (and therefore the `inventory` registrations that the header
     // generator iterates over).
-    let force: [*const (); 47] = [
+    let force: [*const (); 49] = [
         cdk_wallet_open as *const (),
         cdk_wallet_close as *const (),
         cdk_wallet_add_mint as *const (),
@@ -73,6 +73,8 @@ pub fn header_contents() -> String {
         cdk_wallet_list_pending_tokens as *const (),
         cdk_wallet_get_pending_token as *const (),
         cdk_wallet_recover as *const (),
+        cdk_wallet_restore_seed as *const (),
+        cdk_wallet_restore_can_abandon as *const (),
         cdk_generate_mnemonic as *const (),
         cdk_mnemonic_to_entropy as *const (),
         cdk_mnemonic_to_seed as *const (),

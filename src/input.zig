@@ -71,6 +71,7 @@ pub const FrameInput = struct {
     viewport_h: f32 = 640,
 
     backspace: bool = false,
+    paste_shortcut: bool = false,
     characters: [max_frame_characters]u21 = @splat(0),
     character_count: usize = 0,
 };
@@ -102,6 +103,8 @@ pub const Reader = struct {
         // press. The gamepad Start button is the same edge.
         held.escape_clicked = rl.isKeyPressed(.escape);
         held.backspace = rl.isKeyPressed(.backspace) or rl.isKeyPressedRepeat(.backspace);
+        held.paste_shortcut = (rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control) or
+            rl.isKeyDown(.left_super) or rl.isKeyDown(.right_super)) and rl.isKeyPressed(.v);
 
         // Confirm is a keyboard/gamepad edge. Enter (main or keypad) and the
         // bottom face button (A/Cross) activate the selected row.
@@ -422,6 +425,7 @@ fn expectSameUi(expected: FrameInput, actual: FrameInput) !void {
     try std.testing.expectEqual(expected.viewport_w, actual.viewport_w);
     try std.testing.expectEqual(expected.viewport_h, actual.viewport_h);
     try std.testing.expectEqual(expected.backspace, actual.backspace);
+    try std.testing.expectEqual(expected.paste_shortcut, actual.paste_shortcut);
     try std.testing.expectEqual(expected.character_count, actual.character_count);
     try std.testing.expectEqualSlices(u21, &expected.characters, &actual.characters);
     try std.testing.expectEqual(expected.toggle_grid, actual.toggle_grid);

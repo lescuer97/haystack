@@ -84,6 +84,9 @@ const NETWORK_DEADLINE: Duration = Duration::from_secs(60);
 /// Longer deadline for startup / explicit recovery, which may replay several
 /// requests against a mint.
 const RECOVERY_DEADLINE: Duration = Duration::from_secs(120);
+/// Seed restoration can scan many batches across multiple keysets.
+#[cfg(not(target_arch = "wasm32"))]
+const SEED_RESTORE_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// The persistent, multi-threaded Tokio runtime.
 ///
@@ -195,6 +198,8 @@ pub struct CdkWallet {
     repo: WalletRepository,
     /// The underlying database, retained for mint registration and saga reads.
     db: Arc<WalletSqliteDatabase>,
+    #[cfg(not(target_arch = "wasm32"))]
+    db_path: PathBuf,
     /// Exclusive advisory lock held for the lifetime of the handle.
     ///
     /// Never read; dropped (releasing the lock) when the handle is freed.
@@ -258,6 +263,106 @@ impl CdkWallet {
             return deadline;
         }
         RECOVERY_DEADLINE
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod restore_abandon_tests {
+    use super::*;
+    use cdk::nuts::{Proof, State};
+    use cdk::secret::Secret;
+    use cdk_common::wallet::ProofInfo;
+
+    #[test]
+    fn restore_can_abandon_checks_local_artifacts_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let (mut wallet, _) = runtime()
+            .block_on(CdkWallet::open(&[42; 64], path.to_str().unwrap()))
+            .unwrap();
+        let check = || crate::cdk_wallet_restore_can_abandon(Some(&wallet));
+        assert_eq!(check().safe_to_abandon, 1);
+        let mint = MintUrl::from_str("https://test-mint.example.com").unwrap();
+        runtime()
+            .block_on(wallet.db.add_mint(mint.clone(), None))
+            .unwrap();
+        assert_eq!(check().safe_to_abandon, 1);
+        let proof = Proof {
+            amount: Amount::from(1),
+            keyset_id: Id::from_str("00916bbf7ef91a36").unwrap(),
+            secret: Secret::generate(),
+            c: SecretKey::generate().public_key(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        let proof = ProofInfo::new(proof, mint, State::Spent, UNIT).unwrap();
+        runtime()
+            .block_on(wallet.db.update_proofs(vec![proof], vec![]))
+            .unwrap();
+        let result = check();
+        assert_eq!(result.status, CdkStatus::Ok);
+        assert_eq!(result.safe_to_abandon, 0);
+        let null = crate::cdk_wallet_restore_can_abandon(None);
+        assert_eq!(null.status, CdkStatus::NullArgument);
+        assert_eq!(null.safe_to_abandon, 0);
+        crate::cdk_string_free(null.error);
+        crate::api::cdk_test_panic(Some(&mut wallet));
+        let poisoned = crate::cdk_wallet_restore_can_abandon(Some(&wallet));
+        assert_eq!(poisoned.status, CdkStatus::InternalError);
+        assert_eq!(poisoned.safe_to_abandon, 0);
+        crate::cdk_string_free(poisoned.error);
+    }
+
+    #[test]
+    fn restore_can_abandon_rejects_undecodable_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let (wallet, _) = runtime()
+            .block_on(CdkWallet::open(&[42; 64], path.to_str().unwrap()))
+            .unwrap();
+        let mint = MintUrl::from_str("https://test-mint.example.com").unwrap();
+        runtime()
+            .block_on(wallet.db.add_mint(mint.clone(), None))
+            .unwrap();
+        let proof = Proof {
+            amount: Amount::from(1),
+            keyset_id: Id::from_str("00916bbf7ef91a36").unwrap(),
+            secret: Secret::generate(),
+            c: SecretKey::generate().public_key(),
+            witness: None,
+            dleq: None,
+            p2pk_e: None,
+        };
+        let proof = ProofInfo::new(proof, mint, State::Spent, UNIT).unwrap();
+        runtime()
+            .block_on(wallet.db.update_proofs(vec![proof], vec![]))
+            .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(conn.execute("UPDATE proof SET c = x'00'", []).unwrap(), 1);
+        assert!(runtime()
+            .block_on(wallet.db.get_proofs(None, None, None, None))
+            .unwrap()
+            .is_empty());
+        assert!(!runtime().block_on(wallet.restore_can_abandon()).unwrap());
+    }
+
+    #[test]
+    fn restore_can_abandon_rejects_replaced_database_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.sqlite");
+        let (wallet, _) = runtime()
+            .block_on(CdkWallet::open(&[42; 64], path.to_str().unwrap()))
+            .unwrap();
+        fs::rename(&path, dir.path().join("original.sqlite")).unwrap();
+        File::create(&path).unwrap();
+        assert_eq!(
+            runtime()
+                .block_on(wallet.restore_can_abandon())
+                .unwrap_err()
+                .status,
+            CdkStatus::DatabaseError
+        );
     }
 }
 
@@ -407,6 +512,8 @@ impl CdkWallet {
         let mut handle = CdkWallet {
             repo,
             db,
+            #[cfg(not(target_arch = "wasm32"))]
+            db_path: PathBuf::from(path_str),
             _lock: file,
             unresolved: BTreeSet::new(),
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -444,6 +551,55 @@ impl CdkWallet {
             .collect();
         out.sort();
         Ok(out)
+    }
+
+    /// Audit local recovery-owned state only; this neither establishes ownership
+    /// nor proves that a seed has no funds at a mint.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn restore_can_abandon(&self) -> FfiResult<bool> {
+        let check_identity = || -> FfiResult<()> {
+            let locked = self._lock.metadata().map_err(db_error)?;
+            let path = fs::metadata(&self.db_path).map_err(db_error)?;
+            if (locked.dev(), locked.ino()) != (path.dev(), path.ino()) {
+                return Err(FfiErr::new(
+                    CdkStatus::DatabaseError,
+                    "database path no longer identifies the locked file",
+                ));
+            }
+            Ok(())
+        };
+        check_identity()?;
+        let conn = rusqlite::Connection::open_with_flags(
+            &self.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(db_error)?;
+        check_identity()?;
+        let has_proof_rows: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM proof)", [], |row| row.get(0))
+            .map_err(db_error)?;
+        check_identity()?;
+        let proofs = self
+            .db
+            .get_proofs(None, None, None, None)
+            .await
+            .map_err(db_error)?;
+        let mint_quotes = self.db.get_mint_quotes().await.map_err(db_error)?;
+        let melt_quotes = self.db.get_melt_quotes().await.map_err(db_error)?;
+        let transactions = self
+            .db
+            .list_transactions(None, None, None)
+            .await
+            .map_err(db_error)?;
+        let sagas = self.db.get_incomplete_sagas().await.map_err(db_error)?;
+        let p2pk_keys = self.db.list_p2pk_keys().await.map_err(db_error)?;
+        Ok(!has_proof_rows
+            && proofs.is_empty()
+            && mint_quotes.is_empty()
+            && melt_quotes.is_empty()
+            && transactions.is_empty()
+            && sagas.is_empty()
+            && p2pk_keys.is_empty())
     }
 
     /// Register (approve) a mint after validating its URL and advertised units.
@@ -490,6 +646,30 @@ impl CdkWallet {
             .await
             .map_err(|e| FfiErr::new(CdkStatus::MintRegistrationFailed, format!("{e}")))?;
         Ok(())
+    }
+
+    /// Scan deterministic proofs for one Sat mint. Earlier batches may persist
+    /// even if a later batch fails or the deadline expires.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) async fn restore_seed(&mut self, url: &str) -> FfiResult<(u64, u64, u64)> {
+        let mint = parse_mint_url(url)?;
+        self.add_mint(url).await?;
+        let wallet = self.approved_wallet(&mint).await?;
+        match timeout(SEED_RESTORE_DEADLINE, wallet.restore()).await {
+            Ok(Ok(restored)) => Ok((
+                restored.unspent.to_u64(),
+                restored.pending.to_u64(),
+                restored.spent.to_u64(),
+            )),
+            Ok(Err(e)) => Err(FfiErr::new(
+                map_recovery_error(&e),
+                format!("seed restore incomplete; previously restored proofs may remain: {e}"),
+            )),
+            Err(_) => Err(FfiErr::new(
+                CdkStatus::NetworkError,
+                "seed restore exceeded its deadline; previously restored proofs may remain",
+            )),
+        }
     }
 
     /// Receive a token, returning the net Sat amount credited.

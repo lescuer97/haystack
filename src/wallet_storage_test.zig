@@ -11,8 +11,96 @@ const Io = std.Io;
 
 const sf = @import("storage_fs.zig");
 const wallet = @import("wallet.zig");
+test {
+    _ = @import("onboarding_native.zig");
+}
 
 const testing = std.testing;
+
+const recovery_phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+const recovery_id = "0123456789abcdef0123456789abcdef".*;
+const other_recovery_id = "1123456789abcdef0123456789abcdef".*;
+
+test "recovery prepares inspects and commits without overwriting" {
+    var h = try Harness.init();
+    defer h.deinit();
+    const paths = try wallet.recoveryPaths(testing.allocator, h.paths);
+    defer {
+        paths.deinit(testing.allocator);
+        testing.allocator.free(paths.dir);
+    }
+    try wallet.prepareRecovery(testing.io, testing.allocator, h.paths, recovery_phrase, recovery_id);
+    try testing.expectError(error.RecoveryOwnershipMismatch, wallet.inspectRecovery(testing.io, testing.allocator, h.paths, other_recovery_id, false));
+    try testing.expectError(error.RecoveryOwnershipMismatch, wallet.commitRecovery(testing.io, testing.allocator, h.paths, other_recovery_id));
+    var inspected = try wallet.inspectRecovery(testing.io, testing.allocator, h.paths, recovery_id, true);
+    try testing.expectEqual(wallet.State.ready, inspected.state);
+    try inspected.close();
+    const phrase = try wallet.readMnemonic(testing.io, testing.allocator, paths);
+    defer testing.allocator.free(phrase);
+    try testing.expectEqualStrings(recovery_phrase, phrase);
+    _ = try wallet.recoveryCanAbandon(testing.io, testing.allocator, h.paths, recovery_id);
+    try testing.expectEqual(wallet.Durability.durable, try wallet.commitRecovery(testing.io, testing.allocator, h.paths, recovery_id));
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(testing.io, paths.dir, .{ .follow_symlinks = false }));
+    const final_phrase = try wallet.readMnemonic(testing.io, testing.allocator, h.paths);
+    defer testing.allocator.free(final_phrase);
+    try testing.expectEqualStrings(recovery_phrase, final_phrase);
+    const receipt_path = try std.fs.path.join(testing.allocator, &.{ h.paths.dir, "recovery-owner" });
+    defer testing.allocator.free(receipt_path);
+    var receipt = try Io.Dir.cwd().openFile(testing.io, receipt_path, .{ .follow_symlinks = false });
+    defer receipt.close(testing.io);
+    var buf: [33]u8 = undefined;
+    var reader = receipt.reader(testing.io, &.{});
+    const n = try reader.interface.readSliceShort(&buf);
+    try testing.expectEqualStrings(&recovery_id, buf[0..n]);
+    try testing.expectError(error.AlreadyInitialized, wallet.prepareRecovery(testing.io, testing.allocator, h.paths, recovery_phrase, recovery_id));
+}
+
+test "invalid recovery leaves no stage and retained stage does not block create" {
+    var h = try Harness.init();
+    defer h.deinit();
+    const paths = try wallet.recoveryPaths(testing.allocator, h.paths);
+    defer {
+        paths.deinit(testing.allocator);
+        testing.allocator.free(paths.dir);
+    }
+    try testing.expectError(error.InvalidMnemonic, wallet.prepareRecovery(testing.io, testing.allocator, h.paths, "invalid phrase", recovery_id));
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(testing.io, paths.dir, .{ .follow_symlinks = false }));
+    try wallet.prepareRecovery(testing.io, testing.allocator, h.paths, recovery_phrase, recovery_id);
+    const created = try wallet.create(testing.io, testing.allocator, h.paths);
+    defer created.deinit(testing.allocator);
+    try testing.expectError(error.AlreadyInitialized, wallet.commitRecovery(testing.io, testing.allocator, h.paths, recovery_id));
+    var inspected = try wallet.inspectRecovery(testing.io, testing.allocator, h.paths, recovery_id, true);
+    try inspected.close();
+}
+
+test "recovery rejects invalid ids and incomplete stages" {
+    var h = try Harness.init();
+    defer h.deinit();
+    const invalid_id = "0123456789abcdef0123456789abcdeF".*;
+    try testing.expectError(error.InvalidRecoveryId, wallet.prepareRecovery(testing.io, testing.allocator, h.paths, recovery_phrase, invalid_id));
+    try testing.expectError(error.RecoveryStageUnavailable, wallet.inspectRecovery(testing.io, testing.allocator, h.paths, recovery_id, false));
+    try sf.ensureOwnedDir(testing.io, h.dataRoot());
+    const paths = try wallet.recoveryPaths(testing.allocator, h.paths);
+    defer {
+        paths.deinit(testing.allocator);
+        testing.allocator.free(paths.dir);
+    }
+    try Io.Dir.createDirAbsolute(testing.io, paths.dir, sf.mode_dir);
+    try testing.expectError(error.RecoveryStageUnavailable, wallet.inspectRecovery(testing.io, testing.allocator, h.paths, recovery_id, false));
+    try testing.expectError(error.PathAlreadyExists, wallet.prepareRecovery(testing.io, testing.allocator, h.paths, recovery_phrase, recovery_id));
+}
+
+test "recovery commit retains wallet on parent sync failure" {
+    var h = try Harness.init();
+    defer h.deinit();
+    try wallet.prepareRecovery(testing.io, testing.allocator, h.paths, recovery_phrase, recovery_id);
+    wallet.testFailCommitSync = true;
+    defer wallet.testFailCommitSync = false;
+    try testing.expectEqual(wallet.Durability.unknown, try wallet.commitRecovery(testing.io, testing.allocator, h.paths, recovery_id));
+    var inspection = try wallet.inspect(testing.io, testing.allocator, h.paths, true);
+    try testing.expectEqual(wallet.State.ready, inspection.state);
+    try inspection.close();
+}
 
 const Harness = struct {
     tmp: std.testing.TmpDir,

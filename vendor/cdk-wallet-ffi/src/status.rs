@@ -437,6 +437,38 @@ pub struct CdkRecoveryResult {
     pub reports: repr_c::Vec<CdkMintRecovery>,
 }
 
+/// Advisory local-state audit for a recovery-owned staged wallet.
+#[derive_ReprC]
+#[repr(C)]
+#[derive(Debug)]
+pub struct CdkRestoreCanAbandonResult {
+    /// Call status.
+    pub status: CdkStatus,
+    /// Owned diagnostic on failure; free with `cdk_string_free`.
+    pub error: Option<char_p::Box>,
+    /// 1 only when the local audit succeeds and finds no financial artifacts.
+    pub safe_to_abandon: u8,
+}
+
+/// Result of a NUT-13 seed scan, distinct from unfinished-saga recovery.
+#[derive_ReprC]
+#[repr(C)]
+#[derive(Debug)]
+pub struct CdkSeedRestoreResult {
+    /// Call status; only Ok means the scan completed.
+    pub status: CdkStatus,
+    /// Diagnostic on failure; free with `cdk_string_free`.
+    pub error: Option<char_p::Box>,
+    /// 1 if the scan did not complete, otherwise 0. Partial proofs may persist.
+    pub incomplete: u8,
+    /// Scanned proof totals in sats, valid only when incomplete is 0.
+    pub unspent_sats: u64,
+    /// Scanned pending proof total in sats, valid only when incomplete is 0.
+    pub pending_sats: u64,
+    /// Scanned spent proof total in sats, valid only when incomplete is 0.
+    pub spent_sats: u64,
+}
+
 /// Result of generating a Spilman channel keypair.
 ///
 /// Carries a secret key, so [`Debug`] is redacted: never rely on `{:?}` to
