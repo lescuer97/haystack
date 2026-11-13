@@ -29,9 +29,9 @@
     canvas: canvas,
     print: function () { console.log.apply(console, arguments); },
     printErr: function () { console.error.apply(console, arguments); },
-    // Called by the wasm library after the wallet check: "ready" hides the
-    // startup text and focuses the game canvas; "error" leaves a generic
-    // message because the game is never started.
+    // After the settings guard, the renderer draws the in-game onboarding modal
+    // while wallet inspection runs asynchronously. "ready" hides the startup
+    // text and focuses the canvas; "error" shows a generic startup message.
     onHaystackStartup: function (state) {
       if (state === "ready") {
         startup.hidden = true;

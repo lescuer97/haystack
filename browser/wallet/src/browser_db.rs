@@ -11,6 +11,7 @@
 //! rejected with `ConcurrentUpdate` instead of overwriting committed state.
 use async_trait::async_trait;
 use cdk_common::bitcoin::bip32::DerivationPath;
+use cdk_common::bitcoin::hashes::{sha256, Hash as _};
 use cdk_common::database::{Error, WalletDatabase};
 use cdk_common::mint_url::MintUrl;
 use cdk_common::nuts::{
@@ -303,6 +304,7 @@ impl Store {
 pub struct BrowserDatabase {
     name: String,
     fingerprint: String,
+    seed_hash: sha256::Hash,
     // Serializes one handle's read-modify-write mutations. The Web Lock already
     // excludes other tabs; this mutex keeps concurrent CDK calls on one handle
     // from observing and rewriting the same revision.
@@ -351,6 +353,24 @@ fn parse_store(raw: &str, fingerprint: &str) -> Result<Store, DbError> {
     Ok(store)
 }
 
+pub(crate) fn validate_onboarding_store(raw: &str, fingerprint: &str) -> Result<(), DbError> {
+    parse_store(raw, fingerprint).map(|_| ())
+}
+
+pub(crate) fn onboarding_store_can_abandon(raw: &str, fingerprint: &str) -> Result<bool, DbError> {
+    let store = parse_store(raw, fingerprint)?;
+    Ok(store.proofs.is_empty()
+        && store.mint_quotes.is_empty()
+        && store.melt_quotes.is_empty()
+        && store.transactions.is_empty()
+        && store.sagas.is_empty()
+        && store.p2pk_keys.is_empty())
+}
+
+pub(crate) fn initial_onboarding_store(fingerprint: String) -> Result<String, DbError> {
+    serde_json::to_string(&Store::new(fingerprint)).map_err(|_| DbError::WriteFailed)
+}
+
 impl BrowserDatabase {
     /// Open an existing provisioned wallet. Never creates or rewrites records.
     pub async fn open(name: String, fingerprint: String, seed: [u8; 64]) -> Result<Self, DbError> {
@@ -371,8 +391,32 @@ impl BrowserDatabase {
         Ok(Self {
             name,
             fingerprint,
+            seed_hash: sha256::Hash::hash(&seed),
             writes: Mutex::new(()),
         })
+    }
+
+    /// Audit a fresh, complete snapshot. The revision is returned for a later
+    /// compare-and-swap; this check alone does not reserve the snapshot.
+    pub async fn restore_can_abandon(&self) -> Result<(u64, bool), DbError> {
+        let records: Records =
+            serde_json::from_str(&backend::load(&self.name).await.map_err(read_error)?)
+                .map_err(|_| DbError::Corrupt)?;
+        let (mnemonic, state) = match (records.mnemonic, records.state) {
+            (None, None) => return Err(DbError::NotInitialized),
+            (Some(mnemonic), Some(state)) => (Zeroizing::new(mnemonic), state),
+            _ => return Err(DbError::Incomplete),
+        };
+        let (normalized, seed) = parse_mnemonic(&mnemonic)?;
+        let _normalized = Zeroizing::new(normalized);
+        let seed = Zeroizing::new(seed);
+        if sha256::Hash::hash(&seed[..]) != self.seed_hash {
+            return Err(DbError::SeedMismatch);
+        }
+        Ok((
+            state.revision,
+            onboarding_store_can_abandon(&state.data, &self.fingerprint)?,
+        ))
     }
 
     /// Create the two records atomically in one IndexedDB transaction. Callers

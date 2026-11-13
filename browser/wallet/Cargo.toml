@@ -7,6 +7,10 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Test fixture only; never enable in production builds.
+local-mint-fixture = []
+
 [dependencies]
 cdk = { version = "=0.18.3", default-features = false, features = ["wallet"] }
 cdk-common = { version = "=0.18.3", default-features = false, features = ["wallet"] }
@@ -26,7 +30,7 @@ wasm-bindgen = "=0.2.130"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-time = "1"
-web-sys = { version = "0.3", features = ["Window", "Storage", "console"] }
+web-sys = { version = "0.3", features = ["Window", "Location", "Storage", "console"] }
 
 [profile.release]
 opt-level = "s"

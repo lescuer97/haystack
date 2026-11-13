@@ -11,7 +11,8 @@
 export const DATABASE = "haystack-wallet";
 export const MNEMONIC_STORE = "mnemonics";
 export const STATE_STORE = "states";
-export const DATABASE_VERSION = 1;
+export const ONBOARDING_STORE = "onboarding";
+export const DATABASE_VERSION = 2;
 export const USER_WALLET_NAME = "haystack-user";
 
 let connection = null;
@@ -33,6 +34,7 @@ function openDatabase() {
       const database = request.result;
       if (!database.objectStoreNames.contains(MNEMONIC_STORE)) database.createObjectStore(MNEMONIC_STORE);
       if (!database.objectStoreNames.contains(STATE_STORE)) database.createObjectStore(STATE_STORE);
+      if (!database.objectStoreNames.contains(ONBOARDING_STORE)) database.createObjectStore(ONBOARDING_STORE);
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(new Error("IndexedDB could not be opened"));

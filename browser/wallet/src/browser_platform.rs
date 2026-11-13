@@ -62,6 +62,25 @@ async fn lock(name: &str) -> FfiResult<BrowserLock> {
     )?))
 }
 
+pub(crate) async fn onboarding_lock() -> Result<BrowserLock, JsValue> {
+    Ok(BrowserLock(
+        acquire_lock("haystack-onboarding:haystack-user").await?,
+    ))
+}
+
+pub(crate) async fn user_lock() -> FfiResult<BrowserLock> {
+    lock(USER_WALLET_NAME).await
+}
+
+pub(crate) async fn warn_if_storage_not_persistent() {
+    if !probe_persistent_storage(USER_WALLET_NAME)
+        .await
+        .unwrap_or(false)
+    {
+        web_sys::console::warn_1(&JsValue::from_str("Persistent storage was not granted; the wallet is stored but may be evicted under storage pressure"));
+    }
+}
+
 pub async fn open_database(
     seed: &[u8; 64],
     name: &str,

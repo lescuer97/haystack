@@ -14,10 +14,13 @@ menu, without building the other application.
 | `zig build run -Dplatform=wasm` | Build/serve the browser application at `http://127.0.0.1:8000` |
 | `zig build test` | Desktop application tests |
 | `zig build test-wallet` | Native Rust suite, C-header check, Zig wallet/Spilman ABI tests |
-| `zig build test -Dplatform=wasm` | Full browser build, database conformance tests, Node storage bridge tests, ephemeral fake mint, Chromium tests, fixture cleanup |
+| `zig build test -Dplatform=wasm` | Isolated browser fixture, database conformance and Node tests, ephemeral fake mint and Chromium tests; exits nonzero for three known send/swap recovery assertions |
 | `zig build test-storage -Dplatform=wasm` | Node-only settings/content bridge tests against an in-memory IndexedDB (no Chromium) |
 | `zig build test-wallet -Dplatform=wasm` | Browser database conformance tests on the host |
 | `zig build test-mint -Dplatform=wasm` | Build/serve the browser app with a localhost-only fake mint at port 18787 |
+| `zig build wallet-fixture -Dplatform=wasm` | Build the isolated local-mint fixture wallet under `zig-out/wasm-test` |
+| `zig build browser-fixture -Dplatform=wasm` | Build the isolated browser fixture application under `zig-out/wasm-test` |
+| `zig build test-onboarding -Dplatform=wasm` | Linux-only onboarding suite with a fake mint and fresh Chromium incognito contexts |
 | `zig build setup -Dplatform=wasm` | Provision Rust + Wasm target, local wasm-bindgen and Emscripten without building the application |
 | `zig build test-build` | Test graph isolation, explicit setup/check contracts, the native target matrix and the upstream Emscripten adapter |
 
@@ -53,6 +56,14 @@ A normal desktop build does not construct browser tools or compile the browser
 wallet. Browser **tests** explicitly need a native fake-mint executable;
 that helper has its own `browser/wallet/target/test-mint` cache and is never linked
 into or shipped with the browser bundle.
+
+Production browser artifacts install under `zig-out/wasm`; fixture artifacts use
+the separate `zig-out/wasm-test` graph and output. Browser `test` and `test-mint`
+use the fixture, including ReleaseSafe tests. Its `local-mint-fixture` policy
+permits only a same-origin root loopback mint, so tests do not contact the public
+mint. On macOS the fixture build and Node/host tests passed; the Chromium suite
+was not run there. Historical browser results below predate v2 onboarding and
+do not establish end-to-end verification of the new flow.
 
 Desktop support is native Linux (x86_64/aarch64) and native **Apple Silicon**
 macOS (arm64). A foreign desktop target, macOS Intel and universal binaries are
@@ -281,7 +292,8 @@ zig build -Dplatform=wasm -Doffline
 zig build -Doffline
 ```
 
-Outputs remain separated under `<prefix>/desktop` and `<prefix>/wasm`.
+Outputs remain separated under `<prefix>/desktop`, `<prefix>/wasm` and the test
+fixture's `<prefix>/wasm-test`.
 Changing the install prefix does not force a second renderer build or copy a
 whole nested build directory into the result. Old `zig-out/bin`, `zig-out/browser`
 and `zig-out/web` products from the previous build layout are not deleted.
