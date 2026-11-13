@@ -255,6 +255,63 @@ fn temp_db() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 #[test]
+fn e2e_seed_restore_funds_and_spend() {
+    let mint_url = block_on(start_fake_mint(0));
+    let seed = [55u8; 64];
+    let (_original_dir, original_path) = temp_db();
+    let (_restored_dir, restored_path) = temp_db();
+    let (_other_dir, other_path) = temp_db();
+
+    let funding = block_on(fund_wallet(
+        &original_path,
+        seed,
+        &mint_url,
+        1000,
+        SplitTarget::default(),
+    ));
+    drop(funding);
+
+    let mut restored = open_wallet(seed, &restored_path);
+    let result = crate::api::cdk_wallet_restore_seed(
+        Some(&mut restored),
+        Some(cstr_ref(&with_nul(&mint_url))),
+    );
+    let error = result.error.as_ref().map(|e| e.to_str().to_owned());
+    crate::api::cdk_string_free(result.error);
+    assert_eq!(result.status, CdkStatus::Ok, "restore failed: {error:?}");
+    assert_eq!(result.incomplete, 0);
+    assert_eq!(result.unspent_sats, 1000);
+    let balances = block_on(restored.list_balances()).unwrap();
+    assert_eq!(balances.len(), 1);
+    assert_eq!(balances[0], (mint_url.clone(), 1000));
+
+    // A different seed scanning the same mint cannot recover these proofs.
+    let mut other = open_wallet([56u8; 64], &other_path);
+    let other_result =
+        crate::api::cdk_wallet_restore_seed(Some(&mut other), Some(cstr_ref(&with_nul(&mint_url))));
+    let error = other_result.error.as_ref().map(|e| e.to_str().to_owned());
+    crate::api::cdk_string_free(other_result.error);
+    assert_eq!(
+        other_result.status,
+        CdkStatus::Ok,
+        "restore failed: {error:?}"
+    );
+    assert_eq!(other_result.incomplete, 0);
+    assert_eq!(other_result.unspent_sats, 0);
+
+    let outcome = block_on(restored.send(&mint_url, 100, 1000)).unwrap();
+    assert!(!outcome.token.is_empty());
+    assert_eq!(outcome.sender_fee_sats, 0);
+    assert_eq!(block_on(restored.list_balances()).unwrap()[0].1, 900);
+    drop(restored);
+
+    let mut reopened = open_wallet(seed, &restored_path);
+    assert_eq!(block_on(reopened.list_balances()).unwrap()[0].1, 900);
+    let onward = block_on(reopened.send(&mint_url, 100, 1000)).unwrap();
+    assert!(!onward.token.is_empty());
+}
+
+#[test]
 fn e2e_send_receive_roundtrip() {
     let mint_url = block_on(start_fake_mint(0));
     let (_dir_a, path_a) = temp_db();

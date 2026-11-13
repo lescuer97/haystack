@@ -207,8 +207,8 @@ pub fn inspect(
 /// Failed pre-commit work removes only the exact staging directory owned by
 /// this call.
 ///
-/// This is a programmatic/test operation only; the application startup path
-/// must not call it implicitly.
+/// Startup provisioning must first durably record pending onboarding and must
+/// treat unknown durability as blocked without retrying creation in that run.
 pub fn create(
     io: Io,
     allocator: std.mem.Allocator,
@@ -294,6 +294,200 @@ pub fn create(
     return .{ .mnemonic = mnemonic, .durability = durability };
 }
 
+const recovery_dir_name = ".wallet-recovery";
+const recovery_receipt_name = "recovery-owner";
+
+/// The returned directory is separately allocated: call Paths.deinit and then
+/// free its dir with the same allocator.
+pub fn recoveryPaths(allocator: std.mem.Allocator, final_paths: Paths) !Paths {
+    if (!std.fs.path.isAbsolute(final_paths.dir)) return error.InvalidPath;
+    const parent = std.fs.path.dirname(final_paths.dir) orelse return error.InvalidPath;
+    const dir = try std.fs.path.join(allocator, &.{ parent, recovery_dir_name });
+    errdefer allocator.free(dir);
+    return Paths.init(allocator, dir);
+}
+
+fn validateRecoveryId(id: [32]u8) !void {
+    for (id) |c| {
+        if (!(c >= '0' and c <= '9') and !(c >= 'a' and c <= 'f')) return error.InvalidRecoveryId;
+    }
+}
+
+pub fn validateRecoveryPhrase(phrase: []const u8) !void {
+    if (phrase.len == 0 or phrase.len > max_mnemonic_bytes or std.mem.indexOfScalar(u8, phrase, 0) != null) return error.InvalidMnemonic;
+    var buf: [max_mnemonic_bytes + 1]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    @memcpy(buf[0..phrase.len], phrase);
+    buf[phrase.len] = 0;
+    var seed = seedFromMnemonic(@ptrCast(&buf)) catch return error.InvalidMnemonic;
+    std.crypto.secureZero(u8, &seed);
+}
+
+pub fn prepareRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths, phrase: []const u8, id: [32]u8) !void {
+    try validateRecoveryId(id);
+    if (phrase.len == 0 or phrase.len > max_mnemonic_bytes or std.mem.indexOfScalar(u8, phrase, 0) != null) return error.InvalidMnemonic;
+    const phrase_z = try allocator.dupeSentinel(u8, phrase, 0);
+    defer {
+        std.crypto.secureZero(u8, phrase_z);
+        allocator.free(phrase_z);
+    }
+    var seed = seedFromMnemonic(phrase_z.ptr) catch return error.InvalidMnemonic;
+    defer std.crypto.secureZero(u8, &seed);
+
+    const paths = try recoveryPaths(allocator, final_paths);
+    defer {
+        paths.deinit(allocator);
+        allocator.free(paths.dir);
+    }
+    const root = std.fs.path.dirname(final_paths.dir) orelse return error.InvalidPath;
+    const final_name = try sf.basename(final_paths.dir);
+    // Check without following the final entry, including before creating root.
+    if (Io.Dir.cwd().statFile(io, final_paths.dir, .{ .follow_symlinks = false })) |_| {
+        return error.AlreadyInitialized;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    try sf.ensureOwnedDir(io, root);
+    var parent = try Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
+    defer parent.close(io);
+    try sf.verifyNoExtendedAclDir(parent);
+    if (try statEntry(io, parent, final_name) != null) return error.AlreadyInitialized;
+    try parent.createDir(io, recovery_dir_name, sf.mode_dir);
+    // Never remove the stage after creation, even on failure.
+    try sf.verifyDirectory(try parent.statFile(io, recovery_dir_name, .{ .follow_symlinks = false }));
+    var stage = try parent.openDir(io, recovery_dir_name, .{ .follow_symlinks = false });
+    defer stage.close(io);
+    try sf.verifyNoExtendedAclDir(stage);
+    const db_z = try allocator.dupeSentinel(u8, paths.db_path, 0);
+    defer allocator.free(db_z);
+    var staged_wallet = try createWallet(&seed, db_z);
+    try staged_wallet.close();
+    try writeSeedFile(io, stage, phrase);
+    const receipt = try stage.createFile(io, recovery_receipt_name, .{ .exclusive = true, .permissions = sf.mode_file });
+    defer receipt.close(io);
+    try sf.verifyFile(try receipt.stat(io));
+    try sf.verifyNoExtendedAcl(receipt);
+    try receipt.writeStreamingAll(io, &id);
+    try receipt.sync(io);
+    try validateStagedPair(io, allocator, stage, &seed);
+    try sf.syncDirectory(stage);
+    try sf.syncDirectory(parent);
+}
+
+pub fn inspectRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths, id: [32]u8, open: bool) !Inspection {
+    const paths = try recoveryPaths(allocator, final_paths);
+    defer {
+        paths.deinit(allocator);
+        allocator.free(paths.dir);
+    }
+    return inspectOwnedRecovery(io, allocator, paths, id, open);
+}
+
+pub fn inspectCommittedRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths, id: [32]u8, open: bool) !Inspection {
+    return inspectOwnedRecovery(io, allocator, final_paths, id, open);
+}
+
+pub fn retiredRecoveryPaths(allocator: std.mem.Allocator, final_paths: Paths, id: [32]u8) !Paths {
+    try validateRecoveryId(id);
+    const root = std.fs.path.dirname(final_paths.dir) orelse return error.InvalidPath;
+    const basename = try std.fmt.allocPrint(allocator, ".wallet-recovery-retired-{s}", .{id});
+    defer allocator.free(basename);
+    const dir = try std.fs.path.join(allocator, &.{ root, basename });
+    errdefer allocator.free(dir);
+    return Paths.init(allocator, dir);
+}
+
+pub fn inspectRetiredRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths, id: [32]u8, open: bool) !Inspection {
+    const paths = try retiredRecoveryPaths(allocator, final_paths, id);
+    defer {
+        paths.deinit(allocator);
+        allocator.free(paths.dir);
+    }
+    return inspectOwnedRecovery(io, allocator, paths, id, open);
+}
+
+fn inspectOwnedRecovery(io: Io, allocator: std.mem.Allocator, paths: Paths, id: [32]u8, open: bool) !Inspection {
+    try validateRecoveryId(id);
+    const root = std.fs.path.dirname(paths.dir) orelse return error.InvalidPath;
+    sf.verifyOwnedDir(io, root) catch |err| switch (err) {
+        error.FileNotFound => return error.RecoveryStageUnavailable,
+        else => return err,
+    };
+    var parent = try Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
+    defer parent.close(io);
+    const basename = try sf.basename(paths.dir);
+    const stat = (try statEntry(io, parent, basename)) orelse return error.RecoveryStageUnavailable;
+    try sf.verifyDirectory(stat);
+    var stage = try parent.openDir(io, basename, .{ .follow_symlinks = false });
+    defer stage.close(io);
+    try sf.verifyNoExtendedAclDir(stage);
+    const receipt_stat = (try statEntry(io, stage, recovery_receipt_name)) orelse return error.RecoveryStageUnavailable;
+    try sf.verifyFile(receipt_stat);
+    var receipt = stage.openFile(io, recovery_receipt_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return error.RecoveryStageUnavailable,
+        else => return err,
+    };
+    defer receipt.close(io);
+    const opened = try receipt.stat(io);
+    try sf.verifyFile(opened);
+    try sf.verifyNoExtendedAcl(receipt);
+    if (opened.size != id.len) return error.RecoveryStageUnavailable;
+    var buf: [33]u8 = undefined;
+    var reader = receipt.reader(io, &.{});
+    const n = try reader.interface.readSliceShort(&buf);
+    if (n != id.len) return error.RecoveryStageUnavailable;
+    if (!std.mem.eql(u8, buf[0..n], &id)) return error.RecoveryOwnershipMismatch;
+    const inspection = try inspect(io, allocator, paths, open);
+    if (inspection.state != .ready) return error.RecoveryStageUnavailable;
+    return inspection;
+}
+
+pub fn retireRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths, id: [32]u8) !Durability {
+    var inspection = try inspectRecovery(io, allocator, final_paths, id, true);
+    try inspection.close();
+    const paths = try retiredRecoveryPaths(allocator, final_paths, id);
+    defer {
+        paths.deinit(allocator);
+        allocator.free(paths.dir);
+    }
+    var parent = try sf.openParent(io, final_paths.dir);
+    defer parent.close(io);
+    try sf.verifyNoExtendedAclDir(parent);
+    const basename = try sf.basename(paths.dir);
+    if (try statEntry(io, parent, basename) != null) return error.AlreadyInitialized;
+    try Io.Dir.renamePreserve(parent, recovery_dir_name, parent, basename, io);
+    if (builtin.is_test and testFailCommitSync) return .unknown;
+    sf.syncDirectory(parent) catch return .unknown;
+    return .durable;
+}
+
+pub fn commitRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths, id: [32]u8) !Durability {
+    var inspection = try inspectRecovery(io, allocator, final_paths, id, true);
+    try inspection.close();
+    const root = std.fs.path.dirname(final_paths.dir) orelse return error.InvalidPath;
+    var parent = try Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
+    defer parent.close(io);
+    try sf.verifyNoExtendedAclDir(parent);
+    const final_name = try sf.basename(final_paths.dir);
+    if (try statEntry(io, parent, final_name) != null) return error.AlreadyInitialized;
+    try Io.Dir.renamePreserve(parent, recovery_dir_name, parent, final_name, io);
+    if (builtin.is_test and testFailCommitSync) return .unknown;
+    sf.syncDirectory(parent) catch return .unknown;
+    return .durable;
+}
+
+/// Advisory only; this neither proves ownership beyond the receipt nor deletes.
+pub fn recoveryCanAbandon(io: Io, allocator: std.mem.Allocator, final_paths: Paths, id: [32]u8) !bool {
+    var inspection = try inspectRecovery(io, allocator, final_paths, id, true);
+    const handle = if (inspection.wallet) |w| w.wallet else return error.RecoveryStageUnavailable;
+    const result = cdk.c.cdk_wallet_restore_can_abandon(handle);
+    cdk.c.cdk_string_free(result.@"error");
+    const safe = result.status == cdk.c.CDK_STATUS_OK and result.safe_to_abandon == 1;
+    try inspection.close();
+    return safe;
+}
+
 fn statEntry(io: Io, dir: Io.Dir, name: []const u8) !?Io.File.Stat {
     return dir.statFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => null,
@@ -310,6 +504,38 @@ fn seedFromMnemonic(phrase: [*c]const u8) error{CdkFailure}![cdk.seed_len]u8 {
     var seed: [cdk.seed_len]u8 = undefined;
     @memcpy(&seed, result.bytes.ptr[0..cdk.seed_len]);
     return seed;
+}
+
+/// Re-read the original validated phrase. Caller must scrub and free it.
+/// Call only after a successful open-and-close inspection of the pair.
+pub fn readMnemonic(io: Io, allocator: std.mem.Allocator, paths: Paths) ![]u8 {
+    try sf.verifyOwnedDir(io, paths.dir);
+    var dir = try Io.Dir.openDirAbsolute(io, paths.dir, .{ .follow_symlinks = false });
+    defer dir.close(io);
+    try sf.verifyNoExtendedAclDir(dir);
+    const stat = try dir.statFile(io, seed_file_name, .{ .follow_symlinks = false });
+    try sf.verifyFile(stat);
+    var file = try dir.openFile(io, seed_file_name, .{ .follow_symlinks = false });
+    defer file.close(io);
+    const opened = try file.stat(io);
+    try sf.verifyFile(opened);
+    try sf.verifyNoExtendedAcl(file);
+    if (opened.size == 0 or opened.size > max_mnemonic_bytes) return error.InvalidMnemonic;
+    var buffer: [max_mnemonic_bytes + 1]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buffer);
+    var reader = file.reader(io, &.{});
+    const n = try reader.interface.readSliceShort(&buffer);
+    if (n == buffer.len) return error.MnemonicTooLong;
+    const phrase = std.mem.trim(u8, buffer[0..n], " \t\r\n");
+    if (phrase.len == 0) return error.InvalidMnemonic;
+    const z = try allocator.dupeSentinel(u8, phrase, 0);
+    defer {
+        std.crypto.secureZero(u8, z);
+        allocator.free(z);
+    }
+    var seed = try seedFromMnemonic(z.ptr);
+    defer std.crypto.secureZero(u8, &seed);
+    return allocator.dupe(u8, phrase);
 }
 
 /// Read the bounded plaintext mnemonic and derive its seed through the CDK ABI.

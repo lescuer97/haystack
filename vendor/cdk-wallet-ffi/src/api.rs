@@ -24,7 +24,8 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::status::{
     string_to_box, CdkBalanceEntry, CdkBalanceListResult, CdkBytesResult, CdkMintListResult,
     CdkMintRecovery, CdkOpenResult, CdkPendingListResult, CdkPendingToken, CdkReceiveResult,
-    CdkRecoveryResult, CdkSendResult, CdkStatus, CdkStatusResult, CdkStringResult,
+    CdkRecoveryResult, CdkRestoreCanAbandonResult, CdkSeedRestoreResult, CdkSendResult, CdkStatus,
+    CdkStatusResult, CdkStringResult,
 };
 use crate::wallet::{FfiErr, FfiResult, MintRecoveryReport, MAX_TOKEN_BYTES};
 
@@ -217,6 +218,18 @@ fn recovery_error(status: CdkStatus, message: impl Into<String>) -> CdkRecoveryR
         skipped: 0,
         failed: 0,
         reports: repr_c::Vec::from(Vec::new()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn seed_restore_error(status: CdkStatus, message: impl Into<String>) -> CdkSeedRestoreResult {
+    CdkSeedRestoreResult {
+        status,
+        error: string_to_box(message.into()),
+        incomplete: 1,
+        unspent_sats: 0,
+        pending_sats: 0,
+        spent_sats: 0,
     }
 }
 
@@ -555,6 +568,86 @@ pub fn cdk_wallet_get_pending_token(
                     value: string_to_box(token.token),
                 },
                 Err(e) => CdkStringResult::err(e.status, e.message),
+            }
+        },
+    )
+}
+
+/// Audit local artifacts in a staged wallet. Advisory only: the caller must
+/// independently prove recovery ownership. This does not delete anything or
+/// prove that the seed has no funds at a mint. Free error with `cdk_string_free`.
+#[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cdk_wallet_restore_can_abandon(
+    handle: Option<&crate::wallet::CdkWallet>,
+) -> CdkRestoreCanAbandonResult {
+    fn error(e: FfiErr) -> CdkRestoreCanAbandonResult {
+        CdkRestoreCanAbandonResult {
+            status: e.status,
+            error: string_to_box(e.message),
+            safe_to_abandon: 0,
+        }
+    }
+    let poison = handle.as_ref().map(|h| h.poison_flag());
+    guard_poison(
+        poison,
+        || error(FfiErr::new(CdkStatus::InternalError, "internal panic")),
+        || {
+            let handle = match handle {
+                Some(h) => h,
+                None => return error(null_handle()),
+            };
+            if handle.is_poisoned() {
+                return error(poisoned_handle());
+            }
+            match crate::wallet::runtime().block_on(handle.restore_can_abandon()) {
+                Ok(safe) => CdkRestoreCanAbandonResult {
+                    status: CdkStatus::Ok,
+                    error: None,
+                    safe_to_abandon: u8::from(safe),
+                },
+                Err(e) => error(e),
+            }
+        },
+    )
+}
+
+/// Scan a Sat mint for deterministic seed-derived proofs using NUT-13.
+/// This is not saga recovery. Failure may leave previously restored proofs in
+/// the database; totals are valid only when the scan completed. Free `error`
+/// with `cdk_string_free`.
+#[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cdk_wallet_restore_seed(
+    handle: Option<&mut crate::wallet::CdkWallet>,
+    mint_url: Option<char_p::Ref<'_>>,
+) -> CdkSeedRestoreResult {
+    let poison = handle.as_ref().map(|h| h.poison_flag());
+    guard_poison(
+        poison,
+        || seed_restore_error(CdkStatus::InternalError, "internal panic"),
+        || {
+            let handle = match handle {
+                Some(h) => h,
+                None => return seed_restore_error(null_handle().status, null_handle().message),
+            };
+            if handle.is_poisoned() {
+                return seed_restore_error(poisoned_handle().status, poisoned_handle().message);
+            }
+            let url = match opt_cstr_to_string(mint_url) {
+                Ok(url) => url,
+                Err(e) => return seed_restore_error(e.status, e.message),
+            };
+            match crate::wallet::runtime().block_on(handle.restore_seed(&url)) {
+                Ok((unspent_sats, pending_sats, spent_sats)) => CdkSeedRestoreResult {
+                    status: CdkStatus::Ok,
+                    error: None,
+                    incomplete: 0,
+                    unspent_sats,
+                    pending_sats,
+                    spent_sats,
+                },
+                Err(e) => seed_restore_error(e.status, e.message),
             }
         },
     )

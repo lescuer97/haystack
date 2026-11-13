@@ -58,6 +58,26 @@ fn slice_ref(bytes: &[u8]) -> c_slice::Ref<'_, u8> {
     c_slice::Ref::from(bytes)
 }
 
+#[test]
+fn seed_restore_rejects_invalid_arguments_and_is_not_saga_recovery() {
+    let result = crate::cdk_wallet_restore_seed(None, None);
+    assert_eq!(result.status, CdkStatus::NullArgument);
+    assert_eq!(result.incomplete, 1);
+
+    let (_dir, path) = temp_db();
+    let mut handle = open_handle([42; 64], &path);
+    let saga = crate::cdk_wallet_recover(Some(&mut handle), None);
+    assert_eq!(saga.status, CdkStatus::Ok);
+    assert_eq!(saga.reports.len(), 0);
+    let missing = crate::cdk_wallet_restore_seed(Some(&mut handle), None);
+    assert_eq!(missing.status, CdkStatus::NullArgument);
+    assert_eq!(missing.incomplete, 1);
+    let invalid = crate::cdk_wallet_restore_seed(Some(&mut handle), Some(cstr_ref(b"not a url\0")));
+    assert_eq!(invalid.status, CdkStatus::InvalidMintUrl);
+    assert_eq!(invalid.incomplete, 1);
+    assert!(invalid.error.is_some());
+}
+
 /// Snapshot the SQLite schema (table/index names) of a database file.
 fn sqlite_master(path: &Path) -> Vec<(String, String)> {
     let conn = rusqlite::Connection::open(path).unwrap();
