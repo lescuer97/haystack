@@ -46,8 +46,10 @@ mergeInto(LibraryManager.library, {
     defaultChunkBorders: false,
     autosaveBlocked: false,
     dbPromise: null,
-    saveQueue: Promise.resolve(),
-    contentQueue: Promise.resolve(),
+    // Library object values are serialized by emcc. Create Promises only at
+    // runtime; a Promise here is emitted as {}, without a .then method.
+    saveQueue: null,
+    contentQueue: null,
     holdLock: null,
 
     notify: function (status, tileGrid, chunkBorders) {
@@ -397,6 +399,7 @@ mergeInto(LibraryManager.library, {
         return;
       }
 
+      if (this.saveQueue === null) this.saveQueue = Promise.resolve();
       this.saveQueue = this.saveQueue.then(function () {
         if (self.autosaveBlocked) return;
         return self.openDb().then(function (db) {
@@ -415,6 +418,7 @@ mergeInto(LibraryManager.library, {
     reset: function () {
       var self = this;
       this.autosaveBlocked = false;
+      if (this.saveQueue === null) this.saveQueue = Promise.resolve();
       this.saveQueue = this.saveQueue.then(function () {
         return self.openDb().then(function (db) {
           return self.idbWrite(db, self.STORE_CONFIG, function (store) {
@@ -430,6 +434,7 @@ mergeInto(LibraryManager.library, {
     // ── content store ────────────────────────────────────────────────────────
 
     queueContent: function (operation) {
+      if (this.contentQueue === null) this.contentQueue = Promise.resolve();
       var run = function () {
         try {
           return operation().catch(function () { return { status: 5 }; });

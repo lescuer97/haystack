@@ -67,6 +67,36 @@ Expect the fixture build and Node-only storage/bridge tests to pass. Both
 onboarding runs should pass on Linux if the implementation is correct; they
 start an ephemeral local fake mint and use fresh disposable Chromium contexts.
 The ReleaseSafe run checks that fixture isolation also holds in that mode.
+The runner includes the actual game canvas creation/backup/reload/completion
+flow, recovery failure/retry/generation and a second-tab guard check, in addition
+to the direct Rust recovery fixture. Automated game clipboard writes are
+stubbed, never sent to clipboard history. Gameplay readiness is checked by a
+trusted G keypress that changes the committed grid setting, then restores its
+baseline, after both completion and ready-wallet reload in each flow. Runtime
+error/rejection counters live in the Node runner and survive document reloads;
+only fixed category tokens cross the diagnostic binding, never error contents.
+Real clipboard permissions and funded recovery controls below still need
+separate checks. Renderer links reserve a 1 MiB stack and enable
+overflow detection: the decoder's 64 KiB scratch exceeds the default stack once
+frame/result copies are included.
+
+`test-onboarding` also runs eight negative cases through
+`browser/onboarding-regression-test.mjs`: suppressing `ready` or
+`complete_success` callbacks and injecting an uncaught error or unhandled
+rejection during backup, independently for creation and recovery. Each child
+must exit nonzero at its intended assertion; an unrelated failure cannot pass
+the negative check. These faults are runner-only, not production APIs.
+
+With the persistent local fake mint described under Manual browser checks, one
+fault can be reproduced directly (this command is **expected to fail**):
+
+```sh
+ONBOARDING_TEST_FLOW=create ONBOARDING_TEST_FAULT=drop-ready \
+  node browser/onboarding-browser-test.mjs http://127.0.0.1:18787/?smoke
+```
+
+The flow can be `create` or `recovery`; faults are `drop-ready`, `drop-complete`,
+`backup-error` and `backup-rejection`. Normal runs leave both variables unset.
 
 Optional host database conformance tests:
 
@@ -131,6 +161,11 @@ needed rather than touching an existing wallet:
    Malformed records must fail closed without automatic repair. Confirm no
    secrets appear in console or application logs.
 
-The previous macOS host did **not** execute Chromium tests, and final security
-review was unavailable. Please run the Linux browser checks and obtain an
-independent security review before trusting these changes.
+The previous macOS host did **not** execute Chromium tests. Linux validation now
+passes 59 positive onboarding checks and eight negative regression cases in
+both default and ReleaseSafe builds, including 37 actual-game checks. The
+Node-only storage suite passes 21 game-storage checks; the broader wallet runner
+still reports three known recovery failures. See the updated
+[validation results](../docs/browser-wallet.md#linux-validation-after-the-onboarding-startup-fix-2026-11-13).
+The configured independent security reviewer was unavailable during this run.
+This is not a production-security certification.

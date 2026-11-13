@@ -394,6 +394,66 @@ const encoder = new TextEncoder();
 const tests = [];
 const test = (name, fn) => tests.push({name, fn});
 
+test("queue initializers survive library-object serialization", async () => {
+  const env = await new Environment().init();
+  assert.equal(env.storage.saveQueue, null);
+  assert.equal(env.storage.contentQueue, null);
+  // Targeted simulation of the emcc boundary, not a full emcc integration test.
+  // The old Promise-valued initializers become {} under this serialization.
+  const initial = JSON.parse(JSON.stringify({saveQueue: env.storage.saveQueue, contentQueue: env.storage.contentQueue}));
+  Object.assign(env.storage, initial);
+  env.storage.save(true, false);
+  await env.settleSaveQueue();
+  assert.equal(JSON.parse(env.indexedDB.peek(STORE_CONFIG, CONFIG_KEY)).debug.tile_grid, true);
+  assert.equal((await env.write("serialized", new Uint8Array([1]))).status, 0);
+  env.close();
+});
+
+test("settings saves serialize before startup and startup preserves the queue", async () => {
+  const env = await new Environment().init();
+  env.storage.save(true, false);
+  env.storage.save(false, true);
+  const queue = env.storage.saveQueue;
+  await env.settleSaveQueue();
+  assert.deepEqual(JSON.parse(env.indexedDB.peek(STORE_CONFIG, CONFIG_KEY)), {
+    version: 1, debug: {tile_grid: false, chunk_borders: true},
+  });
+  await env.start();
+  assert.equal(env.storage.saveQueue, queue);
+  env.storage.start(() => assert.fail("startup must notify only once"), 0, 0);
+  assert.equal(env.storage.saveQueue, queue);
+  env.close();
+});
+
+test("reset initializes the settings queue without startup", async () => {
+  const env = await new Environment().init();
+  env.indexedDB.seed(STORE_CONFIG, CONFIG_KEY, "{ malformed");
+  env.storage.reset();
+  await env.settleSaveQueue();
+  assert.equal(env.indexedDB.peek(STORE_CONFIG, CONFIG_KEY), undefined);
+  assert.equal(env.storage.started, false);
+  env.close();
+});
+
+test("content operations serialize before startup without replacing the queue", async () => {
+  const env = await new Environment().init();
+  const order = [];
+  let release;
+  const first = env.storage.queueContent(() => new Promise(resolve => {
+    order.push("first started");
+    release = () => { order.push("first finished"); resolve({status: 0}); };
+  }));
+  const second = env.storage.queueContent(async () => { order.push("second"); return {status: 0}; });
+  const queue = env.storage.contentQueue;
+  await env.start();
+  assert.equal(env.storage.contentQueue, queue);
+  assert.deepEqual(order, ["first started"]);
+  release();
+  await Promise.all([first, second]);
+  assert.deepEqual(order, ["first started", "first finished", "second"]);
+  env.close();
+});
+
 test("content round-trip writes, reads, lists and deletes", async () => {
   const env = await new Environment().init();
   const payload = encoder.encode("hello content");

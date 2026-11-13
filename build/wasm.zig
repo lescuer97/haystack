@@ -48,9 +48,19 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     if (options.optimize.runtimeSafety()) try flags.put("-fsanitize=undefined", {});
     var settings = rlz.emsdk.emccDefaultSettings(b.allocator, .{ .optimize = options.optimize });
     try settings.put("EXIT_RUNTIME", "0");
+    // The bounded onboarding decoder alone uses 64 KiB of scrubbed scratch.
+    // Nested frame/result copies exceed Emscripten's default 64 KiB stack.
+    // Both renderer links share this budget; never silently overwrite globals.
+    try settings.put("STACK_SIZE", "1048576");
+    try settings.put("STACK_OVERFLOW_CHECK", if (options.optimize.runtimeSafety()) "2" else "1");
     try settings.put("EXPORTED_FUNCTIONS", "['_main','_haystack_onboarding_link']");
     // Emscripten accepts a single `--js-library` path here. Combine the wallet
     // gate, storage bridge and onboarding input bridge at configure time.
+    // Track configure-time reads as well as emcc's generated-file input, or a
+    // JS-only edit can leave the cached combined library and renderer stale.
+    b.dependOnFileContents(b.path("browser/game-wallet.js"));
+    b.dependOnFileContents(b.path("browser/game-storage.js"));
+    b.dependOnFileContents(b.path("browser/game-onboarding.js"));
     const wallet_js = b.root.root_dir.handle.readFileAlloc(
         b.graph.io,
         "browser/game-wallet.js",
@@ -176,10 +186,21 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         onboarding_tests.step.dependOn(onboarding_assets);
         onboarding_tests.step.dependOn(&mint.step);
         onboarding_tests.step.dependOn(browser_fixture);
-        b.step("test-onboarding", "Run isolated onboarding tests with the local fake mint").dependOn(&onboarding_tests.step);
+        const onboarding_regressions = b.addSystemCommand(&.{ "python3", "build-support/run-browser-tests.py", "--mint" });
+        onboarding_regressions.addFileArg(mint_exe);
+        onboarding_regressions.addArg("--directory");
+        onboarding_regressions.addDirectoryArg(b.graph.path(.install_prefix, "wasm-test"));
+        onboarding_regressions.addArg("--runner");
+        onboarding_regressions.addFileArg(b.path("browser/onboarding-regression-test.mjs"));
+        onboarding_regressions.step.dependOn(&onboarding_tests.step);
+        // Run baseline then fault cases against the same fixture build. Each
+        // runner owns its local mint and disposable Chromium contexts.
+        const onboarding_step = b.step("test-onboarding", "Run onboarding and negative regression tests with local fake mints");
+        onboarding_step.dependOn(&onboarding_regressions.step);
+        b.step("test-onboarding-regressions", "Run the onboarding baseline and eight negative regression cases").dependOn(onboarding_step);
         const test_step = b.step("test", "Build, start an ephemeral fake mint, run Chromium and stop the mint");
         test_step.dependOn(&browser_tests.step);
-        test_step.dependOn(&onboarding_tests.step);
+        test_step.dependOn(onboarding_step);
         test_step.dependOn(storage_step);
         test_step.dependOn(&database.step);
         const run_mint = b.addRunFile(mint_exe);

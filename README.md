@@ -28,9 +28,10 @@ verifies that balances and recovery are empty, then deletes the directory. It
 makes no mint or network request and never logs the mnemonic or seed. This is a
 compile/runtime smoke test only — not a backup, production wallet or key store.
 The browser application is the game only: `/` redirects to `renderer/index.html`,
-and the same disposable wallet check runs *before* any game window or frame loop
-is created. Only a verified success starts the game; a missing or failing wallet
-module leaves a generic `Unable to start game.` message and no game loop. The
+where a blocking shared Zig modal handles persistent `haystack-user` wallet
+creation, backup and recovery. The renderer runs while asynchronous wallet
+inspection completes; gameplay remains gated until onboarding succeeds. Missing
+modules or invalid storage block setup rather than replacing wallet records. The
 browser wallet regression suites use a separate non-interactive test fixture at
 `wallet-test.html`, installed only for `test`/`test-mint`.
 

@@ -87,6 +87,40 @@ Chromium incognito contexts. Tests and `test-mint` use the fixture graph, includ
 in ReleaseSafe; they never contact the public mint. On macOS the fixture build
 and Node/host tests passed, but the Chromium suite was not run.
 
+The onboarding runner also opens the **actual game renderer** in an isolated
+context and drives trusted pointer input through creation, backup confirmation
+gating, backup reload, completion and ready-wallet reload. It checks a second
+game tab is blocked by the settings lifetime guard before wallet startup.
+Clipboard writes in this automated game flow are stubbed: no recovery words
+reach the system clipboard. The separate Rust fixture additionally checks the
+persisted recovery records. Actual game
+recovery checks cover typed invalid phrases, failed recovery, reload, retry,
+zero-balance generation, backup completion and ready-wallet reload.
+
+Ready-state assertions require an actual gameplay action: a trusted G keypress
+must change the committed grid setting and a second press must restore it. This
+runs after completion and after ready-wallet reload for creation and recovery;
+observing a JS `ready` event alone is not sufficient. Runtime error/rejection
+counts are retained by Node across reloads, with category-only notifications.
+The onboarding target additionally runs eight negative checks that require the
+intended failure when callbacks are suppressed or backup runtime faults are
+injected. See [the runner guide](../browser/README.md#automated-checks).
+
+These gameplay checks exposed a separate storage-library initialization bug:
+emcc serialized Promise-valued queue fields as `{}`. Settings and content queues
+now initialize lazily at runtime, preserving transaction ordering without
+requiring startup first. Node tests cover the serialization boundary and the
+actual-game checks verify settings persistence through the compiled renderer.
+The build tracks configure-time reads of all three JS bridges, so JS-only edits
+invalidate the combined library and both renderer links. This was checked for
+each bridge independently; repeated unchanged builds keep the links cached.
+
+The renderer explicitly reserves a **1 MiB Emscripten stack** for both production
+and fixture links. Its bounded, scrubbed JSON decoder needs 64 KiB of scratch;
+nested frame/result copies exceeded the default 64 KiB stack and corrupted the
+onboarding mailbox, freezing the game at `Loading wallet...` despite passing the
+Rust-only fixture. Stack-overflow checks are enabled (level 2 in safety builds).
+
 For manual interaction or browser MCP, start a persistent fake-mint server with
 `zig build test-mint -Dplatform=wasm`. It binds **127.0.0.1:18787**.
 `BROWSER_TEST_PORT` can override the port;
@@ -126,6 +160,23 @@ zig build test-wallet -Dplatform=wasm
 zig build test-wallet
 zig build test
 ```
+
+### Linux validation after the onboarding startup fix (2026-11-13)
+
+| Check | Result |
+| --- | --- |
+| Production bundle, `zig build -Dplatform=wasm -Doffline` | PASS; actual game displays the wallet choice |
+| `test-onboarding`, default and ReleaseSafe | **59 positive checks and 8 negative regression cases passed in each**: 22 direct Rust-fixture checks and 37 actual-game checks |
+| Regression with the previous 64 KiB renderer stack | FAIL at game startup → create, while the direct Rust fixture passes |
+| `test-storage` | PASS: 21 game-storage checks, 28 wallet-storage checks and onboarding bridge/input tests |
+| `test-wallet -Dplatform=wasm` | PASS: 62 database tests and 1 production mint-policy test |
+| Broader wallet Chromium runner | **237 passing checks; 3 known recovery failures**, zero uncaught exceptions; exits nonzero |
+
+These results verify the tested onboarding UI/storage paths, not a live gameplay
+wallet handle, funded recovery through the game UI, real clipboard permissions,
+or production security. `zig test src/onboarding.zig` also passes all 15 tests.
+The optional native `zig build test -Doffline` was run separately and failed 30
+filesystem sync/permission tests on this host; it is not reported as passing.
 
 ### Historical results (before IndexedDB v2 onboarding)
 
@@ -282,6 +333,12 @@ read-only and makes no network request. Incomplete or unknown records block
 onboarding rather than being overwritten. Provisioning requests
 `navigator.storage.persist()`; denial only warns and the wallet remains stored.
 There is no player-facing or production deletion API.
+
+Onboarding readiness means the persistent records have been provisioned and
+validated and gameplay can proceed. The game does **not** yet retain an opened
+`BrowserWallet` or expose a gameplay wallet-operation bridge; wallet operations
+still require the explicit programmatic API below. Do not interpret modal
+completion as end-to-end verification of in-game spending.
 
 The lower-level `provision_wallet(mnemonic, name)` validates the phrase, holds the
 wallet's Web Lock and atomically adds both records only when absent. Regression

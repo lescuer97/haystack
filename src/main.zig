@@ -231,6 +231,7 @@ fn browserFrame() callconv(.c) void {
         browser_onboarding.deliver(&result, &ctx.model);
     }
     clipboard_mailbox.consume(&ctx.model, rl.getTime());
+    ctx.model.expire(rl.getTime());
     const effect = stepFrame(
         &ctx.game_state,
         &ctx.input_reader,
