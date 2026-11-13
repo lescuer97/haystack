@@ -5,8 +5,25 @@ const std = @import("std");
 
 pub const Phase = enum { loading, choice, phrase_entry, restoring, restore_failed, restore_result, backup, completing, blocked, inactive };
 pub const Step = enum { backup_seed };
-pub const Control = enum { copy, checkbox, continue_button };
-pub const Effect = enum { copy_requested, complete_requested, create_requested, paste_requested, restore_requested, retry_requested, generate_requested, finish_restore_requested };
+pub const Action = union(enum) { create_wallet, enter_recovery, paste_phrase, restore_phrase, back_to_choice, retry_recovery, generate_wallet, finish_restore, copy_seed, copy_word: u8, toggle_backup_saved, complete_backup };
+pub const Control = struct { action: Action, label: [:0]const u8, rect: Rect, enabled: bool, kind: enum { button, checkbox, word } = .button };
+pub const Controls = struct {
+    items: [15]Control = undefined,
+    len: usize = 0,
+    fn add(self: *Controls, action: Action, label: [:0]const u8, rect: Rect, enabled: bool, kind: @FieldType(Control, "kind")) void {
+        self.items[self.len] = .{ .action = action, .label = label, .rect = rect, .enabled = enabled, .kind = kind };
+        self.len += 1;
+    }
+    pub fn find(self: *const Controls, action: Action) ?Control {
+        for (self.items[0..self.len]) |control| if (std.meta.eql(control.action, action)) return control;
+        return null;
+    }
+    pub fn hitTest(self: *const Controls, x: f32, y: f32) ?Control {
+        for (self.items[0..self.len]) |control| if (control.rect.contains(x, y)) return control;
+        return null;
+    }
+};
+pub const Effect = union(enum) { copy_requested, copy_word_requested: u8, complete_requested, create_requested, paste_requested, restore_requested, retry_requested, generate_requested, finish_restore_requested };
 
 pub const RestoreReport = struct {
     spendable_sats: u64,
@@ -56,16 +73,18 @@ pub const Layout = struct {
     panel: Rect,
     title: Rect,
     seed: Rect,
+    seed_words: Rect,
     copy: Rect,
     checkbox: Rect,
     continue_button: Rect,
     message: Rect,
 
-    pub fn hitTest(self: Layout, x: f32, y: f32) ?Control {
-        if (self.copy.contains(x, y)) return .copy;
-        if (self.checkbox.contains(x, y)) return .checkbox;
-        if (self.continue_button.contains(x, y)) return .continue_button;
-        return null;
+    pub fn wordRect(self: Layout, index: u8) Rect {
+        const gx = 8 * self.panel.width / 560;
+        const gy = 6 * self.panel.height / 500;
+        const width = (self.seed_words.width - 2 * gx) / 3;
+        const height = (self.seed_words.height - 3 * gy) / 4;
+        return .{ .x = self.seed_words.x + @as(f32, @floatFromInt(index % 3)) * (width + gx), .y = self.seed_words.y + @as(f32, @floatFromInt(index / 3)) * (height + gy), .width = width, .height = height };
     }
 };
 
@@ -92,6 +111,7 @@ pub fn calculateLayout(viewport_w: f32, viewport_h: f32) Layout {
         .panel = panel,
         .title = make(panel, sx, sy, 24, 44),
         .seed = make(panel, sx, sy, 80, 160),
+        .seed_words = make(panel, sx, sy, 107, 133),
         .copy = make(panel, sx, sy, 252, 44),
         .checkbox = make(panel, sx, sy, 308, 44),
         .message = make(panel, sx, sy, 360, 40),
@@ -127,9 +147,11 @@ pub const Onboarding = struct {
     phase: Phase = .loading,
     step: Step = .backup_seed,
     saved: bool = false,
-    copy_requested: bool = false,
+    copied_word: ?u8 = null,
+    feedback_target: ?Action = null,
+    feedback_expiry: f64 = 0,
     retry_message: bool = false,
-    selected: Control = .copy,
+    selected: ?Action = null,
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
     secret: ?[]u8 = null,
@@ -144,7 +166,7 @@ pub const Onboarding = struct {
     finishing_restore: bool = false,
 
     pub const checkbox_label = "I have saved my recovery words";
-    pub const copy_feedback = "Copy requested";
+    pub const copy_feedback = "copied!";
     pub const completion_error = "Could not complete setup. Please try again.";
 
     pub fn init(allocator: std.mem.Allocator) Onboarding {
@@ -157,8 +179,38 @@ pub const Onboarding = struct {
         return if (self.secret) |secret| secret else null;
     }
 
+    pub fn mnemonicWord(self: *const Onboarding, index: u8) ?[]const u8 {
+        if (index >= 12) return null;
+        var words = std.mem.tokenizeScalar(u8, self.mnemonic() orelse return null, ' ');
+        for (0..index) |_| _ = words.next() orelse return null;
+        return words.next();
+    }
+
     pub fn isBlocking(self: *const Onboarding) bool {
         return self.phase != .inactive;
+    }
+
+    pub fn hoverEnabled(self: *const Onboarding, layout: Layout, x: f32, y: f32) bool {
+        const list = self.controls(layout);
+        return if (list.hitTest(x, y)) |control| control.enabled else false;
+    }
+
+    pub fn markCopyHandedOff(self: *Onboarding, action: Action, now: f64) void {
+        if (self.phase != .backup) return;
+        switch (action) {
+            .copy_seed => if (self.mnemonic() == null) return,
+            .copy_word => |index| {
+                if (self.mnemonicWord(index) == null) return;
+                self.copied_word = index;
+            },
+            else => return,
+        }
+        self.feedback_target = action;
+        self.feedback_expiry = now + 3;
+    }
+
+    pub fn expire(self: *Onboarding, now: f64) void {
+        if (self.feedback_target != null and now >= self.feedback_expiry) self.feedback_target = null;
     }
 
     fn destroySecret(self: *Onboarding, secret: []u8) void {
@@ -169,6 +221,9 @@ pub const Onboarding = struct {
     fn clearSecret(self: *Onboarding) void {
         if (self.secret) |secret| self.destroySecret(secret);
         self.secret = null;
+        self.copied_word = null;
+        self.feedback_target = null;
+        self.feedback_expiry = 0;
     }
 
     fn clearPhrase(self: *Onboarding) void {
@@ -205,6 +260,7 @@ pub const Onboarding = struct {
         self.clearSecret();
         self.clearPhrase();
         self.phase = .inactive;
+        self.selected = null;
     }
 
     /// Out-of-order events are ignored; rejected backup payloads are scrubbed.
@@ -213,50 +269,55 @@ pub const Onboarding = struct {
         switch (event) {
             .ready => if (self.phase == .loading) {
                 self.phase = .inactive;
+                self.selected = null;
             },
             .backup => |secret| {
                 if (self.phase == .loading) {
                     self.secret = secret;
                     self.phase = .backup;
+                    self.selected = if (self.mnemonicWord(0) != null) .{ .copy_word = 0 } else .copy_seed;
                 } else self.destroySecret(secret);
             },
             .blocked => if (self.phase != .inactive and self.phase != .blocked) {
                 self.clearSecret();
                 self.clearPhrase();
                 self.phase = .blocked;
+                self.selected = null;
             },
             .complete_success => if (self.phase == .completing) {
                 self.clearSecret();
                 self.clearPhrase();
                 self.phase = .inactive;
+                self.selected = null;
             },
             .complete_fail => if (self.phase == .completing) {
                 self.phase = if (self.finishing_restore) .restore_result else .backup;
                 self.retry_message = true;
+                self.selected = if (self.finishing_restore) .finish_restore else .complete_backup;
             },
             .choice => |choice| if (self.phase == .loading) {
                 self.recover_enabled = choice.recover_enabled;
-                self.selected = .copy;
+                self.selected = .create_wallet;
                 self.phase = .choice;
             },
             .resume_phrase_entry => if (self.phase == .loading) {
                 self.recover_enabled = true;
                 self.stage_created = false;
                 self.recovery_preparation_pending = true;
-                self.selected = .copy;
+                self.selected = .paste_phrase;
                 self.phase = .phrase_entry;
             },
             .resume_failed => |failure| if (self.phase == .loading) {
                 self.stage_created = true;
                 self.can_generate_new = failure.can_generate_new;
-                self.selected = .copy;
+                self.selected = .retry_recovery;
                 self.phase = .restore_failed;
             },
             .resume_result => |report| if (self.phase == .loading) {
                 self.stage_created = true;
                 self.report = report;
                 self.can_generate_new = report.can_generate_new and report.spendable_sats == 0 and report.pending_sats == 0 and report.spent_sats == 0;
-                self.selected = .copy;
+                self.selected = if (self.hasFundsOrHistory()) .finish_restore else .retry_recovery;
                 self.phase = .restore_result;
             },
             .paste => |payload| {
@@ -271,6 +332,7 @@ pub const Onboarding = struct {
             .invalid_phrase => |id| if (self.phase == .restoring and id == self.attempt_id) {
                 self.phase = .phrase_entry;
                 self.retry_message = true;
+                self.selected = .paste_phrase;
             },
             .restore_failed => |failure| if (self.phase == .restoring and failure.attempt_id == self.attempt_id) {
                 self.recovery_preparation_pending = false;
@@ -278,7 +340,7 @@ pub const Onboarding = struct {
                 self.can_generate_new = failure.can_generate_new;
                 if (failure.stage_created) self.clearPhrase();
                 self.phase = .restore_failed;
-                self.selected = .copy;
+                self.selected = .retry_recovery;
             },
             .restore_finished => |result| if (self.phase == .restoring and result.attempt_id == self.attempt_id) {
                 self.recovery_preparation_pending = false;
@@ -287,7 +349,7 @@ pub const Onboarding = struct {
                 self.stage_created = true;
                 self.can_generate_new = result.report.can_generate_new and result.report.spendable_sats == 0 and result.report.pending_sats == 0 and result.report.spent_sats == 0;
                 self.phase = .restore_result;
-                self.selected = .copy;
+                self.selected = if (self.hasFundsOrHistory()) .finish_restore else .retry_recovery;
             },
         }
     }
@@ -297,76 +359,113 @@ pub const Onboarding = struct {
         return r.spendable_sats != 0 or r.pending_sats != 0 or r.spent_sats != 0;
     }
 
-    fn startAttempt(self: *Onboarding, effect: Effect) Effect {
-        self.attempt_id +%= 1;
-        self.phase = .restoring;
-        return effect;
-    }
-
-    fn activateRecovery(self: *Onboarding, control: Control) ?Effect {
+    pub fn controls(self: *const Onboarding, layout: Layout) Controls {
+        var result = Controls{};
         switch (self.phase) {
-            .choice => switch (control) {
-                .copy => {
-                    self.phase = .loading;
-                    return .create_requested;
-                },
-                .checkbox => if (self.recover_enabled) {
-                    self.phase = .phrase_entry;
-                    self.selected = .copy;
-                },
-                else => {},
+            .choice => {
+                result.add(.create_wallet, "Create new", layout.copy, true, .button);
+                result.add(.enter_recovery, "Recover wallet", layout.checkbox, self.recover_enabled, .button);
             },
-            .phrase_entry => switch (control) {
-                .copy => return .paste_requested,
-                .checkbox => {
-                    self.normalize();
-                    if (self.phrase_len != 0) return self.startAttempt(.restore_requested);
-                },
-                .continue_button => {
-                    if (self.recovery_preparation_pending) return null;
-                    self.clearPhrase();
-                    self.phase = .choice;
-                    self.selected = .checkbox;
-                },
+            .phrase_entry => {
+                result.add(.paste_phrase, "Paste", layout.copy, true, .button);
+                result.add(.restore_phrase, "Restore", layout.checkbox, std.mem.trim(u8, self.recoveryPhrase(), " \t\n\r\x0b\x0c").len != 0, .button);
+                result.add(.back_to_choice, "Back", layout.continue_button, !self.recovery_preparation_pending, .button);
             },
-            .restore_failed, .restore_result => switch (control) {
-                .copy => {
-                    if (self.phase == .restore_result and self.hasFundsOrHistory()) {
-                        self.finishing_restore = true;
-                        self.phase = .completing;
-                        return .finish_restore_requested;
-                    }
-                    if (!self.stage_created) {
-                        self.phase = .phrase_entry;
-                        self.selected = .copy;
-                        return null;
-                    }
-                    return self.startAttempt(.retry_requested);
-                },
-                .checkbox => {
-                    if (self.phase == .restore_result and self.hasFundsOrHistory()) return self.startAttempt(.retry_requested);
-                    if (self.can_generate_new) {
-                        self.clearPhrase();
-                        self.phase = .loading;
-                        return .generate_requested;
-                    }
-                },
-                else => {},
+            .restore_failed, .restore_result => {
+                if (self.phase == .restore_result and self.hasFundsOrHistory()) {
+                    result.add(.finish_restore, "Continue", layout.copy, true, .button);
+                    result.add(.retry_recovery, "Retry", layout.checkbox, true, .button);
+                } else {
+                    result.add(.retry_recovery, "Retry", layout.copy, true, .button);
+                    result.add(.generate_wallet, "Generate new", layout.checkbox, self.can_generate_new and !self.hasFundsOrHistory(), .button);
+                }
+            },
+            .backup => {
+                for (0..12) |i| {
+                    const index: u8 = @intCast(i);
+                    if (self.mnemonicWord(index) == null) break;
+                    result.add(.{ .copy_word = index }, "Copy word", layout.wordRect(index), true, .word);
+                }
+                result.add(.copy_seed, if (std.meta.eql(self.feedback_target, @as(?Action, .copy_seed))) copy_feedback else "Copy (optional)", layout.copy, true, .button);
+                result.add(.toggle_backup_saved, if (self.saved) "[x] I have saved my recovery words" else "[ ] I have saved my recovery words", layout.checkbox, true, .checkbox);
+                result.add(.complete_backup, "Continue", layout.continue_button, self.saved, .button);
             },
             else => {},
         }
-        return null;
+        return result;
     }
 
-    fn activate(self: *Onboarding, control: Control) ?Effect {
-        switch (control) {
-            .copy => {
-                self.copy_requested = true;
-                return .copy_requested;
+    fn revalidateSelection(self: *Onboarding, list: *const Controls) void {
+        if (self.selected) |action| if (list.find(action)) |control| {
+            if (control.enabled) return;
+        };
+        self.selected = null;
+        for (list.items[0..list.len]) |control| if (control.enabled) {
+            self.selected = control.action;
+            return;
+        };
+    }
+
+    fn startAttempt(self: *Onboarding, effect: Effect) Effect {
+        self.attempt_id +%= 1;
+        self.phase = .restoring;
+        self.selected = null;
+        return effect;
+    }
+
+    pub fn activateAction(self: *Onboarding, action: Action) ?Effect {
+        const list = self.controls(calculateLayout(1000, 640));
+        const control = list.find(action) orelse return null;
+        if (!control.enabled) return null;
+        switch (action) {
+            .create_wallet => {
+                self.phase = .loading;
+                self.selected = null;
+                return .create_requested;
             },
-            .checkbox => self.saved = !self.saved,
-            .continue_button => if (self.saved) {
+            .enter_recovery => {
+                self.phase = .phrase_entry;
+                self.selected = .paste_phrase;
+            },
+            .paste_phrase => return .paste_requested,
+            .restore_phrase => {
+                self.normalize();
+                return self.startAttempt(.restore_requested);
+            },
+            .back_to_choice => {
+                self.clearPhrase();
+                self.phase = .choice;
+                self.selected = .enter_recovery;
+            },
+            .retry_recovery => {
+                if (!self.stage_created) {
+                    self.phase = .phrase_entry;
+                    self.selected = .paste_phrase;
+                    return null;
+                }
+                return self.startAttempt(.retry_requested);
+            },
+            .generate_wallet => {
+                self.clearPhrase();
+                self.phase = .loading;
+                self.selected = null;
+                return .generate_requested;
+            },
+            .finish_restore => {
+                self.finishing_restore = true;
                 self.phase = .completing;
+                self.selected = null;
+                self.retry_message = false;
+                return .finish_restore_requested;
+            },
+            .copy_seed => return .copy_requested,
+            .copy_word => |index| return .{ .copy_word_requested = index },
+            .toggle_backup_saved => self.saved = !self.saved,
+            .complete_backup => {
+                self.finishing_restore = false;
+                self.feedback_target = null;
+                self.phase = .completing;
+                self.selected = null;
                 self.retry_message = false;
                 return .complete_requested;
             },
@@ -382,7 +481,7 @@ pub const Onboarding = struct {
         self.pointer_y = frame.pointer_y;
         if (!self.isBlocking()) return .{ .consumed = false };
         if (self.phase == .phrase_entry) {
-            if (frame.paste_shortcut) return .{ .consumed = true, .effect = .paste_requested };
+            if (frame.paste_shortcut) return .{ .consumed = true, .effect = self.activateAction(.paste_phrase) };
             if (frame.backspace and self.phrase_len > 0) {
                 self.phrase_len -= 1;
                 while (self.phrase_len > 0 and self.phrase[self.phrase_len] & 0xc0 == 0x80) self.phrase_len -= 1;
@@ -401,20 +500,38 @@ pub const Onboarding = struct {
         if (self.phase != .backup and self.phase != .choice and self.phase != .phrase_entry and self.phase != .restore_failed and self.phase != .restore_result) return .{ .consumed = true };
 
         const layout = calculateLayout(frame.viewport_w, frame.viewport_h);
+        const list = self.controls(layout);
+        const previous_selection = self.selected;
+        self.revalidateSelection(&list);
+        const selection_invalidated = !std.meta.eql(previous_selection, self.selected);
+        var pointer_selected = false;
         const navigated = frame.up != frame.down;
         if (navigated) {
-            const index: usize = @backingInt(self.selected);
-            self.selected = @fromBackingInt(@intCast(if (frame.up) (index + 2) % 3 else (index + 1) % 3));
+            if (self.selected) |selected| {
+                var index: usize = 0;
+                while (index < list.len and !std.meta.eql(list.items[index].action, selected)) : (index += 1) {}
+                for (0..list.len) |_| {
+                    index = if (frame.up) (index + list.len - 1) % list.len else (index + 1) % list.len;
+                    if (list.items[index].enabled) {
+                        self.selected = list.items[index].action;
+                        break;
+                    }
+                }
+            }
         } else if (moved) {
-            if (layout.hitTest(frame.pointer_x, frame.pointer_y)) |control| self.selected = control;
+            if (list.hitTest(frame.pointer_x, frame.pointer_y)) |control| if (control.enabled) {
+                self.selected = control.action;
+                pointer_selected = true;
+            };
         }
         if (frame.clicked) {
-            if (layout.hitTest(frame.pointer_x, frame.pointer_y)) |control| {
-                self.selected = control;
-                return .{ .consumed = true, .effect = if (self.phase == .backup) self.activate(control) else self.activateRecovery(control) };
+            if (list.hitTest(frame.pointer_x, frame.pointer_y)) |control| {
+                if (control.enabled) self.selected = control.action;
+                return .{ .consumed = true, .effect = self.activateAction(control.action) };
             }
         } else if (frame.confirm) {
-            return .{ .consumed = true, .effect = if (self.phase == .backup) self.activate(self.selected) else self.activateRecovery(self.selected) };
+            if (!navigated and !pointer_selected and selection_invalidated) return .{ .consumed = true };
+            if (self.selected) |action| return .{ .consumed = true, .effect = self.activateAction(action) };
         }
         return .{ .consumed = true };
     }
@@ -426,15 +543,15 @@ test "backup confirmation, independent copy, retry and success" {
     try std.testing.expect(model.isBlocking());
     model.receive(.{ .backup = try std.testing.allocator.dupe(u8, "one two three") });
     try std.testing.expectEqual(Phase.backup, model.phase);
-    model.selected = .continue_button;
+    model.selected = .complete_backup;
     try std.testing.expectEqual(@as(?Effect, null), model.applyInput(.{ .confirm = true }).effect);
-    model.selected = .copy;
+    model.selected = .copy_seed;
     try std.testing.expectEqual(@as(?Effect, .copy_requested), model.applyInput(.{ .confirm = true }).effect);
-    try std.testing.expect(model.copy_requested and !model.saved);
-    model.selected = .checkbox;
+    try std.testing.expect(model.feedback_target == null and !model.saved);
+    model.selected = .toggle_backup_saved;
     _ = model.applyInput(.{ .confirm = true });
     try std.testing.expect(model.saved);
-    model.selected = .continue_button;
+    model.selected = .complete_backup;
     try std.testing.expectEqual(@as(?Effect, .complete_requested), model.applyInput(.{ .confirm = true }).effect);
     try std.testing.expectEqual(Phase.completing, model.phase);
     try std.testing.expect(model.applyInput(.{ .escape_clicked = true }).consumed);
@@ -482,11 +599,6 @@ test "layout hit testing and pointer versus directional selection" {
             try std.testing.expect(rect.x + rect.width <= layout.panel.x + layout.panel.width + 0.001);
             try std.testing.expect(rect.y + rect.height <= layout.panel.y + layout.panel.height + 0.001);
         }
-        if (size[0] > 0 and size[1] > 0) {
-            try std.testing.expectEqual(@as(?Control, .copy), layout.hitTest(layout.copy.centerX(), layout.copy.centerY()));
-            try std.testing.expectEqual(@as(?Control, .checkbox), layout.hitTest(layout.checkbox.centerX(), layout.checkbox.centerY()));
-            try std.testing.expectEqual(@as(?Control, .continue_button), layout.hitTest(layout.continue_button.centerX(), layout.continue_button.centerY()));
-        }
     }
     var model = Onboarding.init(std.testing.allocator);
     defer model.deinit();
@@ -495,23 +607,24 @@ test "layout hit testing and pointer versus directional selection" {
     const x = layout.checkbox.centerX();
     const y = layout.checkbox.centerY();
     _ = model.applyInput(.{ .pointer_x = x, .pointer_y = y });
-    try std.testing.expectEqual(Control.checkbox, model.selected);
+    try std.testing.expectEqual(@as(?Action, .toggle_backup_saved), model.selected);
     _ = model.applyInput(.{ .pointer_x = x, .pointer_y = y, .down = true });
     _ = model.applyInput(.{ .pointer_x = x, .pointer_y = y });
-    try std.testing.expectEqual(Control.continue_button, model.selected);
+    try std.testing.expectEqual(@as(?Action, .{ .copy_word = 0 }), model.selected);
     _ = model.applyInput(.{ .pointer_x = x, .pointer_y = y, .clicked = true });
     try std.testing.expect(model.saved);
-    try std.testing.expectEqual(Control.checkbox, model.selected);
+    try std.testing.expectEqual(@as(?Action, .toggle_backup_saved), model.selected);
 }
 
 test "choice, phrase input, paste, invalid and stale events" {
     var m = Onboarding.init(std.testing.allocator);
     defer m.deinit();
     m.receive(.{ .choice = .{ .recover_enabled = false } });
-    m.selected = .checkbox;
+    m.selected = .enter_recovery;
     try std.testing.expect(m.applyInput(.{ .confirm = true }).effect == null);
     try std.testing.expectEqual(Phase.choice, m.phase);
     m.recover_enabled = true;
+    m.selected = .enter_recovery;
     _ = m.applyInput(.{ .confirm = true });
     try std.testing.expectEqual(Phase.phrase_entry, m.phase);
     var input = FrameInput{};
@@ -526,7 +639,7 @@ test "choice, phrase input, paste, invalid and stale events" {
     m.receive(.{ .paste = try std.testing.allocator.dupe(u8, "\xff") });
     m.receive(.{ .paste = try std.testing.allocator.alloc(u8, 1025) });
     try std.testing.expectEqualStrings("one two three", m.recoveryPhrase());
-    m.selected = .checkbox;
+    m.selected = .restore_phrase;
     try std.testing.expectEqual(@as(?Effect, .restore_requested), m.applyInput(.{ .confirm = true }).effect);
     m.receive(.{ .invalid_phrase = m.attempt_id + 1 });
     try std.testing.expectEqual(Phase.restoring, m.phase);
@@ -543,7 +656,7 @@ test "capacity and recovery outcomes gate destructive actions" {
     var m = Onboarding.init(std.testing.allocator);
     defer m.deinit();
     m.receive(.{ .choice = .{ .recover_enabled = true } });
-    m.selected = .checkbox;
+    m.selected = .enter_recovery;
     _ = m.applyInput(.{ .confirm = true });
     const full = try std.testing.allocator.alloc(u8, 1024);
     @memset(full, 'a');
@@ -552,23 +665,23 @@ test "capacity and recovery outcomes gate destructive actions" {
     input.characters[0] = 'b';
     _ = m.applyInput(input);
     try std.testing.expectEqual(@as(usize, 1024), m.phrase_len);
-    m.selected = .checkbox;
+    m.selected = .restore_phrase;
     _ = m.applyInput(.{ .confirm = true });
     const first = m.attempt_id;
     m.receive(.{ .restore_failed = .{ .attempt_id = first, .stage_created = true, .can_generate_new = false } });
     try std.testing.expectEqual(@as(usize, 0), m.phrase_len);
-    m.selected = .checkbox;
+    m.selected = .generate_wallet;
     try std.testing.expect(m.applyInput(.{ .confirm = true }).effect == null);
-    m.selected = .copy;
+    m.selected = .retry_recovery;
     try std.testing.expectEqual(@as(?Effect, .retry_requested), m.applyInput(.{ .confirm = true }).effect);
     m.receive(.{ .restore_finished = .{ .attempt_id = first, .report = .{ .spendable_sats = 0, .pending_sats = 0, .spent_sats = 0, .can_generate_new = true } } });
     try std.testing.expectEqual(Phase.restoring, m.phase);
     m.receive(.{ .restore_finished = .{ .attempt_id = m.attempt_id, .report = .{ .spendable_sats = 0, .pending_sats = 3, .spent_sats = 0, .can_generate_new = true } } });
     try std.testing.expect(!m.can_generate_new);
-    m.selected = .checkbox;
+    m.selected = .retry_recovery;
     try std.testing.expectEqual(@as(?Effect, .retry_requested), m.applyInput(.{ .confirm = true }).effect);
     m.receive(.{ .restore_finished = .{ .attempt_id = m.attempt_id, .report = .{ .spendable_sats = 0, .pending_sats = 0, .spent_sats = 0, .can_generate_new = true } } });
-    m.selected = .checkbox;
+    m.selected = .generate_wallet;
     try std.testing.expectEqual(@as(?Effect, .generate_requested), m.applyInput(.{ .confirm = true }).effect);
     try std.testing.expectEqual(Phase.loading, m.phase);
 }
@@ -599,31 +712,31 @@ test "back is disabled for pending recovery preparation only" {
     try std.testing.expect(resumed.applyInput(.{ .pointer_x = back.centerX(), .pointer_y = back.centerY(), .clicked = true }).effect == null);
     try std.testing.expectEqual(Phase.phrase_entry, resumed.phase);
     try std.testing.expectEqualStrings("one two", resumed.recoveryPhrase());
-    try std.testing.expect(resumed.applyInput(.{ .confirm = true }).effect == null);
-    resumed.selected = .checkbox;
+    try std.testing.expectEqual(@as(?Effect, .paste_requested), resumed.applyInput(.{ .confirm = true }).effect);
+    resumed.selected = .restore_phrase;
     try std.testing.expectEqual(@as(?Effect, .restore_requested), resumed.applyInput(.{ .confirm = true }).effect);
     resumed.receive(.{ .invalid_phrase = resumed.attempt_id });
     try std.testing.expect(resumed.recovery_preparation_pending);
-    resumed.selected = .continue_button;
+    resumed.selected = .back_to_choice;
     _ = resumed.applyInput(.{ .confirm = true });
     try std.testing.expectEqual(Phase.phrase_entry, resumed.phase);
-    resumed.selected = .checkbox;
+    resumed.selected = .restore_phrase;
     _ = resumed.applyInput(.{ .confirm = true });
     resumed.receive(.{ .restore_failed = .{ .attempt_id = resumed.attempt_id +% 1, .can_generate_new = false, .stage_created = false } });
     try std.testing.expect(resumed.recovery_preparation_pending);
     resumed.receive(.{ .restore_failed = .{ .attempt_id = resumed.attempt_id, .can_generate_new = false, .stage_created = false } });
     try std.testing.expect(!resumed.recovery_preparation_pending);
     _ = resumed.applyInput(.{ .confirm = true });
-    resumed.selected = .continue_button;
+    resumed.selected = .back_to_choice;
     _ = resumed.applyInput(.{ .confirm = true });
     try std.testing.expectEqual(Phase.choice, resumed.phase);
 
     var normal = Onboarding.init(std.testing.allocator);
     defer normal.deinit();
     normal.receive(.{ .choice = .{ .recover_enabled = true } });
-    normal.selected = .checkbox;
+    normal.selected = .enter_recovery;
     _ = normal.applyInput(.{ .confirm = true });
-    normal.selected = .continue_button;
+    normal.selected = .back_to_choice;
     _ = normal.applyInput(.{ .confirm = true });
     try std.testing.expectEqual(Phase.choice, normal.phase);
 }
@@ -633,9 +746,200 @@ test "successful resumed recovery clears preparation pending" {
     defer model.deinit();
     model.receive(.resume_phrase_entry);
     model.receive(.{ .paste = try std.testing.allocator.dupe(u8, "one") });
-    model.selected = .checkbox;
+    model.selected = .restore_phrase;
     _ = model.applyInput(.{ .confirm = true });
     model.receive(.{ .restore_finished = .{ .attempt_id = model.attempt_id, .report = .{ .spendable_sats = 0, .pending_sats = 0, .spent_sats = 0, .can_generate_new = false } } });
     try std.testing.expect(!model.recovery_preparation_pending);
     try std.testing.expectEqual(Phase.restore_result, model.phase);
+}
+
+test "semantic controls describe every phase and reject stale or disabled actions" {
+    var m = Onboarding.init(std.testing.allocator);
+    defer m.deinit();
+    const layout = calculateLayout(1000, 640);
+    try std.testing.expectEqual(@as(usize, 0), m.controls(layout).len);
+    m.receive(.{ .choice = .{ .recover_enabled = false } });
+    var list = m.controls(layout);
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualStrings("Create new", list.items[0].label);
+    try std.testing.expectEqualStrings("Recover wallet", list.items[1].label);
+    try std.testing.expect(!list.items[1].enabled);
+    try std.testing.expect(m.activateAction(.enter_recovery) == null);
+    try std.testing.expect(m.activateAction(.copy_seed) == null);
+    m.recover_enabled = true;
+    _ = m.activateAction(.enter_recovery);
+    list = m.controls(layout);
+    try std.testing.expectEqual(@as(usize, 3), list.len);
+    try std.testing.expectEqualStrings("Paste", list.items[0].label);
+    try std.testing.expectEqualStrings("Restore", list.items[1].label);
+    try std.testing.expectEqualStrings("Back", list.items[2].label);
+    try std.testing.expect(!list.items[1].enabled);
+    var input = FrameInput{ .character_count = 1 };
+    input.characters[0] = ' ';
+    _ = m.applyInput(input);
+    try std.testing.expect(!m.controls(layout).items[1].enabled);
+    try std.testing.expect(m.activateAction(.restore_phrase) == null);
+    m.receive(.{ .paste = try std.testing.allocator.dupe(u8, "one") });
+    try std.testing.expect(m.controls(layout).items[1].enabled);
+    try std.testing.expectEqual(@as(?Effect, .restore_requested), m.activateAction(.restore_phrase));
+    try std.testing.expectEqual(@as(usize, 0), m.controls(layout).len);
+    m.receive(.{ .restore_failed = .{ .attempt_id = m.attempt_id, .stage_created = false, .can_generate_new = false } });
+    list = m.controls(layout);
+    try std.testing.expectEqualStrings("Retry", list.items[0].label);
+    try std.testing.expectEqualStrings("Generate new", list.items[1].label);
+    try std.testing.expect(!list.items[1].enabled);
+    try std.testing.expect(m.activateAction(.generate_wallet) == null);
+    _ = m.activateAction(.retry_recovery);
+    try std.testing.expectEqual(Phase.phrase_entry, m.phase);
+    try std.testing.expectEqual(@as(?Action, .paste_phrase), m.selected);
+    _ = m.activateAction(.restore_phrase);
+    m.receive(.{ .restore_finished = .{ .attempt_id = m.attempt_id, .report = .{ .spendable_sats = 1, .pending_sats = 0, .spent_sats = 0, .can_generate_new = true } } });
+    list = m.controls(layout);
+    try std.testing.expectEqualStrings("Continue", list.items[0].label);
+    try std.testing.expectEqualStrings("Retry", list.items[1].label);
+    try std.testing.expectEqual(@as(?Action, .finish_restore), m.selected);
+    try std.testing.expect(m.activateAction(.generate_wallet) == null);
+    try std.testing.expectEqual(@as(?Effect, .finish_restore_requested), m.activateAction(.finish_restore));
+    m.receive(.complete_fail);
+    try std.testing.expectEqual(@as(?Action, .finish_restore), m.selected);
+    try std.testing.expectEqual(@as(?Effect, .finish_restore_requested), m.applyInput(.{ .confirm = true }).effect);
+}
+
+test "backup controls and navigation use enabled semantic actions" {
+    var m = Onboarding.init(std.testing.allocator);
+    defer m.deinit();
+    m.receive(.{ .backup = try std.testing.allocator.dupe(u8, "secret") });
+    const layout = calculateLayout(1000, 640);
+    var list = m.controls(layout);
+    try std.testing.expectEqualStrings("Copy word", list.items[0].label);
+    try std.testing.expectEqualStrings("Copy (optional)", list.items[1].label);
+    try std.testing.expectEqualStrings("[ ] I have saved my recovery words", list.items[2].label);
+    try std.testing.expectEqual(@FieldType(Control, "kind").checkbox, list.items[2].kind);
+    try std.testing.expectEqualStrings("Continue", list.items[3].label);
+    try std.testing.expect(!list.items[3].enabled);
+    _ = m.applyInput(.{ .up = true });
+    try std.testing.expectEqual(@as(?Action, .toggle_backup_saved), m.selected);
+    _ = m.applyInput(.{ .down = true });
+    try std.testing.expectEqual(@as(?Action, .{ .copy_word = 0 }), m.selected);
+    _ = m.applyInput(.{ .pointer_x = layout.continue_button.centerX(), .pointer_y = layout.continue_button.centerY(), .clicked = true });
+    try std.testing.expectEqual(@as(?Action, .{ .copy_word = 0 }), m.selected);
+    _ = m.applyInput(.{ .pointer_x = layout.checkbox.centerX(), .pointer_y = layout.checkbox.centerY(), .clicked = true });
+    list = m.controls(layout);
+    try std.testing.expectEqualStrings("[x] I have saved my recovery words", list.items[2].label);
+    try std.testing.expect(list.items[3].enabled);
+    _ = m.applyInput(.{ .down = true });
+    try std.testing.expectEqual(@as(?Action, .complete_backup), m.selected);
+    try std.testing.expectEqual(@as(?Effect, .complete_requested), m.applyInput(.{ .confirm = true }).effect);
+}
+
+test "backup words have row major geometry, navigation and raw lookup" {
+    var m = Onboarding.init(std.testing.allocator);
+    defer m.deinit();
+    m.receive(.{ .backup = try std.testing.allocator.dupe(u8, "one two three four five six seven eight nine ten eleven twelve") });
+    const expected = [_][]const u8{ "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve" };
+    for ([_][2]f32{ .{ 1000, 640 }, .{ 160, 100 }, .{ 1, 1 } }) |size| {
+        const layout = calculateLayout(size[0], size[1]);
+        const list = m.controls(layout);
+        try std.testing.expectEqual(@as(usize, 15), list.len);
+        for (expected, 0..) |word, i| {
+            const index: u8 = @intCast(i);
+            const rect = layout.wordRect(index);
+            try std.testing.expectEqualStrings(word, m.mnemonicWord(index).?);
+            try std.testing.expectEqualDeep(rect, list.items[i].rect);
+            try std.testing.expectEqualDeep(@as(Action, .{ .copy_word = index }), list.hitTest(rect.centerX(), rect.centerY()).?.action);
+            try std.testing.expect(rect.x >= layout.seed_words.x and rect.y >= layout.seed_words.y);
+            try std.testing.expect(rect.x + rect.width <= layout.seed_words.x + layout.seed_words.width + 0.001);
+            try std.testing.expect(rect.y + rect.height <= layout.seed_words.y + layout.seed_words.height + 0.001);
+            if (i % 3 != 0) try std.testing.expect(rect.x > list.items[i - 1].rect.x + list.items[i - 1].rect.width);
+            if (i >= 3) try std.testing.expect(rect.y > list.items[i - 3].rect.y + list.items[i - 3].rect.height);
+        }
+    }
+    try std.testing.expect(m.mnemonicWord(12) == null);
+    for (0..12) |i| {
+        const index: u8 = @intCast(i);
+        try std.testing.expectEqualDeep(@as(?Action, .{ .copy_word = index }), m.selected);
+        try std.testing.expectEqualDeep(@as(?Effect, .{ .copy_word_requested = index }), m.applyInput(.{ .confirm = true }).effect);
+        m.markCopyHandedOff(.{ .copy_word = index }, 0);
+        try std.testing.expectEqual(@as(?u8, index), m.copied_word);
+        _ = m.applyInput(.{ .down = true });
+    }
+    try std.testing.expectEqualDeep(@as(?Action, .copy_seed), m.selected);
+    try std.testing.expectEqualDeep(@as(?Effect, .copy_requested), m.applyInput(.{ .confirm = true }).effect);
+    try std.testing.expectEqual(@as(?u8, 11), m.copied_word);
+    _ = m.applyInput(.{ .down = true });
+    try std.testing.expectEqualDeep(@as(?Action, .toggle_backup_saved), m.selected);
+    _ = m.applyInput(.{ .down = true });
+    try std.testing.expectEqualDeep(@as(?Action, .{ .copy_word = 0 }), m.selected);
+    const rect = calculateLayout(1000, 640).wordRect(4);
+    try std.testing.expectEqualDeep(@as(?Effect, .{ .copy_word_requested = 4 }), m.applyInput(.{ .pointer_x = rect.centerX(), .pointer_y = rect.centerY(), .clicked = true }).effect);
+    m.receive(.blocked);
+    try std.testing.expect(m.copied_word == null and m.mnemonicWord(4) == null);
+}
+
+test "short backup hides missing words" {
+    var m = Onboarding.init(std.testing.allocator);
+    defer m.deinit();
+    m.receive(.{ .backup = try std.testing.allocator.dupe(u8, " one  two three ") });
+    const list = m.controls(calculateLayout(1000, 640));
+    try std.testing.expectEqual(@as(usize, 6), list.len);
+    try std.testing.expect(m.mnemonicWord(3) == null);
+    try std.testing.expect(m.activateAction(.{ .copy_word = 3 }) == null);
+    try std.testing.expectEqualStrings(" one  two three ", m.mnemonic().?);
+}
+
+test "copy handoff feedback expires and follows most recent successful target" {
+    var m = Onboarding.init(std.testing.allocator);
+    defer m.deinit();
+    m.receive(.{ .backup = try std.testing.allocator.dupe(u8, "one two") });
+    const layout = calculateLayout(1000, 640);
+    const word = layout.wordRect(0);
+    try std.testing.expectEqualDeep(@as(?Effect, .{ .copy_word_requested = 0 }), m.applyInput(.{ .pointer_x = word.centerX(), .pointer_y = word.centerY(), .clicked = true }).effect);
+    try std.testing.expect(m.feedback_target == null and m.copied_word == null);
+    m.markCopyHandedOff(.{ .copy_word = 0 }, 10);
+    m.expire(12.999);
+    try std.testing.expectEqualDeep(@as(?Action, .{ .copy_word = 0 }), m.feedback_target);
+    m.markCopyHandedOff(.{ .copy_word = 0 }, 12);
+    m.expire(13);
+    try std.testing.expect(m.feedback_target != null);
+    m.selected = .copy_seed;
+    try std.testing.expectEqual(@as(?Effect, .copy_requested), m.applyInput(.{ .confirm = true }).effect);
+    m.markCopyHandedOff(.copy_seed, 14);
+    try std.testing.expectEqualStrings("copied!", m.controls(layout).find(.copy_seed).?.label);
+    try std.testing.expectEqual(@as(?u8, 0), m.copied_word);
+    m.markCopyHandedOff(.{ .copy_word = 9 }, 15);
+    try std.testing.expectEqualDeep(@as(?Action, .copy_seed), m.feedback_target);
+    m.expire(17);
+    try std.testing.expect(m.feedback_target == null);
+    try std.testing.expectEqualStrings("Copy (optional)", m.controls(layout).find(.copy_seed).?.label);
+    try std.testing.expectEqual(@as(?u8, 0), m.copied_word);
+    m.markCopyHandedOff(.{ .copy_word = 1 }, 18);
+    try std.testing.expectEqualDeep(@as(?Action, .{ .copy_word = 1 }), m.feedback_target);
+    m.receive(.blocked);
+    try std.testing.expect(m.feedback_target == null and m.copied_word == null);
+}
+
+test "hover uses enabled controls in current phase" {
+    var m = Onboarding.init(std.testing.allocator);
+    defer m.deinit();
+    const layout = calculateLayout(1000, 640);
+    m.receive(.{ .choice = .{ .recover_enabled = false } });
+    try std.testing.expect(m.hoverEnabled(layout, layout.copy.centerX(), layout.copy.centerY()));
+    try std.testing.expect(!m.hoverEnabled(layout, layout.checkbox.centerX(), layout.checkbox.centerY()));
+    try std.testing.expect(!m.hoverEnabled(layout, 0, 0));
+    m.receive(.blocked);
+    try std.testing.expect(!m.hoverEnabled(layout, layout.copy.centerX(), layout.copy.centerY()));
+    var backup = Onboarding.init(std.testing.allocator);
+    defer backup.deinit();
+    backup.receive(.{ .backup = try std.testing.allocator.dupe(u8, "one two") });
+    const word = layout.wordRect(0);
+    try std.testing.expect(backup.hoverEnabled(layout, word.centerX(), word.centerY()));
+    try std.testing.expect(backup.hoverEnabled(layout, layout.copy.centerX(), layout.copy.centerY()));
+    try std.testing.expect(backup.hoverEnabled(layout, layout.checkbox.centerX(), layout.checkbox.centerY()));
+    try std.testing.expect(!backup.hoverEnabled(layout, layout.continue_button.centerX(), layout.continue_button.centerY()));
+    _ = backup.activateAction(.toggle_backup_saved);
+    try std.testing.expect(backup.hoverEnabled(layout, layout.continue_button.centerX(), layout.continue_button.centerY()));
+    _ = backup.activateAction(.complete_backup);
+    try std.testing.expect(!backup.hoverEnabled(layout, layout.continue_button.centerX(), layout.continue_button.centerY()));
+    backup.receive(.complete_success);
+    try std.testing.expect(!backup.hoverEnabled(layout, word.centerX(), word.centerY()));
 }
