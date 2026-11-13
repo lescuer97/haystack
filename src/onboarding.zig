@@ -307,9 +307,9 @@ pub const Onboarding = struct {
                 self.selected = .paste_phrase;
                 self.phase = .phrase_entry;
             },
-            .resume_failed => |failure| if (self.phase == .loading) {
+            .resume_failed => if (self.phase == .loading) {
                 self.stage_created = true;
-                self.can_generate_new = failure.can_generate_new;
+                self.can_generate_new = false;
                 self.selected = .retry_recovery;
                 self.phase = .restore_failed;
             },
@@ -337,7 +337,7 @@ pub const Onboarding = struct {
             .restore_failed => |failure| if (self.phase == .restoring and failure.attempt_id == self.attempt_id) {
                 self.recovery_preparation_pending = false;
                 self.stage_created = failure.stage_created;
-                self.can_generate_new = failure.can_generate_new;
+                self.can_generate_new = false;
                 if (failure.stage_created) self.clearPhrase();
                 self.phase = .restore_failed;
                 self.selected = .retry_recovery;
@@ -371,8 +371,9 @@ pub const Onboarding = struct {
                 result.add(.restore_phrase, "Restore", layout.checkbox, std.mem.trim(u8, self.recoveryPhrase(), " \t\n\r\x0b\x0c").len != 0, .button);
                 result.add(.back_to_choice, "Back", layout.continue_button, !self.recovery_preparation_pending, .button);
             },
-            .restore_failed, .restore_result => {
-                if (self.phase == .restore_result and self.hasFundsOrHistory()) {
+            .restore_failed => result.add(.retry_recovery, "Retry", layout.copy, true, .button),
+            .restore_result => {
+                if (self.hasFundsOrHistory()) {
                     result.add(.finish_restore, "Continue", layout.copy, true, .button);
                     result.add(.retry_recovery, "Retry", layout.checkbox, true, .button);
                 } else {
@@ -668,7 +669,9 @@ test "capacity and recovery outcomes gate destructive actions" {
     m.selected = .restore_phrase;
     _ = m.applyInput(.{ .confirm = true });
     const first = m.attempt_id;
-    m.receive(.{ .restore_failed = .{ .attempt_id = first, .stage_created = true, .can_generate_new = false } });
+    m.receive(.{ .restore_failed = .{ .attempt_id = first, .stage_created = true, .can_generate_new = true } });
+    try std.testing.expect(!m.can_generate_new);
+    try std.testing.expect(m.controls(calculateLayout(1000, 640)).find(.generate_wallet) == null);
     try std.testing.expectEqual(@as(usize, 0), m.phrase_len);
     m.selected = .generate_wallet;
     try std.testing.expect(m.applyInput(.{ .confirm = true }).effect == null);
@@ -695,8 +698,10 @@ test "recovery resume events initialize only loading model" {
     try std.testing.expect(model.phase == .phrase_entry);
     var failed = Onboarding.init(std.testing.allocator);
     defer failed.deinit();
-    failed.receive(.{ .resume_failed = .{ .can_generate_new = false } });
+    failed.receive(.{ .resume_failed = .{ .can_generate_new = true } });
     try std.testing.expect(failed.phase == .restore_failed and failed.stage_created and !failed.can_generate_new);
+    failed.can_generate_new = true;
+    try std.testing.expect(failed.controls(calculateLayout(1000, 640)).find(.generate_wallet) == null);
     var result = Onboarding.init(std.testing.allocator);
     defer result.deinit();
     result.receive(.{ .resume_result = .{ .spendable_sats = 0, .pending_sats = 1, .spent_sats = 0, .can_generate_new = true } });
@@ -786,8 +791,7 @@ test "semantic controls describe every phase and reject stale or disabled action
     m.receive(.{ .restore_failed = .{ .attempt_id = m.attempt_id, .stage_created = false, .can_generate_new = false } });
     list = m.controls(layout);
     try std.testing.expectEqualStrings("Retry", list.items[0].label);
-    try std.testing.expectEqualStrings("Generate new", list.items[1].label);
-    try std.testing.expect(!list.items[1].enabled);
+    try std.testing.expectEqual(@as(usize, 1), list.len);
     try std.testing.expect(m.activateAction(.generate_wallet) == null);
     _ = m.activateAction(.retry_recovery);
     try std.testing.expectEqual(Phase.phrase_entry, m.phase);

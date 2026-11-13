@@ -5,7 +5,9 @@
 #[path = "../../../vendor/cdk-wallet-ffi/src/api.rs"]
 mod api;
 mod browser_db;
+mod browser_onboarding;
 mod browser_platform;
+mod mint_policy;
 #[path = "../../../vendor/cdk-wallet-ffi/src/spilman.rs"]
 mod spilman;
 #[path = "../../../vendor/cdk-wallet-ffi/src/status.rs"]
@@ -38,6 +40,23 @@ pub fn initialize() {
 
 fn js_error(message: &str) -> JsValue {
     js_sys::Error::new(message).into()
+}
+
+/// Select the mint at compile time; start_onboarding independently validates it.
+#[wasm_bindgen]
+pub fn onboarding_mint() -> Result<String, JsValue> {
+    #[cfg(feature = "local-mint-fixture")]
+    {
+        web_sys::window()
+            .ok_or_else(|| js_error("unavailable"))?
+            .location()
+            .origin()
+            .map_err(|_| js_error("unavailable"))
+    }
+    #[cfg(not(feature = "local-mint-fixture"))]
+    {
+        Ok("https://mint.minibits.cash/Bitcoin".to_owned())
+    }
 }
 fn failure(e: FfiErr) -> Value {
     json!({"status":e.status as u8,"error":e.message,"operation_id":e.operation_id.map(|v| uuid::Uuid::from_bytes(v).to_string()),"sender_fee_sats":e.sender_fee_sats.to_string()})
@@ -365,9 +384,13 @@ impl BrowserWallet {
                 match h.get_pending_token(id.as_bytes()).await { Ok(p) => json!({"status":0,"token":p.token,"operation_id":id.to_string()}), Err(e) => failure(e) }
             }
             "recover" => {
+                // FIXME: Known browser send/swap recovery defects are not fixed here:
+                // docs/browser-wallet.md#known-recovery-defects-reported-by-browser-tests
                 let mint=if a.0.is_empty() || a.c(0)?.is_none() { None } else { Some(wallet::parse_mint_url(a.text(0)?).map_err(|e| js_error(&failure(e).to_string()))?) };
                 match h.recover(mint.as_ref()).await { Ok(r) => json!({"status":0,"reports":reports(r)}), Err(e) => failure(e) }
             }
+            "restore_seed" => match h.restore_seed(a.text(0)?).await { Ok((spendable,pending,spent)) => json!({"status":0,"spendable_sats":spendable.to_string(),"pending_sats":pending.to_string(),"spent_sats":spent.to_string()}), Err(e) => failure(e) },
+            "restore_can_abandon" => match h.browser_restore_can_abandon().await { Ok((_revision,can_abandon)) => json!({"status":0,"can_abandon":can_abandon}), Err(e) => failure(e) },
             "get_active_keyset_info_json" => match h.active_keyset_info_json(a.text(0)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
             "get_keyset_info_json" => match h.keyset_info_json(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
             "post_swap" => match h.post_swap(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },

@@ -1,6 +1,7 @@
 zig-out
 zig-pkg
 .zig-cache
+:memory*
 /assets/
 
 # Rust build artifacts for the vendored wallet FFI crate (Cargo.lock is tracked).

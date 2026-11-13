@@ -10,11 +10,14 @@
 // across tabs. Run `zig build test -Dplatform=wasm` for the Chromium suite.
 
 import {strict as assert} from "node:assert";
+import {readFile} from "node:fs/promises";
+import vm from "node:vm";
 import * as walletStore from "./wallet-store.js";
 
 const DATABASE = "haystack-wallet";
 const MNEMONIC_STORE = "mnemonics";
 const STATE_STORE = "states";
+const ONBOARDING_STORE = "onboarding";
 
 class FakeRequest {
   constructor() {
@@ -37,6 +40,12 @@ class FakeObjectStore {
   get(key) {
     const request = new FakeRequest();
     this.transaction.add(request, () => (this.data.has(key) ? this.data.get(key) : undefined));
+    return request;
+  }
+
+  getAllKeys() {
+    const request = new FakeRequest();
+    this.transaction.add(request, () => [...this.data.keys()]);
     return request;
   }
 
@@ -144,10 +153,15 @@ class FakeTransaction {
 
 class FakeDatabase {
   constructor(record, indexedDB) {
+    this.record = record;
     this.stores = record.stores;
     this.indexedDB = indexedDB;
     this.objectStoreNames = {contains: name => this.stores.has(name)};
+    this.closed = false;
+    record.connections.add(this);
   }
+
+  close() { this.closed = true; this.record.connections.delete(this); }
 
   createObjectStore(name) {
     this.stores.set(name, new Map());
@@ -187,7 +201,19 @@ class FakeIndexedDB {
         record = {version: 0, stores: new Map()};
         this.records.set(name, record);
       }
+      record.connections ||= new Set();
+      if (version < record.version) {
+        request.error = new Error("VersionError");
+        request.error.name = "VersionError";
+        if (request.onerror) request.onerror();
+        return;
+      }
       if (version > record.version) {
+        for (const db of [...record.connections]) if (db.onversionchange) db.onversionchange();
+        if (record.connections.size) {
+          if (request.onblocked) request.onblocked();
+          return;
+        }
         upgrade = true;
         record.version = version;
       }
@@ -247,6 +273,120 @@ let checks = 0;
 function check() {
   checks += 1;
 }
+
+// Exercise both independent openers against fresh, v1, and newer databases.
+const originalListeners = new Map(listeners);
+
+// Load the actual Emscripten library, replacing only its build-time macro.
+const gameSource = (await readFile(new URL("./game-wallet.js", import.meta.url), "utf8"))
+  .replace(/\{\{\{ makeDynCall\([^\n]+?\) \}\}\}/, "(function () {})");
+function gameSmoke(indexedDB) {
+  const library = {};
+  vm.runInNewContext(gameSource, {indexedDB, LibraryManager: {library}, mergeInto: Object.assign});
+  return library.$haystackWalletSmoke;
+}
+for (const scenario of ["fresh", "upgrade", "existing", "newer"]) {
+  const isolated = new FakeIndexedDB();
+  const state = {revision: 17, data: "existing", extra: "preserve"};
+  if (scenario !== "fresh") {
+    const stores = new Map([
+      [MNEMONIC_STORE, new Map([["existing", MNEMONIC]])],
+      [STATE_STORE, new Map([["existing", state]])],
+    ]);
+    if (scenario === "existing") stores.set(ONBOARDING_STORE, new Map([["marker", "preserve"]]));
+    isolated.records.set(DATABASE, {version: scenario === "upgrade" ? 1 : scenario === "existing" ? 2 : 3, stores});
+  }
+  const smoke = gameSmoke(isolated);
+  if (scenario === "newer") {
+    await assert.rejects(smoke.openDatabase(), /wallet smoke failed/);
+    assert.equal(isolated.records.get(DATABASE).version, 3);
+    assert.equal(isolated.peek(MNEMONIC_STORE, "existing"), MNEMONIC);
+    assert.deepEqual(isolated.peek(STATE_STORE, "existing"), state);
+    assert.equal(isolated.records.get(DATABASE).stores.has(ONBOARDING_STORE), false);
+  } else {
+    const db = await smoke.openDatabase();
+    assert.equal(isolated.records.get(DATABASE).version, 2);
+    assert.ok(isolated.records.get(DATABASE).stores.has(ONBOARDING_STORE));
+    if (scenario !== "fresh") {
+      assert.equal(isolated.peek(MNEMONIC_STORE, "existing"), MNEMONIC);
+      assert.deepEqual(isolated.peek(STATE_STORE, "existing"), state);
+    }
+    if (scenario === "existing") assert.equal(isolated.peek(ONBOARDING_STORE, "marker"), "preserve");
+    Object.defineProperty(globalThis, "indexedDB", {value: isolated, configurable: true});
+    const isolatedPlatform = await import(`./wallet/platform.js?game-${scenario}`);
+    await isolatedPlatform.provisionWallet("new-wallet", MNEMONIC, "new-state");
+    assert.equal(isolated.peek(MNEMONIC_STORE, "new-wallet"), MNEMONIC);
+    // A subsequent upgrade must not be held up by the smoke connection.
+    const upgrade = isolated.open(DATABASE, 3);
+    await new Promise((resolve, reject) => {
+      upgrade.onsuccess = resolve;
+      upgrade.onerror = reject;
+      upgrade.onblocked = () => reject(new Error("upgrade blocked"));
+    });
+    assert.equal(db.closed, true);
+    assert.equal(smoke.connection, null);
+    upgrade.result.close();
+  }
+  check();
+}
+// A blocked (or errored) request may later succeed; that handle must be closed,
+// and must not replace a subsequent successful connection.
+for (const failure of ["onblocked", "onerror"]) {
+  const requests = [];
+  const smoke = gameSmoke({open() { const request = new FakeRequest(); requests.push(request); return request; }});
+  const first = smoke.openDatabase();
+  requests[0][failure]();
+  await assert.rejects(first, /wallet smoke failed/);
+  const second = smoke.openDatabase();
+  const current = {close() { this.closed = true; }};
+  requests[1].result = current;
+  requests[1].onsuccess();
+  assert.equal(await second, current);
+  const late = {close() { this.closed = true; }};
+  requests[0].result = late;
+  requests[0].onsuccess();
+  assert.equal(late.closed, true);
+  assert.equal(await smoke.openDatabase(), current);
+  check();
+}
+for (const [label, load] of [
+  ["platform", async suffix => (await import(`./wallet/platform.js?${suffix}`)).loadWallet],
+  ["helper", async suffix => (await import(`./wallet-store.js?${suffix}`)).readWallet],
+]) {
+  for (const scenario of ["fresh", "upgrade", "newer"]) {
+    const isolated = new FakeIndexedDB();
+    const state = {revision: 17, data: '{ "version": 1, "contents": [1,2] }', extra: "preserve"};
+    if (scenario !== "fresh") {
+      isolated.records.set(DATABASE, {
+        version: scenario === "upgrade" ? 1 : 3,
+        stores: new Map([
+          [MNEMONIC_STORE, new Map([["existing", MNEMONIC]])],
+          [STATE_STORE, new Map([["existing", state]])],
+        ]),
+      });
+    }
+    Object.defineProperty(globalThis, "indexedDB", {value: isolated, configurable: true});
+    const read = await load(`${label}-${scenario}`);
+    if (scenario === "newer") {
+      await assert.rejects(read("existing"), /IndexedDB could not be opened/);
+      assert.equal(isolated.records.get(DATABASE).version, 3);
+      assert.equal(isolated.records.get(DATABASE).stores.has(ONBOARDING_STORE), false);
+    } else {
+      await read("existing");
+      assert.equal(isolated.records.get(DATABASE).version, 2);
+      assert.deepEqual([...isolated.records.get(DATABASE).stores.keys()].sort(),
+        [MNEMONIC_STORE, ONBOARDING_STORE, STATE_STORE].sort());
+      assert.equal(isolated.store(ONBOARDING_STORE).size, 0);
+      if (scenario === "upgrade") {
+        assert.equal(isolated.peek(MNEMONIC_STORE, "existing"), MNEMONIC);
+        assert.deepEqual(isolated.peek(STATE_STORE, "existing"), state);
+      }
+    }
+    check();
+  }
+}
+Object.defineProperty(globalThis, "indexedDB", {value: fake, configurable: true});
+for (const [type, handler] of originalListeners) listeners.set(type, handler);
 
 // --- Fresh wallet: both records absent ---------------------------------------
 {
@@ -352,6 +492,257 @@ function check() {
   navigator.storage = undefined;
   assert.equal(await platform.requestPersistentStorage(), false);
   check("Persistent storage requests report grant, denial and absence safely");
+}
+
+// --- Onboarding transactions -------------------------------------------------
+{
+  const user = "haystack-user";
+  const fingerprint = "ab".repeat(32);
+  const marker = {version: 1, revision: 0, step: "backup_seed", fingerprint};
+  const data = '{"wallet":true}';
+  let expected = '[]';
+  const create = () => platform.createOnboardingWallet(user, MNEMONIC, data, marker, expected);
+  const complete = (revision = 0, fp = fingerprint, stateRevision = 0, mnemonic = MNEMONIC, state = data) =>
+    platform.completeOnboardingWallet(user, revision, fp, stateRevision, mnemonic, state, expected);
+  const clearUser = () => {
+    for (const store of [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]) fake.store(store).delete(user);
+  };
+  clearUser();
+  let absent = parse(await platform.loadOnboardingSnapshot());
+  assert.equal(absent.hasMarker, false);
+  assert.deepEqual(absent.wallets.find(w => w.name === user), {name: user, hasMnemonic: false, mnemonic: null, hasState: false, state: null});
+  for (const store of [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]) fake.seed(store, user, null);
+  const nulls = parse(await platform.loadOnboardingSnapshot());
+  assert.equal(nulls.hasMarker, true);
+  assert.deepEqual(nulls.wallets.find(w => w.name === user), {name: user, hasMnemonic: true, mnemonic: null, hasState: true, state: null});
+  for (const value of [undefined, 1n, NaN, Infinity, new Date(), (() => { const v = {}; v.self = v; return v; })()]) {
+    fake.seed(STATE_STORE, user, value);
+    await assert.rejects(platform.loadOnboardingSnapshot());
+  }
+  clearUser();
+  const other = fake.peek(STATE_STORE, "wallet-a");
+  fake.seed(MNEMONIC_STORE, user, MNEMONIC);
+  await assert.rejects(create());
+  assert.equal(fake.peek(MNEMONIC_STORE, user), MNEMONIC);
+  assert.equal(fake.peek(STATE_STORE, user), undefined);
+  clearUser();
+  fake.seed(STATE_STORE, user, {revision: 5, data: "existing"});
+  await assert.rejects(create());
+  assert.deepEqual(fake.peek(STATE_STORE, user), {revision: 5, data: "existing"});
+  clearUser();
+  const stage = `haystack-recovery-${"a".repeat(32)}`;
+  fake.seed(STATE_STORE, stage, null);
+  assert.deepEqual(parse(await platform.loadOnboardingSnapshot()).wallets.find(w => w.name === stage),
+    {name: stage, hasMnemonic: false, mnemonic: null, hasState: true, state: null});
+  fake.store(STATE_STORE).delete(stage);
+  fake.seed(MNEMONIC_STORE, "haystack-recovery-invalid", MNEMONIC);
+  assert.ok(parse(await platform.loadOnboardingSnapshot()).wallets.some(w => w.name === "haystack-recovery-invalid"));
+  await assert.rejects(create());
+  fake.store(MNEMONIC_STORE).delete("haystack-recovery-invalid");
+  fake.seed(ONBOARDING_STORE, "unexpected", {version: 99});
+  assert.ok(parse(await platform.loadOnboardingSnapshot()).entries.some(entry => entry.key === "unexpected"));
+  await assert.rejects(create());
+  fake.store(ONBOARDING_STORE).delete("unexpected");
+  fake.seed(MNEMONIC_STORE, stage, MNEMONIC);
+  await assert.rejects(create());
+  fake.seed(STATE_STORE, stage, {revision: 0, data});
+  await assert.rejects(create());
+  const retiredKey = `retired:${"a".repeat(32)}`;
+  fake.seed(ONBOARDING_STORE, retiredKey, {version: 1, step: "retired", id: "a".repeat(32), fingerprint,
+    mint: "https://mint.example", spendable_sats: "0", pending_sats: "0", spent_sats: "0"});
+  expected = JSON.stringify([{id: "a".repeat(32), mnemonic: MNEMONIC, state: {revision: 0, data}, marker: fake.peek(ONBOARDING_STORE, retiredKey)}]);
+  fake.peek(ONBOARDING_STORE, retiredKey).extra = true;
+  await assert.rejects(create());
+  delete fake.peek(ONBOARDING_STORE, retiredKey).extra;
+  fake.peek(STATE_STORE, stage).extra = true;
+  await assert.rejects(create());
+  delete fake.peek(STATE_STORE, stage).extra;
+  fake.abortNextWrite = true;
+  await assert.rejects(create());
+  assert.equal(fake.peek(MNEMONIC_STORE, user), undefined);
+  assert.equal(fake.peek(STATE_STORE, user), undefined);
+  assert.equal(fake.peek(ONBOARDING_STORE, user), undefined);
+  fake.writeFailures = 1;
+  await assert.rejects(create());
+  assert.equal(fake.peek(MNEMONIC_STORE, user), undefined);
+  await create();
+  const snapshot = parse(await platform.loadOnboardingSnapshot());
+  assert.deepEqual(snapshot.marker, marker);
+  assert.deepEqual(snapshot.entries, [{key: retiredKey, marker: fake.peek(ONBOARDING_STORE, retiredKey)}]);
+  assert.deepEqual(snapshot.wallets.find(w => w.name === user), {name: user, hasMnemonic: true, mnemonic: MNEMONIC, hasState: true, state: {revision: 0, data}});
+  assert.ok(snapshot.wallets.some(w => w.name === stage));
+  assert.ok(!snapshot.wallets.some(w => w.name === "wallet-a"));
+  await assert.rejects(create());
+  for (const attempt of [() => complete(1), () => complete(0, "cd".repeat(32)), () => complete(0, fingerprint, 1),
+    () => complete(0, fingerprint, 0, OTHER_MNEMONIC), () => complete(0, fingerprint, 0, MNEMONIC, "different")]) {
+    await assert.rejects(attempt());
+    assert.deepEqual(fake.peek(ONBOARDING_STORE, user), marker);
+  }
+  fake.seed(ONBOARDING_STORE, "unexpected", null);
+  await assert.rejects(complete());
+  fake.store(ONBOARDING_STORE).delete("unexpected");
+  fake.peek(ONBOARDING_STORE, retiredKey).extra = true;
+  await assert.rejects(complete());
+  delete fake.peek(ONBOARDING_STORE, retiredKey).extra;
+  fake.peek(STATE_STORE, user).extra = true;
+  await assert.rejects(complete());
+  delete fake.peek(STATE_STORE, user).extra;
+  fake.store(STATE_STORE).delete(stage);
+  await assert.rejects(complete());
+  fake.seed(STATE_STORE, stage, {revision: 0, data});
+  await assert.rejects(complete(Number.MAX_SAFE_INTEGER));
+  fake.abortNextWrite = true;
+  await assert.rejects(complete());
+  assert.deepEqual(fake.peek(ONBOARDING_STORE, user), marker);
+  await complete();
+  assert.deepEqual(fake.peek(ONBOARDING_STORE, user), {...marker, revision: 1, step: "complete"});
+  await assert.rejects(complete());
+  assert.deepEqual(fake.peek(STATE_STORE, user), {revision: 0, data});
+  assert.deepEqual(fake.peek(STATE_STORE, "wallet-a"), other);
+  clearUser();
+  fake.store(MNEMONIC_STORE).delete(stage);
+  fake.store(STATE_STORE).delete(stage);
+  fake.store(ONBOARDING_STORE).delete(retiredKey);
+  check("Onboarding creation and completion are atomic and compare all validated values");
+}
+
+// Recovery transitions preserve the audited raw stage and commit atomically.
+{
+  const user = "haystack-user", id = "1".repeat(32), key = `haystack-recovery-${id}`;
+  const fingerprint = "ab".repeat(32), data = '{"stage":true}';
+  const scan = {version: 1, revision: 0, step: "scanning", id, fingerprint, mint: "https://mint.example"};
+  const failed = {...scan, revision: 1, step: "failed"};
+  const retry = {...scan, revision: 2};
+  const result = {...retry, revision: 3, step: "result", spendable_sats: "1", pending_sats: "0", spent_sats: "0"};
+  const zero = {...result, spendable_sats: "0"};
+  const backup = {version: 1, revision: 0, step: "backup_seed", fingerprint: "cd".repeat(32)};
+  let expected = '[]';
+  const stage = () => platform.stageOnboardingWallet(user, id, MNEMONIC, data, scan, expected);
+  const update = (a, b, rev = 0, mnemonic = MNEMONIC, raw = data) => platform.updateOnboardingScan(user, a, b, rev, mnemonic, raw, expected);
+  const restore = (m = result, rev = 0) => platform.finishOnboardingRestore(user, m, rev, MNEMONIC, data, expected);
+  const generate = (m = zero, rev = 0, b = backup) => platform.generateOnboardingWallet(user, m, rev, MNEMONIC, data, OTHER_MNEMONIC, "new", b, expected);
+  fake.seed(MNEMONIC_STORE, user, MNEMONIC);
+  await assert.rejects(stage());
+  fake.store(MNEMONIC_STORE).delete(user);
+  fake.seed(MNEMONIC_STORE, "haystack-recovery-bad", MNEMONIC);
+  await assert.rejects(stage());
+  fake.store(MNEMONIC_STORE).delete("haystack-recovery-bad");
+  fake.abortNextWrite = true;
+  await assert.rejects(stage());
+  assert.equal(fake.peek(MNEMONIC_STORE, key), undefined);
+  await stage();
+  await assert.rejects(update(scan, failed, 1));
+  await assert.rejects(update({...scan, mint: "different"}, failed));
+  await assert.rejects(update(scan, {...failed, extra: true}));
+  await update(scan, failed);
+  assert.equal(fake.peek(MNEMONIC_STORE, key), MNEMONIC);
+  await update(failed, retry);
+  await assert.rejects(update(retry, {...result, spendable_sats: "18446744073709551616"}));
+  await update(retry, result);
+  await assert.rejects(generate(result));
+  await assert.rejects(restore(result, 1));
+  fake.seed(STATE_STORE, user, {revision: 0, data: "half"});
+  await assert.rejects(restore());
+  fake.store(STATE_STORE).delete(user);
+  fake.abortNextWrite = true;
+  await assert.rejects(restore());
+  assert.equal(fake.peek(MNEMONIC_STORE, key), MNEMONIC);
+  assert.equal(fake.peek(MNEMONIC_STORE, user), undefined);
+  await restore();
+  assert.equal(fake.peek(MNEMONIC_STORE, key), undefined);
+  assert.equal(fake.peek(MNEMONIC_STORE, user), MNEMONIC);
+  assert.deepEqual(fake.peek(ONBOARDING_STORE, user), {version: 1, revision: 4, step: "complete", fingerprint});
+  for (const store of [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]) fake.store(store).delete(user);
+  await stage();
+  await update(scan, {...zero, revision: 1});
+  const zero1 = {...zero, revision: 1};
+  await assert.rejects(restore(zero1));
+  await assert.rejects(generate(zero1, 1));
+  await assert.rejects(generate(zero1, 0, {...backup, fingerprint}));
+  fake.abortNextWrite = true;
+  await assert.rejects(generate(zero1));
+  assert.equal(fake.peek(ONBOARDING_STORE, `retired:${id}`), undefined);
+  await generate(zero1);
+  assert.equal(fake.peek(MNEMONIC_STORE, key), MNEMONIC);
+  assert.deepEqual(fake.peek(STATE_STORE, key), {revision: 0, data});
+  assert.equal(fake.peek(MNEMONIC_STORE, user), OTHER_MNEMONIC);
+  assert.equal(fake.peek(ONBOARDING_STORE, `retired:${id}`).step, "retired");
+  for (const store of [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]) fake.store(store).delete(user);
+  fake.store(MNEMONIC_STORE).delete(key);
+  fake.store(STATE_STORE).delete(key);
+  fake.store(ONBOARDING_STORE).delete(`retired:${id}`);
+  check("Recovery transitions enforce CAS, gating, orphan checks and rollback");
+}
+
+// Retired records must match the previously audited snapshot for every transition.
+{
+  const user = "haystack-user", id = "2".repeat(32), active = "3".repeat(32);
+  const key = `haystack-recovery-${id}`, activeKey = `haystack-recovery-${active}`;
+  const fingerprint = "ab".repeat(32), mint = "mint";
+  const retired = {version: 1, step: "retired", id, fingerprint, mint, spendable_sats: "0", pending_sats: "0", spent_sats: "0"};
+  const entry = {id, mnemonic: MNEMONIC, state: {revision: 4, data: "raw"}, marker: retired};
+  const expected = JSON.stringify([entry]);
+  const backup = {version: 1, revision: 0, step: "backup_seed", fingerprint};
+  const scan = {version: 1, revision: 0, step: "scanning", id: active, fingerprint, mint};
+  const result = {...scan, step: "result", spendable_sats: "1", pending_sats: "0", spent_sats: "0"};
+  const zero = {...result, spendable_sats: "0"};
+  const cases = [
+    [null, e => platform.createOnboardingWallet(user, MNEMONIC, "data", backup, e)],
+    [backup, e => platform.completeOnboardingWallet(user, 0, fingerprint, 0, MNEMONIC, "data", e)],
+    [null, e => platform.stageOnboardingWallet(user, active, MNEMONIC, "data", scan, e)],
+    [scan, e => platform.updateOnboardingScan(user, scan, {...scan, revision: 1}, 0, MNEMONIC, "data", e)],
+    [result, e => platform.finishOnboardingRestore(user, result, 0, MNEMONIC, "data", e)],
+    [zero, e => platform.generateOnboardingWallet(user, zero, 0, MNEMONIC, "data", OTHER_MNEMONIC, "new", {...backup, fingerprint: "cd".repeat(32)}, e)],
+  ];
+  const clear = () => {
+    for (const store of [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]) {
+      for (const k of [user, key, activeKey, `retired:${id}`]) fake.store(store).delete(k);
+    }
+  };
+  for (let i = 0; i < cases.length; i++) {
+    const [marker, run] = cases[i];
+    const setup = () => {
+      clear();
+      fake.seed(MNEMONIC_STORE, key, MNEMONIC);
+      fake.seed(STATE_STORE, key, {revision: 4, data: "raw"});
+      fake.seed(ONBOARDING_STORE, `retired:${id}`, {...retired});
+      if (i === 1) {
+        fake.seed(MNEMONIC_STORE, user, MNEMONIC);
+        fake.seed(STATE_STORE, user, {revision: 0, data: "data"});
+      }
+      if (i >= 3) {
+        fake.seed(MNEMONIC_STORE, activeKey, MNEMONIC);
+        fake.seed(STATE_STORE, activeKey, {revision: 0, data: "data"});
+      }
+      if (marker) fake.seed(ONBOARDING_STORE, user, {...marker});
+    };
+    const mutations = [
+      () => fake.seed(MNEMONIC_STORE, key, OTHER_MNEMONIC),
+      () => fake.seed(STATE_STORE, key, {revision: 4, data: "changed"}),
+      () => fake.seed(STATE_STORE, key, {revision: 5, data: "raw"}),
+      () => fake.seed(ONBOARDING_STORE, `retired:${id}`, {...retired, mint: "other"}),
+      () => fake.store(ONBOARDING_STORE).delete(`retired:${id}`),
+    ];
+    for (const mutate of mutations) {
+      setup(); mutate();
+      const before = await platform.loadOnboardingSnapshot();
+      await assert.rejects(run(expected));
+      assert.equal(await platform.loadOnboardingSnapshot(), before);
+    }
+    setup();
+    for (const invalid of [undefined, null, "null", "{}", "bad", JSON.stringify([entry, entry]),
+      JSON.stringify([{...entry, extra: 1}]), JSON.stringify([{...entry, state: {...entry.state, extra: 1}}]),
+      JSON.stringify([{...entry, marker: {...retired, extra: 1}}]), '[]']) {
+      const before = await platform.loadOnboardingSnapshot();
+      await assert.rejects(run(invalid));
+      assert.equal(await platform.loadOnboardingSnapshot(), before);
+    }
+    // Marker property order is not significant.
+    const reversed = Object.fromEntries(Object.entries(retired).reverse());
+    await run(JSON.stringify([{...entry, marker: reversed}]));
+  }
+  clear();
+  check("All onboarding transitions bind retired records to the audited snapshot");
 }
 
 // --- The fixed user wallet is never deleted by the test helper --------------

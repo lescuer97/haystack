@@ -85,7 +85,6 @@ const NETWORK_DEADLINE: Duration = Duration::from_secs(60);
 /// requests against a mint.
 const RECOVERY_DEADLINE: Duration = Duration::from_secs(120);
 /// Seed restoration can scan many batches across multiple keysets.
-#[cfg(not(target_arch = "wasm32"))]
 const SEED_RESTORE_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// The persistent, multi-threaded Tokio runtime.
@@ -650,7 +649,6 @@ impl CdkWallet {
 
     /// Scan deterministic proofs for one Sat mint. Earlier batches may persist
     /// even if a later batch fails or the deadline expires.
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) async fn restore_seed(&mut self, url: &str) -> FfiResult<(u64, u64, u64)> {
         let mint = parse_mint_url(url)?;
         self.add_mint(url).await?;
@@ -670,6 +668,11 @@ impl CdkWallet {
                 "seed restore exceeded its deadline; previously restored proofs may remain",
             )),
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn browser_restore_can_abandon(&self) -> FfiResult<(u64, bool)> {
+        self.db.restore_can_abandon().await.map_err(db_error)
     }
 
     /// Receive a token, returning the net Sat amount credited.

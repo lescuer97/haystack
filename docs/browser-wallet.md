@@ -72,11 +72,20 @@ longer a project build step.
 ## Run the local end-to-end tests
 
 One command builds everything, starts its own **local-only fake mint** on a free
-port, runs Chromium plus database conformance tests, and stops the fixture:
+port, runs Chromium plus database conformance tests, and stops the fixture. It
+currently exits nonzero on three known send/swap recovery assertions:
 
 ```sh
 zig build test -Dplatform=wasm
 ```
+
+`zig build wallet-fixture -Dplatform=wasm` and `zig build browser-fixture
+-Dplatform=wasm` build isolated fixture artifacts under `zig-out/wasm-test`,
+separate from the production `zig-out/wasm` bundle. On Linux, `zig build
+test-onboarding -Dplatform=wasm` runs onboarding tests with a fake mint and fresh
+Chromium incognito contexts. Tests and `test-mint` use the fixture graph, including
+in ReleaseSafe; they never contact the public mint. On macOS the fixture build
+and Node/host tests passed, but the Chromium suite was not run.
 
 For manual interaction or browser MCP, start a persistent fake-mint server with
 `zig build test-mint -Dplatform=wasm`. It binds **127.0.0.1:18787**.
@@ -118,11 +127,12 @@ zig build test-wallet
 zig build test
 ```
 
-### Results verified on this machine
+### Historical results (before IndexedDB v2 onboarding)
 
 These figures were recorded before the wallet storage moved from localStorage to
-the dedicated IndexedDB database. Re-run the Chromium suite with
-`zig build test -Dplatform=wasm` to refresh them.
+the dedicated IndexedDB database and before v2 onboarding. They do not verify the
+new onboarding end-to-end flow. Re-run the Chromium suite with `zig build test
+-Dplatform=wasm` to refresh them; the three known failures remain.
 
 | Check | Result |
 | --- | --- |
@@ -265,29 +275,21 @@ rejected rather than tolerated because this writer cannot preserve them: serde
 would drop them on the next mutation. A write whose expected revision is stale is
 rejected with a concurrent-update error.
 
-`provision_wallet(mnemonic, name)` is the only creation path. It validates the
-phrase, holds the wallet's Web Lock, confirms both records are absent, and writes
-both in one IndexedDB transaction that uses `add` for each key. It never replaces
-an existing wallet, and nothing provisions automatically at game startup. The
-single persistent user wallet is named `haystack-user`; only provisioning that
-name calls `navigator.storage.persist()`, and a denial is a warning while the
-wallet is still stored. There is no player-facing or production deletion API.
+The game uses the fixed persistent user wallet `haystack-user`. Its IndexedDB v2
+onboarding records use atomic transitions, with migration from v1 to v2; this is
+not a migration from the previous localStorage layout. Startup inspection is
+read-only and makes no network request. Incomplete or unknown records block
+onboarding rather than being overwritten. Provisioning requests
+`navigator.storage.persist()`; denial only warns and the wallet remains stored.
+There is no player-facing or production deletion API.
 
-The mandatory startup smoke is still disposable: it provisions a unique
-`game-smoke-*` wallet, opens it, verifies it is empty, closes and frees it, then
-deletes exactly its own two records and verifies both are gone before reporting
-success. Browser test fixtures use the test-only `browser/wallet-store.js`
-helper for the same scoped deletion. Neither path deletes the database, clears an
-object store, or touches the game's database or pre-existing localStorage
-entries. The fixed
-`haystack-user` wallet is never provisioned, opened, rewritten or deleted by the
-general browser fixture: the persistence policy and its denial path are exercised
-through a test-only probe that does not touch any wallet record, and the cleanup
-helper refuses `haystack-user` even if a fixture passes it by mistake. A
-mnemonic-only record is treated as initialized, never as absent, and is preserved
-in regression coverage. A unique localStorage canary is checked where the origin
-allows localStorage. There is no migration from the previous localStorage
-layout; a fresh `haystack-wallet` pair must be provisioned explicitly.
+The lower-level `provision_wallet(mnemonic, name)` validates the phrase, holds the
+wallet's Web Lock and atomically adds both records only when absent. Regression
+fixtures still use disposable wallets and scoped cleanup; their test-only helper
+refuses `haystack-user`. They do not clear the database or object stores. A
+mnemonic-only record is preserved in regression coverage, as is a localStorage
+canary where available. `browser/game-wallet.js` retains the old disposable smoke
+for tests but is no longer on the production startup path.
 
 For programmatic usage, import `walletApp` from `app.js`, or the low-level
 generated `wallet/cdk_wallet_browser.js` module. A wallet must be provisioned
@@ -315,9 +317,10 @@ field is secret material; never log it. Generated TypeScript declarations expose
 ## Boundaries and remaining validation
 
 - This is experimental software for **test funds**, not a reviewed production
-  browser wallet. Chromium/Linux is verified; Firefox/Safari and mobile are not.
-- Browser state is plaintext origin storage. Seeds are not automatically saved,
-  but proofs/tokens are bearer secrets. XSS or malicious same-origin scripts can
+  browser wallet. Historical Chromium/Linux results predate v2 onboarding;
+  Firefox/Safari and mobile are not verified.
+- Browser state, including mnemonic words, is plaintext origin storage.
+  Proofs and tokens are bearer secrets. XSS or malicious same-origin scripts can
   compromise them. Browser clearing/eviction can destroy storage. A mnemonic alone
   does not replace the pending-token/database recovery requirements.
 - The native panic-unwind guarantee does **not** carry across unchanged. Rust
@@ -333,21 +336,16 @@ field is secret material; never log it. Generated TypeScript declarations expose
   running fake mint and their proofs are redeemed. Wallet network helpers are
   compiled; not every signing-key/raw-swap combination has browser end-to-end
   coverage.
-- The renderer and wallet remain separate Wasm modules with separate linear
-  memories. The game itself starts a disposable wallet bridge through
-  `browser/game-wallet.js` *before* creating its window or main loop: an
-  Emscripten JS library dynamically imports the async wallet adapter, generates
-  a fresh mnemonic, derives its 64-byte seed, provisions a uniquely named
-  disposable pair in `haystack-wallet`, opens it, verifies empty startup reports
-  and balances, closes/frees it, and deletes only its own two records (verifying
-  both are gone). It never creates, opens or deletes the persistent user wallet,
-  and it never requests durable storage. No mint or network call is involved. A
-  single-shot Zig continuation starts the game only on success; any import,
-  initialization, storage or cleanup failure shows `Unable to start game.` and
-  never creates a game context or frame loop. The game exposes no public
-  `Module` snapshot or status API; startup state is internal. Wallet controls
-  remain in the wallet module and are exercised only by the non-interactive
-  `/wallet-test.html` test fixture.
+- `src/main.zig` starts the settings guard and owns the shared Zig onboarding
+  modal. `browser/game-onboarding.js` supplies an asynchronous bounded bridge to
+  Rust `BrowserOnboarding`; renderer and wallet are separate Wasm modules with
+  separate linear memories. Copy and paste require trusted browser input, and copy
+  feedback is shown only after a successful clipboard write.
+- Production recovery uses exactly `https://mint.minibits.cash/Bitcoin`. The
+  test-only `local-mint-fixture` feature accepts only a same-origin root loopback
+  mint. Recovery failures preserve the stage and offer Retry only. Generate
+  requires three zero totals, a clean Store audit, and a fresh transactional CAS;
+  the retired stage is preserved.
 - IndexedDB writes commit per transaction and are asynchronous, but the whole
   serialized `Store` is still rewritten on every mutation. Do not silently swap
   to a weaker locking, compare-and-swap or persistence model when platform

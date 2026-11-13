@@ -73,6 +73,160 @@ fn assert_rejected_without_overwrite(key: &str, raw: &str, what: &str) {
 }
 
 #[test]
+fn abandonment_audits_fresh_raw_snapshot_and_identity() {
+    use cdk_common::nuts::{CurrencyUnit, Id, Proof, SecretKey, State};
+    use cdk_common::secret::Secret;
+    use cdk_common::wallet::{
+        MeltQuote, MintQuote, OperationData, P2PKSigningKey, ProofInfo, SwapOperationData,
+        SwapSagaState, Transaction, TransactionDirection, TransactionStatus, WalletSaga,
+        WalletSagaState,
+    };
+    use cdk_common::{Amount, MeltQuoteState, PaymentMethod};
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    let key = "abandon-audit";
+    let valid = valid_record(key);
+    let db = open(key).unwrap();
+    let mint: cdk_common::mint_url::MintUrl = "http://127.0.0.1:18787".parse().unwrap();
+    let secret = SecretKey::from_slice(&[1; 32]).unwrap();
+    let method: PaymentMethod = "bolt11".parse().unwrap();
+    let proof = Proof {
+        amount: Amount::from(1),
+        keyset_id: "00916bbf7ef91a36".parse::<Id>().unwrap(),
+        secret: Secret::generate(),
+        c: secret.public_key(),
+        witness: None,
+        dleq: None,
+        p2pk_e: None,
+    };
+    let quote = MintQuote::new(
+        "q".into(),
+        mint.clone(),
+        method.clone(),
+        Some(Amount::from(1)),
+        CurrencyUnit::Sat,
+        "invoice".into(),
+        1,
+        None,
+    );
+    let melt = MeltQuote {
+        id: "q".into(),
+        mint_url: Some(mint.clone()),
+        unit: CurrencyUnit::Sat,
+        amount: Amount::from(1),
+        request: "invoice".into(),
+        fee_reserve: Amount::from(0),
+        state: MeltQuoteState::Unpaid,
+        expiry: 1,
+        payment_proof: None,
+        estimated_blocks: None,
+        fee_index: None,
+        payment_method: method,
+        used_by_operation: None,
+        version: 0,
+    };
+    let transaction = Transaction {
+        mint_url: mint.clone(),
+        direction: TransactionDirection::Incoming,
+        amount: Amount::from(1),
+        fee: Amount::from(0),
+        unit: CurrencyUnit::Sat,
+        ys: vec![secret.public_key()],
+        timestamp: 1,
+        memo: None,
+        metadata: HashMap::new(),
+        quote_id: None,
+        payment_request: None,
+        payment_proof: None,
+        payment_method: None,
+        saga_id: None,
+        status: TransactionStatus::Completed,
+    };
+    let saga = WalletSaga::new(
+        uuid::Uuid::nil(),
+        WalletSagaState::Swap(SwapSagaState::ProofsReserved),
+        Amount::from(1),
+        mint.clone(),
+        CurrencyUnit::Sat,
+        OperationData::Swap(SwapOperationData {
+            input_amount: Amount::from(1),
+            output_amount: Amount::from(1),
+            counter_start: None,
+            counter_end: None,
+            blinded_messages: None,
+        }),
+    );
+    let p2pk = P2PKSigningKey {
+        pubkey: secret.public_key(),
+        derivation_path: "m/0".parse().unwrap(),
+        derivation_index: 0,
+        created_time: 0,
+    };
+
+    assert_eq!(block_on(db.restore_can_abandon()).unwrap(), (0, true));
+    for state in [
+        State::Unspent,
+        State::Spent,
+        State::Pending,
+        State::Reserved,
+        State::PendingSpent,
+    ] {
+        let info = ProofInfo::new(proof.clone(), mint.clone(), state, CurrencyUnit::Sat).unwrap();
+        let mut record: Value = serde_json::from_str(&valid).unwrap();
+        record["proofs"] = json!({"raw": info});
+        test_set_state(key, &record.to_string());
+        assert_eq!(block_on(db.restore_can_abandon()).unwrap(), (0, false));
+    }
+    for (field, value) in [
+        ("mint_quotes", json!({"q": quote})),
+        ("melt_quotes", json!({"q": melt})),
+        ("transactions", json!({"t": transaction})),
+        ("sagas", json!({"s": saga})),
+        ("p2pk_keys", json!([p2pk])),
+    ] {
+        let mut record: Value = serde_json::from_str(&valid).unwrap();
+        record[field] = value;
+        test_set_state(key, &record.to_string());
+        assert_eq!(
+            block_on(db.restore_can_abandon()).unwrap(),
+            (0, false),
+            "{field}"
+        );
+    }
+    test_set_state(key, &valid);
+    block_on(db.kv_write("ns", "", "key", b"metadata")).unwrap();
+    let mut metadata: Value = serde_json::from_str(&test_state(key).unwrap().1).unwrap();
+    metadata["counters"] = json!({"key": 7});
+    metadata["derivation_counters"] = json!({"key": 8});
+    test_set_state(key, &metadata.to_string());
+    assert_eq!(block_on(db.restore_can_abandon()).unwrap(), (1, true));
+    metadata["fingerprint"] = json!("wrong");
+    test_set_state(key, &metadata.to_string());
+    assert_eq!(
+        block_on(db.restore_can_abandon()).unwrap_err(),
+        DbError::SeedMismatch
+    );
+    test_set_state(key, &valid);
+    test_set_mnemonic(key, OTHER_MNEMONIC);
+    assert_eq!(
+        block_on(db.restore_can_abandon()).unwrap_err(),
+        DbError::SeedMismatch
+    );
+    test_remove_mnemonic(key);
+    assert_eq!(
+        block_on(db.restore_can_abandon()).unwrap_err(),
+        DbError::Incomplete
+    );
+    test_set_mnemonic(key, MNEMONIC);
+    test_set_state(key, "{}");
+    assert_eq!(
+        block_on(db.restore_can_abandon()).unwrap_err(),
+        DbError::Corrupt
+    );
+}
+
+#[test]
 fn open_requires_both_provisioned_records() {
     let key = "not-provisioned";
     assert_eq!(open(key).unwrap_err(), DbError::NotInitialized);

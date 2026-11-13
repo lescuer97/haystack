@@ -147,7 +147,6 @@ pub const Native = struct {
         defer dir.close(self.io);
         const state = try self.record(dir);
         if (state) |r| if (r.version == 2) {
-            if (builtin.mode != .debug) return error.WalletUnavailable;
             if (r.step == .committing) {
                 try self.finishCommitting(dir, r);
                 return .ready;
@@ -161,7 +160,7 @@ pub const Native = struct {
             try inspection.close();
             return switch (r.step) {
                 .preparing => .{ .resume_failed = .{ .can_generate_new = false } },
-                .scanning, .failed => .{ .resume_failed = .{ .can_generate_new = self.safe(r.id) } },
+                .scanning, .failed => .{ .resume_failed = .{ .can_generate_new = false } },
                 .result => .{ .resume_result = self.report(r) },
                 else => error.InvalidOnboardingRecord,
             };
@@ -185,8 +184,7 @@ pub const Native = struct {
         }
         const record_value = state orelse {
             if (try self.stageExists()) return error.WalletUnavailable;
-            // TODO: Enable release recovery once a release mint URL is configured.
-            return .{ .choice = .{ .recover_enabled = builtin.mode == .debug } };
+            return .{ .choice = .{ .recover_enabled = true } };
         };
         if (record_value.step == .complete) return error.WalletUnavailable;
         if (try self.stageExists()) return error.WalletUnavailable;
@@ -203,7 +201,6 @@ pub const Native = struct {
     }
 
     pub fn restore(self: *Native, phrase: []const u8, attempt_id: u64) !onboarding.Event {
-        if (builtin.mode != .debug) return error.WalletUnavailable;
         var dir = try self.config();
         defer dir.close(self.io);
         if (try self.exists(self.paths.dir) or try self.stageExists()) return error.WalletUnavailable;
@@ -223,7 +220,7 @@ pub const Native = struct {
     }
 
     pub fn retry(self: *Native, attempt_id: u64) !onboarding.Event {
-        if (builtin.mode != .debug or try self.exists(self.paths.dir)) return error.WalletUnavailable;
+        if (try self.exists(self.paths.dir)) return error.WalletUnavailable;
         var dir = try self.config();
         defer dir.close(self.io);
         var r = try self.record(dir) orelse return error.WalletUnavailable;
@@ -238,8 +235,9 @@ pub const Native = struct {
     fn scan(self: *Native, dir: Io.Dir, input: Record, attempt_id: u64) !onboarding.Event {
         var inspection = try wallet.inspectRecovery(self.io, self.allocator, self.paths, input.id, true);
         const handle = if (inspection.wallet) |w| w.wallet else return error.WalletUnavailable;
-        const outcome: ScanOutcome = if (builtin.is_test and test_scan != null) test_scan.? else blk: {
-            const result = wallet.cdk.c.cdk_wallet_restore_seed(handle, "http://127.0.0.1:18787");
+        const outcome: ScanOutcome = if (builtin.is_test) test_scan orelse .failed else blk: {
+            const mint = if (builtin.mode == .debug) "http://127.0.0.1:18787" else "https://mint.minibits.cash/Bitcoin";
+            const result = wallet.cdk.c.cdk_wallet_restore_seed(handle, mint);
             wallet.cdk.c.cdk_string_free(result.@"error");
             break :blk if (result.status != wallet.cdk.c.CDK_STATUS_OK or result.incomplete != 0) .failed else .{ .success = .{ .spendable = result.unspent_sats, .pending = result.pending_sats, .spent = result.spent_sats } };
         };
@@ -248,7 +246,7 @@ pub const Native = struct {
         if (outcome == .failed) {
             r.step = .failed;
             try self.writeRecord(dir, r);
-            return .{ .restore_failed = .{ .attempt_id = attempt_id, .stage_created = true, .can_generate_new = self.safe(r.id) } };
+            return .{ .restore_failed = .{ .attempt_id = attempt_id, .stage_created = true, .can_generate_new = false } };
         }
         r.step = .result;
         r.spent_sats = outcome.success.spent;
@@ -297,7 +295,6 @@ pub const Native = struct {
     }
 
     pub fn finishRestore(self: *Native) !void {
-        if (builtin.mode != .debug) return error.WalletUnavailable;
         var dir = try self.config();
         defer dir.close(self.io);
         var r = try self.record(dir) orelse return error.WalletUnavailable;
@@ -336,14 +333,12 @@ pub const Native = struct {
     }
 
     pub fn generateNew(self: *Native) !onboarding.Event {
-        if (builtin.mode != .debug) return error.WalletUnavailable;
         var dir = try self.config();
         defer dir.close(self.io);
         var r = try self.record(dir) orelse return error.WalletUnavailable;
         if (r.version != 2) return error.WalletUnavailable;
         if (r.step == .abandoning) return self.finishAbandoning(dir, r);
-        if (r.step != .failed and r.step != .result and r.step != .scanning) return error.WalletUnavailable;
-        if (r.step == .result and hasHistory(r)) return error.WalletUnavailable;
+        if (r.step != .result or hasHistory(r)) return error.WalletUnavailable;
         if (try self.exists(self.paths.dir)) return error.WalletUnavailable;
         if (!self.safe(r.id)) return error.WalletUnavailable;
         r.step = .abandoning;
@@ -439,7 +434,7 @@ test "fresh startup offers choice without creating wallet or marker" {
     var native = f.native();
     const event = try native.start();
     try testing.expect(event == .choice);
-    try testing.expectEqual(builtin.mode == .debug, event.choice.recover_enabled);
+    try testing.expect(event.choice.recover_enabled);
     try testing.expectError(error.FileNotFound, Io.Dir.cwd().statFile(testing.io, f.wallet_dir, .{}));
     var dir = try Io.Dir.openDirAbsolute(testing.io, f.config_dir, .{});
     defer dir.close(testing.io);
@@ -511,7 +506,6 @@ test "unknown durability retains pending and resumes" {
 }
 
 test "recovery failures resume and successful totals persist" {
-    if (builtin.mode != .debug) return;
     var f = try Fixture.init();
     defer f.deinit();
     var native = f.native();
@@ -521,8 +515,17 @@ test "recovery failures resume and successful totals persist" {
     try testing.expect((try native.start()) == .choice);
     test_scan = .failed;
     const failed = try native.restore(phrase, 2);
-    try testing.expect(failed == .restore_failed and failed.restore_failed.stage_created);
-    try testing.expect((try native.start()) == .resume_failed);
+    try testing.expect(failed == .restore_failed and failed.restore_failed.stage_created and !failed.restore_failed.can_generate_new);
+    const resumed_failure = try native.start();
+    try testing.expect(resumed_failure == .resume_failed and !resumed_failure.resume_failed.can_generate_new);
+    try testing.expectError(error.WalletUnavailable, native.generateNew());
+    var marker_dir = try native.config();
+    var scanning = (try native.record(marker_dir)).?;
+    scanning.step = .scanning;
+    try native.writeRecord(marker_dir, scanning);
+    marker_dir.close(testing.io);
+    try testing.expect(!(try native.start()).resume_failed.can_generate_new);
+    try testing.expectError(error.WalletUnavailable, native.generateNew());
     try testing.expectError(error.WalletUnavailable, native.createNew());
     test_scan = .{ .success = .{ .spendable = 0, .pending = 0, .spent = 0 } };
     const empty = try native.retry(3);
@@ -537,7 +540,6 @@ test "recovery failures resume and successful totals persist" {
 }
 
 test "preparing stage resumes without replacing ownership" {
-    if (builtin.mode != .debug) return;
     var f = try Fixture.init();
     defer f.deinit();
     var native = f.native();
@@ -577,16 +579,11 @@ test "v2 markers reject malformed fields and incomplete stages" {
         testing.allocator.free(paths.dir);
     }
     try sf.ensureOwnedDir(testing.io, paths.dir);
-    if (builtin.mode == .debug) {
-        try testing.expectError(error.RecoveryStageUnavailable, native.start());
-    } else {
-        try testing.expectError(error.WalletUnavailable, native.start());
-    }
+    try testing.expectError(error.RecoveryStageUnavailable, native.start());
     try testing.expectError(error.WalletUnavailable, native.restore("invalid", 1));
 }
 
 test "finish recovery commits history and reconciles interrupted rename" {
-    if (builtin.mode != .debug) return;
     defer test_scan = null;
     for ([_]bool{ false, true }) |interrupted| {
         var f = try Fixture.init();
@@ -605,7 +602,6 @@ test "finish recovery commits history and reconciles interrupted rename" {
 }
 
 test "recovery refuses conflicting final and nonzero abandonment" {
-    if (builtin.mode != .debug) return;
     defer test_scan = null;
     var f = try Fixture.init();
     defer f.deinit();
@@ -622,13 +618,12 @@ test "recovery refuses conflicting final and nonzero abandonment" {
 }
 
 test "abandon recovery retains ownership and reconciles both rename states" {
-    if (builtin.mode != .debug) return;
     defer test_scan = null;
     for ([_]u8{ 0, 1, 2 }) |scenario| {
         var f = try Fixture.init();
         defer f.deinit();
         var native = f.native();
-        test_scan = if (scenario == 0) .failed else .{ .success = .{ .spendable = 0, .pending = 0, .spent = 0 } };
+        test_scan = .{ .success = .{ .spendable = 0, .pending = 0, .spent = 0 } };
         _ = try native.restore("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", 1);
         var dir = try native.config();
         const r = (try native.record(dir)).?;

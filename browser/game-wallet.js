@@ -26,6 +26,7 @@ mergeInto(LibraryManager.library, {
     database: "haystack-wallet",
     mnemonicStore: "mnemonics",
     stateStore: "states",
+    onboardingStore: "onboarding",
     namePrefix: "game-smoke-",
     connection: null,
 
@@ -68,23 +69,41 @@ mergeInto(LibraryManager.library, {
       var self = this;
       if (self.connection) return self.connection;
       if (typeof indexedDB === "undefined" || !indexedDB) throw new Error("wallet smoke unavailable");
-      self.connection = new Promise(function (resolve, reject) {
+      var connection = new Promise(function (resolve, reject) {
         var request;
+        var failed = false;
+        function fail(message) {
+          failed = true;
+          reject(new Error(message));
+        }
         try {
-          request = indexedDB.open(self.database, 1);
+          request = indexedDB.open(self.database, 2);
         } catch (_) {
-          reject(new Error("wallet smoke unavailable"));
+          fail("wallet smoke unavailable");
           return;
         }
         request.onupgradeneeded = function () {
           var database = request.result;
           if (!database.objectStoreNames.contains(self.mnemonicStore)) database.createObjectStore(self.mnemonicStore);
           if (!database.objectStoreNames.contains(self.stateStore)) database.createObjectStore(self.stateStore);
+          if (!database.objectStoreNames.contains(self.onboardingStore)) database.createObjectStore(self.onboardingStore);
         };
-        request.onsuccess = function () { resolve(request.result); };
-        request.onerror = function () { reject(new Error("wallet smoke failed")); };
-        request.onblocked = function () { reject(new Error("wallet smoke failed")); };
+        request.onsuccess = function () {
+          var database = request.result;
+          if (failed) { database.close(); return; }
+          database.onversionchange = function () {
+            database.close();
+            if (self.connection === connection) self.connection = null;
+          };
+          resolve(database);
+        };
+        request.onerror = function () { fail("wallet smoke failed"); };
+        request.onblocked = function () { fail("wallet smoke failed"); };
+      }).catch(function (error) {
+        if (self.connection === connection) self.connection = null;
+        throw error;
       });
+      self.connection = connection;
       return self.connection;
     },
 

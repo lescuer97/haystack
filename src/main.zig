@@ -31,6 +31,7 @@ const instance_lock = @import("instance_lock.zig");
 const paths = @import("paths.zig");
 const storage_fs = @import("storage_fs.zig");
 const onboarding = @import("onboarding.zig");
+const browser_onboarding = @import("browser_onboarding.zig");
 const native_onboarding = if (builtin.os.tag != .emscripten) @import("onboarding_native.zig") else struct {};
 const native_wallet = if (builtin.os.tag != .emscripten) @import("wallet.zig") else struct {};
 
@@ -61,16 +62,12 @@ extern "c" fn emscripten_set_main_loop(callback: *const fn () callconv(.c) void,
 extern "c" fn emscripten_cancel_main_loop() void;
 extern "c" fn emscripten_get_element_css_size(target: [*:0]const u8, width: *f64, height: *f64) c_int;
 
-// Provided by the combined browser JS library (`game-wallet.js` plus the
-// separate `game-storage.js`; `build/wasm.zig` concatenates them for the one
-// Emscripten `--js-library` hook). Start returns immediately; the ready callback
-// is invoked exactly once from the JS async continuation.
-extern "c" fn haystack_wallet_smoke_start(callback: *const fn (ok: c_int) callconv(.c) void) void;
 extern "c" fn haystack_ui_result(ok: c_int) void;
 
 // The browser build is a static archive, so explicitly export its C entry point.
 comptime {
     if (builtin.os.tag == .emscripten) @export(&webMain, .{ .name = "main" });
+    if (builtin.os.tag == .emscripten) @export(&browser_onboarding.link, .{ .name = "haystack_onboarding_link" });
 }
 
 /// Everything the browser callback needs between frames. It lives on the heap
@@ -79,42 +76,36 @@ comptime {
 const BrowserContext = struct {
     game_state: game_mod.GameState,
     input_reader: input.Reader,
+    model: onboarding.Onboarding,
+    onboarding_start_failed: bool = false,
 };
 
 var browser_context: ?*BrowserContext = null;
-var wallet_continuation_done = false;
+var clipboard_mailbox: browser_onboarding.ClipboardMailbox = .{};
+extern "c" fn haystack_onboarding_bind_input(*const fn (c_int, c_int, c_int, [*]u8, u32) callconv(.c) c_int, *const fn ([*c]const u8, u32) callconv(.c) void, *const fn (c_int) callconv(.c) void) void;
+extern "c" fn haystack_onboarding_unbind_input() void;
+
+fn clipboardProbe(kind: c_int, x: c_int, y: c_int, ptr: [*]u8, cap: u32) callconv(.c) c_int {
+    const ctx = browser_context orelse return 0;
+    if (cap > 1024) return 0;
+    return browser_onboarding.probe(&ctx.model, kind, x, y, @floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()), ptr[0..cap]);
+}
+fn clipboardPaste(ptr: [*c]const u8, len: u32) callconv(.c) void {
+    if (browser_context == null or len > 1024 or (len > 0 and ptr == null)) return;
+    clipboard_mailbox.paste(if (len == 0) "" else ptr[0..len]);
+}
+fn clipboardCopied(code: c_int) callconv(.c) void {
+    if (browser_context != null and code >= 1 and code <= 13) clipboard_mailbox.copied = code;
+}
 var storage_continuation_done = false;
 
 fn webMain(_: c_int, _: [*c][*c]u8) callconv(.c) c_int {
-    // The browser must prove the wallet bridge runs before any game context or
-    // main loop exists. Start the async task and return immediately; the
-    // single-shot continuation below creates the window and frame loop only on
-    // success. This function never blocks and never enables Asyncify.
     if (builtin.os.tag != .emscripten) return 0;
-    haystack_wallet_smoke_start(&walletReady);
+    browser_storage.start(&storageReady);
     return 0;
 }
 
-/// Exactly one invocation is allowed even if the JS side or a repeated kickoff
-/// tries again. A value of 1 means the disposable wallet was opened, checked,
-/// closed, freed and cleaned up successfully; 0 is a generic failure.
-fn walletReady(ok: c_int) callconv(.c) void {
-    if (wallet_continuation_done) return;
-    wallet_continuation_done = true;
-
-    if (ok == 0) {
-        std.log.err("wallet smoke failed: unable to start game", .{});
-        haystack_ui_result(0);
-        return;
-    }
-
-    // Settings live in IndexedDB and are guarded by a Web Lock. Both are
-    // asynchronous; this second single-shot callback runs after the wallet
-    // gate succeeded and before any game state or frame loop is created.
-    browser_storage.start(&storageReady);
-}
-
-/// Second startup gate: Web Lock plus asynchronous settings load. The JS side
+/// Startup gate: Web Lock plus asynchronous settings load. The JS side
 /// already converted storage failures into built-in defaults, except for the
 /// lock, which is a startup failure just like a second desktop process.
 fn storageReady(
@@ -144,7 +135,7 @@ fn storageReady(
 
     const settings = loaded.settings;
 
-    // Do not build any game state before both gates succeed. Initialization
+    // Do not build any game state before the storage gate succeeds. Initialization
     // failures still clean up every partially-created resource and fail closed.
     startBrowser(settings) catch |err| {
         std.log.err("browser initialization failed: {s}", .{@errorName(err)});
@@ -207,10 +198,17 @@ fn startBrowser(settings: game_mod.Settings) !void {
             settings,
         ),
         .input_reader = .{},
+        .model = onboarding.Onboarding.init(allocator),
     };
     errdefer ctx.game_state.deinit();
+    errdefer ctx.model.deinit();
 
     browser_context = ctx;
+    clipboard_mailbox.clear();
+    haystack_onboarding_bind_input(clipboardProbe, clipboardPaste, clipboardCopied);
+    browser_onboarding.start() catch {
+        ctx.onboarding_start_failed = true;
+    };
 }
 
 /// One browser frame. Errors cannot cross the C callback boundary, so a failure
@@ -222,26 +220,76 @@ fn browserFrame() callconv(.c) void {
     // Never call raylib's `windowShouldClose` here. The pinned web backend
     // implements it with a blocking `emscripten_sleep` that is forbidden
     // inside `emscripten_set_main_loop` (and aborts with asyncify disabled).
-    // Browser lifetime is owned by the page/main loop instead. Both startup
-    // gates (wallet and storage/lock) have already succeeded.
-    _ = stepFrame(
+    // Browser lifetime is owned by the page/main loop instead.
+    if (ctx.onboarding_start_failed) {
+        ctx.onboarding_start_failed = false;
+        ctx.model.receive(.blocked);
+    }
+    if (browser_onboarding.take()) |value| {
+        var result = value;
+        defer std.crypto.secureZero(u8, &result.bytes);
+        browser_onboarding.deliver(&result, &ctx.model);
+    }
+    clipboard_mailbox.consume(&ctx.model, rl.getTime());
+    const effect = stepFrame(
         &ctx.game_state,
         &ctx.input_reader,
         null,
         browser_settings_persister,
-        null,
+        &ctx.model,
     ) catch |err| {
         std.log.err("browser frame failed: {s}", .{@errorName(err)});
         stopBrowser();
         return;
     };
+    if (effect) |e| browserEffect(&ctx.model, e);
+}
+
+fn browserEffect(model: *onboarding.Onboarding, effect: onboarding.Effect) void {
+    const op: []const u8 = switch (effect) {
+        .create_requested => "create",
+        .restore_requested => "restore",
+        .retry_requested => "retry",
+        .generate_requested => "generate",
+        .complete_requested => "complete_backup",
+        .finish_restore_requested => "finish_restore",
+        .copy_requested, .copy_word_requested, .paste_requested => return,
+    };
+    if (effect == .restore_requested) {
+        const args = std.json.Stringify.valueAlloc(model.allocator, .{ .phrase = model.recoveryPhrase() }, .{}) catch {
+            model.receive(.blocked);
+            return;
+        };
+        defer {
+            std.crypto.secureZero(u8, args);
+            model.allocator.free(args);
+        }
+        _ = browser_onboarding.request(op, args) catch {
+            model.receive(.blocked);
+        };
+    } else {
+        _ = browser_onboarding.request(op, "{}") catch {
+            if (effect == .complete_requested or effect == .finish_restore_requested) {
+                model.receive(.complete_fail);
+            } else if (effect == .retry_requested and model.stage_created) {
+                model.receive(.{ .restore_failed = .{ .attempt_id = model.attempt_id, .stage_created = true, .can_generate_new = false } });
+            } else {
+                model.receive(.blocked);
+            }
+        };
+    }
 }
 
 fn stopBrowser() void {
     const ctx = browser_context orelse return;
     browser_context = null;
 
+    haystack_onboarding_unbind_input();
+    clipboard_mailbox.clear();
+
+    browser_onboarding.close();
     emscripten_cancel_main_loop();
+    ctx.model.deinit();
     ctx.game_state.deinit();
     std.heap.c_allocator.destroy(ctx);
     rl.closeWindow();

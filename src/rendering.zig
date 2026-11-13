@@ -498,7 +498,7 @@ fn drawOnboarding(model: *const onboarding.Onboarding, vw: f32, vh: f32) void {
         .restoring => drawCenteredText("Restoring wallet...", onboardingRect(layout.title), size, menu_title_color),
         .choice => {
             drawCenteredText("Set up your wallet", onboardingRect(layout.title), size, menu_title_color);
-            if (!model.recover_enabled) drawCenteredText("Release recovery unavailable until a mint is configured (TODO)", onboardingRect(layout.seed), @max(1, @divTrunc(size * 2, 3)), menu_muted);
+            if (!model.recover_enabled) drawCenteredText("Recovery unavailable", onboardingRect(layout.seed), @max(1, @divTrunc(size * 2, 3)), menu_muted);
         },
         .phrase_entry => {
             drawCenteredText("Enter recovery words", onboardingRect(layout.title), size, menu_title_color);
