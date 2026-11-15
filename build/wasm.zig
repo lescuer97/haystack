@@ -137,13 +137,31 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     const wallet_storage_tests = b.addSystemCommand(&.{ "node", "browser/wallet-store-test.mjs" });
     wallet_storage_tests.setCwd(b.path("."));
     wallet_storage_tests.setName("run browser wallet IndexedDB tests in Node");
+    const fake_indexeddb_tests = b.addSystemCommand(&.{ "node", "browser/test-support/fake-indexeddb-test.mjs" });
+    fake_indexeddb_tests.setCwd(b.path("."));
+    fake_indexeddb_tests.setName("run shared IndexedDB fixture tests in Node");
     const onboarding_bridge_tests = b.addSystemCommand(&.{ "node", "browser/game-onboarding-test.mjs" });
     onboarding_bridge_tests.setCwd(b.path("."));
     onboarding_bridge_tests.setName("run browser onboarding bridge tests in Node");
+    // Chromium/CDP runner helper is Node-only; no browser assets are involved.
+    const cdp_runner_tests = b.addSystemCommand(&.{ "node", "browser/cdp-runner-test.mjs" });
+    cdp_runner_tests.setCwd(b.path("."));
+    cdp_runner_tests.setName("run browser CDP runner helper tests in Node");
     const storage_step = b.step("test-storage", "Run the Node-only browser bridge and storage tests (no Chromium)");
     storage_step.dependOn(&storage_tests.step);
     storage_step.dependOn(&wallet_storage_tests.step);
+    storage_step.dependOn(&fake_indexeddb_tests.step);
     storage_step.dependOn(&onboarding_bridge_tests.step);
+    storage_step.dependOn(&cdp_runner_tests.step);
+
+    // Real-Chromium coverage for the platform module's storage hardening. This
+    // runner serves its own minimal page and the actual module source, so it
+    // needs neither the Wasm bundle nor Rust, the Emsdk graph or a fake mint.
+    const platform_hardening_tests = b.addSystemCommand(&.{ "node", "browser/platform-hardening-browser-test.mjs" });
+    platform_hardening_tests.setCwd(b.path("."));
+    platform_hardening_tests.setName("run real-Chromium platform hardening tests");
+    const platform_hardening_step = b.step("test-platform", "Run real-Chromium platform storage and Web Lock hardening tests (no Rust or fake mint)");
+    platform_hardening_step.dependOn(&platform_hardening_tests.step);
 
     // Native helper compilation is EXPLICITLY test-only. A normal Wasm build
     // never builds this crate or links the desktop archive/system libraries.
@@ -202,6 +220,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         test_step.dependOn(&browser_tests.step);
         test_step.dependOn(onboarding_step);
         test_step.dependOn(storage_step);
+        test_step.dependOn(platform_hardening_step);
         test_step.dependOn(&database.step);
         const run_mint = b.addRunFile(mint_exe);
         run_mint.addDirectoryArg(b.graph.path(.install_prefix, "wasm-test"));

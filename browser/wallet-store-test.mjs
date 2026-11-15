@@ -1,243 +1,31 @@
 // Node-only harness for browser/wallet/platform.js.
 //
 // Chromium is not always available, so this test runs the wallet IndexedDB
-// layer against a small in-memory implementation of the IndexedDB primitives it
-// uses. It covers atomic provisioning, compare-and-swap writes, conflict
-// rejection, injected write/abort failures, fresh reads and the persistent
-// storage request helper.
+// layer against the shared in-memory model in
+// `test-support/fake-indexeddb.mjs`. It covers atomic provisioning,
+// compare-and-swap writes, conflict rejection, injected write/abort failures,
+// fresh reads and the persistent storage request helper.
 //
-// It does not emulate real browser durability, Web Locks, or a shared database
-// across tabs. Run `zig build test -Dplatform=wasm` for the Chromium suite.
+// The model does not emulate real browser durability, Web Locks, or a shared
+// database across tabs; see its module header for the documented limits. Run
+// `zig build test -Dplatform=wasm` for the Chromium suite.
 
 import {strict as assert} from "node:assert";
 import {readFile} from "node:fs/promises";
 import vm from "node:vm";
 import * as walletStore from "./wallet-store.js";
+import {FakeIndexedDB as SharedFakeIndexedDB, FakeDatabase, FakeRequest} from "./test-support/fake-indexeddb.mjs";
 
 const DATABASE = "haystack-wallet";
 const MNEMONIC_STORE = "mnemonics";
 const STATE_STORE = "states";
 const ONBOARDING_STORE = "onboarding";
 
-class FakeRequest {
+// The request/transaction/upgrade model is shared with the game storage
+// harness; this adapter only binds it to the wallet database.
+class FakeIndexedDB extends SharedFakeIndexedDB {
   constructor() {
-    this.result = undefined;
-    this.error = null;
-    this.onsuccess = null;
-    this.onerror = null;
-    this.onupgradeneeded = null;
-    this.onblocked = null;
-  }
-}
-
-class FakeObjectStore {
-  constructor(transaction, name) {
-    this.transaction = transaction;
-    this.name = name;
-    this.data = transaction.db.stores.get(name);
-  }
-
-  get(key) {
-    const request = new FakeRequest();
-    this.transaction.add(request, () => (this.data.has(key) ? this.data.get(key) : undefined));
-    return request;
-  }
-
-  getAllKeys() {
-    const request = new FakeRequest();
-    this.transaction.add(request, () => [...this.data.keys()]);
-    return request;
-  }
-
-  put(value, key) {
-    const request = new FakeRequest();
-    this.transaction.add(request, () => {
-      this.transaction.db.checkWrite();
-      this.data.set(key, value);
-      return key;
-    });
-    return request;
-  }
-
-  add(value, key) {
-    const request = new FakeRequest();
-    this.transaction.add(request, () => {
-      if (this.data.has(key)) {
-        const duplicate = new Error("ConstraintError");
-        duplicate.name = "ConstraintError";
-        throw duplicate;
-      }
-      this.transaction.db.checkWrite();
-      this.data.set(key, value);
-      return key;
-    });
-    return request;
-  }
-
-  delete(key) {
-    const request = new FakeRequest();
-    this.transaction.add(request, () => {
-      this.transaction.db.checkWrite();
-      this.data.delete(key);
-      return undefined;
-    });
-    return request;
-  }
-}
-
-class FakeTransaction {
-  constructor(db, names, mode) {
-    this.db = db;
-    this.names = names;
-    this.mode = mode;
-    this.error = null;
-    this.pending = 0;
-    this.finished = false;
-    this.aborted = false;
-    this.oncomplete = null;
-    this.onerror = null;
-    this.onabort = null;
-    this.snapshots = names.map(name => [name, new Map(db.stores.get(name))]);
-  }
-
-  objectStore(name) {
-    if (!this.names.includes(name)) throw new Error(`store ${name} is not in this transaction`);
-    return new FakeObjectStore(this, name);
-  }
-
-  add(request, action) {
-    this.pending += 1;
-    queueMicrotask(() => {
-      if (this.aborted) return;
-      try {
-        request.result = action();
-        if (request.onsuccess) request.onsuccess();
-      } catch (error) {
-        request.error = error;
-        if (request.onerror) request.onerror();
-        this.abort(error);
-        return;
-      }
-      this.pending -= 1;
-      this.maybeComplete();
-    });
-  }
-
-  maybeComplete() {
-    if (this.pending !== 0 || this.finished) return;
-    if (this.db.indexedDB.abortNextWrite && this.mode === "readwrite") {
-      this.db.indexedDB.abortNextWrite = false;
-      this.abort(new Error("injected transaction abort"));
-      return;
-    }
-    this.finished = true;
-    queueMicrotask(() => {
-      if (this.oncomplete) this.oncomplete();
-    });
-  }
-
-  abort(error) {
-    if (this.finished) return;
-    this.finished = true;
-    this.aborted = true;
-    this.error = error;
-    for (const [name, snapshot] of this.snapshots) this.db.stores.set(name, snapshot);
-    queueMicrotask(() => {
-      if (this.onerror) this.onerror();
-      queueMicrotask(() => {
-        if (this.onabort) this.onabort();
-      });
-    });
-  }
-}
-
-class FakeDatabase {
-  constructor(record, indexedDB) {
-    this.record = record;
-    this.stores = record.stores;
-    this.indexedDB = indexedDB;
-    this.objectStoreNames = {contains: name => this.stores.has(name)};
-    this.closed = false;
-    record.connections.add(this);
-  }
-
-  close() { this.closed = true; this.record.connections.delete(this); }
-
-  createObjectStore(name) {
-    this.stores.set(name, new Map());
-    return {name};
-  }
-
-  transaction(names, mode) {
-    if (typeof names === "string") names = [names];
-    for (const name of names) {
-      if (!this.stores.has(name)) throw new Error(`missing object store ${name}`);
-    }
-    return new FakeTransaction(this, names, mode);
-  }
-
-  // Injected failure for the next write request.
-  checkWrite() {
-    if (this.indexedDB.writeFailures > 0) {
-      this.indexedDB.writeFailures -= 1;
-      throw new Error("injected write failure");
-    }
-  }
-}
-
-class FakeIndexedDB {
-  constructor() {
-    this.records = new Map();
-    this.writeFailures = 0;
-    this.abortNextWrite = false;
-  }
-
-  open(name, version) {
-    const request = new FakeRequest();
-    queueMicrotask(() => {
-      let record = this.records.get(name);
-      let upgrade = false;
-      if (!record) {
-        record = {version: 0, stores: new Map()};
-        this.records.set(name, record);
-      }
-      record.connections ||= new Set();
-      if (version < record.version) {
-        request.error = new Error("VersionError");
-        request.error.name = "VersionError";
-        if (request.onerror) request.onerror();
-        return;
-      }
-      if (version > record.version) {
-        for (const db of [...record.connections]) if (db.onversionchange) db.onversionchange();
-        if (record.connections.size) {
-          if (request.onblocked) request.onblocked();
-          return;
-        }
-        upgrade = true;
-        record.version = version;
-      }
-      const database = new FakeDatabase(record, this);
-      request.result = database;
-      if (upgrade && request.onupgradeneeded) request.onupgradeneeded();
-      if (request.onsuccess) request.onsuccess();
-    });
-    return request;
-  }
-
-  store(storeName) {
-    const record = this.records.get(DATABASE);
-    assert.ok(record, "wallet database was created");
-    assert.ok(record.stores.has(storeName), `${storeName} store exists`);
-    return record.stores.get(storeName);
-  }
-
-  peek(storeName, key) {
-    return this.store(storeName).get(key);
-  }
-
-  seed(storeName, key, value) {
-    this.store(storeName).set(key, value);
+    super({database: DATABASE});
   }
 }
 
@@ -265,6 +53,7 @@ Object.defineProperty(globalThis, "indexedDB", {value: fake, configurable: true}
 Object.defineProperty(globalThis, "navigator", {value: {storage: {persist: () => persist()}, locks}, configurable: true});
 
 const platform = await import("./wallet/platform.js");
+const setIndexedDB = value => Object.defineProperty(globalThis, "indexedDB", {value, configurable: true});
 
 const MNEMONIC = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const OTHER_MNEMONIC = "legal winner thank year wave sausage worth useful legal winner thank yellow";
@@ -372,7 +161,11 @@ for (const [label, load] of [
       assert.equal(isolated.records.get(DATABASE).version, 3);
       assert.equal(isolated.records.get(DATABASE).stores.has(ONBOARDING_STORE), false);
     } else {
-      await read("existing");
+      if (label === "platform" && scenario === "upgrade") {
+        await assert.rejects(read("existing"), /wallet state record is malformed/);
+      } else {
+        await read("existing");
+      }
       assert.equal(isolated.records.get(DATABASE).version, 2);
       assert.deepEqual([...isolated.records.get(DATABASE).stores.keys()].sort(),
         [MNEMONIC_STORE, ONBOARDING_STORE, STATE_STORE].sort());
@@ -502,8 +295,10 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   const data = '{"wallet":true}';
   let expected = '[]';
   const create = () => platform.createOnboardingWallet(user, MNEMONIC, data, marker, expected);
+  const expectedPayload = (marker, stateRevision = 0, mnemonic = MNEMONIC, state = data) =>
+    ({marker, state: {revision: stateRevision, data: state}, mnemonic, retired: expected});
   const complete = (revision = 0, fp = fingerprint, stateRevision = 0, mnemonic = MNEMONIC, state = data) =>
-    platform.completeOnboardingWallet(user, revision, fp, stateRevision, mnemonic, state, expected);
+    platform.completeOnboardingWallet(user, expectedPayload({...marker, revision, fingerprint: fp}, stateRevision, mnemonic, state));
   const clearUser = () => {
     for (const store of [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]) fake.store(store).delete(user);
   };
@@ -573,6 +368,21 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   assert.ok(snapshot.wallets.some(w => w.name === stage));
   assert.ok(!snapshot.wallets.some(w => w.name === "wallet-a"));
   await assert.rejects(create());
+  // The expected snapshot is one named payload validated before any transaction
+  // opens: strict field keys, a whole marker and safe-integer revisions.
+  for (const malformed of [
+    {...expectedPayload(marker), extra: true},
+    {...expectedPayload(marker), state: {...expectedPayload(marker).state, extra: true}},
+    {...expectedPayload(marker), marker: {...marker, extra: true}},
+    {...expectedPayload(marker), state: {revision: -1, data}},
+    {...expectedPayload(marker), state: {revision: 1.5, data}},
+    {...expectedPayload(marker), state: {revision: Number.MAX_SAFE_INTEGER + 1, data}},
+    {...expectedPayload(marker), mnemonic: ""},
+    {...expectedPayload(marker), retired: 7},
+  ]) {
+    await assert.rejects(platform.completeOnboardingWallet(user, malformed));
+    assert.deepEqual(fake.peek(ONBOARDING_STORE, user), marker);
+  }
   for (const attempt of [() => complete(1), () => complete(0, "cd".repeat(32)), () => complete(0, fingerprint, 1),
     () => complete(0, fingerprint, 0, OTHER_MNEMONIC), () => complete(0, fingerprint, 0, MNEMONIC, "different")]) {
     await assert.rejects(attempt());
@@ -618,9 +428,11 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   const backup = {version: 1, revision: 0, step: "backup_seed", fingerprint: "cd".repeat(32)};
   let expected = '[]';
   const stage = () => platform.stageOnboardingWallet(user, id, MNEMONIC, data, scan, expected);
-  const update = (a, b, rev = 0, mnemonic = MNEMONIC, raw = data) => platform.updateOnboardingScan(user, a, b, rev, mnemonic, raw, expected);
-  const restore = (m = result, rev = 0) => platform.finishOnboardingRestore(user, m, rev, MNEMONIC, data, expected);
-  const generate = (m = zero, rev = 0, b = backup) => platform.generateOnboardingWallet(user, m, rev, MNEMONIC, data, OTHER_MNEMONIC, "new", b, expected);
+  const expectedPayload = (marker, revision = 0, mnemonic = MNEMONIC, state = data) =>
+    ({marker, state: {revision, data: state}, mnemonic, retired: expected});
+  const update = (a, b, rev = 0, mnemonic = MNEMONIC, raw = data) => platform.updateOnboardingScan(user, expectedPayload(a, rev, mnemonic, raw), b);
+  const restore = (m = result, rev = 0) => platform.finishOnboardingRestore(user, expectedPayload(m, rev));
+  const generate = (m = zero, rev = 0, b = backup) => platform.generateOnboardingWallet(user, expectedPayload(m, rev), {mnemonic: OTHER_MNEMONIC, state: "new", marker: b});
   fake.seed(MNEMONIC_STORE, user, MNEMONIC);
   await assert.rejects(stage());
   fake.store(MNEMONIC_STORE).delete(user);
@@ -639,6 +451,9 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   await update(failed, retry);
   await assert.rejects(update(retry, {...result, spendable_sats: "18446744073709551616"}));
   await update(retry, result);
+  // The expected snapshot and the replacement wallet both have strict field keys.
+  await assert.rejects(platform.finishOnboardingRestore(user, {...expectedPayload(result), extra: true}));
+  await assert.rejects(platform.generateOnboardingWallet(user, expectedPayload(zero), {mnemonic: OTHER_MNEMONIC, state: "new", marker: backup, extra: true}));
   await assert.rejects(generate(result));
   await assert.rejects(restore(result, 1));
   fake.seed(STATE_STORE, user, {revision: 0, data: "half"});
@@ -686,13 +501,15 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   const scan = {version: 1, revision: 0, step: "scanning", id: active, fingerprint, mint};
   const result = {...scan, step: "result", spendable_sats: "1", pending_sats: "0", spent_sats: "0"};
   const zero = {...result, spendable_sats: "0"};
+  const payload = (e, marker, revision = 0, mnemonic = MNEMONIC, state = "data") =>
+    ({marker, state: {revision, data: state}, mnemonic, retired: e});
   const cases = [
     [null, e => platform.createOnboardingWallet(user, MNEMONIC, "data", backup, e)],
-    [backup, e => platform.completeOnboardingWallet(user, 0, fingerprint, 0, MNEMONIC, "data", e)],
+    [backup, e => platform.completeOnboardingWallet(user, payload(e, backup))],
     [null, e => platform.stageOnboardingWallet(user, active, MNEMONIC, "data", scan, e)],
-    [scan, e => platform.updateOnboardingScan(user, scan, {...scan, revision: 1}, 0, MNEMONIC, "data", e)],
-    [result, e => platform.finishOnboardingRestore(user, result, 0, MNEMONIC, "data", e)],
-    [zero, e => platform.generateOnboardingWallet(user, zero, 0, MNEMONIC, "data", OTHER_MNEMONIC, "new", {...backup, fingerprint: "cd".repeat(32)}, e)],
+    [scan, e => platform.updateOnboardingScan(user, payload(e, scan), {...scan, revision: 1})],
+    [result, e => platform.finishOnboardingRestore(user, payload(e, result))],
+    [zero, e => platform.generateOnboardingWallet(user, payload(e, zero), {mnemonic: OTHER_MNEMONIC, state: "new", marker: {...backup, fingerprint: "cd".repeat(32)}})],
   ];
   const clear = () => {
     for (const store of [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]) {
@@ -759,6 +576,289 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   check("The user wallet is never deleted, including a mnemonic-only sentinel");
 }
 
+// Strict bridge inputs and stored envelopes never silently lose information.
+{
+  const name = "strict-record";
+  const original = {revision: 0, data: "raw"};
+  fake.seed(STATE_STORE, name, original);
+  for (const revision of [null, true, false, 0, 1, {}, [], "", " ", "00", " 0", "0 ", "+0", "-0", "0x0", "0e0", "0.0",
+    ...["\n", "\r", "\u2028", "\u2029"].map(end => "0" + end)]) {
+    await assert.rejects(platform.writeWalletState(name, revision, "changed"), /revision is invalid/);
+    assert.equal(fake.peek(STATE_STORE, name), original);
+  }
+  for (const end of ["\n", "\r", "\u2028", "\u2029"]) {
+    for (const call of [() => platform.loadWallet("valid" + end),
+      () => platform.provisionWallet("valid" + end, MNEMONIC, "raw"),
+      () => platform.writeWalletState("valid" + end, "0", "raw")]) await assert.rejects(call(), /name is invalid/);
+    const id = "a".repeat(32), fingerprint = "b".repeat(64);
+    await assert.rejects(platform.createOnboardingWallet("haystack-user", MNEMONIC, "raw",
+      {version: 1, revision: 0, step: "backup_seed", fingerprint: fingerprint + end}, "[]"));
+    const marker = {version: 1, revision: 0, step: "scanning", id, fingerprint, mint: "mint"};
+    await assert.rejects(platform.stageOnboardingWallet("haystack-user", id + end, MNEMONIC, "raw", {...marker, id: id + end}, "[]"));
+    const result = {...marker, step: "result", spendable_sats: "1" + end, pending_sats: "0", spent_sats: "0"};
+    await assert.rejects(platform.finishOnboardingRestore("haystack-user", {
+      marker: result, state: original, mnemonic: MNEMONIC, retired: "[]",
+    }), /invalid onboarding restore input/);
+  }
+  for (const state of [undefined, null, {...original, extra: true}, {"revision,data": 0, data: "raw"},
+    {...original, [Symbol("hidden")]: true}, Object.defineProperty({...original}, "hidden", {value: 1}),
+    {get revision() { throw new Error("must not access"); }, data: "raw"},
+    Object.assign(Object.create({revision: 0}), {data: "raw"}), {...original, revision: -0}]) {
+    fake.seed(STATE_STORE, name, state);
+    await assert.rejects(platform.loadWallet(name), /state record is malformed/);
+    assert.equal(fake.store(STATE_STORE).has(name), true);
+    assert.equal(fake.peek(STATE_STORE, name), state);
+  }
+  fake.seed(STATE_STORE, name, {revision: Number.MAX_SAFE_INTEGER - 1, data: "raw"});
+  await platform.writeWalletState(name, String(Number.MAX_SAFE_INTEGER - 1), "max");
+  assert.equal(parse(await platform.loadWallet(name)).state.revision, Number.MAX_SAFE_INTEGER);
+  await assert.rejects(platform.writeWalletState(name, String(Number.MAX_SAFE_INTEGER), "unsafe"), /revision is invalid/);
+  for (const value of [undefined, null]) {
+    fake.seed(MNEMONIC_STORE, "present-invalid", value);
+    await assert.rejects(platform.loadWallet("present-invalid"), /mnemonic record is malformed/);
+    assert.equal(fake.store(MNEMONIC_STORE).has("present-invalid"), true);
+  }
+  assert.deepEqual(parse(await platform.loadWallet("strict-record")), {mnemonic: null, state: {revision: Number.MAX_SAFE_INTEGER, data: "max"}});
+  check("Strict revisions, names, fixed hex, totals, presence and own data keys");
+}
+
+// Request errors cannot half-commit even when another listener cancels default
+// abort. Unexpected request/setup/callback messages never cross the bridge.
+{
+  fake.preventRequestErrors = true;
+  for (const store of [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]) fake.store(store).delete("haystack-user");
+  fake.seed(STATE_STORE, "prevented-duplicate", {revision: 0, data: "original"});
+  await assert.rejects(platform.provisionWallet("prevented-duplicate", MNEMONIC, "raw"), /wallet already exists/);
+  assert.equal(fake.peek(MNEMONIC_STORE, "prevented-duplicate"), undefined);
+  fake.writeFailures = 1;
+  await assert.rejects(platform.provisionWallet("prevented-io", MNEMONIC, "raw"), /^Error: wallet provisioning failed$/);
+  assert.equal(fake.peek(STATE_STORE, "prevented-io"), undefined);
+  fake.readFailures = 1;
+  await assert.rejects(platform.loadWallet("wallet-a"), /^Error: wallet storage read failed$/);
+  fake.failReadKeys.add("wallet-a");
+  await assert.rejects(platform.writeWalletState("wallet-a", "7", "raw"), /^Error: wallet storage write failed$/);
+  fake.failReadKeys.clear();
+  fake.failWriteKeys.add("haystack-user");
+  await assert.rejects(platform.createOnboardingWallet("haystack-user", MNEMONIC, "raw",
+    {version: 1, revision: 0, step: "backup_seed", fingerprint: "a".repeat(64)}, "[]"), /^Error: onboarding transition refused$/);
+  assert.equal(fake.peek(STATE_STORE, "haystack-user"), undefined);
+  fake.failWriteKeys.clear();
+  fake.preventRequestErrors = false;
+  check("Prevented errors explicitly abort all wallet and onboarding writes");
+}
+
+// Controlled opens exercise callbacks the deliberately small shared fake does
+// not model (a blocked request resuming, and a stale connection's late events).
+{
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  for (const failure of ["onblocked", "onerror"]) {
+    const isolated = new FakeIndexedDB();
+    const record = isolated.ensure({version: 2, stores: [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]});
+    const requests = [];
+    setIndexedDB({open() { const r = new FakeRequest(); requests.push(r); return r; }});
+    const p = await import(`./wallet/platform.js?ownership-${failure}`);
+    const first = p.loadWallet("absent");
+    await flush();
+    requests[0][failure]();
+    await assert.rejects(first);
+    const second = p.loadWallet("absent");
+    await flush();
+    const current = new FakeDatabase(record, isolated);
+    requests[1].result = current;
+    requests[1].onsuccess();
+    await second;
+    let aborted = false, created = false;
+    requests[0].transaction = {abort() { aborted = true; }};
+    requests[0].result = {objectStoreNames: {contains() { created = true; return false; }}};
+    requests[0].onupgradeneeded();
+    assert.equal(aborted, true);
+    assert.equal(created, false);
+    const late = {close() { this.closed = true; }};
+    requests[0].result = late;
+    requests[0].onsuccess();
+    assert.equal(late.closed, true);
+    await p.loadWallet("absent");
+    assert.equal(requests.length, 2);
+    current.onversionchange();
+    assert.equal(current.closed, true);
+    const third = p.loadWallet("absent");
+    await flush();
+    const newest = new FakeDatabase(record, isolated);
+    requests[2].result = newest;
+    requests[2].onsuccess();
+    await third;
+    current.onclose();
+    await p.loadWallet("absent");
+    assert.equal(requests.length, 3, "stale close cannot clear the current cache");
+    newest.onclose();
+    const fourth = p.loadWallet("absent");
+    await flush();
+    requests[3].result = new FakeDatabase(record, isolated);
+    requests[3].onsuccess();
+    await fourth;
+    check("Open ownership survives late upgrade, success, versionchange and close");
+  }
+  // Upgrade callback exceptions abort and reject without caching the attempt.
+  const requests = [];
+  setIndexedDB({open() { const r = new FakeRequest(); requests.push(r); return r; }});
+  const p = await import("./wallet/platform.js?upgrade-throws");
+  const pending = p.loadWallet("absent");
+  await flush();
+  let aborted = false;
+  requests[0].transaction = {abort() { aborted = true; }};
+  requests[0].result = {objectStoreNames: {contains() { throw new Error(MNEMONIC); }}};
+  requests[0].onupgradeneeded();
+  await assert.rejects(pending, /^Error: IndexedDB could not be opened$/);
+  assert.equal(aborted, true);
+  setIndexedDB(fake);
+  check("Upgrade callback errors are sanitized and abort");
+}
+
+// Capture inputs while blocked on opening, then while queued behind the create.
+{
+  const isolated = new FakeIndexedDB();
+  const record = isolated.ensure({version: 2, stores: [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]});
+  const request = new FakeRequest();
+  setIndexedDB({open() { return request; }});
+  const p = await import("./wallet/platform.js?capture-open-and-queue");
+  const marker = {version: 1, revision: 0, step: "backup_seed", fingerprint: "a".repeat(64)};
+  const creation = p.createOnboardingWallet("haystack-user", MNEMONIC, "raw", marker, "[]");
+  await new Promise(resolve => setImmediate(resolve));
+  const snapshot = {marker: {...marker}, state: {revision: 0, data: "raw"}, mnemonic: MNEMONIC, retired: "[]"};
+  const completion = p.completeOnboardingWallet("haystack-user", snapshot);
+  marker.fingerprint = "b".repeat(64);
+  snapshot.marker.fingerprint = "c".repeat(64);
+  snapshot.state.data = "changed";
+  snapshot.mnemonic = OTHER_MNEMONIC;
+  request.result = new FakeDatabase(record, isolated);
+  request.onsuccess();
+  await creation;
+  await completion;
+  assert.deepEqual(isolated.peek(ONBOARDING_STORE, "haystack-user"), {
+    version: 1, revision: 1, step: "complete", fingerprint: "a".repeat(64),
+  });
+  assert.deepEqual(isolated.peek(STATE_STORE, "haystack-user"), {revision: 0, data: "raw"});
+  for (const name of [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]) isolated.store(name).clear();
+  const id = "d".repeat(32), key = `haystack-recovery-${id}`;
+  const scan = {version: 1, revision: 0, step: "scanning", id, fingerprint: "e".repeat(64), mint: "mint"};
+  const staged = p.stageOnboardingWallet("haystack-user", id, MNEMONIC, "stage", scan, "[]");
+  const scanSnapshot = {marker: {...scan}, state: {revision: 0, data: "stage"}, mnemonic: MNEMONIC, retired: "[]"};
+  const result = {...scan, revision: 1, step: "result", spendable_sats: "0", pending_sats: "0", spent_sats: "0"};
+  const updated = p.updateOnboardingScan("haystack-user", scanSnapshot, result);
+  const generationSnapshot = {...scanSnapshot, marker: {...result}, state: {...scanSnapshot.state}};
+  const replacement = {mnemonic: OTHER_MNEMONIC, state: "replacement", marker: {...marker, fingerprint: "f".repeat(64)}};
+  const generated = p.generateOnboardingWallet("haystack-user", generationSnapshot, replacement);
+  scan.id = "0".repeat(32);
+  scanSnapshot.state.data = "changed";
+  scanSnapshot.marker.mint = "changed";
+  result.pending_sats = "1";
+  generationSnapshot.marker.spendable_sats = "1";
+  generationSnapshot.state.data = "changed";
+  replacement.mnemonic = MNEMONIC;
+  replacement.state = "changed";
+  replacement.marker.fingerprint = "0".repeat(64);
+  await Promise.all([staged, updated, generated]);
+  assert.equal(isolated.peek(MNEMONIC_STORE, key), MNEMONIC);
+  assert.deepEqual(isolated.peek(STATE_STORE, key), {revision: 0, data: "stage"});
+  assert.equal(isolated.peek(MNEMONIC_STORE, "haystack-user"), OTHER_MNEMONIC);
+  assert.deepEqual(isolated.peek(STATE_STORE, "haystack-user"), {revision: 0, data: "replacement"});
+  assert.equal(isolated.peek(ONBOARDING_STORE, "haystack-user").fingerprint, "f".repeat(64));
+  assert.equal(isolated.peek(ONBOARDING_STORE, `retired:${id}`).fingerprint, "e".repeat(64));
+  setIndexedDB(fake);
+  check("All mutable onboarding inputs are captured across open and queue waits");
+}
+
+// Synthetic transaction faults prove success needs all request callbacks, and
+// setup/callback exceptions cannot expose arbitrary database error text.
+{
+  const isolated = new FakeIndexedDB();
+  setIndexedDB(isolated);
+  const p = await import("./wallet/platform.js?transaction-faults");
+  await p.loadWallet("absent");
+  const db = isolated.latest();
+  const transaction = db.transaction.bind(db);
+  db.transaction = () => {
+    const tx = {objectStore() { return {getKey: () => new FakeRequest(), get: () => new FakeRequest()}; }};
+    queueMicrotask(() => tx.oncomplete());
+    return tx;
+  };
+  await assert.rejects(p.loadWallet("absent"), /^Error: wallet storage read failed$/);
+  db.transaction = (...args) => {
+    const tx = transaction(...args);
+    tx.objectStore = () => { throw new Error(MNEMONIC); };
+    return tx;
+  };
+  await assert.rejects(p.provisionWallet("absent", MNEMONIC, "raw"), /^Error: wallet provisioning failed$/);
+  db.transaction = (...args) => {
+    const tx = transaction(...args);
+    const objectStore = tx.objectStore.bind(tx);
+    tx.objectStore = name => {
+      const store = objectStore(name);
+      const getAllKeys = store.getAllKeys.bind(store);
+      store.getAllKeys = () => {
+        const request = getAllKeys();
+        Object.defineProperty(request, "result", {get() { throw new Error(MNEMONIC); }, set() {}});
+        return request;
+      };
+      return store;
+    };
+    return tx;
+  };
+  await assert.rejects(p.loadOnboardingSnapshot(), /^Error: onboarding storage read failed$/);
+  db.transaction = transaction;
+  setIndexedDB(fake);
+  check("Incomplete complete events and setup/callback exceptions fail closed");
+}
+
+// Isolated modules allow poison races without poisoning the main harness.
+{
+  const originalLocks = navigator.locks;
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  navigator.locks = {request(_name, _options, grant) { return Promise.resolve().then(() => grant({})); }};
+  const before = await import("./wallet/platform.js?poison-before-grant");
+  const pending = before.acquireWalletLock("lock:before");
+  listeners.get("unhandledrejection")({reason: new WebAssembly.RuntimeError("fixture")});
+  await assert.rejects(pending, /Wasm instance failed/);
+  // A previous release has begun but the lock manager's request never settles.
+  let finish;
+  navigator.locks = {request(_name, _options, grant) {
+    queueMicrotask(() => grant({}));
+    return new Promise(resolve => { finish = resolve; });
+  }};
+  const closing = await import("./wallet/platform.js?poison-during-close");
+  const release = await closing.acquireWalletLock("lock:closing");
+  release();
+  const reopen = closing.acquireWalletLock("lock:closing");
+  const rejected = assert.rejects(reopen, /Wasm instance failed/);
+  listeners.get("error")({error: new WebAssembly.RuntimeError("fixture")});
+  await Promise.race([rejected, new Promise((_, reject) => {
+    const timer = setTimeout(() => reject(new Error("poison rejection was not prompt")), 1000);
+    rejected.finally(() => clearTimeout(timer));
+  })]);
+  finish();
+  await flush();
+  for (const sync of [true, false]) {
+    navigator.locks = {request() { if (sync) throw new Error("fixture"); return Promise.reject(new Error("fixture")); }};
+    const p = await import(`./wallet/platform.js?lock-request-error-${sync}`);
+    await assert.rejects(p.acquireWalletLock("lock:failed"));
+    navigator.locks = originalLocks;
+    const release = await p.acquireWalletLock("lock:failed");
+    await Promise.all([release(), release()]);
+    const again = await p.acquireWalletLock("lock:failed");
+    await again();
+  }
+  navigator.locks = undefined;
+  const absent = await import("./wallet/platform.js?no-lock-api");
+  await assert.rejects(absent.acquireWalletLock("lock:absent"), /Web Locks are required/);
+  navigator.locks = originalLocks;
+  const plain = await import("./wallet/platform.js?plain-error");
+  listeners.get("error")({error: new Error("fixture")});
+  const normal = await plain.acquireWalletLock("lock:plain");
+  await normal();
+  for (const [type, handler] of originalListeners) listeners.set(type, handler);
+  check("Poison races, request failure cleanup, repeated release and plain errors");
+}
+
 // --- Wasm runtime traps keep held locks and reject new acquisitions ----------
 {
   const release = await platform.acquireWalletLock("trap-wallet");
@@ -767,8 +867,11 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   await assert.rejects(platform.acquireWalletLock("trap-wallet"), /Wasm instance failed/);
   await assert.rejects(platform.acquireWalletLock("other-wallet"), /Wasm instance failed/);
   assert.ok(lockState.held.has("trap-wallet"), "the held lock stays until document destruction");
-  await release();
-  assert.ok(!lockState.held.has("trap-wallet"), "the lock is released only when the document closes it");
+  let settled = false;
+  release().then(() => { settled = true; });
+  await Promise.resolve();
+  assert.equal(settled, false);
+  assert.ok(lockState.held.has("trap-wallet"), "late release must not unlock a poisoned document");
   check("Wasm runtime traps retain held locks and reject new acquisitions");
 }
 
