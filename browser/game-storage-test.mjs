@@ -599,6 +599,175 @@ test("missing Web Locks fails closed", async () => {
   env.close();
 });
 
+for (const [name, navigator] of [
+  ["missing", {}],
+  ["denied", {locks: {request: (_name, _options, callback) => Promise.resolve(callback(null))}}],
+  ["rejected", {locks: {request: () => Promise.reject(new Error("denied"))}}],
+  ["sync throw", {locks: {request: () => { throw new Error("denied"); }}}],
+]) {
+  test(`${name} lock denies every storage API before and after startup`, async () => {
+    let opens = 0;
+    const env = await new Environment({navigator, indexedDB: {open() { opens++; throw new Error("must not open"); }}}).init();
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      for (let pass = 0; pass < 2; pass++) {
+        env.storage.save(true, true);
+        env.storage.reset();
+        await env.settleSaveQueue();
+        assert.equal((await env.write("entry", new Uint8Array([1]))).status, 4);
+        assert.equal((await env.readContent("entry")).status, 4);
+        assert.equal((await env.list()).status, 4);
+        assert.equal((await env.remove("entry")).status, 4);
+        if (!pass) assert.equal((await env.start()).status, 4);
+      }
+      assert.equal(opens, 0);
+    } finally { console.error = originalError; }
+    env.close();
+  });
+}
+
+test("pending acquisition is shared by pre-start operations and startup", async () => {
+  let grant;
+  let requests = 0;
+  let requestDone;
+  const env = await new Environment({navigator: {locks: {request: (_name, _options, callback) => {
+    requests++;
+    return new Promise(resolve => { grant = () => {
+      requestDone = Promise.resolve(callback({name: "held"}));
+      resolve(requestDone);
+    }; });
+  }}}}).init();
+  const writing = env.write("entry", new Uint8Array([1]));
+  env.storage.save(true, false);
+  const starting = env.start();
+  assert.equal(requests, 1);
+  assert.equal(env.storage.dbPromise, null);
+  grant();
+  assert.equal((await writing).status, 0);
+  assert.equal((await starting).status, 0);
+  await env.settleSaveQueue();
+  assert.equal(requests, 1);
+  const db = env.storage.db;
+  env.storage.holdLock();
+  assert.equal(db.closed, true);
+  assert.equal((await env.write("entry", new Uint8Array([2]))).status, 4);
+  assert.equal((await env.readContent("entry")).status, 4);
+  await requestDone;
+  env.close();
+});
+
+test("pre-start acquisition is reused and throwing startup callback releases it", async () => {
+  let requests = 0;
+  let lifetime;
+  const env = await new Environment({navigator: {locks: {request: (_name, _options, callback) => {
+    requests++;
+    lifetime = Promise.resolve(callback({name: "held"}));
+    return lifetime;
+  }}}}).init();
+  assert.equal((await env.write("before", new Uint8Array([1]))).status, 0);
+  const db = env.storage.db;
+  let calls = 0;
+  let notified;
+  const notification = new Promise(resolve => { notified = resolve; });
+  env.storage.start(() => { calls++; notified(); throw new Error("callback failed"); }, 0, 0);
+  await notification;
+  await lifetime;
+  assert.equal(calls, 1);
+  assert.equal(requests, 1);
+  assert.equal(env.storage.lockOwned, false);
+  assert.equal(db.closed, true);
+  assert.equal((await env.write("after", new Uint8Array([1]))).status, 4);
+  assert.equal((await env.list()).status, 4);
+  assert.equal((await env.remove("before")).status, 4);
+  assert.equal((await env.readContent("before")).status, 4);
+  const raw = JSON.stringify({version: 1, debug: {tile_grid: true}});
+  env.indexedDB.seed(STORE_CONFIG, CONFIG_KEY, raw);
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    env.storage.reset();
+    env.storage.save(false, false);
+    await env.settleSaveQueue();
+  } finally { console.error = originalError; }
+  assert.equal(env.indexedDB.peek(STORE_CONFIG, CONFIG_KEY), raw);
+  env.storage.start(() => assert.fail("must not notify twice"), 0, 0);
+  env.close();
+});
+
+test("blocked open closes late success without invalidating a newer open", async () => {
+  const requests = [];
+  let opened;
+  const nextOpen = () => new Promise(resolve => { opened = resolve; });
+  const env = await new Environment({indexedDB: {open() {
+    const request = {};
+    requests.push(request);
+    opened();
+    return request;
+  }}}).init();
+  await env.storage.acquireLock();
+  let opening = nextOpen();
+  const first = env.storage.openDb();
+  await opening;
+  requests[0].onblocked();
+  await assert.rejects(first, /blocked/);
+  opening = nextOpen();
+  const second = env.storage.openDb();
+  await opening;
+  const late = {closed: false, close() { this.closed = true; }};
+  requests[0].result = late;
+  requests[0].onsuccess();
+  assert.equal(late.closed, true);
+  const current = {closed: false, close() { this.closed = true; }};
+  requests[1].result = current;
+  requests[1].onsuccess();
+  assert.equal(await second, current);
+  assert.equal(await env.storage.openDb(), current);
+  current.onversionchange();
+  assert.equal(current.closed, true);
+  opening = nextOpen();
+  const third = env.storage.openDb();
+  await opening;
+  assert.equal(requests.length, 3);
+  // An old versionchange event must not evict a new pending connection.
+  const pending = env.storage.dbPromise;
+  current.onversionchange();
+  assert.equal(env.storage.dbPromise, pending);
+  requests[2].result = {close() {}};
+  requests[2].onsuccess();
+  await third;
+  env.close();
+});
+
+test("read helpers reject a transaction abort without a request event", async () => {
+  const env = await new Environment().init();
+  const transactions = [];
+  const db = {transaction() {
+    const transaction = {error: new Error("aborted"), objectStore() {
+      return {get() { return {}; }, getAllKeys() { return {}; }};
+    }};
+    transactions.push(transaction);
+    return transaction;
+  }};
+  const get = env.storage.idbGet(db, STORE_CONTENT, "entry");
+  const list = env.storage.idbGetAllKeys(db, STORE_CONTENT);
+  transactions.forEach(transaction => transaction.onabort());
+  await assert.rejects(get, /aborted/);
+  await assert.rejects(list, /aborted/);
+  env.close();
+});
+
+test("write and delete results wait for completion and reject aborts", async () => {
+  const env = await new Environment().init();
+  await env.start();
+  env.indexedDB.latest().abortStore = STORE_CONTENT;
+  assert.equal((await env.write("entry", new Uint8Array([1]))).status, 5);
+  env.indexedDB.seed(STORE_CONTENT, "entry", new Uint8Array([1]));
+  assert.equal((await env.remove("entry")).status, 5);
+  assert.deepEqual(env.indexedDB.peek(STORE_CONTENT, "entry"), new Uint8Array([1]));
+  env.close();
+});
+
 test("IndexedDB unavailable still starts with defaults and blocked autosave", async () => {
   const env = await new Environment({indexedDB: {open() { throw new Error("unavailable"); }}}).init();
   const started = await env.start();

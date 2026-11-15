@@ -95,35 +95,32 @@ pub fn verifyFile(stat: Io.File.Stat) Error!void {
 /// Ensure `path` exists as a Haystack-owned `0700` directory without changing
 /// the mode of an existing directory or creating any of its parents.
 pub fn ensureOwnedDir(io: Io, path: []const u8) !void {
-    const cwd = Io.Dir.cwd();
-    const stat = cwd.statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => {
-            try Io.Dir.createDirAbsolute(io, path, mode_dir);
-            const created = try cwd.statFile(io, path, .{ .follow_symlinks = false });
-            try verifyDirectory(created);
-            return verifyDirectoryAcl(io, path);
-        },
-        else => return err,
-    };
-    try verifyDirectory(stat);
-    try verifyDirectoryAcl(io, path);
+    const dir = try openOwnedDir(io, path, .{ .create = true });
+    dir.close(io);
 }
 
 /// Verify that `path` exists as a real Haystack-owned `0700` directory without
 /// creating or modifying anything. Missing paths return `error.FileNotFound`.
 pub fn verifyOwnedDir(io: Io, path: []const u8) !void {
-    const stat = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound => return error.FileNotFound,
-        else => return err,
-    };
-    try verifyDirectory(stat);
-    try verifyDirectoryAcl(io, path);
+    const dir = try openOwnedDir(io, path, .{});
+    dir.close(io);
 }
 
-fn verifyDirectoryAcl(io: Io, path: []const u8) !void {
-    var dir = try Io.Dir.openDirAbsolute(io, path, .{ .follow_symlinks = false });
-    defer dir.close(io);
+/// Validate mode and ACL on the returned descriptor. Only the final component
+/// is no-follow; standard user parents may contain symlinks.
+pub fn openOwnedDir(io: Io, path: []const u8, options: struct { iterate: bool = false, create: bool = false }) !Io.Dir {
+    if (options.create) Io.Dir.createDirAbsolute(io, path, mode_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    const dir = Io.Dir.openDirAbsolute(io, path, .{ .iterate = options.iterate, .follow_symlinks = false }) catch |err| switch (err) {
+        error.SymLinkLoop, error.NotDir => return error.InsecureEntry,
+        else => return err,
+    };
+    errdefer dir.close(io);
+    try verifyDirectory(try dir.stat(io));
     try verifyNoExtendedAclDir(dir);
+    return dir;
 }
 
 /// Create any missing standard parent directories in order.
@@ -208,6 +205,7 @@ pub fn writeAtomicIn(dir: Io.Dir, io: Io, name: []const u8, data: []const u8) !v
         // The process umask can only clear bits, but a hostile or broken umask
         // must not silently produce a managed file that the next load rejects.
         try verifyFile(try file.stat(io));
+        try verifyNoExtendedAcl(file);
         try file.writeStreamingAll(io, data);
         try file.sync(io);
     }
@@ -296,6 +294,27 @@ test "standard parents are created once and existing modes are preserved" {
     });
     try testing.expectError(error.NotDir, ensureStandardParents(io, &.{file_path}));
     _ = try Io.Dir.cwd().statFile(io, file_path, .{ .follow_symlinks = false });
+}
+
+test "verified owned directory retains the validated object after path replacement" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const path = try std.fs.path.join(testing.allocator, &.{ root, "owned" });
+    defer testing.allocator.free(path);
+    const dir = try openOwnedDir(io, path, .{ .create = true, .iterate = true });
+    defer dir.close(io);
+    const original = try dir.stat(io);
+    try tmp.dir.rename("owned", tmp.dir, "moved", io);
+    try tmp.dir.createDir(io, "owned", Io.File.Permissions.fromMode(0o755));
+    try testing.expectError(error.InsecurePermissions, openOwnedDir(io, path, .{}));
+    try verifyDirectory(try dir.stat(io));
+    try testing.expectEqual(original.inode, (try dir.stat(io)).inode);
+    try writeAtomicIn(dir, io, "entry", "bound to original");
+    _ = try tmp.dir.statFile(io, "moved/entry", .{});
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "owned/entry", .{}));
 }
 
 fn addExtendedAcl(io: Io, path: []const u8) !void {

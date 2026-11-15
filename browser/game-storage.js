@@ -47,6 +47,10 @@ mergeInto(LibraryManager.library, {
     defaultChunkBorders: false,
     autosaveBlocked: false,
     dbPromise: null,
+    db: null,
+    lockPromise: null,
+    lockOwned: false,
+    lockFailed: false,
     // Library object values are serialized by emcc. Create Promises only at
     // runtime; a Promise here is emitted as {}, without a .then method.
     saveQueue: null,
@@ -66,6 +70,7 @@ mergeInto(LibraryManager.library, {
       } catch (_) {
         // A failure in the Zig callback must not keep the lock or the page in a
         // half-started state; nothing else is safe to do from here.
+        this.failLock();
       }
     },
 
@@ -108,10 +113,70 @@ mergeInto(LibraryManager.library, {
       return this.validKey(key) ? key : null;
     },
 
+    failLock: function () {
+      this.lockFailed = true;
+      this.lockOwned = false;
+      this.autosaveBlocked = true;
+      if (this.db) {
+        try { this.db.close(); } catch (_) {}
+        this.db = null;
+      }
+      this.dbPromise = null;
+      if (this.holdLock) {
+        var release = this.holdLock;
+        this.holdLock = null;
+        release();
+      }
+    },
+
+    acquireLock: function () {
+      var self = this;
+      if (this.lockFailed) return Promise.reject(new Error("Storage lock unavailable"));
+      if (!this.lockPromise) {
+        this.lockPromise = new Promise(function (resolve, reject) {
+          var fail = function () {
+            self.failLock();
+            reject(new Error("Storage lock unavailable"));
+          };
+          try {
+            if (typeof navigator === "undefined" || !navigator.locks || typeof navigator.locks.request !== "function") {
+              fail();
+              return;
+            }
+            Promise.resolve(navigator.locks.request(self.LOCK_NAME, { mode: "exclusive", ifAvailable: true }, function (lock) {
+              if (!lock || self.lockFailed) { fail(); return; }
+              // Install the lifetime hold BEFORE publishing ownership. The
+              // request promise itself settles only after this hold ends.
+              var lifetime = new Promise(function (release) {
+                self.holdLock = function () { self.holdLock = null; self.failLock(); release(); };
+              });
+              self.lockOwned = true;
+              resolve();
+              return lifetime;
+            })).then(fail, fail);
+          } catch (_) { fail(); }
+        });
+      }
+      return this.lockPromise.then(function () {
+        if (!self.lockOwned || self.lockFailed) throw new Error("Storage lock unavailable");
+      });
+    },
+
     openDb: function () {
       var self = this;
+      return this.acquireLock().then(function () {
+        return self.openLockedDb();
+      }).then(function (db) {
+        if (!self.lockOwned || self.lockFailed) throw new Error("Storage lock unavailable");
+        return db;
+      });
+    },
+
+    openLockedDb: function () {
+      var self = this;
+      if (!this.lockOwned || this.lockFailed) return Promise.reject(new Error("Storage lock unavailable"));
       if (!this.dbPromise) {
-        this.dbPromise = new Promise(function (resolve, reject) {
+        var pending = new Promise(function (resolve, reject) {
           if (typeof indexedDB === "undefined" || !indexedDB) {
             reject(new Error("IndexedDB unavailable"));
             return;
@@ -123,24 +188,58 @@ mergeInto(LibraryManager.library, {
             reject(new Error("IndexedDB unavailable"));
             return;
           }
+          var settled = false;
+          var fail = function (error) {
+            if (settled) return;
+            settled = true;
+            reject(error);
+          };
           request.onupgradeneeded = function () {
+            if (self.lockFailed || !self.lockOwned) {
+              try { request.transaction.abort(); } catch (_) {}
+              return;
+            }
             var db = request.result;
             if (!db.objectStoreNames.contains(self.STORE_CONFIG)) db.createObjectStore(self.STORE_CONFIG);
             if (!db.objectStoreNames.contains(self.STORE_CONTENT)) db.createObjectStore(self.STORE_CONTENT);
           };
-          request.onsuccess = function () { resolve(request.result); };
-          request.onerror = function () { reject(request.error || new Error("IndexedDB open failed")); };
-          request.onblocked = function () { reject(new Error("IndexedDB blocked")); };
+          request.onsuccess = function () {
+            var db = request.result;
+            if (settled || self.lockFailed || !self.lockOwned) {
+              db.close();
+              fail(new Error("Storage lock unavailable"));
+              return;
+            }
+            settled = true;
+            self.db = db;
+            db.onversionchange = function () {
+              db.close();
+              if (self.db === db) self.db = null;
+              if (self.dbPromise === pending) self.dbPromise = null;
+            };
+            resolve(db);
+          };
+          request.onerror = function () { fail(request.error || new Error("IndexedDB open failed")); };
+          request.onblocked = function () { fail(new Error("IndexedDB blocked")); };
         });
         // Do not cache a permanently rejected promise forever if the browser
         // was merely opening the database; a later save may retry.
-        this.dbPromise.catch(function () { self.dbPromise = null; });
+        this.dbPromise = pending;
+        pending.catch(function () { if (self.dbPromise === pending) self.dbPromise = null; });
       }
       return this.dbPromise;
     },
 
     // Reads resolve on the request result; there is no write to wait for.
     idbGet: function (db, store, key) {
+      return this.idbRead(db, store, function (objectStore) { return objectStore.get(key); });
+    },
+
+    idbGetAllKeys: function (db, store) {
+      return this.idbRead(db, store, function (objectStore) { return objectStore.getAllKeys(); });
+    },
+
+    idbRead: function (db, store, action) {
       return new Promise(function (resolve, reject) {
         var transaction;
         try {
@@ -151,7 +250,10 @@ mergeInto(LibraryManager.library, {
         }
         var request;
         try {
-          request = transaction.objectStore(store).get(key);
+          transaction.onabort = transaction.onerror = function () {
+            reject(transaction.error || new Error("IndexedDB read failed"));
+          };
+          request = action(transaction.objectStore(store));
         } catch (_) {
           reject(new Error("IndexedDB read failed"));
           return;
@@ -161,30 +263,9 @@ mergeInto(LibraryManager.library, {
       });
     },
 
-    idbGetAllKeys: function (db, store) {
-      return new Promise(function (resolve, reject) {
-        var transaction;
-        try {
-          transaction = db.transaction(store, "readonly");
-        } catch (_) {
-          reject(new Error("IndexedDB read failed"));
-          return;
-        }
-        var request;
-        try {
-          request = transaction.objectStore(store).getAllKeys();
-        } catch (_) {
-          reject(new Error("IndexedDB read failed"));
-          return;
-        }
-        request.onsuccess = function () { resolve(request.result || []); };
-        request.onerror = function () { reject(request.error || new Error("IndexedDB read failed")); };
-      });
-    },
-
     // Writes succeed only when the transaction completes. A request error
     // bubbles to the transaction and aborts it; do not resolve early.
-    idbWrite: function (db, store, action) {
+    idbWrite: function (db, store, action, result) {
       return new Promise(function (resolve, reject) {
         var transaction;
         try {
@@ -202,12 +283,12 @@ mergeInto(LibraryManager.library, {
         transaction.oncomplete = function () {
           if (settled) return;
           settled = true;
-          resolve();
+          resolve(result ? result() : undefined);
         };
         transaction.onabort = function () { fail(transaction.error); };
         transaction.onerror = function () { fail(transaction.error); };
         try {
-          action(transaction.objectStore(store));
+          action(transaction.objectStore(store), fail, transaction);
         } catch (error) {
           try { transaction.abort(); } catch (_) {}
           fail(error);
@@ -220,50 +301,25 @@ mergeInto(LibraryManager.library, {
     // remove or recreate the key in between. The result is only reported after
     // `oncomplete`, like every other write/delete.
     idbDelete: function (db, store, key) {
-      return new Promise(function (resolve, reject) {
-        var transaction;
-        try {
-          transaction = db.transaction(store, "readwrite");
-        } catch (_) {
-          reject(new Error("IndexedDB delete failed"));
-          return;
-        }
-        var settled = false;
-        var found = false;
-        var fail = function (error) {
-          if (settled) return;
-          settled = true;
-          reject(error || new Error("IndexedDB transaction failed"));
+      var found = false;
+      return this.idbWrite(db, store, function (objectStore, fail, transaction) {
+        // `getKey` checks presence without materialising the stored value;
+        // deleting a large entry only needs the key back.
+        var request = objectStore.getKey(key);
+        request.onsuccess = function () {
+          found = request.result !== undefined;
+          if (!found) return;
+          try {
+            objectStore.delete(key);
+          } catch (error) {
+            try { transaction.abort(); } catch (_) {}
+            fail(error);
+          }
         };
-        transaction.oncomplete = function () {
-          if (settled) return;
-          settled = true;
-          resolve(found);
+        request.onerror = function () {
+          fail(request.error || new Error("IndexedDB read failed"));
         };
-        transaction.onabort = function () { fail(transaction.error); };
-        transaction.onerror = function () { fail(transaction.error); };
-        try {
-          // `getKey` checks presence without materialising the stored value;
-          // deleting a large entry only needs the key back.
-          var request = transaction.objectStore(store).getKey(key);
-          request.onsuccess = function () {
-            found = request.result !== undefined;
-            if (!found) return;
-            try {
-              transaction.objectStore(store).delete(key);
-            } catch (error) {
-              try { transaction.abort(); } catch (_) {}
-              fail(error);
-            }
-          };
-          request.onerror = function () {
-            fail(request.error || new Error("IndexedDB read failed"));
-          };
-        } catch (error) {
-          try { transaction.abort(); } catch (_) {}
-          fail(error);
-        }
-      });
+      }, function () { return found; });
     },
 
     parseConfig: function (raw) {
@@ -309,14 +365,13 @@ mergeInto(LibraryManager.library, {
           if (raw === undefined) {
             return { status: 0, tileGrid: self.defaultTileGrid, chunkBorders: self.defaultChunkBorders };
           }
-          if (typeof raw !== "string") return { status: 2 };
-          if (self.byteLength(raw) > self.MAX_CONFIG_BYTES) return { status: 2 };
           return self.parseConfig(raw);
         });
       });
     },
 
     finishLoad: function (result) {
+      if (this.lockFailed) { this.notifyDefault(4); return; }
       if (result.status === 2 || result.status === 3) {
         // Preserve the existing value and stop every automatic overwrite until
         // an explicit reset removes it.
@@ -345,36 +400,13 @@ mergeInto(LibraryManager.library, {
       this.defaultChunkBorders = defaultChunkBorders !== 0;
 
       var self = this;
-      if (typeof navigator === "undefined" || !navigator.locks || typeof navigator.locks.request !== "function") {
-        // The wallet gate also requires Web Locks. Failing closed here keeps
-        // the one-tab invariant instead of silently allowing a second tab.
-        this.notifyDefault(4);
-        return;
-      }
-
-      navigator.locks.request(
-        this.LOCK_NAME,
-        { mode: "exclusive", ifAvailable: true },
-        function (lock) {
-          if (!lock) {
-            self.notifyDefault(4);
-            return Promise.resolve();
-          }
-
-          // Load while the lock is held, then keep the lock for the page
-          // lifetime without blocking the frame loop.
-          return self.loadConfig().then(
-            function (result) { self.finishLoad(result); },
-            function () { self.finishLoad({ status: 1 }); },
-          ).then(function () {
-            return new Promise(function (resolve) {
-              // Resolving this promise would release the lock. Closing the tab
-              // releases it automatically.
-              self.holdLock = resolve;
-            });
-          });
-        },
-      ).catch(function () {
+      this.acquireLock().then(function () {
+        return self.loadConfig().then(
+          function (result) { self.finishLoad(result); },
+          function () { self.finishLoad({ status: self.lockFailed ? 4 : 1 }); },
+        );
+      }).catch(function () {
+        self.failLock();
         self.notifyDefault(4);
       });
     },
