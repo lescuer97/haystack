@@ -88,6 +88,19 @@ class PackageTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "generated/private package member"):
                 package.validate_package(archive, "hash")
 
+    def test_renamed_browser_inputs_are_required(self):
+        for missing in ("browser/game-ui.js", "browser/wallet-integration.js",
+                        "browser/wallet-test.html", "browser/app.js"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temporary:
+                self.assertIn(missing, package.REQUIRED)
+                archive = Path(temporary) / "missing.tar"
+                with tarfile.open(archive, "w") as output:
+                    for name in package.REQUIRED:
+                        if name != missing:
+                            output.addfile(tarfile.TarInfo(f"hash/{name}"))
+                with self.assertRaisesRegex(RuntimeError, f"missing required package inputs: {missing}"):
+                    package.validate_package(archive, "hash")
+
     def test_command_failure_is_not_reported_as_success(self):
         with mock.patch.object(package.subprocess, "Popen") as launch:
             process = launch.return_value.__enter__.return_value

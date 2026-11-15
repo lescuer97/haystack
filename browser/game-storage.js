@@ -1,9 +1,9 @@
 // Emscripten JS library: browser settings/content storage and single-tab guard.
 //
-// This is deliberately separate from `game-wallet.js`. Startup first acquires
+// This is deliberately separate from `game-ui.js`. Startup first acquires
 // this storage Web Lock and loads the settings, then starts the renderer and
 // its context, and only afterwards begins the persistent wallet onboarding
-// asynchronously. `game-wallet.js` is a disposable gate used by tests.
+// asynchronously. `game-ui.js` only reports the cosmetic startup result.
 //
 // The bridge:
 //   * acquires one exclusive Web Lock for the origin and holds it for the page

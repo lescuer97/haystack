@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             directory,
         })
         .map_err(|_| "server stopped")?;
-    println!("Local fake mint ready: {url}/?smoke (TEST FUNDS ONLY)");
+    println!("Local fake mint ready: {url}/ (TEST FUNDS ONLY)");
     server.1.await?;
     drop(temp);
     Ok(())

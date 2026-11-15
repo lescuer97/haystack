@@ -54,20 +54,20 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     try settings.put("STACK_SIZE", "1048576");
     try settings.put("STACK_OVERFLOW_CHECK", if (options.optimize.runtimeSafety()) "2" else "1");
     try settings.put("EXPORTED_FUNCTIONS", "['_main','_haystack_onboarding_link']");
-    // Emscripten accepts a single `--js-library` path here. Combine the wallet
-    // gate, storage bridge and onboarding input bridge at configure time.
+    // Emscripten accepts a single `--js-library` path here. Combine the startup
+    // UI, storage bridge and onboarding input bridge at configure time.
     // Track configure-time reads as well as emcc's generated-file input, or a
     // JS-only edit can leave the cached combined library and renderer stale.
-    b.dependOnFileContents(b.path("browser/game-wallet.js"));
+    b.dependOnFileContents(b.path("browser/game-ui.js"));
     b.dependOnFileContents(b.path("browser/game-storage.js"));
     b.dependOnFileContents(b.path("browser/game-onboarding.js"));
-    const wallet_js = b.root.root_dir.handle.readFileAlloc(
+    const ui_js = b.root.root_dir.handle.readFileAlloc(
         b.graph.io,
-        "browser/game-wallet.js",
+        "browser/game-ui.js",
         b.allocator,
         .limited(256 * 1024),
     ) catch |err| {
-        std.log.err("cannot read browser/game-wallet.js: {s}", .{@errorName(err)});
+        std.log.err("cannot read browser/game-ui.js: {s}", .{@errorName(err)});
         return err;
     };
     const storage_js = b.root.root_dir.handle.readFileAlloc(
@@ -80,7 +80,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         return err;
     };
     const onboarding_js = try b.root.root_dir.handle.readFileAlloc(b.graph.io, "browser/game-onboarding.js", b.allocator, .limited(256 * 1024));
-    const libraries_js = try std.mem.concat(b.allocator, u8, &.{ wallet_js, "\n", storage_js, "\n", onboarding_js });
+    const libraries_js = try std.mem.concat(b.allocator, u8, &.{ ui_js, "\n", storage_js, "\n", onboarding_js });
     const write_files = b.addWriteFiles();
     const combined_library = write_files.add("haystack-game-libraries.js", libraries_js);
     const linked = try rlz.emsdk.emccStep(b, &.{}, &.{renderer}, .{
@@ -169,7 +169,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         // Shared by `test` and `test-mint`. These files are regression-test
         // inputs only, so a normal browser build never installs them.
         const test_assets = b.step("test-assets", "Install browser regression test fixtures (test/test-mint only)");
-        for ([_][]const u8{ "app.js", "smoke.js", "spilman-negative.js", "live-channels.js", "test-faults.js", "fault-scenarios.js", "recovery.js", "wallet-test.html", "test-wallet.js", "wallet-store.js" }) |file| {
+        for ([_][]const u8{ "app.js", "wallet-integration.js", "spilman-negative.js", "live-channels.js", "test-faults.js", "fault-scenarios.js", "recovery.js", "wallet-test.html", "test-wallet.js", "wallet-store.js" }) |file| {
             test_assets.dependOn(&b.addInstallFile(b.path(b.fmt("browser/{s}", .{file})), b.fmt("wasm-test/{s}", .{file})).step);
         }
         test_assets.dependOn(&b.addInstallFile(b.path("src/testdata/spilman_vectors.json"), "wasm-test/spilman_vectors.json").step);

@@ -34,7 +34,7 @@ def main():
             if line is None:
                 raise RuntimeError(f"fake mint exited before readiness (status {mint.wait()})")
             print(line, end="", flush=True)
-            match = re.search(r"Local fake mint ready: (http://127\.0\.0\.1:\d+/\?smoke)", line)
+            match = re.search(r"Local fake mint ready: (http://127\.0\.0\.1:\d+/) \(TEST FUNDS ONLY\)", line)
             if match:
                 url = match.group(1)
                 break

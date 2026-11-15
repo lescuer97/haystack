@@ -18,6 +18,8 @@ PRUNED = {
     ".profiles", "chromium-profile", "secrets", ".secrets",
 }
 REQUIRED = (
+    "browser/game-ui.js", "browser/wallet-integration.js",
+    "browser/wallet-test.html", "browser/app.js",
     "build.zig", "build.zig.zon", "README.md", "docs/build.md",
     "docs/browser-wallet.md", ".github/workflows/ci.yml",
     "build-support/test_ci_workflow.py", "build-support/check_package.py",

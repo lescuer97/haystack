@@ -5,8 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>haystack</title>
 <script>
-  // The default application is the game only. Preserve query/hash so deep
-  // links such as ?smoke still reach the renderer.
+  // The default application is the game only. Preserve query/hash for deep links.
   location.replace("renderer/index.html" + location.search + location.hash);
 </script>
 <noscript><meta http-equiv="refresh" content="0; url=renderer/index.html"></noscript>

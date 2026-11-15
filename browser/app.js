@@ -1,7 +1,7 @@
 import init, {open_wallet, call_pure, probe_persistent_storage, provision_wallet} from "./wallet/cdk_wallet_browser.js";
 
 // Test-only DOM adapter for the non-interactive wallet fixture. It exposes the
-// serialized wallet API used by browser/smoke.js and browser/wallet-browser-test.mjs; the game
+// serialized wallet API used by browser/wallet-integration.js and browser/wallet-browser-test.mjs; the game
 // never loads this file.
 let rawWallet = null;
 let queue = Promise.resolve();
@@ -10,7 +10,6 @@ let rejectFatal;
 const fatalSignal = new Promise((_, reject) => { rejectFatal = reject; });
 fatalSignal.catch(() => {});
 const status = document.getElementById("status");
-const result = document.getElementById("result");
 export const ready = init();
 
 function failInstance(error) {
@@ -63,17 +62,3 @@ export const walletApp = {
 window.walletApp = walletApp;
 
 ready.then(() => { status.textContent = "Rust wallet WebAssembly loaded — ready to open"; }).catch(() => { status.textContent = "Failed to load browser wallet WebAssembly"; });
-
-if (new URLSearchParams(location.search).has("smoke")) {
-  import("./smoke.js").then(({runSmoke}) => runSmoke(walletApp)).then(report => {
-    window.browserTestReport = report;
-    status.textContent = report.ok ? "BROWSER TESTS PASSED" : "BROWSER TESTS FAILED";
-    result.textContent = JSON.stringify(report, null, 2);
-    window.reportBrowserTests?.(JSON.stringify(report));
-  }).catch(error => {
-    window.browserTestReport = {ok:false,error:String(error.message || error)};
-    status.textContent = "BROWSER TESTS FAILED";
-    result.textContent = JSON.stringify(window.browserTestReport);
-    window.reportBrowserTests?.(JSON.stringify(window.browserTestReport));
-  });
-}

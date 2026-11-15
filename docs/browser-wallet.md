@@ -149,13 +149,13 @@ node browser/wallet-browser-test.mjs
 For a different port/browser:
 
 ```sh
-CHROMIUM=/path/to/chromium node browser/wallet-browser-test.mjs http://127.0.0.1:PORT/?smoke
+CHROMIUM=/path/to/chromium node browser/wallet-browser-test.mjs http://127.0.0.1:PORT/
 ```
 
-You can also visit <http://127.0.0.1:18787/wallet-test.html?smoke> manually. The
-default `/` is the game, so the Node runner rewrites the fake mint's `/?smoke`
-URL to the non-interactive `/wallet-test.html?smoke` fixture and leaves the
-Python mint URL detection unchanged. The fixture reports its browser checks; the
+You can also visit <http://127.0.0.1:18787/wallet-test.html?integration> manually. The
+default `/` is the game, so the Node runner rewrites the fake mint's root
+URL to the non-interactive `/wallet-test.html?integration` fixture. The Python
+wrapper recognizes the mint's bare local root URL. The fixture reports its checks; the
 Node runner additionally tests actual separate tabs, document reload, and
 document destruction after interrupted send/receive operations. It uses a fresh
 Chromium profile and deletes only generated test-wallet records (after closing
@@ -377,8 +377,9 @@ wallet's Web Lock and atomically adds both records only when absent. Regression
 fixtures still use disposable wallets and scoped cleanup; their test-only helper
 refuses `haystack-user`. They do not clear the database or object stores. A
 mnemonic-only record is preserved in regression coverage, as is a localStorage
-canary where available. `browser/game-wallet.js` retains the old disposable smoke
-for tests but is no longer on the production startup path.
+canary where available. The obsolete disposable startup gate has been removed;
+`browser/game-ui.js` only notifies the cosmetic startup UI. Wallet integration
+coverage lives in the test-only `browser/wallet-integration.js` suite.
 
 For programmatic usage, import `walletApp` from `app.js`, or the low-level
 generated `wallet/cdk_wallet_browser.js` module. A wallet must be provisioned

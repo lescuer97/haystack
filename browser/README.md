@@ -38,7 +38,7 @@ See [build details](../docs/build.md) and the
   (CAS), mint restrictions and the retained retired stage.
 - `build/wasm.zig`: separation of production and fixture builds.
 - `browser/onboarding-test.js` and `browser/onboarding-browser-test.mjs`:
-  onboarding checks and Chromium runner; also review the existing wallet smoke
+  onboarding checks and Chromium runner; also review the existing wallet integration
   and recovery tests under `browser/`.
 
 ## Safety and isolation
@@ -92,7 +92,7 @@ fault can be reproduced directly (this command is **expected to fail**):
 
 ```sh
 ONBOARDING_TEST_FLOW=create ONBOARDING_TEST_FAULT=drop-ready \
-  node browser/onboarding-browser-test.mjs http://127.0.0.1:18787/?smoke
+  node browser/onboarding-browser-test.mjs http://127.0.0.1:18787/
 ```
 
 The flow can be `create` or `recovery`; faults are `drop-ready`, `drop-complete`,

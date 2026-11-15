@@ -1,4 +1,5 @@
-// Browser-only tests. Deterministic public fixtures and a local fake mint only.
+// Browser-only wallet integration tests. Public fixtures and a local fake mint only.
+import {walletApp} from "./app.js";
 import {open_wallet} from "./wallet/cdk_wallet_browser.js";
 import {installSwapFaults} from "./test-faults.js";
 import {runSpilmanNegatives} from "./spilman-negative.js";
@@ -16,7 +17,7 @@ import {
   writeState,
 } from "./test-wallet.js";
 
-export async function runSmoke(app) {
+export async function runWalletIntegration(app) {
   await app.ready;
   const checks = [];
   const failures = [];
@@ -37,7 +38,7 @@ export async function runSmoke(app) {
   const faults = installSwapFaults();
   const v = await fetch("spilman_vectors.json").then(r => r.json());
   const suffix = crypto.randomUUID().replaceAll("-", "");
-  const name = `smoke-${suffix}`;
+  const name = `integration-${suffix}`;
   const secondName = `receiver-${suffix}`;
   const canaryName = `canary-${suffix}`;
   const partialName = `partial-${suffix}`;
@@ -320,4 +321,20 @@ export async function runSmoke(app) {
   }
 
   return {ok: completed && failures.length === 0 && !cleanupFailed, completed, cleanupFailed, checks, failures, count: checks.length, failureCount: failures.length};
+}
+
+if (new URLSearchParams(location.search).has("integration")) {
+  const status = document.getElementById("status");
+  const result = document.getElementById("result");
+  runWalletIntegration(walletApp).then(report => {
+    window.browserTestReport = report;
+    status.textContent = report.ok ? "BROWSER TESTS PASSED" : "BROWSER TESTS FAILED";
+    result.textContent = JSON.stringify(report, null, 2);
+    window.reportBrowserTests?.(JSON.stringify(report));
+  }).catch(error => {
+    window.browserTestReport = {ok:false,error:String(error.message || error)};
+    status.textContent = "BROWSER TESTS FAILED";
+    result.textContent = JSON.stringify(window.browserTestReport);
+    window.reportBrowserTests?.(JSON.stringify(window.browserTestReport));
+  });
 }

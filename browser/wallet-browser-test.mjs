@@ -13,15 +13,15 @@ const directory=await makeProfile("cdk-browser-test-");
 const artifacts=await makeProfile("cdk-browser-test-artifacts-");
 const browser=launchBrowser(directory,["--use-gl=angle","--use-angle=swiftshader","--enable-unsafe-swiftshader"]);
 
-// The Python wrapper prints the fake mint's normal application URL (`/?smoke`).
+// The Python wrapper prints the fake mint's normal application root URL.
 // Wallet checks run on the explicit non-interactive test fixture, while `/` is
 // only a redirect to the game. Normalize the input once and reuse the origin.
-const inputUrl=process.argv[2] || "http://127.0.0.1:18787/?smoke";
+const inputUrl=process.argv[2] || "http://127.0.0.1:18787/";
 const parsedInput=new URL(inputUrl);
 const baseOrigin=parsedInput.origin;
 const fixtureUrl=search => {
   const url=new URL("/wallet-test.html",baseOrigin);
-  url.search=search===undefined? (parsedInput.search || "?smoke") : `?${search}`;
+  url.search=search===undefined? (parsedInput.search || "?integration") : `?${search}`;
   return url.href;
 };
 
@@ -93,11 +93,11 @@ const work=(async () => {
   await send("Runtime.addBinding",{name:"reportBrowserTests"},sessionId);
   await send("Page.navigate",{url:fixtureUrl()},sessionId);
 
-  const smoke=await report;
-  Object.assign(result,smoke);
-  result.checks=Array.isArray(smoke.checks)? smoke.checks.slice() : [];
-  result.failures=Array.isArray(smoke.failures)? smoke.failures.slice() : [];
-  result.completed=smoke.completed === true;
+  const integration=await report;
+  Object.assign(result,integration);
+  result.checks=Array.isArray(integration.checks)? integration.checks.slice() : [];
+  result.failures=Array.isArray(integration.failures)? integration.failures.slice() : [];
+  result.completed=integration.completed === true;
   result.count=result.checks.length;
   result.failureCount=result.failures.length;
   if(!result.completed) {

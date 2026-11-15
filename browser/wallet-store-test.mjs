@@ -63,81 +63,29 @@ function check() {
   checks += 1;
 }
 
-// Exercise both independent openers against fresh, v1, and newer databases.
 const originalListeners = new Map(listeners);
 
-// Load the actual Emscripten library, replacing only its build-time macro.
-const gameSource = (await readFile(new URL("./game-wallet.js", import.meta.url), "utf8"))
-  .replace(/\{\{\{ makeDynCall\([^\n]+?\) \}\}\}/, "(function () {})");
-function gameSmoke(indexedDB) {
+// The game library only notifies the UI; no wallet helpers or entrypoints remain.
+const uiSource = await readFile(new URL("./game-ui.js", import.meta.url), "utf8");
+for (const module of [undefined, {}, {onHaystackStartup() { throw new Error("cosmetic"); }}]) {
   const library = {};
-  vm.runInNewContext(gameSource, {indexedDB, LibraryManager: {library}, mergeInto: Object.assign});
-  return library.$haystackWalletSmoke;
-}
-for (const scenario of ["fresh", "upgrade", "existing", "newer"]) {
-  const isolated = new FakeIndexedDB();
-  const state = {revision: 17, data: "existing", extra: "preserve"};
-  if (scenario !== "fresh") {
-    const stores = new Map([
-      [MNEMONIC_STORE, new Map([["existing", MNEMONIC]])],
-      [STATE_STORE, new Map([["existing", state]])],
-    ]);
-    if (scenario === "existing") stores.set(ONBOARDING_STORE, new Map([["marker", "preserve"]]));
-    isolated.records.set(DATABASE, {version: scenario === "upgrade" ? 1 : scenario === "existing" ? 2 : 3, stores});
-  }
-  const smoke = gameSmoke(isolated);
-  if (scenario === "newer") {
-    await assert.rejects(smoke.openDatabase(), /wallet smoke failed/);
-    assert.equal(isolated.records.get(DATABASE).version, 3);
-    assert.equal(isolated.peek(MNEMONIC_STORE, "existing"), MNEMONIC);
-    assert.deepEqual(isolated.peek(STATE_STORE, "existing"), state);
-    assert.equal(isolated.records.get(DATABASE).stores.has(ONBOARDING_STORE), false);
-  } else {
-    const db = await smoke.openDatabase();
-    assert.equal(isolated.records.get(DATABASE).version, 2);
-    assert.ok(isolated.records.get(DATABASE).stores.has(ONBOARDING_STORE));
-    if (scenario !== "fresh") {
-      assert.equal(isolated.peek(MNEMONIC_STORE, "existing"), MNEMONIC);
-      assert.deepEqual(isolated.peek(STATE_STORE, "existing"), state);
-    }
-    if (scenario === "existing") assert.equal(isolated.peek(ONBOARDING_STORE, "marker"), "preserve");
-    Object.defineProperty(globalThis, "indexedDB", {value: isolated, configurable: true});
-    const isolatedPlatform = await import(`./wallet/platform.js?game-${scenario}`);
-    await isolatedPlatform.provisionWallet("new-wallet", MNEMONIC, "new-state");
-    assert.equal(isolated.peek(MNEMONIC_STORE, "new-wallet"), MNEMONIC);
-    // A subsequent upgrade must not be held up by the smoke connection.
-    const upgrade = isolated.open(DATABASE, 3);
-    await new Promise((resolve, reject) => {
-      upgrade.onsuccess = resolve;
-      upgrade.onerror = reject;
-      upgrade.onblocked = () => reject(new Error("upgrade blocked"));
-    });
-    assert.equal(db.closed, true);
-    assert.equal(smoke.connection, null);
-    upgrade.result.close();
-  }
+  vm.runInNewContext(uiSource, {Module: module, LibraryManager: {library}, mergeInto: Object.assign});
+  assert.deepEqual(Object.keys(library).sort(), ["haystack_ui_result", "haystack_ui_result__sig"]);
+  assert.equal(library.haystack_ui_result__sig, "vi");
+  assert.doesNotThrow(() => library.haystack_ui_result(1));
+  assert.doesNotThrow(() => library.haystack_ui_result(0));
   check();
 }
-// A blocked (or errored) request may later succeed; that handle must be closed,
-// and must not replace a subsequent successful connection.
-for (const failure of ["onblocked", "onerror"]) {
-  const requests = [];
-  const smoke = gameSmoke({open() { const request = new FakeRequest(); requests.push(request); return request; }});
-  const first = smoke.openDatabase();
-  requests[0][failure]();
-  await assert.rejects(first, /wallet smoke failed/);
-  const second = smoke.openDatabase();
-  const current = {close() { this.closed = true; }};
-  requests[1].result = current;
-  requests[1].onsuccess();
-  assert.equal(await second, current);
-  const late = {close() { this.closed = true; }};
-  requests[0].result = late;
-  requests[0].onsuccess();
-  assert.equal(late.closed, true);
-  assert.equal(await smoke.openDatabase(), current);
+{
+  const library = {};
+  const results = [];
+  vm.runInNewContext(uiSource, {Module: {onHaystackStartup: value => results.push(value)}, LibraryManager: {library}, mergeInto: Object.assign});
+  library.haystack_ui_result(1);
+  library.haystack_ui_result(0);
+  assert.deepEqual(results, ["ready", "error"]);
   check();
 }
+// Exercise both independent openers against fresh, v1, and newer databases.
 for (const [label, load] of [
   ["platform", async suffix => (await import(`./wallet/platform.js?${suffix}`)).loadWallet],
   ["helper", async suffix => (await import(`./wallet-store.js?${suffix}`)).readWallet],
