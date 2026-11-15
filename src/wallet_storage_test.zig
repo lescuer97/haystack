@@ -21,6 +21,81 @@ const recovery_phrase = "abandon abandon abandon abandon abandon abandon abandon
 const recovery_id = "0123456789abcdef0123456789abcdef".*;
 const other_recovery_id = "1123456789abcdef0123456789abcdef".*;
 
+var sync_events: [3]wallet.TestSync = undefined;
+var sync_count: usize = 0;
+var sync_root: []const u8 = "";
+var sync_targets_match = true;
+
+fn observeSync(kind: wallet.TestSync, path: []const u8) void {
+    if (sync_count < sync_events.len) sync_events[sync_count] = kind;
+    sync_count += 1;
+    sync_targets_match = sync_targets_match and switch (kind) {
+        .stage => std.mem.eql(u8, std.fs.path.dirname(path).?, sync_root),
+        .data_root => std.mem.eql(u8, path, sync_root),
+        .ancestor => std.mem.eql(u8, path, std.fs.path.dirname(sync_root).?),
+    };
+}
+
+test "creation and preparation flush stage root and ancestor for absent and existing roots" {
+    defer {
+        wallet.testSyncObserver = null;
+        sync_count = 0;
+        sync_root = "";
+        sync_targets_match = true;
+    }
+    for ([_]bool{ false, true }) |existing| {
+        for ([_]bool{ false, true }) |recovery| {
+            var h = try Harness.init();
+            defer h.deinit();
+            if (existing) try sf.ensureOwnedDir(testing.io, h.dataRoot());
+            sync_root = h.dataRoot();
+            sync_count = 0;
+            sync_targets_match = true;
+            wallet.testSyncObserver = observeSync;
+            if (recovery) {
+                try wallet.prepareRecovery(testing.io, testing.allocator, h.paths, recovery_phrase, recovery_id);
+            } else {
+                const created = try wallet.create(testing.io, testing.allocator, h.paths);
+                defer created.deinit(testing.allocator);
+                try testing.expectEqual(wallet.Durability.durable, created.durability);
+            }
+            try testing.expectEqual(@as(usize, 3), sync_count);
+            try testing.expectEqualSlices(wallet.TestSync, &.{ .stage, .data_root, .ancestor }, &sync_events);
+            try testing.expect(sync_targets_match);
+        }
+    }
+}
+
+test "ancestor failure retains created pair and prevents overwrite" {
+    var h = try Harness.init();
+    defer h.deinit();
+    wallet.testFailAncestorSync = true;
+    defer wallet.testFailAncestorSync = false;
+    const created = try wallet.create(testing.io, testing.allocator, h.paths);
+    defer created.deinit(testing.allocator);
+    try testing.expectEqual(wallet.Durability.unknown, created.durability);
+    var inspection = try wallet.inspect(testing.io, testing.allocator, h.paths, true);
+    try inspection.close();
+    try testing.expectError(error.AlreadyInitialized, wallet.create(testing.io, testing.allocator, h.paths));
+    const phrase = try wallet.readMnemonic(testing.io, testing.allocator, h.paths);
+    defer {
+        std.crypto.secureZero(u8, phrase);
+        testing.allocator.free(phrase);
+    }
+    try testing.expect(std.mem.eql(u8, created.mnemonic, phrase));
+}
+
+test "ancestor failure retains prepared recovery and ownership receipt" {
+    var h = try Harness.init();
+    defer h.deinit();
+    wallet.testFailAncestorSync = true;
+    defer wallet.testFailAncestorSync = false;
+    try testing.expectError(error.SyncFailed, wallet.prepareRecovery(testing.io, testing.allocator, h.paths, recovery_phrase, recovery_id));
+    var inspection = try wallet.inspectRecovery(testing.io, testing.allocator, h.paths, recovery_id, true);
+    try inspection.close();
+    try testing.expectError(error.PathAlreadyExists, wallet.prepareRecovery(testing.io, testing.allocator, h.paths, recovery_phrase, recovery_id));
+}
+
 test "recovery prepares inspects and commits without overwriting" {
     var h = try Harness.init();
     defer h.deinit();

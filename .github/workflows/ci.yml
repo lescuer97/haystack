@@ -275,6 +275,9 @@ jobs:
       - name: Browser database conformance tests
         run: zig build test-wallet -Dplatform=wasm
 
+      - name: Offline Zig-filtered source package regression
+        run: zig build test-package -Dplatform=wasm -Doffline
+
       - name: Browser and fake-mint integration tests
         env:
           CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}

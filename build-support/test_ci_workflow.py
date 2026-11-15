@@ -118,5 +118,22 @@ class DependencyProvenanceContractTests(unittest.TestCase):
                     )
 
 
+class PackageRegressionContractTests(unittest.TestCase):
+    def test_browser_package_check_runs_after_warm_build_before_known_failing_suite(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        block = job_block(text, "linux-browser-wasm")
+        name = "Offline Zig-filtered source package regression"
+        step = step_block(block, name)
+        self.assertIsNotNone(step)
+        self.assertIn("zig build test-package -Dplatform=wasm -Doffline", step)
+        self.assertLess(block.index("- name: Build the complete browser application"), block.index(f"- name: {name}"))
+        self.assertLess(block.index("- name: Browser database conformance tests"), block.index(f"- name: {name}"))
+        self.assertLess(block.index(f"- name: {name}"), block.index("- name: Browser and fake-mint integration tests"))
+        self.assertNotIn("continue-on-error", block)
+        self.assertNotIn("zig build setup", step)
+        for job in DESKTOP_JOBS:
+            self.assertNotIn("zig build test-package", job_block(text, job))
+
+
 if __name__ == "__main__":
     unittest.main()

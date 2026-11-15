@@ -23,6 +23,7 @@ menu, without building the other application.
 | `zig build test-onboarding -Dplatform=wasm` | Linux-only onboarding suite with a fake mint and fresh Chromium incognito contexts |
 | `zig build setup -Dplatform=wasm` | Provision Rust + Wasm target, local wasm-bindgen and Emscripten without building the application |
 | `zig build test-build` | Test graph isolation, explicit setup/check contracts, the native target matrix and the upstream Emscripten adapter |
+| `zig build test-package -Dplatform=wasm -Doffline` | Explicit offline Zig-filtered source-package regression (warmed browser caches required; also available in the desktop graph) |
 
 `zig build -Dtarget=wasm32-emscripten` **does not** select the Wasm graph. Browser
 builds require the explicit platform flag: `zig build -Dplatform=wasm` (optionally
@@ -188,8 +189,8 @@ check/provision step above; no upstream installer is reachable from the normal
 renderer or wallet graph. The native desktop graph never constructs the
 Emscripten dependency.
 
-The small scripts in `build-support/` only handle check/provision modes and the
-test-server lifecycle. `--check` is used by normal builds and can never fall
+The small scripts in `build-support/` handle check/provision modes, explicit
+regressions and the test-server lifecycle. `--check` is used by normal builds and can never fall
 through to an installer; `--provision` is used only by `setup` and still reuses
 an already matching tool without updating it. Zig owns the Rust build, generated
 bindings, renderer compilation/linking, dependency ordering, caching and
@@ -198,6 +199,53 @@ invoked each build so edits to the shared Rust sources cannot leave Zig linking
 a stale archive. The wasm-bindgen output is a generated Zig build artifact and is
 cached when the Rust `.wasm` and tool are unchanged. Static assets have their own
 install steps.
+
+## Source-package regression
+
+After `zig build setup -Dplatform=wasm` and an ordinary complete browser build
+have warmed Zig/Cargo dependency caches, run:
+
+```sh
+zig build test-package -Dplatform=wasm -Doffline
+```
+
+This is a source `.paths` filter check, **not** signed desktop packaging, an
+asset-pack check or a graphical desktop test. It is available in either graph,
+but never runs automatically from a normal build or `test-build`. Its script is
+deliberately not named `test_*.py`: packaged unittest discovery cannot recurse
+into another complete package build. Small fixture tests do exercise real Zig
+filtering, including a deliberately omitted onboarding bridge.
+
+Zig 0.17's local-directory fetch copies everything before filtering, so the
+checker first writes a temporary tar of the **current working tree**, including
+uncommitted/untracked sources and any genuine assets. A fixed exclusion list,
+independent of `.paths`, prunes Git metadata, Cargo targets, tool/build caches,
+local repros, profiles, logs, wallet databases and common secret files. It rejects
+remaining symlinks/special files rather than dereferencing external inputs. This
+preprocessing is not the package filter: actual `zig fetch` applies `.paths` to
+that tar in an isolated global package cache. The resulting `p/<hash>.tar.gz` is
+checked for required runtime/test/document inputs and forbidden artifacts before
+extraction into a disposable writable workspace. No original source directory
+is linked back into that workspace. The checker queries native and Wasm help,
+runs `test-build`, Node-only Wasm `test-storage`, and builds the **production**
+`browser` step there. It never runs a mint or installs tools.
+
+Prerequisites are Node, the selected Rust toolchain/Wasm target (default pinned
+1.99.0; `-Drust-toolchain` is forwarded), warmed Cargo registry/Git dependencies,
+and the provisioned Emscripten SDK in the existing `zig-pkg` dependency cache
+(`ZIG_LOCAL_PKG_DIR` is honored). Builds reuse that cache with Zig's `--system`
+no-fetch mode and Cargo offline mode. Managed wasm-bindgen 0.2.130 must exist in
+the invoking build's local cache; the checker forwards its absolute binary path
+instead of packaging it. The check assumes the managed CLI, not a custom
+`-Dwasm-bindgen` override. Only compiler-cache directories (`b/h/o/z`), never the
+global package cache (`p`), are shared with the isolated fetch. No shared package
+cache is modified to repair missing source inputs.
+
+Temporary tar/fetch/workspace data is cleaned on success or failure, under
+`/tmp/opencode` when available (system temporary directory otherwise). Commands
+have finite timeouts and identify failing stages. A fresh Rust compilation in
+the disposable workspace can take several minutes and multiple GiB of disk;
+compiled checkout targets are intentionally neither copied nor packaged.
 
 ## macOS Apple Silicon desktop
 
@@ -401,6 +449,24 @@ single `v0.18.1` source. This is a deliberate downgrade from the `0.18.3`
 registry crates this project used before, and it is **not** a claim that the two
 releases are equivalent, nor a production certification.
 
+### Current wallet status
+
+On **2026-11-15**, the maintainer confirmed that **no production wallets
+currently exist**. There is therefore no current production-wallet migration need:
+unverified funded-wallet backward compatibility is not a blocker for this
+pre-production migration. The CDK `v0.18.1` pairing with upstream Spilman
+`v0.2.0` is intentional, and its known risks are accepted in this current
+pre-production context. This does not imply that there are no deployments or
+funded test wallets; agents should not treat the lack of funded-wallet downgrade
+validation as an existing production incident.
+
+This is dated context, not a permanent waiver or a claim that missing fixes are
+resolved. Known transaction/recovery bugs remain, the documented send/swap
+recovery test failures remain failures, and use is still **test funds only**.
+Before allowing production funds, revisit the dependency fixes, recovery
+validation and wallet-data upgrade policy. The source-review findings and
+empty-wallet evidence below retain their original limits.
+
 Source review of upstream `v0.18.1…v0.18.3` for the paths this ABI uses:
 
 - all 168 SQL migration files (62 wallet, 79 mint, 7 mint-auth, 20 supabase) are
@@ -431,9 +497,9 @@ Schema-level evidence is limited to a disposable fixture: a pristine, empty
 0.18.3 SQLite wallet produced by the wrapper (dummy seed, 40 migrations, 36-byte
 wrapper marker, no funds and no mints) was reopened through a copy under 0.18.1.
 That proves the empty, unfunded schema reopens; it does **not** prove a funded
-wallet or full history compatibility. Treat existing wallets conservatively:
-back up the wallet directory before switching builds, and remember this is an
-experimental, test-funds-only wallet. See
+wallet or full history compatibility. Treat any funded test wallets and future
+production wallets conservatively: back up the wallet directory before
+switching builds, and remember this is an experimental, test-funds-only wallet. See
 [browser-wallet.md](browser-wallet.md#boundaries-and-remaining-validation) for
 the browser-side limits.
 
@@ -565,7 +631,8 @@ fetched or downloaded.
 - **Linux browser (Wasm)**: installs Node 22 and Chrome for Testing, runs
   `zig build setup -Dplatform=wasm` to provision the Wasm toolchain, local
   wasm-bindgen and Emscripten, then runs the complete Wasm build, browser
-  database tests and the fake-mint/Chromium suite. It is independent of both
+  database tests, the offline filtered-package regression, and finally the
+  fake-mint/Chromium suite (whose known failures remain failures). It is independent of both
   desktop jobs.
 
 The workflow installs Zig 0.17.0 through `build-support/install-zig.py`, which

@@ -61,6 +61,16 @@ pub fn build(b: *std.Build) !void {
     build_tests.step.dependOn(&b.addRunArtifact(emsdk_compat_tests).step);
     b.step("test-build", "Test platform graph isolation, explicit setup/check contracts, the upstream Emscripten adapter and the native target matrix").dependOn(&build_tests.step);
 
+    // Explicit only: unittest discovery in the filtered package must not
+    // recursively launch another package build.
+    const package_check = b.addSystemCommand(&.{ "python3", "build-support/check_package.py", "--zig", b.graph.zig_exe, "--rust-toolchain", options.toolchain, "--global-cache" });
+    package_check.addDirectoryArg(b.graph.path(.global_cache, ""));
+    package_check.addArg("--local-cache");
+    package_check.addDirectoryArg(b.graph.path(.local_cache, ""));
+    package_check.setCwd(b.path("."));
+    package_check.has_side_effects = true;
+    b.step("test-package", "Check Zig-filtered source package and build the production browser offline (warmed caches required)").dependOn(&package_check.step);
+
     // Deliberately configure ONE graph. Desktop never initializes browser
     // toolchains; Wasm never translates/links the native C ABI or desktop raylib.
     switch (platform) {

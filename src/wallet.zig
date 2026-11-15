@@ -128,6 +128,38 @@ pub const Created = struct {
 /// written outside tests; the committed pair must be retained either way.
 pub var testFailCommitSync = false;
 
+/// Test-only directory-sync observation and ancestor fault injection. Production
+/// never reads these hooks; stage observations occur only after its flush.
+pub const TestSync = enum { stage, data_root, ancestor };
+pub var testSyncObserver: ?*const fn (TestSync, []const u8) void = null;
+pub var testFailAncestorSync = false;
+
+fn observeSync(kind: TestSync, path: []const u8) void {
+    if (builtin.is_test) if (testSyncObserver) |observe| observe(kind, path);
+}
+
+/// Flush both the wallet entry and the data-root entry, including on resume.
+/// Always flush the ancestor: an existing root may follow a failed earlier sync.
+/// Call explicitly after validating existing data; inspection remains read-only.
+pub fn syncDurability(io: Io, paths: Paths) !void {
+    const root = std.fs.path.dirname(paths.dir) orelse return error.InvalidPath;
+    var dir = try sf.openDirSyncable(io, root);
+    defer dir.close(io);
+    try sf.verifyNoExtendedAclDir(dir);
+    try syncDataRoot(io, root, dir);
+}
+
+fn syncDataRoot(io: Io, root: []const u8, dir: Io.Dir) !void {
+    observeSync(.data_root, root);
+    if (builtin.is_test and testFailCommitSync) return error.SyncFailed;
+    try sf.syncDirectory(dir);
+    var ancestor = try sf.openParent(io, root);
+    defer ancestor.close(io);
+    observeSync(.ancestor, std.fs.path.dirname(root) orelse return error.InvalidPath);
+    if (builtin.is_test and testFailAncestorSync) return error.SyncFailed;
+    try sf.syncDirectory(ancestor);
+}
+
 /// Inspect the managed pair without provisioning or repairing a missing pair.
 ///
 /// With `open = false` this function neither creates nor mutates anything: the
@@ -270,6 +302,7 @@ pub fn create(
     // The staged directory entries (mnemonic and closed SQLite database) must
     // reach disk before the directory itself is committed.
     try sf.syncDirectory(staging);
+    observeSync(.stage, std.fs.path.dirname(staging_db).?);
 
     // Copy the phrase before the commit: after a successful rename the pair is
     // retained and the caller must still receive the backup material.
@@ -287,8 +320,7 @@ pub fn create(
     // The pair is committed now. A failed parent sync is reported as
     // durability-unknown and never rolls the committed pair back.
     const durability: Durability = blk: {
-        if (builtin.is_test and testFailCommitSync) break :blk .unknown;
-        sf.syncDirectory(parent) catch break :blk .unknown;
+        syncDataRoot(io, data_root, parent) catch break :blk .unknown;
         break :blk .durable;
     };
 
@@ -373,7 +405,8 @@ pub fn prepareRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths,
     try receipt.sync(io);
     try validateStagedPair(io, allocator, stage, &seed);
     try sf.syncDirectory(stage);
-    try sf.syncDirectory(parent);
+    observeSync(.stage, paths.dir);
+    try syncDataRoot(io, root, parent);
 }
 
 pub fn inspectRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths, id: [32]u8, open: bool) !Inspection {
@@ -458,8 +491,7 @@ pub fn retireRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths, 
     const basename = try sf.basename(paths.dir);
     if (try statEntry(io, parent, basename) != null) return error.AlreadyInitialized;
     try Io.Dir.renamePreserve(parent, recovery_dir_name, parent, basename, io);
-    if (builtin.is_test and testFailCommitSync) return .unknown;
-    sf.syncDirectory(parent) catch return .unknown;
+    syncDataRoot(io, std.fs.path.dirname(final_paths.dir) orelse return .unknown, parent) catch return .unknown;
     return .durable;
 }
 
@@ -473,8 +505,7 @@ pub fn commitRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths, 
     const final_name = try sf.basename(final_paths.dir);
     if (try statEntry(io, parent, final_name) != null) return error.AlreadyInitialized;
     try Io.Dir.renamePreserve(parent, recovery_dir_name, parent, final_name, io);
-    if (builtin.is_test and testFailCommitSync) return .unknown;
-    sf.syncDirectory(parent) catch return .unknown;
+    syncDataRoot(io, root, parent) catch return .unknown;
     return .durable;
 }
 

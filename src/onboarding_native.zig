@@ -160,6 +160,7 @@ pub const Native = struct {
             if (!stage_exists) return error.WalletUnavailable;
             var inspection = try wallet.inspectRecovery(self.io, self.allocator, self.paths, r.id, true);
             try inspection.close();
+            try wallet.syncDurability(self.io, self.paths);
             return switch (r.step) {
                 .preparing => .{ .resume_failed = .{ .can_generate_new = false } },
                 .scanning, .failed => .{ .resume_failed = .{ .can_generate_new = false } },
@@ -176,6 +177,7 @@ pub const Native = struct {
         };
         if (final_exists) {
             try self.validate();
+            try wallet.syncDurability(self.io, self.paths);
             if (state == null) return .ready;
             if (state.?.step == .complete) {
                 try sf.syncDirectory(dir);
@@ -229,6 +231,7 @@ pub const Native = struct {
         if (r.version != 2 or (r.step != .preparing and r.step != .scanning and r.step != .failed and r.step != .result)) return error.WalletUnavailable;
         var inspection = try wallet.inspectRecovery(self.io, self.allocator, self.paths, r.id, true);
         try inspection.close();
+        try wallet.syncDurability(self.io, self.paths);
         r.step = .scanning;
         try self.writeRecord(dir, r);
         return self.scan(dir, r, attempt_id);
@@ -273,12 +276,6 @@ pub const Native = struct {
         return r.spent_sats != 0 or r.pending_sats != 0 or r.spendable_sats != 0;
     }
 
-    fn syncWalletParent(self: *Native) !void {
-        var parent = try sf.openParent(self.io, self.paths.dir);
-        defer parent.close(self.io);
-        try sf.syncDirectory(parent);
-    }
-
     fn finishCommitting(self: *Native, dir: Io.Dir, r: Record) !void {
         if (!hasHistory(r)) return error.WalletUnavailable;
         const stage = try self.stageExists();
@@ -289,7 +286,7 @@ pub const Native = struct {
         } else {
             var inspection = try wallet.inspectCommittedRecovery(self.io, self.allocator, self.paths, r.id, true);
             try inspection.close();
-            try self.syncWalletParent();
+            try wallet.syncDurability(self.io, self.paths);
         }
         try sf.writeAtomicIn(dir, self.io, name, completed);
         try sf.syncDirectory(dir);
@@ -305,6 +302,7 @@ pub const Native = struct {
             if (try self.exists(self.paths.dir)) return error.WalletUnavailable;
             var inspection = try wallet.inspectRecovery(self.io, self.allocator, self.paths, r.id, true);
             try inspection.close();
+            try wallet.syncDurability(self.io, self.paths);
             r.step = .committing;
             try self.writeRecord(dir, r);
         }
@@ -326,7 +324,7 @@ pub const Native = struct {
         } else {
             var inspection = try wallet.inspectRetiredRecovery(self.io, self.allocator, self.paths, r.id, true);
             try inspection.close();
-            try self.syncWalletParent();
+            try wallet.syncDurability(self.io, self.paths);
         }
         try sf.writeAtomicIn(dir, self.io, name, pending);
         try sf.syncDirectory(dir);
@@ -343,6 +341,7 @@ pub const Native = struct {
         if (r.step != .result or hasHistory(r)) return error.WalletUnavailable;
         if (try self.exists(self.paths.dir)) return error.WalletUnavailable;
         if (!self.safe(r.id)) return error.WalletUnavailable;
+        try wallet.syncDurability(self.io, self.paths);
         r.step = .abandoning;
         try self.writeRecord(dir, r);
         return self.finishAbandoning(dir, r);
@@ -354,6 +353,7 @@ pub const Native = struct {
         const state = try self.record(dir) orelse return error.InvalidOnboardingRecord;
         if (state.version != 1) return error.InvalidOnboardingRecord;
         try self.validate();
+        try wallet.syncDurability(self.io, self.paths);
         // A previous rename may have succeeded even if its directory sync failed.
         if (state.step == .complete) return sf.syncDirectory(dir);
         try sf.writeAtomicIn(dir, self.io, name, completed);
@@ -370,6 +370,10 @@ const Fixture = struct {
     paths: wallet.Paths,
 
     fn init() !Fixture {
+        return initWithDataRoot(true);
+    }
+
+    fn initWithDataRoot(create_data_root: bool) !Fixture {
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
         const a = testing.allocator;
@@ -379,7 +383,7 @@ const Fixture = struct {
         errdefer a.free(config_dir);
         const data_dir = try std.fs.path.join(a, &.{ root, "data" });
         defer a.free(data_dir);
-        try sf.ensureOwnedDir(testing.io, data_dir);
+        if (create_data_root) try sf.ensureOwnedDir(testing.io, data_dir);
         const wallet_dir = try std.fs.path.join(a, &.{ data_dir, "wallet" });
         errdefer a.free(wallet_dir);
         try sf.ensureOwnedDir(testing.io, config_dir);
@@ -594,6 +598,11 @@ test "finish recovery commits history and reconciles interrupted rename" {
         test_scan = .{ .success = .{ .spendable = if (interrupted) 5 else 0, .pending = if (interrupted) 0 else 2, .spent = 0 } };
         _ = try native.restore("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", 1);
         if (interrupted) {
+            var dir = try native.config();
+            var r = (try native.record(dir)).?;
+            r.step = .committing;
+            try native.writeRecord(dir, r);
+            dir.close(testing.io);
             wallet.testFailCommitSync = true;
             defer wallet.testFailCommitSync = false;
             try testing.expectError(error.WalletDurabilityUnknown, native.finishRestore());
@@ -637,6 +646,11 @@ test "abandon recovery retains ownership and reconciles both rename states" {
         dir.close(testing.io);
         const event = if (scenario == 1) try native.start() else blk: {
             if (scenario == 2) {
+                var marker_dir = try native.config();
+                var abandoning = r;
+                abandoning.step = .abandoning;
+                try native.writeRecord(marker_dir, abandoning);
+                marker_dir.close(testing.io);
                 wallet.testFailCommitSync = true;
                 defer wallet.testFailCommitSync = false;
                 try testing.expectError(error.WalletDurabilityUnknown, native.generateNew());
@@ -649,5 +663,101 @@ test "abandon recovery retains ownership and reconciles both rename states" {
         try testing.expect(event == .backup);
         var inspection = try wallet.inspectRetiredRecovery(testing.io, testing.allocator, f.paths, r.id, true);
         try inspection.close();
+    }
+}
+
+test "ancestor failure blocks existing wallet startup and completion without marker changes" {
+    defer wallet.testFailAncestorSync = false;
+    for ([_]?[]const u8{ null, pending, completed }) |marker| {
+        var f = try Fixture.initWithDataRoot(false);
+        defer f.deinit();
+        var native = f.native();
+        const created = try wallet.create(testing.io, testing.allocator, f.paths);
+        defer created.deinit(testing.allocator);
+        if (marker) |data| try f.marker(data);
+        wallet.testFailAncestorSync = true;
+        try testing.expectError(error.SyncFailed, native.start());
+        if (marker != null) try testing.expectError(error.SyncFailed, native.complete());
+        var dir = try native.config();
+        defer dir.close(testing.io);
+        if (marker) |data| {
+            const actual = try dir.readFileAlloc(testing.io, name, testing.allocator, .limited(256));
+            defer testing.allocator.free(actual);
+            try testing.expectEqualStrings(data, actual);
+        } else try testing.expect((try native.record(dir)) == null);
+        wallet.testFailAncestorSync = false;
+        const event = try native.start();
+        defer freeEvent(event);
+        try testing.expect(if (marker != null and std.mem.eql(u8, marker.?, pending)) event == .backup else event == .ready);
+        if (marker != null) try native.complete();
+    }
+}
+
+test "ancestor failure leaves absent-root restore preparing and blocks resume and retry" {
+    var f = try Fixture.initWithDataRoot(false);
+    defer f.deinit();
+    var native = f.native();
+    defer wallet.testFailAncestorSync = false;
+    defer test_scan = null;
+    test_scan = .{ .success = .{ .spendable = 1, .pending = 0, .spent = 0 } };
+    wallet.testFailAncestorSync = true;
+    try testing.expectError(error.SyncFailed, native.restore("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", 1));
+    var dir = try native.config();
+    defer dir.close(testing.io);
+    const before = (try native.record(dir)).?;
+    try testing.expect(before.step == .preparing);
+    var inspection = try wallet.inspectRecovery(testing.io, testing.allocator, f.paths, before.id, true);
+    try inspection.close();
+    try testing.expectError(error.SyncFailed, native.start());
+    try testing.expectError(error.SyncFailed, native.retry(2));
+    try testing.expect((try native.record(dir)).?.step == .preparing);
+    wallet.testFailAncestorSync = false;
+    try testing.expect((try native.start()) == .resume_failed);
+    try testing.expect((try native.retry(3)) == .restore_finished);
+    wallet.testFailAncestorSync = true;
+    try testing.expectError(error.SyncFailed, native.start());
+    try testing.expectError(error.SyncFailed, native.retry(4));
+    try testing.expectError(error.SyncFailed, native.finishRestore());
+    try testing.expect((try native.record(dir)).?.step == .result);
+    wallet.testFailAncestorSync = false;
+    try testing.expect((try native.start()) == .resume_result);
+    try native.finishRestore();
+}
+
+test "ancestor failure retains committing and abandoning renames until resume sync succeeds" {
+    defer wallet.testFailAncestorSync = false;
+    defer test_scan = null;
+    for ([_]bool{ false, true }) |abandon| {
+        var f = try Fixture.initWithDataRoot(false);
+        defer f.deinit();
+        var native = f.native();
+        test_scan = .{ .success = .{ .spendable = if (abandon) 0 else 1, .pending = 0, .spent = 0 } };
+        _ = try native.restore("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", 1);
+        var dir = try native.config();
+        defer dir.close(testing.io);
+        wallet.testFailAncestorSync = true;
+        if (abandon) {
+            try testing.expectError(error.SyncFailed, native.generateNew());
+        } else try testing.expectError(error.SyncFailed, native.finishRestore());
+        var r = (try native.record(dir)).?;
+        try testing.expect(r.step == .result);
+        wallet.testFailAncestorSync = false;
+        r.step = if (abandon) .abandoning else .committing;
+        try native.writeRecord(dir, r);
+        wallet.testFailAncestorSync = true;
+        if (abandon) {
+            try testing.expectError(error.WalletDurabilityUnknown, native.generateNew());
+        } else try testing.expectError(error.WalletDurabilityUnknown, native.finishRestore());
+        var inspection = if (abandon)
+            try wallet.inspectRetiredRecovery(testing.io, testing.allocator, f.paths, r.id, true)
+        else
+            try wallet.inspectCommittedRecovery(testing.io, testing.allocator, f.paths, r.id, true);
+        try inspection.close();
+        try testing.expectError(error.SyncFailed, native.start());
+        try testing.expectEqual(r.step, (try native.record(dir)).?.step);
+        wallet.testFailAncestorSync = false;
+        const event = try native.start();
+        defer freeEvent(event);
+        try testing.expect(if (abandon) event == .backup else event == .ready);
     }
 }

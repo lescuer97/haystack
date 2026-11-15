@@ -92,9 +92,14 @@ workspace merge, `[patch]`, fork or local Spilman crate copy.
 This is a deliberate step from the registry `0.18.3` crates to `v0.18.1`,
 because upstream Spilman `v0.2.0` itself pins `v0.18.1`. It is **not** a claim
 that the releases are equivalent and not a production certification; the wallet
-SQL schema is identical between them. Existing wallets should be backed up
-before switching builds. Details, the reviewed upstream differences and the
-limits of the empty-wallet reopen evidence are in
+SQL schema is identical between them. As confirmed by the maintainer on
+2026-11-15, no production wallets currently exist, so funded-wallet downgrade
+validation is not a blocker for this pre-production migration; the CDK pairing
+and its risks are accepted for now, for **test funds only**. See the
+[current wallet status](docs/build.md#current-wallet-status) for when to revisit
+this decision. Any funded test wallets (and future production wallets) should
+be backed up before switching builds. Details, the reviewed upstream differences
+and the limits of the empty-wallet reopen evidence are in
 [build.md](docs/build.md#dependency-provenance-cdk-v0181-and-spilman-v020).
 
 Verify the resolved graph after provisioning tools (check-only; never installs):

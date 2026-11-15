@@ -414,6 +414,12 @@ field is secret material; never log it. Generated TypeScript declarations expose
   wallet SQL schema is unchanged across those releases, but this is not a claim
   that the releases are equivalent and not a compatibility certification for
   funded wallets; see [build.md](build.md#dependency-provenance-cdk-v0181-and-spilman-v020).
+  As confirmed by the maintainer on 2026-11-15, no production wallets currently
+  exist: funded-wallet downgrade validation is not a current migration blocker,
+  and the pairing's risks are accepted for pre-production, test-funds-only use.
+  Known bugs and test failures remain; see the
+  [current wallet status](build.md#current-wallet-status) for the context and
+  what must be revisited before allowing production funds.
 - Browser state, including mnemonic words, is plaintext origin storage.
   Proofs and tokens are bearer secrets. XSS or malicious same-origin scripts can
   compromise them. Browser clearing/eviction can destroy storage. A mnemonic alone
