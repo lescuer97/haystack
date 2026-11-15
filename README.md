@@ -21,12 +21,20 @@ build installs `zig-out/desktop/bin/haystack_game` and a shared raylib library
 `$ORIGIN/../lib` (Linux) or `@loader_path/../lib` (macOS) lookup, so the
 installed `desktop` directory can be moved outside the repository.
 
-On Linux, the desktop binary runs a disposable startup wallet check before
-creating its window: it generates a fresh mnemonic, derives the 64-byte seed,
-opens and closes an owner-only SQLite wallet in a private temporary directory,
-verifies that balances and recovery are empty, then deletes the directory. It
-makes no mint or network request and never logs the mnemonic or seed. This is a
-compile/runtime smoke test only — not a backup, production wallet or key store.
+On Linux and macOS the desktop binary creates its window and world first, then
+runs native wallet startup inspection. A validated existing wallet proceeds to
+the game. A new or pending wallet shows a blocking onboarding overlay that
+requires saving and acknowledging the recovery words (or recovering an existing
+wallet) before gameplay. The desktop wallet is persistent: a plaintext BIP-39
+mnemonic (`seed-words.txt`) and a CDK SQLite database (`wallet.sqlite`) live in a
+Haystack-owned wallet directory with owner-only permissions; macOS extended ACLs
+are rejected. Startup inspection is local and makes no mint request. Invalid or
+unavailable storage blocks startup rather than repairing or replacing existing
+records. This remains an experimental, test-funds-only wallet, not a production
+key store. See [game-loop.md](docs/game-loop.md#native-wallet-startup) and
+[cdk-wallet-ffi.md](docs/cdk-wallet-ffi.md) for the native startup and storage
+contracts.
+
 The browser application is the game only: `/` redirects to `renderer/index.html`,
 where a blocking shared Zig modal handles persistent `haystack-user` wallet
 creation, backup and recovery. The renderer runs while asynchronous wallet
@@ -69,6 +77,30 @@ validation limits.
 zig build run -Dplatform=wasm    # build and serve at localhost:8000
 zig build test-wallet           # native Rust + Zig C-ABI regression suites
 zig build test -Dplatform=wasm   # browser database + fake-mint/Chromium tests
+```
+
+## Dependencies
+
+Both Cargo roots (`vendor/cdk-wallet-ffi` for the native C ABI, `browser/wallet`
+for the Wasm module) resolve **one** CDK source: Git tag `v0.18.1` of
+`https://github.com/cashubtc/cdk.git` (commit
+`a056e0f0f69e94f431b1aeb90d883f18c61ea4c6`), with `version = "=0.18.1"` guards.
+Spilman comes from `https://github.com/SatsAndSports/cashu_spilman_channels` at
+rev `8a5350dfd4d7c2902dc15c726a91dbfb2c793d43` (`v0.2.0`). There is no Cargo
+workspace merge, `[patch]`, fork or local Spilman crate copy.
+
+This is a deliberate step from the registry `0.18.3` crates to `v0.18.1`,
+because upstream Spilman `v0.2.0` itself pins `v0.18.1`. It is **not** a claim
+that the releases are equivalent and not a production certification; the wallet
+SQL schema is identical between them. Existing wallets should be backed up
+before switching builds. Details, the reviewed upstream differences and the
+limits of the empty-wallet reopen evidence are in
+[build.md](docs/build.md#dependency-provenance-cdk-v0181-and-spilman-v020).
+
+Verify the resolved graph after provisioning tools (check-only; never installs):
+
+```sh
+python3 build-support/check_dependency_pins.py           # --offline to forbid Cargo network
 ```
 
 Browser tests require Node 22+ and Chromium. They start and stop their own

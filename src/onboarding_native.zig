@@ -36,7 +36,9 @@ pub const Native = struct {
     fn config(self: *Native) !Io.Dir {
         if (!std.fs.path.isAbsolute(self.config_dir)) return error.InvalidPath;
         try sf.verifyOwnedDir(self.io, self.config_dir);
-        const dir = try Io.Dir.openDirAbsolute(self.io, self.config_dir, .{ .follow_symlinks = false });
+        // The returned handle is written through and flushed by callers, so it
+        // must be sync-capable.
+        const dir = try sf.openDirSyncable(self.io, self.config_dir);
         errdefer dir.close(self.io);
         try sf.verifyNoExtendedAclDir(dir);
         return dir;
@@ -399,7 +401,7 @@ const Fixture = struct {
     }
 
     fn marker(self: *Fixture, data: []const u8) !void {
-        var dir = try Io.Dir.openDirAbsolute(testing.io, self.config_dir, .{});
+        var dir = try sf.openDirSyncable(testing.io, self.config_dir);
         defer dir.close(testing.io);
         try sf.writeAtomicIn(dir, testing.io, name, data);
     }

@@ -1,8 +1,8 @@
 # `cdk-wallet-ffi`
 
 A minimal, boring **C ABI** over a small subset of
-[`cdk::wallet::WalletRepository`] (upstream CDK `0.18.3`), designed to be linked
-into the Zig application as a Rust `staticlib`.
+[`cdk::wallet::WalletRepository`] (CDK from Git tag `v0.18.1`), designed to be
+linked into the Zig application as a Rust `staticlib`.
 
 It is deliberately small: one SQLite database, one 64-byte seed, Sat-only
 balances, explicit mint approval, BIP-39 mnemonic generation plus
@@ -10,7 +10,7 @@ entropy/seed derivation, and a handful of synchronous calls. Everything else
 (Lightning, history, mnemonic storage/backup/restore, multi-unit,
 callbacks/jobs/futures, other currencies, cross-mint operations) is out of scope.
 
-[`cdk::wallet::WalletRepository`]: https://docs.rs/cdk/0.18.3/cdk/wallet/struct.WalletRepository.html
+[`cdk::wallet::WalletRepository`]: https://docs.rs/cdk/0.18.1/cdk/wallet/struct.WalletRepository.html
 
 ---
 
@@ -399,10 +399,27 @@ cargo +stable fmt --check
 cargo +stable clippy --locked --all-targets --features headers
 ```
 
-The crate is pinned: `cdk` and `cdk-sqlite` at `=0.18.3` with
-`default-features = false, features = ["wallet"]`, `safer-ffi = "=0.1.13"`, and
-`bip39 = "=2.2.2"` (with `rand` + `zeroize`) for the mnemonic helpers.
-`Cargo.lock` is committed and builds are expected to use `--locked`.
+The crate is pinned to a **source**, not a registry version: `cdk`, `cdk-sqlite`,
+`cdk-common` and the dev-only `cdk-axum`/`cdk-fake-wallet` come from
+`https://github.com/cashubtc/cdk.git` at tag `v0.18.1` (resolved commit
+`a056e0f0f69e94f431b1aeb90d883f18c61ea4c6`), each with a `version = "=0.18.1"`
+version guard. The lockfile and explicit dependency-provenance check additionally
+guard the source and resolved commit, including same-version source drift. `cdk-spilman`
+comes from `https://github.com/SatsAndSports/cashu_spilman_channels` at rev
+`8a5350dfd4d7c2902dc15c726a91dbfb2c793d43` (release `v0.2.0`). Also pinned:
+`safer-ffi = "=0.1.13"` and `bip39 = "=2.2.2"` (with `rand` + `zeroize`) for the
+mnemonic helpers. `Cargo.lock` is committed and builds are expected to use
+`--locked`.
+
+### Why `0.18.1` when this crate used `0.18.3`
+
+The moved piece is Spilman: it is no longer a local crate copy but the upstream
+repository, and upstream `v0.2.0` itself pins CDK `v0.18.1`. This repository
+therefore keeps **one** CDK source for the native ABI, the browser wallet and the
+tests, and takes the deliberate `0.18.3` → `0.18.1` step rather than mixing a
+published Spilman crate with a different CDK resolution. See
+[`../../docs/build.md`](../../docs/build.md) for what that downgrade does and
+does not guarantee.
 
 ### Native linking (Linux and macOS)
 

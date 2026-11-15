@@ -1,8 +1,9 @@
 // Emscripten JS library: browser settings/content storage and single-tab guard.
 //
-// This is deliberately separate from `game-wallet.js`. The wallet gate runs
-// first and never touches this file; only after the wallet callback succeeds
-// does the Zig startup code call `haystack_storage_start`.
+// This is deliberately separate from `game-wallet.js`. Startup first acquires
+// this storage Web Lock and loads the settings, then starts the renderer and
+// its context, and only afterwards begins the persistent wallet onboarding
+// asynchronously. `game-wallet.js` is a disposable gate used by tests.
 //
 // The bridge:
 //   * acquires one exclusive Web Lock for the origin and holds it for the page
@@ -417,7 +418,13 @@ mergeInto(LibraryManager.library, {
 
     reset: function () {
       var self = this;
-      this.autosaveBlocked = false;
+      // Do not unblock here. If autosave is already blocked it must stay
+      // blocked until this reset commits, so nothing can overwrite the
+      // configuration the reset is about to remove (or failed to remove). A
+      // save accepted while the reset is pending is serialized behind it by
+      // saveQueue; if the reset fails, the failure block is set before that
+      // save's queued step runs, so it is skipped. Only a committed reset
+      // proves it is safe to save again.
       if (this.saveQueue === null) this.saveQueue = Promise.resolve();
       this.saveQueue = this.saveQueue.then(function () {
         return self.openDb().then(function (db) {
@@ -425,6 +432,11 @@ mergeInto(LibraryManager.library, {
             store.delete(self.CONFIG_KEY);
           });
         });
+      }).then(function () {
+        // The delete committed. A save that failed earlier may have blocked
+        // autosave after this reset was requested; the successful reset is the
+        // newer event, so it clears that block.
+        self.autosaveBlocked = false;
       }).catch(function (err) {
         self.autosaveBlocked = true;
         try { console.error("haystack storage: settings reset failed", err); } catch (_) {}

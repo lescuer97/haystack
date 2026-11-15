@@ -32,46 +32,23 @@ extern "C" {
         marker: &JsValue,
         retired: &str,
     ) -> Result<(), JsValue>;
+    // The compare-and-swap transitions take one named expected snapshot:
+    // `{marker, state: {revision, data}, mnemonic, retired}`.
     #[wasm_bindgen(catch, js_name = updateOnboardingScan)]
     async fn update_scan(
         name: &str,
-        expected_marker: &JsValue,
+        expected: &JsValue,
         new_marker: &JsValue,
-        expected_stage_revision: f64,
-        expected_mnemonic: &str,
-        expected_state_data: &str,
-        expected_retired_json: &str,
     ) -> Result<(), JsValue>;
     #[wasm_bindgen(catch, js_name = completeOnboardingWallet)]
-    async fn complete(
-        name: &str,
-        revision: f64,
-        fingerprint: &str,
-        state_revision: f64,
-        mnemonic: &str,
-        state: &str,
-        retired: &str,
-    ) -> Result<(), JsValue>;
+    async fn complete(name: &str, expected: &JsValue) -> Result<(), JsValue>;
     #[wasm_bindgen(catch, js_name = finishOnboardingRestore)]
-    async fn finish_restore(
-        name: &str,
-        marker: &JsValue,
-        revision: f64,
-        mnemonic: &str,
-        state: &str,
-        retired: &str,
-    ) -> Result<(), JsValue>;
+    async fn finish_restore(name: &str, expected: &JsValue) -> Result<(), JsValue>;
     #[wasm_bindgen(catch, js_name = generateOnboardingWallet)]
     async fn generate_wallet(
         name: &str,
-        marker: &JsValue,
-        revision: f64,
-        mnemonic: &str,
-        state: &str,
-        new_mnemonic: &str,
-        new_state: &str,
-        new_marker: &JsValue,
-        retired: &str,
+        expected: &JsValue,
+        replacement: &JsValue,
     ) -> Result<(), JsValue>;
 }
 
@@ -87,7 +64,7 @@ struct Snapshot {
     entries: Vec<Entry>,
     wallets: Vec<Wallet>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Marker {
     version: u32,
@@ -171,6 +148,58 @@ struct Expected {
     mnemonic: String,
     state: State,
     marker: Retired,
+}
+
+// The internal Rust <-> JS bridge payload for every compare-and-swap
+// transition. `retired` stays the serialized string audited from the snapshot,
+// so `parseRetired`/`matchesRetired` remain the single authority for it.
+#[derive(Serialize)]
+struct ExpectedSnapshot<'a, M: Serialize> {
+    marker: &'a M,
+    state: &'a State,
+    mnemonic: &'a str,
+    retired: &'a str,
+}
+
+// The newly generated wallet written by `generateOnboardingWallet`.
+#[derive(Serialize)]
+struct ReplacementWallet<'a> {
+    mnemonic: &'a str,
+    state: &'a str,
+    marker: &'a serde_json::Value,
+}
+
+fn js_json<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
+    // The payload carries the mnemonic (and the retired entries' mnemonics), so
+    // the intermediate serialized buffer is scrubbed when it is dropped.
+    let json = Zeroizing::new(serde_json::to_string(value).map_err(|_| unavailable())?);
+    js_sys::JSON::parse(json.as_str()).map_err(|_| unavailable())
+}
+
+fn expected_snapshot<M: Serialize>(
+    marker: &M,
+    state: &State,
+    mnemonic: &str,
+    retired: &str,
+) -> Result<JsValue, JsValue> {
+    js_json(&ExpectedSnapshot {
+        marker,
+        state,
+        mnemonic,
+        retired,
+    })
+}
+
+fn replacement_wallet(
+    mnemonic: &str,
+    state: &str,
+    marker: &serde_json::Value,
+) -> Result<JsValue, JsValue> {
+    js_json(&ReplacementWallet {
+        mnemonic,
+        state,
+        marker,
+    })
 }
 enum View {
     Choice,
@@ -462,8 +491,13 @@ impl BrowserOnboarding {
             Some(revision) if revision < MAX_SAFE => revision + 1,
             _ => return failed_event(),
         };
-        let expected = match js_sys::JSON::parse(&stage.marker.to_string()) {
-            Ok(marker) => marker,
+        let expected = match expected_snapshot(
+            &stage.marker,
+            &stage.state,
+            &stage.mnemonic,
+            &audited.retired,
+        ) {
+            Ok(value) => value,
             Err(_) => return failed_event(),
         };
         let mut failed = stage.marker.clone();
@@ -487,32 +521,15 @@ impl BrowserOnboarding {
                 && browser_db::onboarding_store_can_abandon(&stage.state.data, fingerprint)
                     .unwrap_or(false);
             if let Ok(marker) = js_sys::JSON::parse(&result.to_string()) {
-                if update_scan(
-                    USER_WALLET_NAME,
-                    &expected,
-                    &marker,
-                    stage.state.revision as f64,
-                    &stage.mnemonic,
-                    &stage.state.data,
-                    &audited.retired,
-                )
-                .await
-                .is_ok()
+                if update_scan(USER_WALLET_NAME, &expected, &marker)
+                    .await
+                    .is_ok()
                 {
                     return json!({"event":"restore_finished","report":{"spendable_sats":spendable.to_string(),"pending_sats":pending.to_string(),"spent_sats":spent.to_string(),"can_generate_new":can_generate_new}}).to_string();
                 }
             }
         }
-        let _ = update_scan(
-            USER_WALLET_NAME,
-            &expected,
-            &failed_marker,
-            stage.state.revision as f64,
-            &stage.mnemonic,
-            &stage.state.data,
-            &audited.retired,
-        )
-        .await;
+        let _ = update_scan(USER_WALLET_NAME, &expected, &failed_marker).await;
         failed_event()
     }
 
@@ -678,22 +695,19 @@ impl BrowserOnboarding {
                 return Ok(failed());
             };
             let (Ok(expected), Ok(marker)) = (
-                js_sys::JSON::parse(&active.marker.to_string()),
+                expected_snapshot(
+                    &active.marker,
+                    &active.state,
+                    &active.mnemonic,
+                    &audited.retired,
+                ),
                 js_sys::JSON::parse(&scanning.to_string()),
             ) else {
                 return Ok(failed());
             };
-            if update_scan(
-                USER_WALLET_NAME,
-                &expected,
-                &marker,
-                active.state.revision as f64,
-                &active.mnemonic,
-                &active.state.data,
-                &audited.retired,
-            )
-            .await
-            .is_err()
+            if update_scan(USER_WALLET_NAME, &expected, &marker)
+                .await
+                .is_err()
             {
                 return Ok(failed());
             }
@@ -719,22 +733,17 @@ impl BrowserOnboarding {
             let Some(active) = audited.active else {
                 return Ok(event(fail));
             };
-            let Ok(marker) = js_sys::JSON::parse(&active.marker.to_string()) else {
+            let Ok(expected) = expected_snapshot(
+                &active.marker,
+                &active.state,
+                &active.mnemonic,
+                &audited.retired,
+            ) else {
                 return Ok(event(fail));
             };
             if op == "finish_restore" {
                 return Ok(event(
-                    if finish_restore(
-                        USER_WALLET_NAME,
-                        &marker,
-                        active.state.revision as f64,
-                        &active.mnemonic,
-                        &active.state.data,
-                        &audited.retired,
-                    )
-                    .await
-                    .is_ok()
-                    {
+                    if finish_restore(USER_WALLET_NAME, &expected).await.is_ok() {
                         "complete_success"
                     } else {
                         fail
@@ -755,23 +764,13 @@ impl BrowserOnboarding {
             };
             let new_marker =
                 json!({"version":1,"revision":0,"step":"backup_seed","fingerprint":fingerprint});
-            let Ok(new_marker) = js_sys::JSON::parse(&new_marker.to_string()) else {
+            let Ok(replacement) = replacement_wallet(&mnemonic, &state, &new_marker) else {
                 return Ok(event(fail));
             };
             browser_platform::warn_if_storage_not_persistent().await;
-            if generate_wallet(
-                USER_WALLET_NAME,
-                &marker,
-                active.state.revision as f64,
-                &active.mnemonic,
-                &active.state.data,
-                &mnemonic,
-                &state,
-                &new_marker,
-                &audited.retired,
-            )
-            .await
-            .is_err()
+            if generate_wallet(USER_WALLET_NAME, &expected, &replacement)
+                .await
+                .is_err()
             {
                 return Ok(event(fail));
             }
@@ -824,18 +823,11 @@ impl BrowserOnboarding {
                     marker,
                 },
             ) => {
-                if complete(
-                    USER_WALLET_NAME,
-                    marker.revision as f64,
-                    &marker.fingerprint,
-                    state.revision as f64,
-                    &mnemonic,
-                    &state.data,
-                    &audited.retired,
-                )
-                .await
-                .is_err()
-                {
+                let expected = match expected_snapshot(&marker, &state, &mnemonic, &audited.retired) {
+                    Ok(value) => value,
+                    Err(_) => return Ok(event(fail)),
+                };
+                if complete(USER_WALLET_NAME, &expected).await.is_err() {
                     return Ok(event(fail));
                 }
                 Ok(event("complete_success"))

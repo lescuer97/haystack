@@ -10,6 +10,9 @@
 //! * Writes use a temporary file in the destination directory and an atomic
 //!   rename, so readers never observe a partially written managed file. The
 //!   directory is synced after the rename; a failed sync is reported.
+//! * A directory descriptor that will be flushed must be opened sync-capable:
+//!   on Linux the default open options use `O_PATH`, where `fsync` fails with
+//!   `EBADF`. There is no policy difference beyond that open flag.
 //!
 //! `ensureOwnedDir` creates only the Haystack-owned directory at the final path
 //! component; it never creates or chmods standard parents such as `~/.config`.
@@ -140,10 +143,28 @@ pub fn ensureStandardParents(io: Io, parents: []const []const u8) !void {
     }
 }
 
-/// Open the parent directory of an absolute managed path.
+/// Open an absolute directory that may later be flushed with `syncDirectory`
+/// (directly or through `writeAtomicIn`), without following a final symlink.
+///
+/// `iterate = true` is required here for more than iteration: on Linux the
+/// default directory options open the path `O_PATH`, and `fsync` on an
+/// `O_PATH` descriptor fails with `EBADF`. This changes no permission, ACL or
+/// symlink policy.
+pub fn openDirSyncable(io: Io, path: []const u8) !Io.Dir {
+    return Io.Dir.openDirAbsolute(io, path, .{ .iterate = true, .follow_symlinks = false });
+}
+
+/// Open a child directory of an already-open parent for a later flush. Same
+/// sync-capability requirement and no-follow policy as `openDirSyncable`.
+pub fn openChildDirSyncable(parent: Io.Dir, io: Io, name: []const u8) !Io.Dir {
+    return parent.openDir(io, name, .{ .iterate = true, .follow_symlinks = false });
+}
+
+/// Open the parent directory of an absolute managed path. The descriptor is
+/// sync-capable so callers may flush it after creating or renaming entries.
 pub fn openParent(io: Io, path: []const u8) !Io.Dir {
     const parent = std.fs.path.dirname(path) orelse return error.InvalidPath;
-    return Io.Dir.openDirAbsolute(io, parent, .{});
+    return Io.Dir.openDirAbsolute(io, parent, .{ .iterate = true });
 }
 
 pub fn basename(path: []const u8) ![]const u8 {
@@ -153,14 +174,16 @@ pub fn basename(path: []const u8) ![]const u8 {
 }
 
 /// Flush a directory after creating or renaming entries in it. A failed sync is
-/// reported, never treated as durable just because the rename returned.
+/// reported, never treated as durable just because the rename returned. The
+/// descriptor must have been opened sync-capable (see `openDirSyncable`).
 pub fn syncDirectory(dir: Io.Dir) error{SyncFailed}!void {
     if (std.c.fsync(dir.handle) != 0) return error.SyncFailed;
 }
 
 /// Atomically replace `dir/name` with `data`, creating the temporary file with
 /// `0600` permissions. The caller is responsible for validating any existing
-/// destination before calling this.
+/// destination before calling this, and for passing a sync-capable directory
+/// (see `openDirSyncable`); a failed directory sync is an error.
 pub fn writeAtomicIn(dir: Io.Dir, io: Io, name: []const u8, data: []const u8) !void {
     var random: [16]u8 = undefined;
     io.random(&random);
@@ -342,4 +365,43 @@ test "macOS extended ACLs fail closed on opened files and directories" {
 test "a failed directory sync is reported, never claimed durable" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     try testing.expectError(error.SyncFailed, syncDirectory(.{ .handle = -1 }));
+}
+
+test "directories opened for flushing accept a directory sync" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = testing.io;
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+
+    const owned = try std.fs.path.join(testing.allocator, &.{ root, "owned" });
+    defer testing.allocator.free(owned);
+    try ensureOwnedDir(io, owned);
+
+    // The managed open helpers must produce a descriptor that can be fsynced;
+    // the regression was a failed sync on a default (Linux `O_PATH`) open.
+    {
+        var dir = try openDirSyncable(io, owned);
+        defer dir.close(io);
+        try syncDirectory(dir);
+    }
+
+    var parent = try openDirSyncable(io, owned);
+    defer parent.close(io);
+    try parent.createDir(io, "child", mode_dir);
+    {
+        var child = try openChildDirSyncable(parent, io, "child");
+        defer child.close(io);
+        try syncDirectory(child);
+    }
+
+    // A direct caller using `openParent` can write and flush atomically too.
+    const entry_path = try std.fs.path.join(testing.allocator, &.{ owned, "entry.json" });
+    defer testing.allocator.free(entry_path);
+    var dir = try openParent(io, entry_path);
+    defer dir.close(io);
+    try writeAtomicIn(dir, io, "entry.json", "x");
 }

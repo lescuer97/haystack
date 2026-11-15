@@ -746,39 +746,12 @@ impl CdkWallet {
             .map_err(|e| FfiErr::new(CdkStatus::InternalError, format!("{e}")))?;
 
         let deadline = self.network_deadline();
-        let amount = match timeout(
+        let outcome = timeout(
             deadline,
             wallet.receive(token_str, receive_options(signing_keys)),
         )
-        .await
-        {
-            Ok(Ok(amount)) => amount,
-            Ok(Err(e)) => {
-                let err = map_receive_error(&e);
-                if is_clearly_definitive(&e) {
-                    return Err(err);
-                }
-                // The swap may have partially executed at the mint (HTTP error,
-                // malformed response, ...). Fail closed and require an explicit
-                // recovery before this mint is used again.
-                self.unresolved.insert(mint_url);
-                return Err(FfiErr::new(
-                    err.status,
-                    format!(
-                        "receive outcome is uncertain; the mint is blocked pending recovery: {e}"
-                    ),
-                ));
-            }
-            Err(_) => {
-                // The swap may have partially executed; fail closed.
-                self.unresolved.insert(mint_url);
-                return Err(FfiErr::new(
-                    CdkStatus::NetworkError,
-                    "receive exceeded the network deadline; the mint is blocked pending recovery",
-                ));
-            }
-        };
-        Ok(amount.to_u64())
+        .await;
+        self.finish_receive(mint_url, outcome)
     }
 
     /// Fetch the mint's active Sat keyset and return it as Spilman keyset JSON.
@@ -928,35 +901,55 @@ impl CdkWallet {
 
         let wallet = self.approved_wallet(&mint_url).await?;
         let deadline = self.network_deadline();
-        let amount = match timeout(
+        let outcome = timeout(
             deadline,
             wallet.receive_proofs(proofs, receive_options(signing_keys), None, None),
         )
-        .await
-        {
-            Ok(Ok(amount)) => amount,
+        .await;
+        self.finish_receive(mint_url, outcome)
+    }
+
+    /// Classify a completed `receive` attempt and apply the fail-closed policy.
+    ///
+    /// Both [`receive_with_keys`](Self::receive_with_keys) and
+    /// [`receive_proofs`](Self::receive_proofs) run the same mint swap, so a
+    /// success, a clearly definitive error, an ambiguous error, and a timeout
+    /// must be reported identically: ambiguous outcomes and timeouts block the
+    /// mint until an explicit recovery run. `outcome` is the timed result of
+    /// the swap; its timeout error type is the platform adapter's, so it stays
+    /// generic and is only ever observed as "the deadline expired".
+    fn finish_receive<E>(
+        &mut self,
+        mint_url: MintUrl,
+        outcome: Result<Result<Amount, CdkError>, E>,
+    ) -> FfiResult<u64> {
+        match outcome {
+            Ok(Ok(amount)) => Ok(amount.to_u64()),
             Ok(Err(e)) => {
                 let err = map_receive_error(&e);
                 if is_clearly_definitive(&e) {
                     return Err(err);
                 }
+                // The swap may have partially executed at the mint (HTTP error,
+                // malformed response, ...). Fail closed and require an explicit
+                // recovery before this mint is used again.
                 self.unresolved.insert(mint_url);
-                return Err(FfiErr::new(
+                Err(FfiErr::new(
                     err.status,
                     format!(
                         "receive outcome is uncertain; the mint is blocked pending recovery: {e}"
                     ),
-                ));
+                ))
             }
             Err(_) => {
+                // The swap may have partially executed; fail closed.
                 self.unresolved.insert(mint_url);
-                return Err(FfiErr::new(
+                Err(FfiErr::new(
                     CdkStatus::NetworkError,
                     "receive exceeded the network deadline; the mint is blocked pending recovery",
-                ));
+                ))
             }
-        };
-        Ok(amount.to_u64())
+        }
     }
 
     /// One-shot send from an explicitly selected mint.

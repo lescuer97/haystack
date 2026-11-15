@@ -1,9 +1,21 @@
 # Experimental browser wallet: compiled and runtime-tested
 
-The complete browser bundle now builds and runs: CDK **0.18.3**, this repository's
-shared wallet-policy implementation, the vendored Spilman bindings, and the
-Zig/raylib renderer. **Use test funds only.** This is a working experimental port,
-not a production-security or full fault-recovery certification.
+The complete browser bundle now builds and runs: CDK **0.18.1** (Git tag
+`v0.18.1`, commit `a056e0f0f69e94f431b1aeb90d883f18c61ea4c6`), this repository's
+shared wallet-policy implementation, the upstream Spilman bindings (`cdk-spilman`
+`v0.2.0`, rev `8a5350dfd4d7c2902dc15c726a91dbfb2c793d43`), and the Zig/raylib
+renderer. The native C ABI uses exactly the same CDK source and the same Spilman
+rev. **Use test funds only.** This is a working experimental port, not a
+production-security or full fault-recovery certification.
+
+The CDK pin moved from the registry `0.18.3` crates to the upstream `v0.18.1` Git
+tag because upstream Spilman `v0.2.0` pins `v0.18.1`; see
+[dependency provenance and the deliberate downgrade](build.md#dependency-provenance-cdk-v0181-and-spilman-v020)
+for why, what the source review covers, and what it does **not** guarantee. That
+section also documents the explicit
+`python3 build-support/check_dependency_pins.py` check (`--offline` supported)
+that fails when the two Cargo roots disagree about a package's source, tag or
+commit.
 
 ## Build
 
@@ -161,7 +173,27 @@ zig build test-wallet
 zig build test
 ```
 
-### Linux validation after the onboarding startup fix (2026-11-13)
+### Dependency migration validation (2026-11-15)
+
+On Linux x86_64 with Zig 0.17.0 and Rust 1.99.0, the CDK `v0.18.1` /
+Spilman `v0.2.0` source pair passed offline provenance checks for native,
+browser Wasm and browser host/dev/fixture graphs. Production and local-mint
+fixture bundles built in both default and ReleaseSafe profiles. In each profile:
+
+- 62 browser database tests and 1 production mint-policy test passed (these host
+  tests use Cargo's unoptimized test profile in the existing browser graph);
+- all 59 onboarding checks and 8 negative regression cases passed;
+- the broader runner reproduced 237 passing checks and the same 3 documented
+  send/swap recovery failures, with no uncaught exceptions or cleanup failure.
+  Both full-suite commands exited **1**; neither is reported as passing.
+
+The separate current Node storage suite passed 23 game-storage, 36 wallet-storage,
+10 IndexedDB fixture and 15 CDP-helper checks, plus onboarding transport/input
+tests. Concurrent browser hardening changes were left intact. Logs are under
+`/tmp/opencode/spilman-completion-20261115-logs`. These results do not certify
+funded-wallet downgrade compatibility, macOS ARM, or production safety.
+
+### Historical Linux validation after the onboarding startup fix (2026-11-13)
 
 | Check | Result |
 | --- | --- |
@@ -376,6 +408,12 @@ field is secret material; never log it. Generated TypeScript declarations expose
 - This is experimental software for **test funds**, not a reviewed production
   browser wallet. Historical Chromium/Linux results predate v2 onboarding;
   Firefox/Safari and mobile are not verified.
+- The CDK source is the upstream `v0.18.1` Git tag, a deliberate step down from
+  the registry `0.18.3` crates this project used before, chosen so native,
+  browser and tests share one CDK resolution with upstream Spilman `v0.2.0`. The
+  wallet SQL schema is unchanged across those releases, but this is not a claim
+  that the releases are equivalent and not a compatibility certification for
+  funded wallets; see [build.md](build.md#dependency-provenance-cdk-v0181-and-spilman-v020).
 - Browser state, including mnemonic words, is plaintext origin storage.
   Proofs and tokens are bearer secrets. XSS or malicious same-origin scripts can
   compromise them. Browser clearing/eviction can destroy storage. A mnemonic alone

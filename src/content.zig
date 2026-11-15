@@ -44,7 +44,9 @@ pub const Store = struct {
         try sf.ensureOwnedDir(io, parent);
         try sf.ensureOwnedDir(io, self.root);
 
-        var dir = try self.openVerifiedRoot(io, false);
+        // The root descriptor is flushed after the atomic rename, so it must
+        // be opened sync-capable (a plain Linux directory open is `O_PATH`).
+        var dir = try self.openVerifiedRoot(io, true);
         defer dir.close(io);
 
         const existing = dir.statFile(io, key, .{ .follow_symlinks = false }) catch |err| switch (err) {
@@ -124,7 +126,12 @@ pub const Store = struct {
     /// Verify the Haystack-owned parent and content root without creating them,
     /// then open the root without following a final symlink. Both directory
     /// entries must be real `0700` directories.
-    fn openVerifiedRoot(self: Store, io: Io, iterate: bool) !Io.Dir {
+    ///
+    /// `syncable` selects open options that allow flushing the descriptor:
+    /// listings need an iterable handle and writes need a handle that can be
+    /// `fsync`ed after the rename. Both require a non-`O_PATH` directory on
+    /// Linux; reads and deletes do not.
+    fn openVerifiedRoot(self: Store, io: Io, syncable: bool) !Io.Dir {
         const parent = std.fs.path.dirname(self.root) orelse return error.InvalidPath;
         sf.verifyOwnedDir(io, parent) catch |err| switch (err) {
             error.FileNotFound => return error.FileNotFound,
@@ -137,7 +144,7 @@ pub const Store = struct {
         try sf.verifyDirectory(root_stat);
 
         return Io.Dir.openDirAbsolute(io, self.root, .{
-            .iterate = iterate,
+            .iterate = syncable,
             .follow_symlinks = false,
         });
     }
@@ -296,6 +303,13 @@ test "insecure content entries are rejected without chmod" {
     try testing.expectError(error.InsecurePermissions, store.read(testing.io, testing.allocator, "broad"));
     const after = try Io.Dir.cwd().statFile(testing.io, path, .{ .follow_symlinks = false });
     try testing.expectEqual(@as(u32, 0o644), sf.modeOf(after));
+    // With only the broad entry present, listing deterministically reports the
+    // same violation instead of depending on enumeration order.
+    try testing.expectError(error.InsecurePermissions, store.list(testing.io, testing.allocator));
+
+    // Remove the broad entry only after its unchanged mode was proven, so the
+    // symlink scenario below cannot observe it first.
+    try Io.Dir.cwd().deleteFile(testing.io, path);
 
     // A symlinked managed entry is not a committed content file.
     const target = try std.fs.path.join(testing.allocator, &.{ temp.root, "target" });

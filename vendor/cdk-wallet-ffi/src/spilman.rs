@@ -5,10 +5,11 @@
 //! * five wallet-backed helpers that expose the pieces a Spilman flow needs
 //!   from the local wallet (keyset info, raw NUT-03 swaps, and receiving
 //!   proofs/tokens that may be P2PK-locked);
-//! * twenty-three pure conversion helpers that wrap the vendored
-//!   [`cdk_spilman`] crate, so the Zig side can drive channel setup, balance
-//!   updates, cooperative close, and post-expiry sender refunds without
-//!   reimplementing any of the cryptography.
+//! * twenty-three pure conversion helpers that wrap the upstream
+//!   [`cdk_spilman`] crate (a Git dependency at an exact release commit), so
+//!   the Zig side can drive channel setup, balance updates, cooperative close,
+//!   and post-expiry sender refunds without reimplementing any of the
+//!   cryptography.
 //!
 //! Every function is panic-safe, returns a fixed-width status, and never echoes
 //! secret material in an error message. Secret-key and channel-secret hex inputs
@@ -17,19 +18,18 @@
 use safer_ffi::prelude::*;
 use zeroize::Zeroizing;
 
-use cdk::nuts::{BlindSignature, P2PKWitness, Proof, Proofs, SecretKey, Token, Witness};
+use cdk::nuts::{BlindSignature, CurrencyUnit, Id, Proof, Proofs, PublicKey, SecretKey, Token};
 use cdk::secp256k1::schnorr::Signature;
 use cdk::util::hex;
-use cdk_common::bitcoin::hashes::{sha256::Hash as Sha256Hash, Hash as _};
 use cdk_spilman::{
-    attach_signature_to_balance_update, attach_signature_to_first_input, build_cashu_a_token,
-    build_cashu_b_token, channel_parameters_get_channel_id, complete_funding_swap,
-    compute_channel_from_token, compute_channel_secret_from_hex, compute_funding_token_amount,
-    construct_proofs, create_funding_outputs, create_funding_swap, create_signed_balance_update,
-    create_unsigned_balance_update, parse_keyset_info_from_json, sig_all_message_hash_hex,
-    sign_with_tweaked_key_util, unblind_and_verify_stage1_response, verify_valid_channel,
-    BalanceUpdateMessage, ChannelParameters, CommitmentOutputs, DeterministicSecretWithBlinding,
-    EstablishedChannel, KeysetInfo, PreparedSenderRefund, Stage2Role,
+    attach_signature_to_balance_update, build_cashu_a_token, build_cashu_b_token,
+    channel_parameters_get_channel_id, complete_funding_swap, compute_channel_from_token,
+    compute_channel_secret_from_hex, compute_funding_token_amount, construct_proofs,
+    create_funding_outputs, create_funding_swap, create_signed_balance_update,
+    create_unsigned_balance_update, parse_keyset_info_from_json, sign_with_tweaked_key_util,
+    unblind_and_verify_stage1_response, verify_valid_channel, BalanceUpdateMessage, BridgeError,
+    ChannelFunding, ChannelParameters, ChannelState, ClosingData, DeterministicSecretWithBlinding,
+    EstablishedChannel, KeysetInfo, PaymentProof, PreparedSenderRefund, SpilmanBridge, SpilmanHost,
 };
 
 use crate::api::{
@@ -117,7 +117,7 @@ fn string_ok(value: String) -> CdkStringResult {
 
 /// Map an upstream `Result<String, String>` onto a [`CdkStringResult`].
 ///
-/// The vendored helpers report structural / validation failures as plain
+/// The upstream helpers report structural / validation failures as plain
 /// strings, so every failure maps to [`CdkStatus::InvalidArgument`].
 fn spilman_string(result: Result<String, String>) -> CdkStringResult {
     match result {
@@ -267,17 +267,225 @@ fn parse_signing_keys(raw: Option<char_p::Ref<'_>>) -> FfiResult<Vec<SecretKey>>
 // Spilman flow helpers
 // ---------------------------------------------------------------------------
 
-/// Replicate the receiver-side close preparation without a host.
+/// Fixed diagnostic for a host capability this one-call adapter must never use.
 ///
-/// Mirrors the upstream `prepare_close_data_impl`: attach the sender's
-/// signature to the first input, derive the receiver's blinded-signing tweak,
-/// sign the SIG_ALL message, and attach that second signature. The returned
-/// JSON carries the signed swap request plus the metadata
-/// [`cdk_spilman_unblind_close_swap`] needs.
+/// The cooperative-close path only reads the arguments it was given; anything
+/// that would persist, refresh keysets, or reach the network is a programming
+/// error, so the adapter refuses instead of pretending the mutation succeeded.
+/// No secret material is ever part of this text.
+const CLOSE_PREPARATION_UNSUPPORTED_HOST_CALL: &str =
+    "close preparation host does not support this operation";
+
+/// Panic guard for the trait's void mutators.
+///
+/// [`SpilmanHost`] declares two mutators that return no value, so a failure
+/// cannot be reported through `Result`. Refusing by panic (instead of silently
+/// dropping the write) is caught by the ABI's panic guard and surfaces as an
+/// internal error; nothing is persisted and no material is logged.
+fn close_preparation_reject_mutation(operation: &'static str) -> ! {
+    panic!("{CLOSE_PREPARATION_UNSUPPORTED_HOST_CALL}: {operation}")
+}
+
+/// Single-call [`SpilmanHost`] for cooperative-close preparation.
+///
+/// The upstream bridge is built around a stateful host that owns storage,
+/// keysets, and the receiver's signing capability. This ABI is stateless, so
+/// the host is constructed per call from arguments the caller already supplied
+/// and answers only the questions the close-preparation path asks:
+///
+/// * the channel identity must be the one derived from the caller's own
+///   channel parameters; every other identity is unknown;
+/// * the amount due is the caller's recipient balance, so the bridge's
+///   due-check cannot silently rewrite the signed commitment;
+/// * the only active keyset is the caller-selected output keyset, returned
+///   unchanged (never re-selected, refreshed, or replaced);
+/// * the clock is a synthetic `0` so the bridge's keyset-expiry filter keeps
+///   this adapter's historical behaviour (no expiry narrowing is introduced
+///   here, including `final_expiry = 0` and already-expired test keysets);
+/// * the receiver signature is produced only after the bridge has verified the
+///   sender signature, and only after this adapter checks that the supplied
+///   receiver secret key owns the channel's receiver public key.
+struct ClosePreparationHost {
+    /// Channel id derived from the caller's channel parameters.
+    channel_id: String,
+    /// Funding material parsed from the caller's arguments.
+    funding: ChannelFunding,
+    /// Caller-selected close output keyset.
+    output_keyset: KeysetInfo,
+    /// The same keyset as the caller's JSON, returned byte-for-byte.
+    output_keyset_json: String,
+    /// Recipient balance the sender signed.
+    amount_due: u64,
+    /// Receiver secret key, zeroized for the host's lifetime.
+    receiver_secret_key_hex: Zeroizing<String>,
+    /// Channel receiver public key the secret must own.
+    receiver_pubkey: PublicKey,
+}
+
+impl SpilmanHost<String> for ClosePreparationHost {
+    fn receiver_key_is_acceptable(&self, receiver_pubkey: &PublicKey) -> bool {
+        receiver_pubkey == &self.receiver_pubkey
+    }
+
+    fn mint_and_keyset_is_acceptable(&self, _mint: &str, keyset_id: &Id) -> bool {
+        keyset_id == &self.output_keyset.keyset_id
+    }
+
+    fn get_funding(&self, channel_id: &str) -> Option<ChannelFunding> {
+        (channel_id == self.channel_id).then(|| self.funding.clone())
+    }
+
+    fn save_funding(
+        &self,
+        _channel_id: &str,
+        _funding: ChannelFunding,
+        _initial_payment: PaymentProof,
+    ) {
+        close_preparation_reject_mutation("save_funding")
+    }
+
+    fn get_amount_due(&self, channel_id: &str, _context: Option<&String>) -> u64 {
+        if channel_id == self.channel_id {
+            self.amount_due
+        } else {
+            0
+        }
+    }
+
+    fn record_payment(&self, _channel_id: &str, _payment: PaymentProof, _context: &String) {
+        close_preparation_reject_mutation("record_payment")
+    }
+
+    fn get_channel_state(&self, channel_id: &str) -> Result<Option<ChannelState>, String> {
+        // The caller is closing a channel it just described; the adapter has no
+        // stored lifecycle and must not report a closed channel it cannot know.
+        Ok((channel_id == self.channel_id).then_some(ChannelState::Open))
+    }
+
+    fn mark_channel_closing(
+        &self,
+        _channel_id: &str,
+        _expiry_timestamp: u64,
+        _payment: PaymentProof,
+    ) -> Result<(), String> {
+        Err(CLOSE_PREPARATION_UNSUPPORTED_HOST_CALL.to_string())
+    }
+
+    fn get_closing_data(&self, _channel_id: &str) -> Option<ClosingData> {
+        None
+    }
+
+    fn get_channel_policy(&self, _unit: &str) -> Option<cdk_spilman::ChannelPolicy> {
+        None
+    }
+
+    fn now_seconds(&self) -> u64 {
+        // Synthetic clock: keeps the bridge's `is_unexpired_at` filter true for
+        // every keyset, including `final_expiry = 0`, so this adapter performs
+        // exactly the expiry checking it always did (none).
+        0
+    }
+
+    fn get_balance_and_signature_for_unilateral_exit(
+        &self,
+        _channel_id: &str,
+    ) -> Option<PaymentProof> {
+        None
+    }
+
+    fn get_active_keyset_ids(&self, _mint: &str, _unit: &CurrencyUnit) -> Vec<Id> {
+        // Only the caller's keyset; the bridge must not choose another one.
+        vec![self.output_keyset.keyset_id]
+    }
+
+    fn has_keysets_for_unit(&self, _mint: &str, _unit: &CurrencyUnit) -> bool {
+        false
+    }
+
+    fn get_keyset_info(&self, _mint: &str, keyset_id: &Id) -> Option<String> {
+        (keyset_id == &self.output_keyset.keyset_id).then(|| self.output_keyset_json.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mark_channel_closed(
+        &self,
+        _channel_id: &str,
+        _expiry_timestamp: u64,
+        _balance: u64,
+        _receiver_proofs_json: &str,
+        _sender_proofs_json: &str,
+        _receiver_sum: u64,
+        _sender_sum: u64,
+    ) -> Result<(), String> {
+        Err(CLOSE_PREPARATION_UNSUPPORTED_HOST_CALL.to_string())
+    }
+
+    fn compute_channel_secret(
+        &self,
+        _receiver_pubkey_hex: &str,
+        _sender_pubkey_hex: &str,
+    ) -> Result<String, String> {
+        Err(CLOSE_PREPARATION_UNSUPPORTED_HOST_CALL.to_string())
+    }
+
+    fn sign_with_tweaked_key(
+        &self,
+        signer_pubkey_hex: &str,
+        message_hex: &str,
+        tweak_scalar_hex: &str,
+    ) -> Result<String, String> {
+        // Runs inside the bridge, after the sender signature verified: the
+        // receiver's ownership check keeps its original phase and wording.
+        let receiver_secret = SecretKey::from_hex(&self.receiver_secret_key_hex)
+            .map_err(|_| "Invalid receiver secret key".to_string())?;
+        let receiver_pubkey = receiver_secret.public_key();
+        if receiver_pubkey != self.receiver_pubkey || receiver_pubkey.to_hex() != signer_pubkey_hex
+        {
+            return Err(
+                "receiver secret key does not match channel receiver public key".to_string(),
+            );
+        }
+        sign_with_tweaked_key_util(&self.receiver_secret_key_hex, message_hex, tweak_scalar_hex)
+            .map_err(|e| format!("Failed to sign close message: {e}"))
+    }
+}
+
+/// Render a bridge failure with this ABI's stable diagnostic wording.
+///
+/// The two adapter-owned categories keep their exact historical text. Anything
+/// the bridge reports as an internal build/derivation failure becomes a fixed,
+/// sanitized message: upstream hides its step names, and the C ABI must not
+/// depend on private wording it cannot inspect.
+fn close_preparation_error(error: BridgeError) -> String {
+    match error {
+        BridgeError::InvalidSignature(e) => format!("Invalid sender signature: {e}"),
+        // The signing callback already produced this adapter's final wording.
+        BridgeError::ServerMisconfigured(message) => message,
+        BridgeError::BalanceExceedsCapacity { balance, capacity } => {
+            format!("balance {balance} exceeds channel capacity {capacity}")
+        }
+        _ => "failed to prepare cooperative close".to_string(),
+    }
+}
+
+/// Prepare the receiver-side close request through the upstream bridge.
+///
+/// The bridge is the upstream `validate_and_prepare_cooperative_close` entry
+/// point driven by [`ClosePreparationHost`]: the sender's signature is verified
+/// against the caller's channel id, the commitment swap is built and
+/// co-signed, and the amount-sorted secret metadata is returned. Only this
+/// adapter's own validation (capacity, output unit, receiver-key ownership) and
+/// the public JSON shape live here, and the JSON keeps its historical keys so
+/// [`cdk_spilman_unblind_close_swap`] keeps working unchanged.
+#[allow(clippy::too_many_arguments)]
 fn prepare_close_swap_json(
     params: &ChannelParameters,
+    channel_parameters_json: &str,
+    channel_secret_hex: &str,
+    funding_keyset_info_json: &str,
     output_keyset: &KeysetInfo,
-    funding_proofs: Vec<Proof>,
+    output_keyset_info_json: &str,
+    funding_proofs_json: &str,
     balance: u64,
     sender_signature_hex: &str,
     receiver_secret_key_hex: &str,
@@ -297,68 +505,35 @@ fn prepare_close_swap_json(
         .parse()
         .map_err(|e| format!("Invalid sender signature: {e}"))?;
 
-    let commitment = CommitmentOutputs::for_balance(balance, params)
-        .map_err(|e| format!("Failed to build commitment outputs: {e}"))?;
-    let mut swap = commitment
-        .create_swap_request(funding_proofs.clone(), Some(output_keyset.keyset_id))
-        .map_err(|e| format!("Failed to create close swap request: {e}"))?;
-    attach_signature_to_first_input(&mut swap, &sender_signature.to_string())
-        .map_err(|e| format!("Failed to attach sender signature: {e}"))?;
-
-    let channel = EstablishedChannel::new(params.clone(), funding_proofs)
-        .map_err(|e| format!("Failed to build channel: {e}"))?;
-    BalanceUpdateMessage {
+    let host = ClosePreparationHost {
         channel_id: params.get_channel_id(),
-        amount: balance,
-        signature: sender_signature,
-    }
-    .verify_sender_signature(&channel)
-    .map_err(|e| format!("Invalid sender signature: {e}"))?;
+        funding: ChannelFunding {
+            params_json: channel_parameters_json.to_string(),
+            funding_proofs_json: funding_proofs_json.to_string(),
+            channel_secret_hex: channel_secret_hex.to_string(),
+            keyset_info_json: funding_keyset_info_json.to_string(),
+        },
+        output_keyset: output_keyset.clone(),
+        output_keyset_json: output_keyset_info_json.to_string(),
+        amount_due: balance,
+        receiver_secret_key_hex: Zeroizing::new(receiver_secret_key_hex.to_string()),
+        receiver_pubkey: params.receiver_pubkey,
+    };
 
-    let tweak = hex::encode(
-        params
-            .derive_receiver_blinding_scalar_for_stage1()
-            .map_err(|e| format!("Failed to derive receiver blinding scalar: {e}"))?
-            .to_be_bytes(),
-    );
-    let sig_all_message_hash = sig_all_message_hash_hex(&swap);
-    let blinded_receiver_pubkey = params
-        .get_receiver_blinded_pubkey_for_stage1()
-        .map_err(|e| format!("Failed to derive receiver blinded pubkey: {e}"))?
-        .to_hex();
-    let receiver_secret = SecretKey::from_hex(receiver_secret_key_hex)
-        .map_err(|_| "Invalid receiver secret key".to_string())?;
-    if receiver_secret.public_key() != params.receiver_pubkey {
-        return Err("receiver secret key does not match channel receiver public key".to_string());
-    }
-    let receiver_signature =
-        sign_with_tweaked_key_util(receiver_secret_key_hex, &sig_all_message_hash, &tweak)
-            .map_err(|e| format!("Failed to sign close message: {e}"))?;
-    attach_signature_to_first_input(&mut swap, &receiver_signature)
-        .map_err(|e| format!("Failed to attach receiver signature: {e}"))?;
+    // The bridge deserializes the payment itself; only the three signed fields
+    // are needed, and the caller's arguments stay authoritative.
+    let request = serde_json::json!({
+        "channel_id": params.get_channel_id(),
+        "balance": balance,
+        "signature": sender_signature.to_string(),
+    });
 
-    let expected_total = params
-        .get_value_after_stage1_with_keyset(output_keyset)
-        .map_err(|e| format!("Failed to compute expected total: {e}"))?;
+    let close = SpilmanBridge::new(host)
+        .validate_and_prepare_cooperative_close(&request.to_string())
+        .map_err(close_preparation_error)?;
 
-    let mut secrets_with_blinding: Vec<(DeterministicSecretWithBlinding, bool)> = commitment
-        .receiver_outputs
-        .get_secrets_with_blinding()
-        .map_err(|e| format!("Failed to derive receiver secrets: {e}"))?
-        .into_iter()
-        .map(|secret| (secret, true))
-        .chain(
-            commitment
-                .sender_outputs
-                .get_secrets_with_blinding()
-                .map_err(|e| format!("Failed to derive sender secrets: {e}"))?
-                .into_iter()
-                .map(|secret| (secret, false)),
-        )
-        .collect();
-    secrets_with_blinding.sort_by_key(|(secret, _)| secret.amount);
-
-    let secrets_with_blinding: Vec<serde_json::Value> = secrets_with_blinding
+    let secrets_with_blinding: Vec<serde_json::Value> = close
+        .secrets_with_blinding
         .iter()
         .map(|(secret, is_receiver)| {
             serde_json::json!({
@@ -372,13 +547,13 @@ fn prepare_close_swap_json(
         .collect();
 
     let result = serde_json::json!({
-        "swap_request": serde_json::to_value(&swap)
+        "swap_request": serde_json::to_value(&close.swap_request)
             .map_err(|e| format!("Failed to serialize swap request: {e}"))?,
-        "sig_all_message_hash": sig_all_message_hash,
-        "blinded_receiver_pubkey": blinded_receiver_pubkey,
-        "expected_total": expected_total,
+        "sig_all_message_hash": close.sig_all_message_hash,
+        "blinded_receiver_pubkey": close.blinded_receiver_pubkey,
+        "expected_total": close.expected_total,
         "secrets_with_blinding": secrets_with_blinding,
-        "output_keyset_info": serde_json::to_value(output_keyset)
+        "output_keyset_info": serde_json::to_value(&close.output_keyset_info)
             .map_err(|e| format!("Failed to serialize output keyset info: {e}"))?,
     });
     Ok(result.to_string())
@@ -387,8 +562,10 @@ fn prepare_close_swap_json(
 /// Unblind a close swap response and sign the receiver's proofs.
 ///
 /// [`unblind_and_verify_stage1_response`] already attaches the stage-2 P2PK
-/// secret to each proof, so this only has to derive the per-proof tweak, sign
-/// the secret hash, and install the witness.
+/// secret to each proof, so this only has to derive the per-proof stage-2 key
+/// from the receiver's channel key and sign the proof secret with it. The
+/// derivation and signing are both public upstream operations; this adapter
+/// never recomposes the crypto itself.
 fn unblind_close_swap(
     params: &ChannelParameters,
     output_keyset: &KeysetInfo,
@@ -405,7 +582,7 @@ fn unblind_close_swap(
     // receiver public key before signing; `None` means the caller only wants
     // the stage-2 P2PK secret attached (e.g. Alice unblinding the close
     // response) without pre-signing `receiver_proofs`.
-    let receiver_secret_key_hex = match receiver_secret_key_hex {
+    let receiver_secret = match receiver_secret_key_hex {
         Some(hex) => {
             let receiver_secret =
                 SecretKey::from_hex(hex).map_err(|_| "Invalid receiver secret key".to_string())?;
@@ -414,7 +591,7 @@ fn unblind_close_swap(
                     "receiver secret key does not match channel receiver public key".to_string(),
                 );
             }
-            Some(hex)
+            Some(receiver_secret)
         }
         None => None,
     };
@@ -431,23 +608,21 @@ fn unblind_close_swap(
     let mut receiver_proofs = Vec::with_capacity(result.receiver_proofs.len());
     for proof_meta in &result.receiver_proofs {
         let mut proof = proof_meta.proof.clone();
-        if let Some(receiver_secret_key_hex) = receiver_secret_key_hex {
-            let tweak_info = params
-                .stage2_tweak_info_for_role(
-                    Stage2Role::Receiver,
+        if let Some(receiver_secret) = &receiver_secret {
+            let stage2_secret = params
+                .get_receiver_blinded_secret_key_for_stage2_output(
+                    receiver_secret,
                     proof_meta.amount,
                     proof_meta.index,
                 )
-                .map_err(|e| format!("Failed to derive receiver stage-2 tweak: {e}"))?;
-            let tweak_hex = hex::encode(tweak_info.stage2_tweak_scalar.to_be_bytes());
-            let message_hash = Sha256Hash::hash(&proof.secret.to_bytes());
-            let message_hex = hex::encode(message_hash.to_byte_array());
-            let signature =
-                sign_with_tweaked_key_util(receiver_secret_key_hex, &message_hex, &tweak_hex)
-                    .map_err(|e| format!("Failed to sign receiver proof: {e}"))?;
-            proof.witness = Some(Witness::P2PKWitness(P2PKWitness {
-                signatures: vec![signature],
-            }));
+                .map_err(|e| format!("Failed to derive receiver stage-2 key: {e}"))?;
+            // `Proof::sign_p2pk` hashes the proof secret internally and would
+            // append to an inherited witness; the wrapper has always replaced
+            // it with exactly one receiver signature.
+            proof.witness = None;
+            proof
+                .sign_p2pk(stage2_secret)
+                .map_err(|e| format!("Failed to sign receiver proof: {e}"))?;
         }
         receiver_proofs.push(proof);
     }
@@ -1492,14 +1667,20 @@ pub fn cdk_spilman_prepare_close_swap(
                 Ok(keyset) => keyset,
                 Err(e) => return CdkStringResult::err(CdkStatus::InvalidArgument, e),
             };
-            let funding_proofs = match parse_proofs(&funding_proofs_json) {
-                Ok(proofs) => proofs,
-                Err(e) => return CdkStringResult::err(CdkStatus::InvalidArgument, e),
-            };
+            // Validate the caller's funding proofs up front, at this adapter's
+            // original phase; the bridge re-parses the same caller JSON so no
+            // value is re-serialized on the way in.
+            if let Err(e) = parse_proofs(&funding_proofs_json) {
+                return CdkStringResult::err(CdkStatus::InvalidArgument, e);
+            }
             spilman_string(prepare_close_swap_json(
                 &params,
+                &params_json,
+                &channel_secret_hex,
+                &funding_keyset_info_json,
                 &output_keyset,
-                funding_proofs,
+                &output_keyset_info_json,
+                &funding_proofs_json,
                 balance,
                 &sender_signature_hex,
                 &receiver_secret_key_hex,

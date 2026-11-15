@@ -300,11 +300,17 @@ and `zig-out/web` products from the previous build layout are not deleted.
 
 The desktop graph installs the checkout-level `assets` directory into
 `<prefix>/desktop/bin/assets`, next to the executable. That directory is
-deliberately gitignored and is not part of a clean checkout; a desktop install
-therefore requires the asset source to be present locally. A missing `assets`
-directory fails the install step rather than silently skipping the assets. The
-browser renderer currently loads no assets; assets are not installed into the
-Wasm bundle.
+deliberately gitignored and is not part of a clean checkout; a local desktop
+install therefore requires the asset source directory to exist. A missing
+`assets` directory fails the install step rather than silently skipping the
+assets. The current renderer loads no external assets, so local builds may use an
+empty `assets` directory; a real asset pack is optional, local-only content. The
+CI desktop jobs create an empty `assets` fixture before their first desktop
+install. That fixture only exercises the existing install and relocation
+packaging path: it is not a real asset pack, does not validate asset loading or
+production content, and CI never fetches or downloads assets. The browser
+renderer currently loads no assets; assets are not installed into the Wasm
+bundle.
 
 Default optimization is **Debug for desktop**, **ReleaseSmall for Wasm**.
 An unqualified `--release` selects ReleaseSafe on desktop and ReleaseSmall on Wasm.
@@ -341,13 +347,139 @@ Optional advanced overrides:
 Normal `run -Dplatform=wasm` only serves static assets; it never starts a fake
 mint or creates funds. Fake mint behavior is explicit and test-only.
 
+## Dependency provenance: CDK `v0.18.1` and Spilman `v0.2.0`
+
+Both Cargo roots — `vendor/cdk-wallet-ffi` (native C ABI) and `browser/wallet`
+(Wasm) — declare the same direct CDK packages as Git dependencies, not registry
+versions:
+
+| Package | Source | Selector |
+| --- | --- | --- |
+| `cdk`, `cdk-common`, `cdk-sqlite`, `cashu` (transitive) | `https://github.com/cashubtc/cdk.git` | tag `v0.18.1` → commit `a056e0f0f69e94f431b1aeb90d883f18c61ea4c6` |
+| `cdk-axum`, `cdk-fake-wallet` (native dev/test only) | same | same tag and commit |
+| `cdk-spilman` | `https://github.com/SatsAndSports/cashu_spilman_channels` | rev `8a5350dfd4d7c2902dc15c726a91dbfb2c793d43` (release `v0.2.0`) |
+
+Each direct CDK dependency also carries `version = "=0.18.1"` as a version guard.
+The lockfiles and provenance check additionally guard the source and commit,
+including a moved tag that still reports the same version. Identity is checked by **source URL, selector and resolved
+commit**, not by version string alone: a registry copy that happened to report
+`0.18.1` would still be rejected. There is no Cargo workspace merge, no
+`[patch]` section, no fork and no local crate copy: `vendor/cdk-spilman` was
+removed once the upstream Git dependency compiled and the equivalence tests
+passed.
+
+Verify the resolved graph explicitly, after provisioning tools:
+
+```sh
+python3 build-support/check_dependency_pins.py              # add --offline to forbid Cargo network access
+```
+
+The checker runs `rustup run 1.99.0 cargo metadata --locked --format-version 1
+--all-features --filter-platform …` for both manifests (host triple for the native
+graph; both `wasm32-unknown-unknown` and the host triple for the browser graph).
+This includes dev/test dependencies and the browser's local-mint fixture feature. It
+fails when a CDK/Cashu package comes from anywhere else, when a version,
+selector or commit differs, when a package is resolved from two sources, when
+Spilman is not the pinned rev, or when the two roots disagree about a shared
+package's identity. It is a **check only**: it never provisions tools, and a
+normal `zig build` never runs it. CI runs it once per job after the job's own
+tool-provisioning step.
+
+**Offline Git cache priming is separate from setup.** `zig build setup` installs
+toolchains, targets, wasm-bindgen and Emscripten; it never fetches Cargo
+dependencies. Publishing the pinned Git sources requires an ordinary online
+`cargo fetch`/`cargo metadata` (or any normal build) in both roots to populate
+`~/.cargo/git`; only then do `-Doffline` builds and the checker's `--offline`
+flag work. No step installs tools implicitly.
+
+### Why `0.18.3` → `0.18.1` (deliberate, not equivalent)
+
+Upstream Spilman `v0.2.0` pins CDK `v0.18.1`. Rather than mix a published
+Spilman crate with a registry CDK and risk two CDK resolutions across native,
+browser and tests, this repository moved **all** CDK/Cashu dependencies to the
+single `v0.18.1` source. This is a deliberate downgrade from the `0.18.3`
+registry crates this project used before, and it is **not** a claim that the two
+releases are equivalent, nor a production certification.
+
+Source review of upstream `v0.18.1…v0.18.3` for the paths this ABI uses:
+
+- all 168 SQL migration files (62 wallet, 79 mint, 7 mint-auth, 20 supabase) are
+  byte-identical, so the stored schema is unchanged;
+- `wallet/send`, `wallet/receive`, `wallet/swap` and `wallet/saga` are
+  unchanged;
+- the wallet files that do differ are `wallet/issue`, `wallet/melt`,
+  `npubcash`, `wallet_trait` and `test_utils`, plus SQL transaction
+  cleanup/pool and in-memory database handling outside the wallet module.
+  Even when this ABI does not call a changed wallet operation directly, shared
+  database transaction cleanup can affect the operations it does call.
+
+Relevant fixes that are therefore **not** included, and their scope:
+
+- `f1cbc3031fb1e80309091f17f9e6926e1d2737f1` — hardens SQL transaction cleanup
+  (`sqlx`/`rusqlite` transaction helpers). This ABI's own writes go through its
+  wrapper and upstream saga code; the fix still concerns transaction teardown,
+  so its absence is a real (if narrow) difference.
+- `c64d253e54ecf5bba9e6aba09924fb656c51ef2e` — fail on a lost in-memory database.
+- `322fe0b09c8c634497ef3fdf3c41b69830105cfd` — recover mint quote signing
+  keys from the seed. Not used by this small ABI.
+
+This adapter is not the upstream `cdk-ffi` crate: it has its own panic/poison
+guard, so upstream `cdk-ffi`-only fixes are not evidence about this wrapper
+either way.
+
+Schema-level evidence is limited to a disposable fixture: a pristine, empty
+0.18.3 SQLite wallet produced by the wrapper (dummy seed, 40 migrations, 36-byte
+wrapper marker, no funds and no mints) was reopened through a copy under 0.18.1.
+That proves the empty, unfunded schema reopens; it does **not** prove a funded
+wallet or full history compatibility. Treat existing wallets conservatively:
+back up the wallet directory before switching builds, and remember this is an
+experimental, test-funds-only wallet. See
+[browser-wallet.md](browser-wallet.md#boundaries-and-remaining-validation) for
+the browser-side limits.
+
 ## Verification
 
-Verified on this Linux machine (Zig 0.17.0, Rust 1.99.0):
+### Dependency migration validation (2026-11-15, Linux x86_64)
 
-- `zig build test-build`: **139** Python setup/check/graph-isolation tests and
-  **15** Zig tests (11 native-platform-matrix plus 4 upstream Emscripten adapter
-  tests) passed. Coverage includes installed/missing/partial Rust
+With Zig 0.17.0 and pinned Rust 1.99.0, using warmed caches and `-Doffline`:
+
+- Dependency guard: **36 unit tests passed**; real locked, all-feature metadata
+  passed for native, browser Wasm and browser host/dev/fixture graphs.
+- `zig build test-build -Doffline`: **180 Python tests passed** and both Zig
+  graph-contract test artifacts succeeded.
+- Native Cargo check and browser Wasm Cargo check (including the local-mint
+  fixture feature) passed. Native Rust suites passed **74 tests**, up from the
+  pre-migration baseline of 69, in both Debug and ReleaseSafe.
+- Native `header-check`, `test-spilman`, `test-wallet` and application `test`
+  passed; the native Zig suites reported **193 passed, 2 skipped**, also in
+  ReleaseSafe. The checked-in header and Spilman JSON vectors are unchanged.
+- Desktop and production Wasm bundles built in both default and ReleaseSafe
+  profiles. Browser host tests passed **62 database tests plus 1 mint-policy
+  test** in both invocations (the existing browser graph runs these host tests
+  in Cargo's unoptimized test profile). Default and ReleaseSafe browser integration each
+  reproduced **237 passing checks and only the same 3 documented send/swap
+  recovery failures**; each command exited **1**, not success, with no uncaught
+  exceptions or cleanup failure. Both ran all 59 onboarding checks and 8 negative
+  regression cases successfully. The separate current Node storage run passed
+  23 game-storage, 36 wallet-storage, 10 IndexedDB fixture and 15 CDP-helper
+  checks, plus onboarding transport/input tests; concurrent browser hardening
+  work was preserved rather than included in the migration implementation.
+- The disposable 0.18.3 empty-wallet copy reopened under 0.18.1 with unchanged
+  schema, applied migrations, marker and logical row counts; the pristine
+  snapshot hash remained unchanged. This is not funded-wallet certification.
+
+Logs: `/tmp/opencode/spilman-completion-20261115-logs`; earlier downgrade-probe
+logs: `/tmp/opencode/spilman-migration-20261115-143423/logs/22…24-*`.
+macOS ARM verification remains CI-only; it was not run on this Linux host.
+
+### Historical build-tooling checks
+
+Historical checks before the 2026-11-15 dependency migration, on this Linux
+machine (Zig 0.17.0, Rust 1.99.0); these counts are not post-migration results:
+
+- `zig build test-build`: **141** Python setup/check/graph-isolation/CI-workflow
+  tests and **15** Zig tests (11 native-platform-matrix plus 4 upstream Emscripten
+  adapter tests) passed. Coverage includes installed/missing/partial Rust
   toolchain+target states, wasm-bindgen and Emscripten check/provision/offline
   modes, exact `emcc` banner-version parsing (rejecting `4.0.190`, `4.0.19x` and
   arbitrary text), installer-call assertions, the synthetic GNU/musl/
@@ -410,7 +542,12 @@ claims otherwise.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs three independent jobs:
+`.github/workflows/ci.yml` runs three independent jobs. Both desktop jobs create
+an empty `assets/` fixture before their first desktop install: the checkout-level
+asset directory is gitignored, the current renderer loads no external assets, and
+the empty fixture only exercises the existing install/relocation packaging path.
+It is not a real asset pack, is not validation of asset loading and is never
+fetched or downloaded.
 
 - **Linux desktop**: installs the pinned Zig plus raylib/X11/OpenGL
   prerequisites, runs `zig build setup` to provision the selected Rust

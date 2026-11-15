@@ -1,8 +1,5 @@
 // Isolated CDP runner: all wallet data lives in disposable browser contexts.
-import {spawn} from 'node:child_process';
-import {mkdtemp, rm} from 'node:fs/promises';
-import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {bounded, CdpConnection, discoverEndpoint, launchBrowser, makeProfile, removeProfile, stopBrowser, watchdog} from './cdp-runner.mjs';
 
 const input = new URL(process.argv[2]);
 if (input.protocol !== 'http:' || input.hostname !== '127.0.0.1' || !input.port) throw new Error('Expected local fake mint URL');
@@ -12,60 +9,36 @@ if (!['', 'drop-ready', 'drop-complete', 'backup-error', 'backup-rejection'].inc
     !['all', 'create', 'recovery'].includes(selectedFlow) || (fault && selectedFlow === 'all')) {
   throw new Error('Invalid onboarding test fault/flow selection');
 }
-const profile = await mkdtemp(join(tmpdir(), 'haystack-onboarding-'));
-const browser = spawn(process.env.CHROMIUM || 'chromium', ['--headless', '--no-sandbox', `--user-data-dir=${profile}`, '--remote-debugging-port=0', 'about:blank'], {stdio:['ignore','ignore','pipe']});
-let socket, sequence = 0;
-const pending = new Map(), contexts = [];
+const profile = await makeProfile('haystack-onboarding-');
+const browser = launchBrowser(profile);
+let connection;
+const contexts = [];
 const runtimeBinding = 'haystackTestRuntime';
 // Node owns these counters: destroying a document must never erase its errors.
 const runtimeReports = new Map();
-let timer;
 let failureLabel = 'browser startup';
 function send(method, params = {}, sessionId) {
-  const id = ++sequence;
-  return new Promise((resolve, reject) => {
-    pending.set(id, {resolve, reject});
-    socket.send(JSON.stringify({id, method, params, ...(sessionId ? {sessionId} : {})}));
-  });
+  return connection.send(method, params, sessionId);
 }
 async function run() {
-  const endpoint = await new Promise((resolve, reject) => {
-    let stderr = '';
-    browser.stderr.on('data', chunk => {
-      stderr += chunk;
-      const match = stderr.match(/DevTools listening on (ws:\/\/[^\s]+)/);
-      if (match) resolve(match[1]);
-    });
-    browser.once('error', reject);
-    browser.once('exit', () => reject(new Error('browser exited')));
-  });
-  socket = new WebSocket(endpoint);
-  await new Promise((resolve, reject) => { socket.onopen = resolve; socket.onerror = reject; });
-  socket.onclose = () => { for (const p of pending.values()) p.reject(new Error('CDP closed')); pending.clear(); };
-  socket.onmessage = ({data}) => {
-    const message = JSON.parse(data);
-    if (message.method === 'Runtime.bindingCalled' && message.params.name === runtimeBinding) {
-      const report = runtimeReports.get(message.sessionId);
-      if (!report) return;
-      // Deliberately discard exception messages, values, stacks and URLs.
-      switch (message.params.payload) {
-        case 'error': report.errors++; break;
-        case 'rejection': report.rejections++; break;
-        case 'barrier': report.barriers++; break;
-        case 'fault':
-          if (!report.faultInjected) console.log(`Fault injected: ${fault} (${report.flow})`);
-          report.faultInjected = true;
-          break;
-        default: report.monitorErrors++;
-      }
-      return;
+  const endpoint = await discoverEndpoint(browser);
+  connection = await CdpConnection.connect(endpoint);
+  connection.on('Runtime.bindingCalled', message => {
+    if (message.params.name !== runtimeBinding) return;
+    const report = runtimeReports.get(message.sessionId);
+    if (!report) return;
+    // Deliberately discard exception messages, values, stacks and URLs.
+    switch (message.params.payload) {
+      case 'error': report.errors++; break;
+      case 'rejection': report.rejections++; break;
+      case 'barrier': report.barriers++; break;
+      case 'fault':
+        if (!report.faultInjected) console.log(`Fault injected: ${fault} (${report.flow})`);
+        report.faultInjected = true;
+        break;
+      default: report.monitorErrors++;
     }
-    if (!message.id) return;
-    const p = pending.get(message.id);
-    if (!p) return;
-    pending.delete(message.id);
-    if (message.error) p.reject(new Error('CDP command failed')); else p.resolve(message.result);
-  };
+  });
   // Fault runs isolate one actual-game flow; normal runs keep the Rust fixture.
   for (const flow of fault ? [] : ['create', 'restore']) {
     const {browserContextId} = await send('Target.createBrowserContext', {disposeOnDetach:true});
@@ -81,7 +54,7 @@ async function run() {
         const result = await send('Runtime.evaluate', {expression:'window.onboardingTestReport || null', returnByValue:true}, sessionId);
         report = result.result?.value;
       } catch (_) {
-        if (socket.readyState !== WebSocket.OPEN) throw new Error('CDP closed');
+        if (!connection.isOpen) throw new Error('CDP closed');
       }
       if (!report) await new Promise(resolve => setTimeout(resolve, 200));
     }
@@ -208,7 +181,7 @@ async function runGame(flow) {
         if (await evaluate(expression)) { checks.push(label); return; }
       } catch (_) {
         // Reload temporarily destroys the old execution context.
-        if (socket.readyState !== WebSocket.OPEN) throw new Error('CDP closed');
+        if (!connection.isOpen) throw new Error('CDP closed');
       }
       await new Promise(resolve => setTimeout(resolve, 50));
     }
@@ -345,23 +318,27 @@ async function runGame(flow) {
   checks.push('recovery game has no uncaught errors across reloads');
   console.log(JSON.stringify({flow:'game-recovery-reload', ok:true, checks}));
 }
+const watch = watchdog(fault ? 45000 : 240000, 'onboarding test');
+const work = run();
+// If the watchdog wins the race, the losing execution must not surface as an
+// unhandled rejection while the browser is being torn down.
+work.catch(() => {});
 try {
-  await Promise.race([run(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('onboarding test timed out')), fault ? 45000 : 240000); })]);
+  await Promise.race([work, watch.promise]);
 } catch (_) {
   console.error(`Onboarding browser test failed or timed out: ${failureLabel}`);
   process.exitCode = 1;
 } finally {
-  clearTimeout(timer);
-  if (socket?.readyState === WebSocket.OPEN) {
+  watch.stop();
+  if (connection?.isOpen) {
     for (const browserContextId of contexts) {
-      try { await Promise.race([send('Target.disposeBrowserContext', {browserContextId}), new Promise(resolve => setTimeout(resolve, 1000))]); } catch (_) {}
+      try { await bounded(send('Target.disposeBrowserContext', {browserContextId}), 1000, 'context disposal'); } catch (_) {}
     }
-    socket.close();
+    connection.close();
   }
-  browser.kill('SIGKILL');
-  await new Promise(resolve => { if (browser.exitCode !== null || browser.signalCode !== null) resolve(); else { browser.once('exit', resolve); setTimeout(resolve, 3000); } });
+  await stopBrowser(browser);
   // Chromium helpers can finish touching the disposable profile just after the
   // main process exits. Retry bounded transient ENOTEMPTY/EBUSY failures.
-  try { await rm(profile, {recursive:true, force:true, maxRetries:5, retryDelay:100}); }
+  try { await removeProfile(profile); }
   catch (_) { console.error('Disposable onboarding browser profile cleanup failed'); process.exitCode = 1; }
 }

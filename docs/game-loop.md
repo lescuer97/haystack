@@ -102,30 +102,50 @@ protects completion-transition frames that started with recovery words visible.
 
 After the window and world are initialized, the first frame displays a blocking
 loading overlay. Native wallet inspection and, when needed, provisioning run
-synchronously after that frame. A valid legacy wallet proceeds directly to the
-game. A newly provisioned or pending wallet displays its recovery words and
+synchronously after that frame. A validated existing wallet proceeds directly to
+the game. A newly provisioned or pending wallet displays its recovery words and
 requires the player to acknowledge saving them before continuing. Completion
 must be persisted successfully; otherwise the player can retry. Invalid or
 unavailable wallet storage blocks startup without repairing existing data.
 Copying is optional and exposes the words to other applications and clipboard
-history; the clipboard is not automatically cleared. Browser startup and its
-separate wallet provisioning policy are unchanged.
+history; the clipboard is not automatically cleared. The desktop wallet is
+persistent: `seed-words.txt` and `wallet.sqlite` live in a Haystack-owned wallet
+directory with owner-only permissions. The mnemonic is plaintext, so filesystem
+access exposes it; see [cdk-wallet-ffi.md](cdk-wallet-ffi.md) for the native
+storage and ACL rules. Browser startup uses the same shared onboarding model but
+a persistent IndexedDB wallet, described below.
 
 ## Browser loop
 
 The five stages are factored into one `stepFrame` helper and run unchanged on
 both platforms. Native `main` calls it from the blocking `while` loop above. The
 browser build exports a C `main` instead. It does **not** create a window or a
-main loop: it starts an async disposable-wallet gate and returns immediately.
-Only when the JS bridge has generated a mnemonic, opened and verified an empty
-wallet, closed/freed it and removed its storage key does it invoke one
-single-shot Zig C continuation. That continuation creates the heap-owned
-`BrowserContext` (the `GameState` plus the persistent `input.Reader`) and hands
-an Emscripten callback to `emscripten_set_main_loop(browserFrame, 0, 0)`, so the
-page is never blocked. The context outlives the entry function; Emscripten never
-receives a pointer to a returned stack frame. A wallet import, initialization,
-storage or cleanup failure shows the generic `Unable to start game.` message and
-creates no game context or frame loop.
+main loop itself: it starts the asynchronous settings gate and returns. That gate
+takes the lifetime Web Lock and loads IndexedDB settings. A lock conflict or a
+failure creating the window or renderer context is a startup failure: it shows
+the generic `Unable to start game.` message and creates no frame loop. Malformed
+or unavailable settings do not fail startup; they are preserved with autosave
+disabled or replaced with built-in settings, as described in
+[browser-storage.md](browser-storage.md).
+
+Once the settings gate succeeds, its continuation creates the heap-owned
+`BrowserContext` (the `GameState`, persistent `input.Reader`, and shared onboarding
+model), starts the asynchronous `BrowserOnboarding` inspection, and hands an
+Emscripten callback to `emscripten_set_main_loop(browserFrame, 0, 0)`. The context
+outlives the entry function; Emscripten never receives a pointer to a returned
+stack frame. The page is never blocked.
+
+Wallet inspection and onboarding continue asynchronously and are delivered to
+the shared onboarding model. Until that model reports ready, it is blocking, so
+the frame loop keeps running but gameplay input is gated and the onboarding
+modal (initially a loading state) is drawn on the canvas. A wallet inspection,
+creation, recovery or storage failure appears as that blocked modal, not as the
+generic startup message. Ready means the persistent `haystack-user` records were
+provisioned and validated; the JS wallet is not retained as an open
+`BrowserWallet`, and there is no gameplay wallet-operation or spending bridge, so
+completing onboarding is not end-to-end in-game spending verification. See
+[browser-wallet.md](browser-wallet.md) for the IndexedDB records and their
+limitations.
 
 `browser/game-shell.html` is the game-only shell: one full-viewport canvas with
 no border, margin or scroll, a temporary non-interactive startup line, and
@@ -148,13 +168,16 @@ still polls input and timing normally. The browser also sets raylib's target FPS
 to zero so `requestAnimationFrame`, not a raylib sleep, controls pacing.
 
 Browser teardown is explicit and idempotent: `stopBrowser` clears the global
-context first, cancels the main loop, deinitializes `GameState`, destroys the
-context, and closes the window. A callback that finds no context returns
-immediately, so no stage touches freed state after cleanup. Initialization
-failures log, run the same cleanup, call the generic error UI and never register
-a loop. Both entry points disable Raylib's Escape quit key so Escape toggles the
-menu. The browser exposes no game snapshot or test-only `Module` status API;
-startup state is internal to the single-shot wallet gate.
+context first, unbinds the onboarding callbacks, closes the onboarding bridge,
+cancels the main loop, deinitializes the onboarding model and `GameState`,
+destroys the context, and closes the window. A callback that finds no context
+returns immediately, so no stage touches freed state after cleanup. Settings-gate
+or renderer-initialization failures log, run the same cleanup, call the generic
+error UI and never register a loop. Wallet/onboarding failures after startup keep
+the loop running behind the blocked modal instead. Both entry points disable
+Raylib's Escape quit key so Escape toggles the menu. The browser exposes no game
+snapshot or test-only `Module` status API; startup state is internal to the
+shared onboarding model and its asynchronous bridge.
 
 ## Four kinds of data
 

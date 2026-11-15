@@ -222,7 +222,8 @@ pub fn create(
     // symlink, broad mode, or non-directory instead of repairing it.
     try sf.ensureOwnedDir(io, data_root);
 
-    var parent = try Io.Dir.openDirAbsolute(io, data_root, .{ .follow_symlinks = false });
+    // The parent is flushed after the commit, so it must be sync-capable.
+    var parent = try sf.openDirSyncable(io, data_root);
     defer parent.close(io);
     try sf.verifyNoExtendedAclDir(parent);
 
@@ -247,7 +248,7 @@ pub fn create(
     var staging_owned = true;
     errdefer if (staging_owned) parent.deleteTree(io, staging_name) catch {};
 
-    var staging = try parent.openDir(io, staging_name, .{ .follow_symlinks = false });
+    var staging = try sf.openChildDirSyncable(parent, io, staging_name);
     defer staging.close(io);
     try sf.verifyDirectory(try parent.statFile(io, staging_name, .{ .follow_symlinks = false }));
     try sf.verifyNoExtendedAclDir(staging);
@@ -349,14 +350,14 @@ pub fn prepareRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths,
         else => return err,
     }
     try sf.ensureOwnedDir(io, root);
-    var parent = try Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
+    var parent = try sf.openDirSyncable(io, root);
     defer parent.close(io);
     try sf.verifyNoExtendedAclDir(parent);
     if (try statEntry(io, parent, final_name) != null) return error.AlreadyInitialized;
     try parent.createDir(io, recovery_dir_name, sf.mode_dir);
     // Never remove the stage after creation, even on failure.
     try sf.verifyDirectory(try parent.statFile(io, recovery_dir_name, .{ .follow_symlinks = false }));
-    var stage = try parent.openDir(io, recovery_dir_name, .{ .follow_symlinks = false });
+    var stage = try sf.openChildDirSyncable(parent, io, recovery_dir_name);
     defer stage.close(io);
     try sf.verifyNoExtendedAclDir(stage);
     const db_z = try allocator.dupeSentinel(u8, paths.db_path, 0);
@@ -466,7 +467,7 @@ pub fn commitRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths, 
     var inspection = try inspectRecovery(io, allocator, final_paths, id, true);
     try inspection.close();
     const root = std.fs.path.dirname(final_paths.dir) orelse return error.InvalidPath;
-    var parent = try Io.Dir.openDirAbsolute(io, root, .{ .follow_symlinks = false });
+    var parent = try sf.openDirSyncable(io, root);
     defer parent.close(io);
     try sf.verifyNoExtendedAclDir(parent);
     const final_name = try sf.basename(final_paths.dir);
@@ -506,7 +507,8 @@ fn seedFromMnemonic(phrase: [*c]const u8) error{CdkFailure}![cdk.seed_len]u8 {
     return seed;
 }
 
-/// Re-read the original validated phrase. Caller must scrub and free it.
+/// Re-read the original validated phrase. The returned buffer is caller-owned
+/// secret material: scrub it and free it when done.
 /// Call only after a successful open-and-close inspection of the pair.
 pub fn readMnemonic(io: Io, allocator: std.mem.Allocator, paths: Paths) ![]u8 {
     try sf.verifyOwnedDir(io, paths.dir);
@@ -515,37 +517,31 @@ pub fn readMnemonic(io: Io, allocator: std.mem.Allocator, paths: Paths) ![]u8 {
     try sf.verifyNoExtendedAclDir(dir);
     const stat = try dir.statFile(io, seed_file_name, .{ .follow_symlinks = false });
     try sf.verifyFile(stat);
-    var file = try dir.openFile(io, seed_file_name, .{ .follow_symlinks = false });
-    defer file.close(io);
-    const opened = try file.stat(io);
-    try sf.verifyFile(opened);
-    try sf.verifyNoExtendedAcl(file);
-    if (opened.size == 0 or opened.size > max_mnemonic_bytes) return error.InvalidMnemonic;
-    var buffer: [max_mnemonic_bytes + 1]u8 = undefined;
-    defer std.crypto.secureZero(u8, &buffer);
-    var reader = file.reader(io, &.{});
-    const n = try reader.interface.readSliceShort(&buffer);
-    if (n == buffer.len) return error.MnemonicTooLong;
-    const phrase = std.mem.trim(u8, buffer[0..n], " \t\r\n");
-    if (phrase.len == 0) return error.InvalidMnemonic;
-    const z = try allocator.dupeSentinel(u8, phrase, 0);
-    defer {
-        std.crypto.secureZero(u8, z);
-        allocator.free(z);
+    const phrase = try readMnemonicFromDir(io, allocator, dir, stat);
+    errdefer {
+        std.crypto.secureZero(u8, phrase);
+        allocator.free(phrase);
     }
-    var seed = try seedFromMnemonic(z.ptr);
-    defer std.crypto.secureZero(u8, &seed);
-    return allocator.dupe(u8, phrase);
+    // Deriving the seed through the CDK ABI is also the mnemonic validity
+    // check; the derived seed itself is discarded and scrubbed.
+    var seed = try seedFromPhrase(allocator, phrase);
+    std.crypto.secureZero(u8, &seed);
+    return phrase;
 }
 
-/// Read the bounded plaintext mnemonic and derive its seed through the CDK ABI.
-/// Temporary plaintext buffers are scrubbed before they are freed.
-fn readSeed(
+/// Read the bounded plaintext mnemonic from an already validated directory.
+///
+/// Both readers share these checks: the entry is opened without following a
+/// symlink, the opened descriptor is verified again (mode and extended ACL),
+/// the on-disk bound is enforced before and after opening, and the read buffer
+/// is scrubbed. The returned phrase is allocated and caller-owned; callers
+/// must scrub and free it.
+fn readMnemonicFromDir(
     io: Io,
     allocator: std.mem.Allocator,
     dir: Io.Dir,
     stat: Io.File.Stat,
-) ![cdk.seed_len]u8 {
+) ![]u8 {
     if (stat.size == 0 or stat.size > max_mnemonic_bytes) return error.InvalidMnemonic;
 
     var file = try dir.openFile(io, seed_file_name, .{ .follow_symlinks = false });
@@ -566,14 +562,35 @@ fn readSeed(
     if (read == buffer.len) return error.MnemonicTooLong;
 
     const phrase = std.mem.trim(u8, buffer[0..read], " \t\r\n");
-    if (phrase.len == 0 or phrase.len > max_mnemonic_bytes) return error.InvalidMnemonic;
+    if (phrase.len == 0) return error.InvalidMnemonic;
+    return allocator.dupe(u8, phrase);
+}
 
+/// Derive a seed from a validated phrase through the CDK ABI. The temporary
+/// NUL-terminated copy is scrubbed before it is freed.
+fn seedFromPhrase(allocator: std.mem.Allocator, phrase: []const u8) ![cdk.seed_len]u8 {
     const phrase_z = try allocator.dupeSentinel(u8, phrase, 0);
     defer {
         std.crypto.secureZero(u8, phrase_z);
         allocator.free(phrase_z);
     }
     return seedFromMnemonic(phrase_z.ptr);
+}
+
+/// Read the bounded plaintext mnemonic and derive its seed through the CDK ABI.
+/// The intermediate plaintext phrase is scrubbed before it is freed.
+fn readSeed(
+    io: Io,
+    allocator: std.mem.Allocator,
+    dir: Io.Dir,
+    stat: Io.File.Stat,
+) ![cdk.seed_len]u8 {
+    const phrase = try readMnemonicFromDir(io, allocator, dir, stat);
+    defer {
+        std.crypto.secureZero(u8, phrase);
+        allocator.free(phrase);
+    }
+    return seedFromPhrase(allocator, phrase);
 }
 
 fn writeSeedFile(io: Io, dir: Io.Dir, phrase: []const u8) !void {

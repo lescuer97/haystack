@@ -1,15 +1,19 @@
 // Node-only harness for browser/game-storage.js.
 //
 // Chromium is not always available, so this test evaluates the Emscripten JS
-// library against a small in-memory IndexedDB implementation. It covers the
-// content bridge (round-trip, Blob reads, list ordering, limits, transaction
-// failures) and settings validation (64 KiB cap, schema, preserve/reset).
+// library against the shared in-memory IndexedDB model in
+// `test-support/fake-indexeddb.mjs`. It covers the content bridge (round-trip,
+// Blob reads, list ordering, limits, transaction failures) and settings
+// validation (64 KiB cap, schema, preserve/reset).
 //
-// It does not emulate a real browser's IndexedDB durability, Web Locks or
-// storage quotas. Run `zig build test -Dplatform=wasm` for the Chromium suite.
+// The model does not emulate a real browser's IndexedDB durability, Web Locks,
+// storage quotas, or a shared database across tabs; see its module header for
+// the documented limits. Run `zig build test -Dplatform=wasm` for the Chromium
+// suite.
 
 import {readFile} from "node:fs/promises";
 import {strict as assert} from "node:assert";
+import {FakeIndexedDB as SharedFakeIndexedDB} from "./test-support/fake-indexeddb.mjs";
 
 const DB_NAME = "haystack-game";
 const STORE_CONFIG = "config";
@@ -18,204 +22,16 @@ const CONFIG_KEY = "settings";
 const MAX_CONFIG = 64 * 1024;
 const MAX_CONTENT = 64 * 1024 * 1024;
 
-class FakeRequest {
+// The request/transaction/upgrade model lives in test-support/fake-indexeddb.mjs
+// and is shared with the wallet harness. This adapter only adds the game's
+// single-database seed/peek helpers.
+class FakeIndexedDB extends SharedFakeIndexedDB {
   constructor() {
-    this.result = undefined;
-    this.error = null;
-    this.onsuccess = null;
-    this.onerror = null;
-    this.onupgradeneeded = null;
-    this.onblocked = null;
-  }
-}
-
-class FakeObjectStore {
-  constructor(transaction, name) {
-    this.transaction = transaction;
-    this.name = name;
-    this.data = transaction.db.stores.get(name);
-  }
-
-  get(key) {
-    const request = new FakeRequest();
-    this.transaction.add(request, () => (this.data.has(key) ? this.data.get(key) : undefined));
-    return request;
-  }
-
-  getAllKeys() {
-    const request = new FakeRequest();
-    this.transaction.add(request, () => Array.from(this.data.keys()));
-    return request;
-  }
-
-  getKey(key) {
-    const request = new FakeRequest();
-    this.transaction.add(request, () => (this.data.has(key) ? key : undefined));
-    return request;
-  }
-
-  put(value, key) {
-    const request = new FakeRequest();
-    this.transaction.add(request, () => {
-      if (this.transaction.db.failStore === this.name) throw new Error("injected write failure");
-      this.data.set(key, value instanceof Uint8Array ? value.slice() : value);
-      return key;
-    });
-    return request;
-  }
-
-  delete(key) {
-    const request = new FakeRequest();
-    this.transaction.add(request, () => {
-      if (this.transaction.db.failStore === this.name) throw new Error("injected delete failure");
-      this.data.delete(key);
-      return undefined;
-    });
-    return request;
-  }
-}
-
-class FakeTransaction {
-  constructor(db, names, mode) {
-    this.db = db;
-    this.names = names;
-    this.mode = mode;
-    this.error = null;
-    this.pending = 0;
-    this.finished = false;
-    this.aborted = false;
-    this.oncomplete = null;
-    this.onerror = null;
-    this.onabort = null;
-    this.snapshots = names.map((name) => [name, new Map(db.stores.get(name))]);
-  }
-
-  objectStore(name) {
-    if (!this.names.includes(name)) throw new Error(`store ${name} is not in this transaction`);
-    return new FakeObjectStore(this, name);
-  }
-
-  add(request, action) {
-    this.pending += 1;
-    queueMicrotask(() => {
-      if (this.aborted) return;
-      try {
-        request.result = action();
-        if (request.onsuccess) request.onsuccess();
-      } catch (error) {
-        request.error = error;
-        if (request.onerror) request.onerror();
-        this.abort(error);
-        return;
-      }
-      this.pending -= 1;
-      this.maybeComplete();
-    });
-  }
-
-  maybeComplete() {
-    if (this.pending !== 0 || this.finished) return;
-    if (this.db.abortStore === this.names[0] && this.mode === "readwrite") {
-      this.abort(new Error("injected transaction abort"));
-      return;
-    }
-    this.finished = true;
-    queueMicrotask(() => {
-      if (this.oncomplete) this.oncomplete();
-    });
-  }
-
-  abort(error) {
-    if (this.finished) return;
-    this.finished = true;
-    this.aborted = true;
-    this.error = error;
-    for (const [name, snapshot] of this.snapshots) this.db.stores.set(name, snapshot);
-    queueMicrotask(() => {
-      if (this.onerror) this.onerror();
-      queueMicrotask(() => {
-        if (this.onabort) this.onabort();
-      });
-    });
-  }
-}
-
-class FakeDatabase {
-  constructor(record) {
-    this.stores = record.stores;
-    this.failStore = null;
-    this.abortStore = null;
-    this.objectStoreNames = {
-      contains: (name) => this.stores.has(name),
-    };
-  }
-
-  createObjectStore(name) {
-    this.stores.set(name, new Map());
-    return {name};
-  }
-
-  transaction(names, mode) {
-    if (typeof names === "string") names = [names];
-    for (const name of names) {
-      if (!this.stores.has(name)) throw new Error(`missing object store ${name}`);
-    }
-    return new FakeTransaction(this, names, mode);
-  }
-}
-
-class FakeIndexedDB {
-  constructor() {
-    this.records = new Map();
-    this.instances = [];
-    this.nextOpenFailure = false;
-  }
-
-  open(name, version) {
-    const request = new FakeRequest();
-    queueMicrotask(() => {
-      if (this.nextOpenFailure) {
-        request.error = new Error("injected open failure");
-        if (request.onerror) request.onerror();
-        return;
-      }
-      let record = this.records.get(name);
-      let upgrade = false;
-      if (!record) {
-        record = {version: 0, stores: new Map()};
-        this.records.set(name, record);
-      }
-      if (version > record.version) {
-        upgrade = true;
-        record.version = version;
-      }
-      const db = new FakeDatabase(record);
-      this.instances.push(db);
-      request.result = db;
-      if (upgrade && request.onupgradeneeded) request.onupgradeneeded();
-      if (request.onsuccess) request.onsuccess();
-    });
-    return request;
+    super({database: DB_NAME, version: 1, stores: [STORE_CONFIG, STORE_CONTENT]});
   }
 
   seed(store, key, value) {
-    let record = this.records.get(DB_NAME);
-    if (!record) {
-      record = {version: 1, stores: new Map()};
-      this.records.set(DB_NAME, record);
-    }
-    if (!record.stores.has(STORE_CONFIG)) record.stores.set(STORE_CONFIG, new Map());
-    if (!record.stores.has(STORE_CONTENT)) record.stores.set(STORE_CONTENT, new Map());
-    record.stores.get(store).set(key, value);
-  }
-
-  peek(store, key) {
-    const record = this.records.get(DB_NAME);
-    return record && record.stores.has(store) ? record.stores.get(store).get(key) : undefined;
-  }
-
-  latest() {
-    return this.instances[this.instances.length - 1];
+    return super.seed(store, key, value, {create: true});
   }
 }
 
@@ -712,6 +528,68 @@ test("reset deletes the config and re-enables autosave", async () => {
     version: 1,
     debug: {tile_grid: true, chunk_borders: false},
   });
+  env.close();
+});
+
+test("a successful reset clears the block left by an earlier failed save", async () => {
+  const env = await new Environment().init();
+  await env.start();
+
+  // The queued save fails after the reset request has already been queued.
+  // Previously the reset cleared the block before the queue ran and never
+  // cleared it again afterwards, so autosave stayed blocked for the page.
+  env.indexedDB.writeFailures = 1;
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    env.storage.save(true, true);
+    env.storage.reset();
+    await env.settleSaveQueue();
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(env.indexedDB.writeFailures, 0);
+  assert.equal(env.indexedDB.peek(STORE_CONFIG, CONFIG_KEY), undefined);
+  assert.equal(env.storage.autosaveBlocked, false);
+
+  env.storage.save(true, false);
+  await env.settleSaveQueue();
+  assert.deepEqual(JSON.parse(env.indexedDB.peek(STORE_CONFIG, CONFIG_KEY)), {
+    version: 1,
+    debug: {tile_grid: true, chunk_borders: false},
+  });
+  env.close();
+});
+
+test("a failed reset keeps autosave blocked and preserves the stored config", async () => {
+  const env = await new Environment().init();
+  const raw = JSON.stringify({version: 1, debug: {tile_grid: true}, extra: true});
+  env.indexedDB.seed(STORE_CONFIG, CONFIG_KEY, raw);
+  const started = await env.start();
+  assert.equal(started.status, 2);
+  assert.equal(started.blocked, 1);
+
+  env.indexedDB.latest().failStore = STORE_CONFIG;
+  const originalError = console.error;
+  console.error = () => {};
+  try {
+    env.storage.reset();
+    // The reset has not committed yet, so a save requested now must be
+    // refused rather than queued behind an unknown outcome.
+    assert.equal(env.storage.autosaveBlocked, true);
+    env.storage.save(true, true);
+    await env.settleSaveQueue();
+  } finally {
+    console.error = originalError;
+    env.indexedDB.latest().failStore = null;
+  }
+  assert.equal(env.storage.autosaveBlocked, true);
+  assert.equal(env.indexedDB.peek(STORE_CONFIG, CONFIG_KEY), raw);
+
+  env.storage.reset();
+  await env.settleSaveQueue();
+  assert.equal(env.indexedDB.peek(STORE_CONFIG, CONFIG_KEY), undefined);
+  assert.equal(env.storage.autosaveBlocked, false);
   env.close();
 });
 

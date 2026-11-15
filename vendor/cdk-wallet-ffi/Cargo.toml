@@ -26,12 +26,15 @@ default = []
 headers = ["safer-ffi/headers"]
 
 [dependencies]
-# Exact pins required by the project brief.
-cdk = { version = "=0.18.3", default-features = false, features = ["wallet"] }
-cdk-sqlite = { version = "=0.18.3", default-features = false, features = ["wallet"] }
+# Exact source pins required by the project brief: the CDK family comes from
+# the upstream Git tag the Spilman release itself depends on, not from a
+# registry version. The `version` guard turns a silent tag/dependency drift into
+# a build error instead of compiling an unintended source.
+cdk = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", version = "=0.18.1", default-features = false, features = ["wallet"] }
+cdk-sqlite = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", version = "=0.18.1", default-features = false, features = ["wallet"] }
 # Used only for the `bitcoin::hashes` SHA-256 re-export (no bespoke crypto) and
 # for the `WalletDatabase` trait / saga types.
-cdk-common = { version = "=0.18.3", default-features = false }
+cdk-common = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", version = "=0.18.1", default-features = false }
 safer-ffi = { version = "=0.1.13", features = ["proc_macros"] }
 # Persistent multi-threaded runtime; the Zig side calls the blocking ABI from a
 # worker thread.
@@ -58,9 +61,11 @@ zeroize = "1"
 # always compiled in, so no language feature is required.
 bip39 = { version = "=2.2.2", features = ["rand", "zeroize"] }
 
-# Vendored Spilman payment-channel library. The FFI layer exposes a stateless
-# subset of its pure primitives plus a handful of CDK wallet conversion helpers.
-cdk-spilman = { path = "../cdk-spilman", default-features = false, features = ["wallet"] }
+# Vendored-then-dropped Spilman payment-channel library. The FFI layer exposes a
+# stateless subset of its pure primitives plus a handful of CDK wallet
+# conversion helpers. The dependency is the upstream repository at the exact
+# release commit; no local crate copy or fork is used.
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels", rev = "8a5350dfd4d7c2902dc15c726a91dbfb2c793d43", default-features = false, features = ["wallet"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -68,10 +73,10 @@ serde_json = "1"
 # the end-to-end test can run against an in-process fake mint. They are never
 # part of a normal `cargo build` of the library.
 [dev-dependencies]
-cdk = { version = "=0.18.3", features = ["mint"] }
-cdk-sqlite = { version = "=0.18.3", features = ["mint"] }
-cdk-axum = "=0.18.3"
-cdk-fake-wallet = "=0.18.3"
+cdk = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", version = "=0.18.1", features = ["mint"] }
+cdk-sqlite = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", version = "=0.18.1", features = ["mint"] }
+cdk-axum = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", version = "=0.18.1" }
+cdk-fake-wallet = { git = "https://github.com/cashubtc/cdk.git", tag = "v0.18.1", version = "=0.18.1" }
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }
 tempfile = "3"

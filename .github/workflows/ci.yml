@@ -21,6 +21,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Create empty desktop assets fixture
+        run: |
+          # The desktop install copies the checkout-level assets/ directory next
+          # to the executable, but a clean checkout has none. The current
+          # renderer loads no external assets, so this empty directory only
+          # satisfies the existing install and relocation packaging path. It is
+          # not a real asset pack, does not validate asset loading or production
+          # content, and never replaces a local asset source.
+          mkdir -p assets
+
       - name: Install native desktop prerequisites
         run: |
           sudo apt-get update
@@ -35,6 +45,9 @@ jobs:
 
       - name: Provision selected desktop toolchain
         run: zig build setup
+
+      - name: Verify dependency provenance
+        run: python3 build-support/check_dependency_pins.py
 
       - name: Graph isolation and setup/check contract tests
         run: zig build test-build
@@ -118,6 +131,16 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Create empty desktop assets fixture
+        run: |
+          # The desktop install copies the checkout-level assets/ directory next
+          # to the executable, but a clean checkout has none. The current
+          # renderer loads no external assets, so this empty directory only
+          # satisfies the existing install and relocation packaging path. It is
+          # not a real asset pack, does not validate asset loading or production
+          # content, and never replaces a local asset source.
+          mkdir -p assets
+
       - name: Verify native arm64 host
         run: |
           test "$(uname -m)" = arm64
@@ -137,6 +160,9 @@ jobs:
 
       - name: Provision selected desktop toolchain and run native preflight
         run: zig build setup
+
+      - name: Verify dependency provenance
+        run: python3 build-support/check_dependency_pins.py
 
       - name: Debug desktop build
         run: zig build
@@ -239,6 +265,9 @@ jobs:
 
       - name: Provision Wasm toolchain, wasm-bindgen and Emscripten
         run: zig build setup -Dplatform=wasm
+
+      - name: Verify dependency provenance
+        run: python3 build-support/check_dependency_pins.py
 
       - name: Build the complete browser application
         run: zig build -Dplatform=wasm

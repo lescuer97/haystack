@@ -5,16 +5,13 @@
 // (scenario/expected/actual/message) instead of being asserted as successful
 // behavior. Their presence makes the run exit nonzero while the remaining
 // independent scenarios still execute. Unexpected check failures abort the run.
-import {spawn} from "node:child_process";
-import {existsSync} from "node:fs";
-import {mkdtemp, writeFile, rm} from "node:fs/promises";
-import {tmpdir} from "node:os";
+import {bounded, CdpConnection, discoverEndpoint, launchBrowser, makeProfile, removeProfile, stopBrowser, watchdog} from "./cdp-runner.mjs";
+import {writeFile} from "node:fs/promises";
 import {join} from "node:path";
 
-const base=existsSync("/tmp/opencode")? "/tmp/opencode" : tmpdir();
-const directory=await mkdtemp(join(base,"cdk-browser-test-"));
-const artifacts=await mkdtemp(join(base,"cdk-browser-test-artifacts-"));
-const browser=spawn(process.env.CHROMIUM || "chromium",["--headless","--no-sandbox","--use-gl=angle","--use-angle=swiftshader","--enable-unsafe-swiftshader",`--user-data-dir=${directory}`,"--remote-debugging-port=0","about:blank"],{stdio:["ignore","ignore","pipe"]});
+const directory=await makeProfile("cdk-browser-test-");
+const artifacts=await makeProfile("cdk-browser-test-artifacts-");
+const browser=launchBrowser(directory,["--use-gl=angle","--use-angle=swiftshader","--enable-unsafe-swiftshader"]);
 
 // The Python wrapper prints the fake mint's normal application URL (`/?smoke`).
 // Wallet checks run on the explicit non-interactive test fixture, while `/` is
@@ -35,80 +32,43 @@ const addFailure=failure => {
 };
 const seedExpr=hex => `Uint8Array.from(${JSON.stringify(hex)}.match(/../g),byte=>parseInt(byte,16))`;
 
-let socket=null;
-let sequence=0;
+let connection=null;
 let activeSession=null;
 let exceptions=[];
 let dumpProgress=async () => {};
-const requests=new Map();
 function send(method,params={},sessionId) {
-  const id=++sequence;
-  return new Promise((resolve,reject) => { requests.set(id,{resolve,reject}); socket.send(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})})); });
+  return connection.send(method,params,sessionId);
 }
 
-const bounded=async (promise,milliseconds,label) => {
-  let handle;
-  const guarded=Promise.resolve(promise);
-  // If the timeout wins, the losing operation must not surface later as an
-  // unhandled rejection while the browser is being torn down.
-  guarded.catch(() => {});
-  try {
-    return await Promise.race([
-      guarded,
-      new Promise((_,reject) => { handle=setTimeout(() => reject(new Error(`${label} timed out`)),milliseconds); }),
-    ]);
-  } finally {
-    clearTimeout(handle);
-  }
-};
-
-let timeoutReject;
-const timeout=new Promise((_,reject) => { timeoutReject=reject; });
-const timer=setTimeout(() => timeoutReject(new Error("Browser test timed out")),240_000);
+const watch=watchdog(240_000,"Browser test");
 // Test-only hook used to validate that a disconnected/killed browser still
 // produces bounded diagnostics, a JSON artifact, and an escalated shutdown.
 const killAfter=Number(process.env.BROWSER_TEST_KILL_MS || 0);
 const killHook=killAfter>0? setTimeout(() => { try { browser.kill("SIGKILL"); } catch {} },killAfter) : null;
 
 const work=(async () => {
-  const endpoint=await new Promise((resolve,reject) => {
-    let stderr="";
-    browser.stderr.on("data",chunk => { stderr+=chunk; const match=stderr.match(/DevTools listening on (ws:\/\/[^\s]+)/); if(match) resolve(match[1]); });
-    browser.on("error",reject);
-    browser.on("exit",code => reject(new Error(`Chromium exited: ${code}`)));
-  });
-  socket=new WebSocket(endpoint);
-  await new Promise((resolve,reject) => { socket.onopen=resolve; socket.onerror=reject; });
+  const endpoint=await discoverEndpoint(browser);
+  connection=await CdpConnection.connect(endpoint);
 
   let complete;
   let reportReject;
   const report=new Promise((resolve,reject) => { complete=resolve; reportReject=reject; });
   report.catch(() => {});
-  const events=new Map();
-  const disconnected=() => {
-    const error=new Error("CDP connection closed");
-    for(const pending of requests.values()) pending.reject(error);
-    requests.clear();
+  function disconnected(error) {
     reportReject(error);
-  };
-  socket.onclose=disconnected;
-  socket.onerror=disconnected;
-  socket.onmessage=({data}) => {
-    const message=JSON.parse(data);
-    const key=`${message.sessionId}:${message.method}`;
-    if(events.has(key)) { events.get(key)(message.params); events.delete(key); }
-    if(message.id) {
-      const pending=requests.get(message.id); requests.delete(message.id);
-      if(message.error) pending.reject(new Error(message.error.message)); else pending.resolve(message.result);
-    }
-    if(message.method === "Runtime.bindingCalled" && message.params.name === "reportBrowserTests") complete(JSON.parse(message.params.payload));
-    if(message.method === "Runtime.exceptionThrown") {
-      exceptions.push(message.params.exceptionDetails.text);
-      complete({ok:false,completed:false,error:message.params.exceptionDetails.exception?.description || message.params.exceptionDetails.text});
-    }
-    if(message.method === "Runtime.consoleAPICalled" && message.params.type === "error") console.error(message.params.args.map(v => v.value || v.description).join(" "));
-  };
-  const once=(method,sessionId) => new Promise(resolve => events.set(`${sessionId}:${method}`,resolve));
+  }
+  connection.onClose(disconnected);
+  connection.on("Runtime.bindingCalled", message => {
+    if(message.params.name === "reportBrowserTests") complete(JSON.parse(message.params.payload));
+  });
+  connection.on("Runtime.exceptionThrown", message => {
+    exceptions.push(message.params.exceptionDetails.text);
+    complete({ok:false,completed:false,error:message.params.exceptionDetails.exception?.description || message.params.exceptionDetails.text});
+  });
+  connection.on("Runtime.consoleAPICalled", message => {
+    if(message.params.type === "error") console.error(message.params.args.map(v => v.value || v.description).join(" "));
+  });
+  const once=(method,sessionId) => connection.once(method,sessionId);
   async function evaluate(sessionId,expression) {
     const response=await send("Runtime.evaluate",{expression,awaitPromise:true,returnByValue:true},sessionId);
     if(response.exceptionDetails) throw new Error(response.exceptionDetails.exception?.description || response.exceptionDetails.text);
@@ -416,14 +376,14 @@ const work=(async () => {
 work.catch(() => {});
 
 try {
-  await Promise.race([work,timeout]);
+  await Promise.race([work,watch.promise]);
 } catch(error) {
   result.ok=false;
   result.completed=false;
   result.error=String(error.message || error);
   await bounded(dumpProgress(),5_000,"progress diagnostics").catch(() => {});
 } finally {
-  clearTimeout(timer);
+  watch.stop();
   if(killHook) clearTimeout(killHook);
   result.uncaughtExceptions=exceptions;
   if(exceptions.length) result.ok=false;
@@ -445,18 +405,7 @@ try {
   console.error(`Browser test artifacts: ${artifacts}`);
   console.log(JSON.stringify(result,null,2));
   process.exitCode=result.ok?0:1;
-  socket?.close();
-  const waitExit=milliseconds => new Promise(resolve => {
-    if(browser.exitCode !== null) { resolve(true); return; }
-    let handle;
-    const onExit=() => { clearTimeout(handle); resolve(true); };
-    browser.once("exit",onExit);
-    handle=setTimeout(() => { browser.off("exit",onExit); resolve(false); },milliseconds);
-  });
-  browser.kill("SIGTERM");
-  if(!(await waitExit(3_000))) {
-    try { browser.kill("SIGKILL"); } catch {}
-    await waitExit(3_000);
-  }
-  await bounded(rm(directory,{recursive:true,force:true,maxRetries:5,retryDelay:100}),5_000,"profile cleanup").catch(() => {});
+  connection?.close();
+  await stopBrowser(browser);
+  await removeProfile(directory,{timeout:5_000}).catch(() => {});
 }

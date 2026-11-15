@@ -19,10 +19,9 @@ pub const Locations = struct {
     config_path: []u8,
     content_dir: []u8,
     /// One fixed user wallet. The directory is Haystack-owned; its two entries
-    /// are the plaintext BIP-39 mnemonic and the CDK SQLite database.
+    /// (the plaintext BIP-39 mnemonic and the CDK SQLite database) are derived
+    /// by `wallet.Paths`, not stored here.
     wallet_dir: []u8,
-    wallet_seed_path: []u8,
-    wallet_db_path: []u8,
     /// Standard environment directories that a clean HOME may lack. They are
     /// created only when missing; existing entries are never modified. Explicit
     /// XDG overrides are not listed and must already exist.
@@ -33,8 +32,6 @@ pub const Locations = struct {
         allocator.free(self.config_path);
         allocator.free(self.content_dir);
         allocator.free(self.wallet_dir);
-        allocator.free(self.wallet_seed_path);
-        allocator.free(self.wallet_db_path);
         for (self.standard_parents) |path| allocator.free(path);
         allocator.free(self.standard_parents);
     }
@@ -95,12 +92,6 @@ pub fn resolve(
     };
     errdefer allocator.free(wallet_dir);
 
-    const wallet_seed_path = try std.fs.path.join(allocator, &.{ wallet_dir, "seed-words.txt" });
-    errdefer allocator.free(wallet_seed_path);
-
-    const wallet_db_path = try std.fs.path.join(allocator, &.{ wallet_dir, "wallet.sqlite" });
-    errdefer allocator.free(wallet_db_path);
-
     var parents: std.ArrayList([]u8) = .empty;
     errdefer {
         for (parents.items) |path| allocator.free(path);
@@ -127,8 +118,6 @@ pub fn resolve(
         .config_path = config_path,
         .content_dir = content_dir,
         .wallet_dir = wallet_dir,
-        .wallet_seed_path = wallet_seed_path,
-        .wallet_db_path = wallet_db_path,
         .standard_parents = try parents.toOwnedSlice(allocator),
     };
 }
@@ -183,8 +172,6 @@ test "linux defaults to XDG base directories under HOME" {
     try testing.expectEqualStrings("/home/player/.config/haystack/config.json", locations.config_path);
     try testing.expectEqualStrings("/home/player/.local/share/haystack/content", locations.content_dir);
     try testing.expectEqualStrings("/home/player/.local/share/haystack/wallet", locations.wallet_dir);
-    try testing.expectEqualStrings("/home/player/.local/share/haystack/wallet/seed-words.txt", locations.wallet_seed_path);
-    try testing.expectEqualStrings("/home/player/.local/share/haystack/wallet/wallet.sqlite", locations.wallet_db_path);
     try testing.expectEqual(@as(usize, 3), locations.standard_parents.len);
     try testing.expectEqualStrings("/home/player/.config", locations.standard_parents[0]);
     try testing.expectEqualStrings("/home/player/.local", locations.standard_parents[1]);
@@ -204,8 +191,6 @@ test "linux honours absolute XDG overrides" {
     try testing.expectEqualStrings("/srv/config/haystack", locations.config_dir);
     try testing.expectEqualStrings("/srv/data/haystack/content", locations.content_dir);
     try testing.expectEqualStrings("/srv/data/haystack/wallet", locations.wallet_dir);
-    try testing.expectEqualStrings("/srv/data/haystack/wallet/seed-words.txt", locations.wallet_seed_path);
-    try testing.expectEqualStrings("/srv/data/haystack/wallet/wallet.sqlite", locations.wallet_db_path);
     // Explicit XDG bases are user-supplied and must already exist.
     try testing.expectEqual(@as(usize, 0), locations.standard_parents.len);
 }
@@ -239,8 +224,6 @@ test "macos ignores XDG and uses Application Support" {
     try testing.expectEqualStrings("/Users/player/Library/Application Support/haystack/config.json", locations.config_path);
     try testing.expectEqualStrings("/Users/player/Library/Application Support/haystack/content", locations.content_dir);
     try testing.expectEqualStrings("/Users/player/Library/Application Support/haystack/wallet", locations.wallet_dir);
-    try testing.expectEqualStrings("/Users/player/Library/Application Support/haystack/wallet/seed-words.txt", locations.wallet_seed_path);
-    try testing.expectEqualStrings("/Users/player/Library/Application Support/haystack/wallet/wallet.sqlite", locations.wallet_db_path);
     try testing.expectEqual(@as(usize, 2), locations.standard_parents.len);
     try testing.expectEqualStrings("/Users/player/Library", locations.standard_parents[0]);
     try testing.expectEqualStrings("/Users/player/Library/Application Support", locations.standard_parents[1]);
