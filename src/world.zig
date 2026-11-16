@@ -38,7 +38,7 @@ pub const MIN_PREHEATED_CHUNKS: usize = 64;
 
 /// Generated terrain. Gameplay state (cut, tilled, ownership, …) is not stored
 /// here yet; see `docs/world.md` for the planned delta model.
-pub const Tile = enum(u8) { grass, dirt, rock };
+pub const Tile = enum(u8) { grass, dirt, rock, tree };
 
 pub const Chunk = struct {
     cx: i32 = 0,
@@ -155,6 +155,52 @@ fn mix32(value: u32) u32 {
     return h;
 }
 
+const forest_spacing = 32;
+const rock_spacing = 16;
+const dirt_spacing = 8;
+const forest_threshold = 32000;
+const rock_threshold = 51000;
+const dirt_threshold = 55000;
+
+fn layoutHash(seed: [32]u8, domain: u8, x: i32, y: i32) u32 {
+    var derived = seed;
+    derived[0] ^= domain;
+    return hash2(derived, x, y);
+}
+
+// Fixed point uses 65536 as one; all divisions round down.
+fn smoothFraction(remainder: i32, comptime spacing: i32) u64 {
+    const t = @as(u64, @intCast(remainder)) * 65536 / @as(u64, spacing);
+    return (t * t * (3 * 65536 - 2 * t)) >> 32;
+}
+
+fn interpolate(a: u64, b: u64, t: u64) u64 {
+    return (a * (65536 - t) + b * t) >> 16;
+}
+
+fn valueNoise(seed: [32]u8, domain: u8, x: i32, y: i32, comptime spacing: i32) u32 {
+    const gx = @divFloor(x, spacing);
+    const gy = @divFloor(y, spacing);
+    const tx = smoothFraction(@mod(x, spacing), spacing);
+    const ty = smoothFraction(@mod(y, spacing), spacing);
+    // Lattice coordinates are divided by at least eight, so +1 fits even at i32 limits.
+    const top = interpolate(layoutHash(seed, domain, gx, gy) >> 16, layoutHash(seed, domain, gx + 1, gy) >> 16, tx);
+    const bottom = interpolate(layoutHash(seed, domain, gx, gy + 1) >> 16, layoutHash(seed, domain, gx + 1, gy + 1) >> 16, tx);
+    return @intCast(interpolate(top, bottom, ty));
+}
+
+fn sampleTile(seed: [32]u8, x: i32, y: i32) Tile {
+    // ponytail: one smooth field per feature; add octaves only if terrain needs finer detail.
+    if (valueNoise(seed, 2, x, y, rock_spacing) >= rock_threshold) return .rock;
+    const forest = valueNoise(seed, 1, x, y, forest_spacing);
+    if (forest >= forest_threshold) {
+        const density = @min(56000, 22000 + forest - forest_threshold);
+        if (layoutHash(seed, 4, x, y) >> 16 < density) return .tree;
+    }
+    if (valueNoise(seed, 3, x, y, dirt_spacing) >= dirt_threshold) return .dirt;
+    return .grass;
+}
+
 // ── private yield ────────────────────────────────────────────────────────────
 
 // Keyed BLAKE3-256 is the standard PRF for private yields: 32-byte secret key,
@@ -215,13 +261,7 @@ fn generate(chunk: *Chunk) void {
         for (0..CT) |lx| {
             const x = chunk.cx * CHUNK_TILES + @as(i32, @intCast(lx));
             const y = chunk.cy * CHUNK_TILES + @as(i32, @intCast(ly));
-            const h = hash2(public_seed, x, y);
-            chunk.tiles[ly * CT + lx] = if (h % 31 == 0)
-                .rock
-            else if (h % 17 == 0)
-                .dirt
-            else
-                .grass;
+            chunk.tiles[ly * CT + lx] = sampleTile(public_seed, x, y);
         }
     }
 }
@@ -422,6 +462,99 @@ pub const World = struct {
 pub const StreamError = std.mem.Allocator.Error || CoordinateError;
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+test "terrain v1 distribution correlation and fixed region checksum" {
+    const side = 512;
+    const total = side * side;
+    var tiles: [total]Tile = undefined;
+    var counts: [4]u64 = @splat(0);
+    var neighbors: [4]u64 = @splat(0);
+    var forest_grass: usize = 0;
+    var forest_trees: usize = 0;
+    var checksum: u64 = 0xcbf29ce484222325;
+    for (&tiles, 0..) |*tile, i| {
+        const x = @as(i32, @intCast(i % side)) - side / 2;
+        const y = @as(i32, @intCast(i / side)) - side / 2;
+        tile.* = sampleTile(zero_seed, x, y);
+        counts[@backingInt(tile.*)] += 1;
+        checksum = (checksum ^ @backingInt(tile.*)) *% 0x100000001b3;
+        if (valueNoise(zero_seed, 1, x, y, forest_spacing) >= forest_threshold) {
+            if (tile.* == .grass) forest_grass += 1;
+            if (tile.* == .tree) forest_trees += 1;
+        }
+    }
+    for (tiles, 0..) |tile, i| {
+        if (i % side + 1 < side and tile == tiles[i + 1]) neighbors[@backingInt(tile)] += 1;
+        if (i / side + 1 < side and tile == tiles[i + side]) neighbors[@backingInt(tile)] += 1;
+    }
+    const grass = counts[@backingInt(Tile.grass)];
+    const trees = counts[@backingInt(Tile.tree)];
+    const rocks = counts[@backingInt(Tile.rock)];
+    const dirt = counts[@backingInt(Tile.dirt)];
+    try std.testing.expect(grass > total / 2 and grass > trees and trees > rocks and rocks > dirt and dirt > 0);
+    for ([_]Tile{ .tree, .rock, .dirt }) |tile| {
+        const i = @backingInt(tile);
+        // Conditional neighbor match must exceed independent tiles' baseline by 30%.
+        try std.testing.expect(neighbors[i] * total * 10 > counts[i] * counts[i] * 26);
+    }
+    try std.testing.expect(forest_trees > 0 and forest_grass > forest_trees / 4);
+    try std.testing.expectEqual(@as(u64, 0xec04d88c8e6885e5), checksum);
+}
+
+test "terrain absolute sampling crosses negative seams and drawable bounds" {
+    inline for (.{
+        .{ .domain = 1, .spacing = forest_spacing },
+        .{ .domain = 2, .spacing = rock_spacing },
+        .{ .domain = 3, .spacing = dirt_spacing },
+    }) |field| {
+        for ([_]i32{ -1, 0, 1 }) |gy| {
+            for ([_]i32{ -1, 0, 1 }) |gx| {
+                const x = gx * field.spacing;
+                const y = gy * field.spacing;
+                const corner = layoutHash(zero_seed, field.domain, gx, gy) >> 16;
+                try std.testing.expectEqual(corner, valueNoise(zero_seed, field.domain, x, y, field.spacing));
+                for ([_][2]i32{ .{ -1, 0 }, .{ 1, 0 }, .{ 0, -1 }, .{ 0, 1 } }) |offset| {
+                    const nearby = valueNoise(zero_seed, field.domain, x + offset[0], y + offset[1], field.spacing);
+                    try std.testing.expect(@abs(@as(i64, nearby) - corner) <= 4096);
+                }
+            }
+        }
+    }
+    for ([_]i32{ -2, -1, 0, 1, MIN_DRAWABLE_CHUNK, MAX_DRAWABLE_CHUNK }) |cy| {
+        for ([_]i32{ -2, -1, 0, 1, MIN_DRAWABLE_CHUNK, MAX_DRAWABLE_CHUNK }) |cx| {
+            var chunk = Chunk{ .cx = cx, .cy = cy };
+            generate(&chunk);
+            for (chunk.tiles, 0..) |tile, i| {
+                try std.testing.expectEqual(sampleTile(zero_seed, cx * CHUNK_TILES + @as(i32, @intCast(i % CT)), cy * CHUNK_TILES + @as(i32, @intCast(i / CT))), tile);
+            }
+        }
+    }
+    // Even sampling beyond drawable pixels has safe adjacent lattice corners.
+    _ = sampleTile(zero_seed, std.math.minInt(i32), std.math.maxInt(i32));
+    _ = sampleTile(zero_seed, std.math.maxInt(i32), std.math.minInt(i32));
+}
+
+test "terrain survives eviction regeneration and reversed load order" {
+    var first = try World.init(std.testing.allocator, 4);
+    defer first.deinit();
+    var second = try World.init(std.testing.allocator, 4);
+    defer second.deinit();
+    const coords = [_][2]i32{ .{ -1, -1 }, .{ 0, -1 }, .{ -1, 0 }, .{ 0, 0 } };
+    for (coords) |c| try first.ensureLoaded(c[0], c[1]);
+    for (0..coords.len) |i| {
+        const c = coords[coords.len - 1 - i];
+        try second.ensureLoaded(c[0], c[1]);
+    }
+    for (coords) |c| {
+        const expected = first.get(c[0], c[1]).?.tiles;
+        try std.testing.expectEqualSlices(Tile, &expected, &second.get(c[0], c[1]).?.tiles);
+        first.unload(World.keyOf(c[0], c[1]));
+        try std.testing.expect(first.get(c[0], c[1]) == null);
+        try first.ensureLoaded(c[0], c[1]);
+        try std.testing.expectEqualSlices(Tile, &expected, &first.get(c[0], c[1]).?.tiles);
+    }
+    try std.testing.expectEqual(@as(u64, 4), first.stats().unloaded);
+}
 
 test "stream keeps visible chunks plus a 2-chunk margin" {
     const alloc = std.testing.allocator;

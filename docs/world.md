@@ -9,9 +9,10 @@ Bare-bones reference for how the world is addressed, generated, and changed.
 Implemented today in `src/world.zig`:
 
 - 32×32 px tiles, 16×16-tile chunks (512×512 px).
-- A `Tile` enum (`grass`, `dirt`, `rock`) generated deterministically from tile
-  coordinates by a coordinate hash. The hash takes an explicit `[32]u8` public
-  seed; the demo passes a fixed all-zero placeholder, and there is no
+- A `Tile` enum (`grass`, `dirt`, `rock`, `tree`, in that ordinal order), rendered
+  as centered `G`/`D`/`R`/`T` letters. Terrain generator v1 uses hash-based smooth
+  value noise at absolute tile coordinates, independent of chunk residency or
+  load order. The demo uses a fixed all-zero `[32]u8` public seed; there is no
   world-seed configuration plumbing yet.
 - `privateYield(private_seed: [32]u8, x: i32, y: i32) u64`, a keyed BLAKE3-256
   roll. It is implemented and tested but **unused**: not wired into gameplay,
@@ -36,7 +37,8 @@ format should be invented until it is.
 The unused starter draft also mentioned a `TileEntity` union
 (`Tree`/`Grass`/`Character` with `CutStatus`), per-chunk `dirty` flags, and a
 `Character{ yourself: bool }` entity. Those ideas are not implemented; today a
-tile is only the generated grass/dirt/rock `Tile` enum above.
+tile is only the generated grass/dirt/rock/tree `Tile` enum above, with no tree
+entities, collision, harvesting, or separate layers.
 
 ---
 
@@ -64,6 +66,29 @@ Nothing is stored for untouched space. An untouched chunk is not resident; the
 deterministic generator recreates it on demand. The resident chunk map is a
 cache, not the world itself.
 
+### Terrain generator v1
+
+Each smooth field bilinearly interpolates the high 16 bits of four `hash2`
+lattice-corner values, using smoothstep `t*t*(3-2*t)` on each axis. Fixed point
+uses 65536 as one, widened `u64` products, and rounds down after smoothstep and
+each interpolation. Floor division and nonnegative remainders keep negative
+coordinates continuous across lattice and chunk boundaries.
+
+Domains XOR the first public-seed byte with 1 (forest), 2 (rock), 3 (dirt), or
+4 (per-tile tree density roll); `hash2` itself is unchanged. Selection order:
+
+1. Rock noise on a 16-tile lattice >= 51000 produces solid rock formations.
+2. Forest noise on a 32-tile lattice >= 32000 permits trees. A tile becomes a
+   tree when its domain-4 hash's high 16 bits are below
+   `min(56000, 22000 + forest - 32000)`, leaving grassy gaps even in dense areas.
+3. Remaining tiles with dirt noise on an 8-tile lattice >= 55000 become dirt.
+4. Everything else is grass.
+
+These are single fields, not multi-octave noise. Grass is the majority, followed
+by trees, rock, then dirt over representative large regions, not necessarily
+every chunk. Changing these rules or constants changes the generated layout;
+the v1 region checksum test locks the current output.
+
 ---
 
 ## 2. The two seeds (**server integration planned**)
@@ -87,8 +112,10 @@ The client generates the world itself. The server never sends terrain.
 It is fine that anyone can compute the whole map — that is the design.
 
 `hash2` accepts a `[32]u8` public seed. `generate` currently supplies a fixed
-all-zero placeholder internally; world-seed configuration and plumbing do not
-exist yet. This is a public layout hash, not a PRF.
+all-zero placeholder internally to the terrain sampler, which derives the four
+public layout domains described above; world-seed configuration and plumbing
+do not exist yet. This is a public layout hash, not a PRF. Private yields are
+unchanged and never participate in terrain generation.
 
 ### Private seed
 

@@ -46,6 +46,7 @@ fn tileLetter(tile: world.Tile) u8 {
         .grass => 'G',
         .dirt => 'D',
         .rock => 'R',
+        .tree => 'T',
     };
 }
 
@@ -448,6 +449,7 @@ test "every terrain type has its own uppercase letter" {
         .{ .tile = .grass, .letter = 'G' },
         .{ .tile = .dirt, .letter = 'D' },
         .{ .tile = .rock, .letter = 'R' },
+        .{ .tile = .tree, .letter = 'T' },
     };
     for (cases) |c| {
         try std.testing.expectEqual(c.letter, tileLetter(c.tile));
