@@ -41,6 +41,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     artifact.step.dependOn(&sdk_check.step);
     const root = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = options.target, .optimize = options.optimize, .link_libc = true });
     root.addImport("shared", @import("shared.zig").create(b, options.target, options.optimize));
+    root.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
     root.addImport("raylib", raylib.module("raylib"));
     root.linkLibrary(artifact);
     const renderer = b.addLibrary(.{ .name = "haystack_renderer", .linkage = .static, .root_module = root });

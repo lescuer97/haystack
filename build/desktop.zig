@@ -74,6 +74,7 @@ pub fn build(b: *std.Build, options_in: common.Options) !void {
     if (preflight) |step| raylib_artifact.step.dependOn(&step.step);
     const root = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = options.optimize });
     root.addImport("shared", shared);
+    root.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
     root.addImport("haystack_game", mod);
     root.addImport("raylib", raylib_module);
     root.addImport("raygui", raylib.module("raygui"));
@@ -247,6 +248,7 @@ fn linkWallet(module: *std.Build.Module, cdk: *std.Build.Module, archive: std.Bu
 
 fn abiTests(b: *std.Build, options: common.Options, source: []const u8, cdk: *std.Build.Module, archive: std.Build.LazyPath, rust: *std.Build.Step, policy: platform.Policy) *std.Build.Step.Run {
     const module = b.createModule(.{ .root_source_file = b.path(source), .target = options.target, .optimize = options.optimize });
+    if (std.mem.eql(u8, source, "src/wallet_storage_test.zig")) module.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
     linkWallet(module, cdk, archive, policy);
     const tests = b.addTest(.{ .root_module = module });
     tests.step.dependOn(rust);

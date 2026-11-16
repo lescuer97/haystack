@@ -117,5 +117,6 @@
         "vendor/cdk-wallet-ffi/include",
         "vendor/cdk-wallet-ffi/src",
         "vendor/cdk-wallet-ffi/examples",
+        "vendor/qrcodegen",
     },
 }

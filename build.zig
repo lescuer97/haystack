@@ -60,6 +60,15 @@ pub fn build(b: *std.Build) !void {
     });
     build_tests.step.dependOn(&b.addRunArtifact(emsdk_compat_tests).step);
     b.step("test-build", "Test platform graph isolation, explicit setup/check contracts, the upstream Emscripten adapter and the native target matrix").dependOn(&build_tests.step);
+    const qr_portability = b.step("test-qr-portability", "Cross-compile the shared C QR encoder for supported native architectures (no SDK install or runtime claim)");
+    for ([_][]const u8{ "x86_64-linux-gnu", "aarch64-linux-gnu", "aarch64-macos.15.0" }) |triple| {
+        const compile = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-target", triple, "-std=c99", "-Wall", "-Wextra", "-Werror", "-c" });
+        compile.addFileArg(b.path("vendor/qrcodegen/qrcodegen.c"));
+        compile.addFileInput(b.path("vendor/qrcodegen/qrcodegen.h"));
+        compile.addArg("-o");
+        _ = compile.addOutputFileArg(b.fmt("qr-{s}.o", .{triple}));
+        qr_portability.dependOn(&compile.step);
+    }
 
     // Explicit only: unittest discovery in the filtered package must not
     // recursively launch another package build.

@@ -30,6 +30,8 @@ REQUIRED = (
     "browser/onboarding-test.js", "browser/onboarding-regression-test.mjs",
     "browser/test-support/fake-indexeddb.mjs",
     "browser/test-support/fake-indexeddb-test.mjs",
+    "vendor/qrcodegen/qrcodegen.c", "vendor/qrcodegen/qrcodegen.h",
+    "vendor/qrcodegen/LICENSE", "vendor/qrcodegen/README.md",
 )
 
 
