@@ -82,7 +82,7 @@ async function depositCounts() {
   return counts;
 }
 const instrumentation = `(() => {
-  window.walletUiChecks = {generation:crypto.randomUUID(),errors:0,requests:[],operations:{},replies:[],invoices:{},events:[],active:0,settledAt:0,overlap:false,invoice:null,snapshot:null,history:null,resumed:null,copied:false,copiedText:null};
+  window.walletUiChecks = {generation:crypto.randomUUID(),errors:0,requests:[],requestTimes:{},operations:{},replies:[],invoices:{},events:[],active:0,settledAt:0,overlap:false,invoice:null,snapshot:null,history:null,resumed:null,copied:false,copiedText:null};
   addEventListener('error',()=>walletUiChecks.errors++);
   addEventListener('unhandledrejection',()=>walletUiChecks.errors++);
   Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{walletUiChecks.copiedText=text;walletUiChecks.copied=text===walletUiChecks.invoice?.invoice;}}});
@@ -92,6 +92,7 @@ const instrumentation = `(() => {
     bridge.walletRequest=function(generation,serial,operation){
       walletUiChecks.requests.push(operation);
       walletUiChecks.operations[serial]=operation;
+      walletUiChecks.requestTimes[serial]=Date.now();
       if(++walletUiChecks.active>1)walletUiChecks.overlap=true;
       return request.apply(this,arguments);
     };
@@ -102,7 +103,7 @@ const instrumentation = `(() => {
          if(typeof text==='string'){
            const value=JSON.parse(text);
            const operation=walletUiChecks.operations[serial];
-           walletUiChecks.replies.push({serial,operation,value});
+           walletUiChecks.replies.push({serial,operation,value,started:walletUiChecks.requestTimes[serial],finished:Date.now()});
           if(typeof value.sats==='string')walletUiChecks.snapshot=value;
           if(Array.isArray(value.rows))walletUiChecks.history=value;
            if(operation===5)walletUiChecks.resumed=value;
@@ -215,7 +216,7 @@ async function run() {
   const selectivePay=new URL('/test-pay',origin);
   selectivePay.searchParams.set('except',chosen.id);
    const selectiveResponse=await fetch(selectivePay);
-   fixtureTrace.gates.push({action:'pay-others',heldId:chosen.id,status:selectiveResponse.status});
+   fixtureTrace.gates.push({action:'pay-others',heldId:chosen.id,status:selectiveResponse.status,at:Date.now()});
    if(!selectiveResponse.ok)throw new Error('Could not selectively release payment gate');
   await expect('closed-menu service locally confirms both other real deposits',`[${JSON.stringify(first.id)},${JSON.stringify(second.id)}].every(id=>walletUiChecks.replies.slice(${replyStart}).some(r=>r.operation===7 && r.value.invoice?.id===id && r.value.invoice.state==='ISSUED' && r.value.invoice.confirmed===true)) && walletUiChecks.invoices[${JSON.stringify(chosen.id)}]?.state==='UNPAID' && walletUiChecks.snapshot?.sats==='163' && walletUiChecks.active===0 && !walletUiChecks.overlap`);
    counts=await depositCounts();
@@ -245,6 +246,7 @@ catch (_) {
     try{state=await bounded(evaluate(`({generation:window.walletUiChecks?.generation,errors:window.walletUiChecks?.errors,events:window.walletUiChecks?.events,requests:window.walletUiChecks?.requests,sats:window.walletUiChecks?.snapshot?.sats,replies:window.walletUiChecks?.replies.map(r=>{const invoice=typeof r.value.invoice==='string'?r.value:r.value.invoice;return {serial:r.serial,operation:r.operation,id:invoice?.id,amount:invoice?.amount,state:invoice?.state,confirmed:invoice?.confirmed,cursor:r.value.cursor,wallet_changed:r.value.wallet_changed,recovery_pending:r.value.recovery_pending,errorStatus:r.value.error?.status};}),startupFailed:document.getElementById('startup')?.textContent==='Unable to start game.'})`),1000,'diagnostics');}catch(_){}
   console.error(`Wallet UI regression failed: ${label}`);
    console.error(JSON.stringify({diagnostics,state,captures,fixtureTrace}));
+   try{console.error(JSON.stringify(await bounded(evaluate('walletUiChecks.replies.map(r=>({serial:r.serial,op:r.operation,started:r.started,finished:r.finished}))'),1000,'request timing diagnostics')));}catch(_){}
   process.exitCode=1;
 }
 finally {

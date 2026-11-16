@@ -42,7 +42,7 @@ field that was previously focused; the caret appears only after activation.
 Pages and rows:
 
 - **Main**: `Wallet` (navigation), `Resume` (close).
-- **Wallet**: selected-mint sat balance, `Deposit`, disabled `Withdraw - unavailable`,
+- **Wallet**: selected-mint sat balance, `Deposit`, `Withdraw`,
   `History`, `Back to Main`.
 - **Deposit**: custom positive integer sats, presets 21/42/100/1000, `Deposit`, `Back`.
 - **Invoice**: cached QR, bounded invoice preview, actual quote state,
@@ -52,12 +52,31 @@ Pages and rows:
   persisted state and mint identity. Legacy mints are marked `not refreshed`;
   unknown melt owners stay unknown. Paid deposits are not completed deposits.
   Rows are selectable by pointer, keyboard, and gamepad; activation opens the saved
-  invoice. Previous appears only with an earlier page, Next only with a later page;
+  deposit invoice or read-only withdrawal detail for this mint. Previous appears only with an earlier page, Next only with a later page;
   a single page shows neither.
 
 Deposit navigation and the Deposit amount action use green text and rectangular
-outlines, never filled backgrounds or pills. Withdraw uses red and is intentionally not implemented; existing melt
-quotes still appear in history.
+outlines, never filled backgrounds or pills. Withdraw uses red rectangular outlines.
+
+**Withdraw** accepts one complete, amount-bearing Lightning BOLT11 invoice (4096
+UTF-8 bytes maximum). Focus the large wrapped field to type or use Ctrl+V / Paste;
+oversized or control-containing paste is refused atomically. Clear and Back erase
+the draft; drafts do not survive restart. Amountless invoices, BOLT12 and scanning
+are not supported. Review obtains a CDK quote and reserves funds, but does not
+submit a payment. It shows amount, routing reserve, Cashu swap/input fees, expiry
+and estimated total; the estimate is **not a guaranteed cap**. Only the explicit
+red Withdraw action consumes the single-use prepared operation. An expired review
+cannot be confirmed. Cancel, Back or closing cancels unsubmitted preparation,
+including one whose reply arrives after closing. Cancellation failure warns that
+funds may remain reserved and pauses conflicting work; it does not claim success.
+
+Prepared review pauses deposit and withdrawal recovery/mutations. Once submitted,
+CDK checks continue with the menu closed and after restart. A pending payment is
+not declared expired merely because its deadline passed. Outgoing History opens
+local CDK detail, never a new quote or payment. Review again is available only when
+CDK permits it: it prefills the invoice but still requires a fresh Review click.
+All displayed amounts come from CDK decimal strings; balances/history are reread
+after every withdrawal mutation, including failures, not calculated by the UI.
 
 Deposit disables duplicate requests until the persisted quote returns. Payment
 checks run serially, about two seconds after the previous completion, backing
@@ -159,7 +178,8 @@ pub const MenuItem = union(enum) {
    on a page. The renderer draws any field generically through
    `textFieldConst` and `isFocused`.
 
-`TextField` is fixed at 128 UTF-8 bytes and never allocates. Appends work on
+The deposit `TextField` remains fixed at 128 UTF-8 bytes; the separate withdrawal
+field uses 4096. Neither allocates. Appends work on
 whole Unicode codepoints, reject controls and surrogate halves, and stop at
 capacity; backspace removes one whole codepoint. Rendering scrolls the value so
 the caret stays visible, and scissors it to the input box.

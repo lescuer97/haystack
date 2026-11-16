@@ -22,6 +22,7 @@ menu, without building the other application.
 | `zig build browser-fixture -Dplatform=wasm` | Build the isolated browser fixture application under `zig-out/wasm-test` |
 | `zig build test-onboarding -Dplatform=wasm` | Linux-only onboarding suite with a fake mint and fresh Chromium incognito contexts |
 | `zig build test-wallet-ui -Dplatform=wasm -Doffline` | Functional game wallet deposits, complete-invoice clipboard, exactly-once payment, closed-menu settlement and persisted history/selection/reload; gated ephemeral fake mint and isolated Chromium, no image checks |
+| `zig build test-withdrawal-ui -Dplatform=wasm -Doffline` | Functional real-renderer withdrawal Review/Cancel/explicit payment, long clipboard invoice, Pending/reload/recovery and local history; fresh isolated fake mint and Chromium, no image checks |
 | `zig build test-qr-portability -Doffline` | C encoder object checks for Linux x86_64/aarch64 and macOS 15 ARM64; not ARM64 application/runtime verification |
 | `zig build setup -Dplatform=wasm` | Provision Rust + Wasm target, local wasm-bindgen and Emscripten without building the application |
 | `zig build test-build` | Test graph isolation, explicit setup/check contracts, the native target matrix and the upstream Emscripten adapter |

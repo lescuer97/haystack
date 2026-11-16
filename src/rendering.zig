@@ -366,11 +366,11 @@ fn drawTextInput(
 
 fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, state: *const menu.Menu, selected: bool) void {
     const incoming = (item == .navigate and item.navigate == .Deposit) or (item == .action and item.action == .deposit);
-    const outgoing = item == .action and item.action == .unavailable;
+    const outgoing = (item == .navigate and item.navigate == .Withdraw) or (item == .action and item.action == .confirm_withdrawal);
     if (incoming or outgoing) {
         const color = if (outgoing) rl.Color.red else rl.Color.green;
         rl.drawRectangleLinesEx(toRaylibRect(rect), if (selected) 3 else 1, color);
-        drawCenteredText(menu.itemLabel(item), rect, if (outgoing) 15 else 20, color);
+        drawCenteredText(menu.itemLabel(item), rect, 20, if (item == .action and item.action == .confirm_withdrawal and !state.wallet.canConfirmWithdrawal()) menu_muted else color);
         return;
     }
     if (item == .action and item.action == .balance) {
@@ -378,6 +378,11 @@ fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, state: *const menu.Menu, s
         return;
     }
     const text_field = menu.itemField(item);
+    if (text_field == .withdrawal_invoice) {
+        rl.drawRectangleLinesEx(toRaylibRect(rect), if (state.isFocused(.withdrawal_invoice)) 2 else 1, menu_accent);
+        drawWrapped(state.withdrawal_invoice.slice(), rect, 16, true);
+        return;
+    }
     const focused = if (text_field) |field| state.isFocused(field) else false;
 
     const fill = if (focused)
@@ -403,7 +408,7 @@ fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, state: *const menu.Menu, s
             if (item == .navigate and item.navigate == .Wallet and state.currentPage != .Main) "Back" else menu.itemLabel(item),
             rect,
             if (rect.height < 32) 14 else 20,
-            menu_text_color,
+            if (item == .action and ((item.action == .review_again and !state.wallet.withdrawal.retry_review_allowed) or (item.action == .review_withdrawal and !state.wallet.canPrepareWithdrawal(state.withdrawal_invoice.slice())))) menu_muted else menu_text_color,
         ),
     }
 }
@@ -469,6 +474,27 @@ fn drawWalletContent(state: *const menu.Menu, rect: menu.Rect) void {
         }
         return;
     }
+    if (state.currentPage == .Withdraw or state.currentPage == .Withdrawal) {
+        const message = if (model.withdrawal_error_status != 0) model.withdrawalFailureMessage() else model.message.slice();
+        drawWrapped(message, .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = if (state.currentPage == .Withdraw) 30 else 52 }, 13, false);
+        if (state.currentPage == .Withdraw) {
+            if (model.prepareWithdrawalReason(state.withdrawal_invoice.slice())) |reason| drawWrapped(reason, .{ .x = rect.x, .y = rect.y + 32, .width = rect.width, .height = 28 }, 13, false);
+            return;
+        }
+        if (model.withdrawal_loading) {
+            rl.drawText("Loading selected saved withdrawal...", x, y + 55, 16, menu_muted);
+            return;
+        }
+        const view = &model.withdrawal;
+        if (view.quote_id.len == 0) return;
+        var buf: [1024:0]u8 = @splat(0);
+        const text = if (model.reviewLive())
+            std.fmt.bufPrint(&buf, "Amount: {s} sat\nRouting fee reserve: {s} sat\nCashu swap fee: {s} sat | input fee: {s} sat\nEstimated total: {s} sat (not a guaranteed cap)\nQuote expiry (Unix): {s} | invoice expiry: {s}\nCDK status: {s} | quote: {s}{s}", .{ view.amount.slice(), view.fee_reserve.slice(), view.swap_fee.slice(), view.input_fee.slice(), view.estimated_total.slice(), view.quote_expiry.slice(), view.invoice_expiry.slice(), @tagName(view.status), view.quote_state.slice(), if (view.expired) " | expired" else "" }) catch "Details exceed display limit"
+        else
+            std.fmt.bufPrint(&buf, "Amount: {s} sat\nQuote expiry (Unix): {s}\nInvoice expiry (Unix): {s}\nCDK status: {s} | quote: {s}{s}", .{ view.amount.slice(), view.quote_expiry.slice(), view.invoice_expiry.slice(), @tagName(view.status), view.quote_state.slice(), if (view.expired) " | expired" else "" }) catch "Details exceed display limit";
+        drawWrapped(text, .{ .x = rect.x, .y = rect.y + 56, .width = rect.width, .height = @max(1, rect.height - 56) }, 16, false);
+        return;
+    }
     if (state.currentPage == .Invoice and model.invoice.len != 0 and !model.expired) {
         const pixels: u32 = @intFromFloat(@max(0, @min(rect.height - 46, rect.width * 0.48)));
         if (model.qr.size() == 0 or model.qr.scale(pixels) == 0) {
@@ -521,6 +547,42 @@ fn drawWalletContent(state: *const menu.Menu, rect: menu.Rect) void {
         @memcpy(buf[0..count], model.invoice.slice()[start..][0..count]);
         rl.drawText(buf[0..count :0], text_x, y + 65 + @as(i32, @intCast(line)) * 16, 14, menu_text_color);
         start += count;
+    }
+}
+
+// UTF-8-safe wrapping shared by the large editable invoice and read-only details.
+// The editable field scrolls to its tail rather than silently hiding new input.
+fn drawWrapped(text: []const u8, rect: menu.Rect, size: i32, tail: bool) void {
+    if (rect.width < 2 or rect.height < 2) return;
+    const columns: usize = @intFromFloat(@max(1, @min(120, (rect.width - 16) / @as(f32, @floatFromInt(size)))));
+    const line_height = @as(f32, @floatFromInt(size + 4));
+    const visible: usize = @intFromFloat(@max(1, (rect.height - 12) / line_height));
+    var starts: [4098]usize = undefined;
+    var count: usize = 1;
+    starts[0] = 0;
+    var width: usize = 0;
+    var index: usize = 0;
+    while (index < text.len and count < starts.len) {
+        const n = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
+        const newline = text[index] == '\n';
+        index += @min(n, text.len - index);
+        width += 1;
+        if (newline or width >= columns) {
+            starts[count] = index;
+            count += 1;
+            width = 0;
+        }
+    }
+    const first = if (tail and count > visible) count - visible else 0;
+    rl.beginScissorMode(@intFromFloat(rect.x + 1), @intFromFloat(rect.y + 1), @intFromFloat(@max(1, rect.width - 2)), @intFromFloat(@max(1, rect.height - 2)));
+    defer rl.endScissorMode();
+    var row: usize = first;
+    while (row < count and row - first < visible) : (row += 1) {
+        const end = if (row + 1 < count) starts[row + 1] else text.len;
+        var line: [512:0]u8 = @splat(0);
+        const len = @min(end - starts[row], 511);
+        @memcpy(line[0..len], text[starts[row]..][0..len]);
+        rl.drawText(line[0..len :0], @intFromFloat(rect.x + 8), @intFromFloat(rect.y + 6 + @as(f32, @floatFromInt(row - first)) * line_height), size, menu_text_color);
     }
 }
 

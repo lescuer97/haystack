@@ -40,10 +40,12 @@ class GraphIsolationTests(unittest.TestCase):
         # browser wallet/renderer graph itself is independent of that helper.
         if HOST_SYSTEM == "Linux":
             self.assertIn("test-mint", self.wasm)
+            self.assertIn("test-withdrawal-ui", self.wasm)
         else:
             self.assertNotIn("test-mint", self.wasm)
         self.assertNotIn("header-check", self.wasm)
         self.assertNotIn("test-spilman", self.wasm)
+        self.assertNotIn("test-withdrawal-ui", self.desktop)
 
     def test_wasm_does_not_configure_macos_desktop_preflight(self):
         # The wasm help text itself mentions macOS in Zig's generic host

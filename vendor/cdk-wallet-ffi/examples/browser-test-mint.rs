@@ -35,6 +35,100 @@ struct App {
     directory: PathBuf,
 }
 
+fn withdrawal_invoice(query: &HashMap<String, String>) -> Result<String, StatusCode> {
+    let sats = query
+        .get("sats")
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| (1..=10_000).contains(n))
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let amount_msat = sats.checked_mul(1000).ok_or(StatusCode::BAD_REQUEST)?;
+    let description_bytes = match query.get("description_bytes") {
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n <= 600)
+            .ok_or(StatusCode::BAD_REQUEST)?,
+        None => 600,
+    };
+    let pending = match query.get("pending").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+    let description = if pending {
+        let mut description = serde_json::to_string(&cdk_fake_wallet::FakeInvoiceDescription {
+            pay_invoice_state: cdk::nuts::MeltQuoteState::Pending,
+            check_payment_state: cdk::nuts::MeltQuoteState::Paid,
+            pay_err: false,
+            check_err: false,
+        }).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let padding = description_bytes.checked_sub(description.len()).ok_or(StatusCode::BAD_REQUEST)?;
+        description.push_str(&" ".repeat(padding));
+        description
+    } else {
+        "x".repeat(description_bytes)
+    };
+    Ok(cdk_fake_wallet::create_fake_invoice(amount_msat, description).to_string())
+}
+
+fn withdrawal_mode(query: &HashMap<String, String>) -> Result<bool, StatusCode> {
+    match query.get("mode").map(String::as_str) {
+        Some("pending") => Ok(true),
+        Some("paid") => Ok(false),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn withdrawal_fixture_validates_before_building_invoice() {
+        let mut query = HashMap::from([("sats".into(), "21".into())]);
+        let invoice = withdrawal_invoice(&query).unwrap();
+        assert!((1025..=4096).contains(&invoice.len()));
+        let parsed: cdk::lightning_invoice::Bolt11Invoice = invoice.parse().unwrap();
+        assert_eq!(parsed.amount_milli_satoshis(), Some(21_000));
+        for bytes in ["601", "1300", "2000", "-1", "invalid", "18446744073709551616"] {
+            query.insert("description_bytes".into(), bytes.into());
+            assert_eq!(withdrawal_invoice(&query), Err(StatusCode::BAD_REQUEST));
+        }
+        for bytes in ["0", "600"] {
+            query.insert("description_bytes".into(), bytes.into());
+            assert!(withdrawal_invoice(&query).is_ok());
+        }
+        for sats in ["0", "-1", "10001", "18446744073709551615", "18446744073709551616", "invalid"] {
+            query.insert("sats".into(), sats.into());
+            assert_eq!(withdrawal_invoice(&query), Err(StatusCode::BAD_REQUEST));
+        }
+        query.remove("sats");
+        assert_eq!(withdrawal_invoice(&query), Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn withdrawal_pending_description_is_long_valid_json_and_modes_are_exact() {
+        let mut query = HashMap::from([("sats".into(), "21".into()), ("pending".into(), "true".into())]);
+        let invoice = withdrawal_invoice(&query).unwrap();
+        assert!((1025..=4096).contains(&invoice.len()));
+        let parsed: cdk::lightning_invoice::Bolt11Invoice = invoice.parse().unwrap();
+        let description = parsed.description().to_string();
+        assert_eq!(description.len(), 600);
+        let control: cdk_fake_wallet::FakeInvoiceDescription = serde_json::from_str(&description).unwrap();
+        assert_eq!(control.pay_invoice_state, cdk::nuts::MeltQuoteState::Pending);
+        assert_eq!(control.check_payment_state, cdk::nuts::MeltQuoteState::Paid);
+        assert!(!control.pay_err && !control.check_err);
+        query.insert("description_bytes".into(), "0".into());
+        assert_eq!(withdrawal_invoice(&query), Err(StatusCode::BAD_REQUEST));
+        query.insert("pending".into(), "invalid".into());
+        assert_eq!(withdrawal_invoice(&query), Err(StatusCode::BAD_REQUEST));
+        for (mode, expected) in [("pending", Ok(true)), ("paid", Ok(false)), ("invalid", Err(StatusCode::BAD_REQUEST))] {
+            assert_eq!(withdrawal_mode(&HashMap::from([("mode".into(), mode.into())])), expected);
+        }
+        assert_eq!(withdrawal_mode(&HashMap::new()), Err(StatusCode::BAD_REQUEST));
+    }
+}
+
 async fn token(State(app): State<App>) -> Result<Json<serde_json::Value>, StatusCode> {
     let wallet = app.wallet.lock().await;
     let prepared = wallet
@@ -126,18 +220,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paid = Arc::new(AtomicBool::new(true));
     let quotes = Arc::new(AtomicU64::new(0));
     let claims = Arc::new(AtomicU64::new(0));
+    let withdrawal_quotes = Arc::new(AtomicU64::new(0));
+    let melt_posts = Arc::new(AtomicU64::new(0));
+    let withdrawal_pending = Arc::new(AtomicBool::new(false));
     let unpaid_quote = Arc::new(tokio::sync::Mutex::new(None::<String>));
     let gate = paid.clone();
     let except = unpaid_quote.clone();
     let quote_count = quotes.clone();
     let claim_count = claims.clone();
+    let withdrawal_quote_count = withdrawal_quotes.clone();
+    let melt_count = melt_posts.clone();
+    let withdrawal_gate = withdrawal_pending.clone();
     let router = router.layer(middleware::from_fn(move |req: Request, next: Next| {
         let paid = gate.clone();
         let quotes = quote_count.clone();
         let claims = claim_count.clone();
+        let withdrawal_quotes = withdrawal_quote_count.clone();
+        let melt_posts = melt_count.clone();
+        let withdrawal_pending = withdrawal_gate.clone();
         let except = except.clone();
         async move {
             let path = req.uri().path().to_owned();
+            let withdrawal_get = path.starts_with("/v1/melt/quote/bolt11/") && req.method() == axum::http::Method::GET;
+            let withdrawal_post = path == "/v1/melt/bolt11" && req.method() == axum::http::Method::POST;
+            if req.method() == axum::http::Method::POST {
+                if path == "/v1/melt/quote/bolt11" { withdrawal_quotes.fetch_add(1, Ordering::SeqCst); }
+                if path == "/v1/melt/bolt11" { melt_posts.fetch_add(1, Ordering::SeqCst); }
+            }
             let create =
                 req.method() == axum::http::Method::POST && path == "/v1/mint/quote/bolt11";
             let claim = req.method() == axum::http::Method::POST && path == "/v1/mint/bolt11";
@@ -148,6 +257,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 claims.fetch_add(1, Ordering::SeqCst);
             }
             let response = next.run(req).await;
+            if withdrawal_pending.load(Ordering::SeqCst) && (withdrawal_get || withdrawal_post) {
+                let (mut parts, body) = response.into_parts();
+                let bytes = axum::body::to_bytes(body, 65536).await.unwrap();
+                if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    // Hold only real payment progress/completion. Never turn
+                    // a rejection or an unsubmitted quote into a pending one.
+                    if matches!(value["state"].as_str(), Some("PENDING" | "PAID")) {
+                        value["state"] = "PENDING".into();
+                        value["payment_preimage"] = serde_json::Value::Null;
+                        value["change"] = serde_json::Value::Null;
+                        parts.headers.remove(header::CONTENT_LENGTH);
+                        return Response::from_parts(parts, Body::from(value.to_string()));
+                    }
+                }
+                return Response::from_parts(parts, Body::from(bytes));
+            }
             let held = except.lock().await.clone();
             if gated && (!paid.load(Ordering::SeqCst) || held.as_deref() == Some(path.as_str())) && path.starts_with("/v1/mint/quote/bolt11") {
                 let (mut parts, body) = response.into_parts();
@@ -169,6 +294,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gate_ready = paid.clone();
     let quote_ready = quotes.clone();
     let claim_ready = claims.clone();
+    let withdrawal_quote_ready = withdrawal_quotes.clone();
+    let melt_ready = melt_posts.clone();
     let server = tokio::spawn(async move {
         // Funding happens after the listener begins accepting requests.
         let (sender, receiver) = tokio::sync::oneshot::channel::<App>();
@@ -181,6 +308,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let for_quotes = quotes.clone();
         let for_claims = claims.clone();
         let extra = Router::new()
+            .route("/test-withdrawal-mode", get(move |axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>| {
+                let pending = withdrawal_pending.clone();
+                async move {
+                    let hold = withdrawal_mode(&query)?;
+                    pending.store(hold, Ordering::SeqCst);
+                    Ok::<_, StatusCode>(StatusCode::OK)
+                }
+            }))
+            .route("/test-withdrawal-invoice", get(|axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>| async move {
+                let invoice = withdrawal_invoice(&query)?;
+                Ok::<_, StatusCode>(Json(serde_json::json!({"invoice":invoice})))
+            }))
+            .route("/test-withdrawal-counts", get(move || {
+                let quotes = withdrawal_quotes.clone();
+                let posts = melt_posts.clone();
+                async move { Json(serde_json::json!({"quotes":quotes.load(Ordering::SeqCst),"melt_posts":posts.load(Ordering::SeqCst)})) }
+            }))
             .route("/test-unpay", get(move || {
                 let paid = for_unpay.clone();
                 async move {
@@ -272,6 +416,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     wallet.mint(&quote.id, SplitTarget::default(), None).await?;
     quote_ready.store(0, Ordering::SeqCst);
     claim_ready.store(0, Ordering::SeqCst);
+    withdrawal_quote_ready.store(0, Ordering::SeqCst);
+    melt_ready.store(0, Ordering::SeqCst);
     if gated {
         gate_ready.store(false, Ordering::SeqCst);
     }

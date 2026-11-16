@@ -21,14 +21,14 @@ const wallet_ui = @import("wallet_ui.zig");
 /// backing array is the sentinel that makes `cString` possible.
 pub const max_text_bytes: usize = 128;
 
-pub const MenuPage = enum { Main, Wallet, Deposit, Invoice, History };
+pub const MenuPage = enum { Main, Wallet, Deposit, Invoice, History, Withdraw, Withdrawal };
 
 /// Local menu actions. None of these touch a wallet, payment, or network layer;
 /// they only change menu-local UI state.
-pub const Action = enum { close_menu, unavailable, balance, preset21, preset42, preset100, preset1000, deposit, previous, next, copy_invoice };
+pub const Action = enum { close_menu, balance, preset21, preset42, preset100, preset1000, deposit, previous, next, copy_invoice, review_withdrawal, confirm_withdrawal, cancel_withdrawal, review_again, paste_withdrawal, clear_withdrawal };
 
 /// Editable fields. A field is a data key; its runtime value lives in `Menu`.
-pub const InputField = enum { deposit_sats };
+pub const InputField = enum { deposit_sats, withdrawal_invoice };
 
 /// One menu row. The tag decides what activation does, so adding a new kind
 /// makes the exhaustive switches below require a decision.
@@ -42,52 +42,66 @@ pub const MenuItem = union(enum) {
 
 /// Bounded UTF-8 text with no allocation. Appends and backspaces operate on
 /// whole codepoints; `bytes[len]` is always the sentinel 0.
-pub const TextField = struct {
-    bytes: [max_text_bytes + 1]u8 = @splat(0),
-    len: usize = 0,
+pub const TextField = BoundedTextField(max_text_bytes);
+pub fn BoundedTextField(comptime capacity: usize) type {
+    return struct {
+        const Self = @This();
+        bytes: [capacity + 1]u8 = @splat(0),
+        len: usize = 0,
 
-    pub fn slice(self: *const TextField) []const u8 {
-        return self.bytes[0..self.len];
-    }
-
-    /// Sentinel-terminated view for Raylib's text functions.
-    pub fn cString(self: *const TextField) [:0]const u8 {
-        return self.bytes[0..self.len :0];
-    }
-
-    pub fn clear(self: *TextField) void {
-        self.len = 0;
-        self.bytes[0] = 0;
-    }
-
-    /// Append one printable Unicode codepoint. Returns false for control
-    /// characters, surrogate halves, out-of-range values, or a full buffer.
-    pub fn appendCodepoint(self: *TextField, codepoint: u21) bool {
-        if (!isPrintable(codepoint)) return false;
-
-        var encoded: [4]u8 = undefined;
-        const encoded_len: usize = std.unicode.utf8Encode(codepoint, &encoded) catch return false;
-        if (self.len + encoded_len > max_text_bytes) return false;
-
-        @memcpy(self.bytes[self.len..][0..encoded_len], encoded[0..encoded_len]);
-        self.len += encoded_len;
-        self.bytes[self.len] = 0;
-        return true;
-    }
-
-    /// Remove the last whole codepoint. Returns false when already empty.
-    pub fn backspace(self: *TextField) bool {
-        if (self.len == 0) return false;
-
-        var index = self.len - 1;
-        while (index > 0 and (self.bytes[index] & 0xC0) == 0x80) {
-            index -= 1;
+        pub fn slice(self: *const Self) []const u8 {
+            return self.bytes[0..self.len];
         }
-        self.len = index;
-        self.bytes[self.len] = 0;
-        return true;
-    }
-};
+
+        /// Sentinel-terminated view for Raylib's text functions.
+        pub fn cString(self: *const Self) [:0]const u8 {
+            return self.bytes[0..self.len :0];
+        }
+
+        pub fn clear(self: *Self) void {
+            self.len = 0;
+            self.bytes[0] = 0;
+        }
+
+        /// Append one printable Unicode codepoint. Returns false for control
+        /// characters, surrogate halves, out-of-range values, or a full buffer.
+        pub fn appendCodepoint(self: *Self, codepoint: u21) bool {
+            if (!isPrintable(codepoint)) return false;
+
+            var encoded: [4]u8 = undefined;
+            const encoded_len: usize = std.unicode.utf8Encode(codepoint, &encoded) catch return false;
+            if (self.len + encoded_len > capacity) return false;
+
+            @memcpy(self.bytes[self.len..][0..encoded_len], encoded[0..encoded_len]);
+            self.len += encoded_len;
+            self.bytes[self.len] = 0;
+            return true;
+        }
+
+        /// Remove the last whole codepoint. Returns false when already empty.
+        pub fn backspace(self: *Self) bool {
+            if (self.len == 0) return false;
+
+            var index = self.len - 1;
+            while (index > 0 and (self.bytes[index] & 0xC0) == 0x80) {
+                index -= 1;
+            }
+            self.len = index;
+            self.bytes[self.len] = 0;
+            return true;
+        }
+        pub fn replace(self: *Self, value: []const u8) bool {
+            if (value.len > capacity) return false;
+            const view = std.unicode.Utf8View.init(value) catch return false;
+            var iter = view.iterator();
+            while (iter.nextCodepoint()) |cp| if (!isPrintable(cp)) return false;
+            @memcpy(self.bytes[0..value.len], value);
+            self.len = value.len;
+            self.bytes[self.len] = 0;
+            return true;
+        }
+    };
+}
 
 /// Printable text: no C0/C1 controls and no values outside Unicode. Surrogate
 /// halves also pass this check but are rejected by `utf8Encode`.
@@ -107,7 +121,7 @@ const main_items = [_]MenuItem{
 const wallet_items = [_]MenuItem{
     .{ .action = .balance },
     .{ .navigate = .Deposit },
-    .{ .action = .unavailable },
+    .{ .navigate = .Withdraw },
     .{ .navigate = .History },
     .{ .navigate = .Main },
 };
@@ -123,6 +137,9 @@ const deposit_items = [_]MenuItem{
 const invoice_items = [_]MenuItem{ .{ .action = .copy_invoice }, .{ .navigate = .Deposit }, .{ .navigate = .Wallet } };
 const history_items = [_]MenuItem{ .{ .action = .previous }, .{ .action = .next }, .{ .navigate = .Wallet } };
 const history_previous_items = [_]MenuItem{ .{ .action = .previous }, .{ .navigate = .Wallet } };
+const withdraw_items = [_]MenuItem{ .{ .text_input = .withdrawal_invoice }, .{ .action = .paste_withdrawal }, .{ .action = .clear_withdrawal }, .{ .action = .review_withdrawal }, .{ .navigate = .Wallet } };
+const withdrawal_review_items = [_]MenuItem{ .{ .action = .confirm_withdrawal }, .{ .action = .cancel_withdrawal } };
+const withdrawal_detail_items = [_]MenuItem{ .{ .action = .review_again }, .{ .navigate = .Wallet } };
 
 pub fn pageTitle(page: MenuPage) [:0]const u8 {
     return switch (page) {
@@ -131,6 +148,8 @@ pub fn pageTitle(page: MenuPage) [:0]const u8 {
         .Deposit => "Deposit - sats",
         .Invoice => "Deposit - invoice",
         .History => "History",
+        .Withdraw => "Withdraw - Lightning BOLT11",
+        .Withdrawal => "Withdraw - review / saved payment",
     };
 }
 
@@ -141,6 +160,8 @@ pub fn pageItems(page: MenuPage) []const MenuItem {
         .Deposit => &deposit_items,
         .Invoice => &invoice_items,
         .History => &history_items,
+        .Withdraw => &withdraw_items,
+        .Withdrawal => &withdrawal_review_items,
     };
 }
 
@@ -152,11 +173,12 @@ pub fn itemLabel(item: MenuItem) [:0]const u8 {
             .Deposit => "Deposit",
             .Invoice => "Saved invoice",
             .History => "History",
+            .Withdraw => "Withdraw",
+            .Withdrawal => "Saved withdrawal",
         },
         .action => |action| switch (action) {
             .close_menu => "Resume",
             .balance => "Balance (sat)",
-            .unavailable => "Withdraw - unavailable",
             .preset21 => "21 sat",
             .preset42 => "42 sat",
             .preset100 => "100 sat",
@@ -165,9 +187,16 @@ pub fn itemLabel(item: MenuItem) [:0]const u8 {
             .previous => "Previous",
             .next => "Next",
             .copy_invoice => "Copy invoice",
+            .review_withdrawal => "Review",
+            .confirm_withdrawal => "Withdraw",
+            .cancel_withdrawal => "Cancel / Back",
+            .review_again => "Review again",
+            .paste_withdrawal => "Paste",
+            .clear_withdrawal => "Clear",
         },
         .text_input => |field| switch (field) {
             .deposit_sats => "Custom sats",
+            .withdrawal_invoice => "Lightning BOLT11 (up to 4096 bytes)",
         },
     };
 }
@@ -264,9 +293,12 @@ fn calculateLayoutCount(page: MenuPage, viewport_w: f32, viewport_h: f32, item_c
         .Wallet, .Deposit => 62,
         .Invoice => 340,
         .History => 352,
+        .Withdraw => 62,
+        .Withdrawal => 320,
     };
-    const desired_width: f32 = if (page == .Invoice or page == .History) 760 else desired_panel_width;
-    const desired_h = panel_padding * 2 + title_height + content_height +
+    const desired_width: f32 = if (page == .Invoice or page == .History or page == .Withdraw or page == .Withdrawal) 760 else desired_panel_width;
+    const field_extra: f32 = if (page == .Withdraw) 112 else 0;
+    const desired_h = panel_padding * 2 + title_height + content_height + field_extra +
         item_count_f * desired_item_height + gap_total;
 
     const panel = Rect{
@@ -285,7 +317,7 @@ fn calculateLayoutCount(page: MenuPage, viewport_w: f32, viewport_h: f32, item_c
     const title_h = @min(title_height, inner_h * 0.4);
     const rows_height = @max(inner_h - title_h, 0);
 
-    const desired_rows = item_count_f * desired_item_height + gap_total + content_height;
+    const desired_rows = item_count_f * desired_item_height + gap_total + content_height + field_extra;
     const row_scale = if (desired_rows > 0)
         @min(rows_height / desired_rows, 1)
     else
@@ -312,9 +344,9 @@ fn calculateLayoutCount(page: MenuPage, viewport_w: f32, viewport_h: f32, item_c
     while (index < count) : (index += 1) {
         result.items[index] = .{
             .x = item_x,
-            .y = first_item_y + @as(f32, @floatFromInt(index)) * (item_h + row_gap),
+            .y = first_item_y + @as(f32, @floatFromInt(index)) * (item_h + row_gap) + (if (index > 0) field_extra * row_scale else 0),
             .width = item_w,
-            .height = item_h,
+            .height = item_h + (if (index == 0) field_extra * row_scale else 0),
         };
     }
 
@@ -329,6 +361,8 @@ pub const Menu = struct {
     currentPage: MenuPage = .Main,
     focus: ?InputField = null,
     deposit_sats: TextField = .{},
+    withdrawal_invoice: BoundedTextField(4096) = .{},
+    paste_requested: bool = false,
 
     /// Persistent row highlight. Opening a page selects its first row; it then
     /// moves only when a menu direction step or moving pointer selects another
@@ -408,6 +442,9 @@ pub const Menu = struct {
     }
 
     pub fn close(self: *Menu) void {
+        self.wallet.leaveWithdrawal();
+        self.withdrawal_invoice.clear();
+        self.paste_requested = false;
         self.wallet.history_active = false;
         self.opened = false;
         self.focus = null;
@@ -425,6 +462,7 @@ pub const Menu = struct {
         return if (self.currentPage == .History) self.wallet.row_count else 0;
     }
     pub fn items(self: *const Menu) []const MenuItem {
+        if (self.currentPage == .Withdrawal) return if (self.wallet.reviewLive() or (self.wallet.pending and (self.wallet.operation == .prepare_withdrawal or self.wallet.operation == .cancel_withdrawal))) &withdrawal_review_items else &withdrawal_detail_items;
         if (self.currentPage != .History) return pageItems(self.currentPage);
         const previous = self.wallet.total_rows > 8 and self.wallet.desired_offset > 0;
         const next = @as(u64, self.wallet.desired_offset) + 8 < self.wallet.total_rows;
@@ -450,8 +488,9 @@ pub const Menu = struct {
     pub fn activateIndex(self: *Menu, index: usize) void {
         if (index < self.rowCount()) {
             if (self.wallet.openRow(index)) {
-                self.currentPage = .Invoice;
+                self.currentPage = if (self.wallet.rows[index].outgoing) .Withdrawal else .Invoice;
                 self.wallet.history_active = false;
+                self.focus = null;
                 self.selected_index = 0;
             }
         } else if (index - self.rowCount() < self.items().len) self.activate(self.items()[index - self.rowCount()]);
@@ -486,18 +525,25 @@ pub const Menu = struct {
     pub fn textField(self: *Menu, field: InputField) *TextField {
         return switch (field) {
             .deposit_sats => &self.deposit_sats,
+            .withdrawal_invoice => unreachable,
         };
     }
 
     pub fn textFieldConst(self: *const Menu, field: InputField) *const TextField {
         return switch (field) {
             .deposit_sats => &self.deposit_sats,
+            .withdrawal_invoice => unreachable,
         };
     }
 
     fn activate(self: *Menu, item: MenuItem) void {
         switch (item) {
             .navigate => |page| {
+                if ((self.currentPage == .Withdraw or self.currentPage == .Withdrawal) and page != self.currentPage) {
+                    self.wallet.leaveWithdrawal();
+                    self.withdrawal_invoice.clear();
+                    self.paste_requested = false;
+                }
                 if (page == .Deposit and self.wallet.invoice.len != 0 and !self.wallet.issued and !self.wallet.expired and self.currentPage == .Wallet) {
                     self.currentPage = .Invoice;
                 } else self.currentPage = page;
@@ -507,7 +553,7 @@ pub const Menu = struct {
             },
             .action => |action| switch (action) {
                 .close_menu => self.close(),
-                .unavailable, .balance => {},
+                .balance => {},
                 .preset21, .preset42, .preset100, .preset1000 => {
                     self.deposit_sats.clear();
                     const text = switch (action) {
@@ -527,9 +573,42 @@ pub const Menu = struct {
                         self.selected_index = 0;
                     }
                 },
-                .previous => self.wallet.changePage(-1, std.heap.page_allocator),
-                .next => self.wallet.changePage(1, std.heap.page_allocator),
+                .previous => self.wallet.changePage(-1),
+                .next => self.wallet.changePage(1),
                 .copy_invoice => self.wallet.copy_requested = self.wallet.canCopyInvoice(),
+                .review_withdrawal => {
+                    self.focus = null;
+                    if (self.wallet.prepareWithdrawal(self.withdrawal_invoice.slice())) {
+                        self.currentPage = .Withdrawal;
+                        self.selected_index = 0;
+                    }
+                },
+                .confirm_withdrawal => {
+                    _ = self.wallet.confirmWithdrawal();
+                },
+                .cancel_withdrawal => {
+                    self.wallet.leaveWithdrawal();
+                    self.withdrawal_invoice.clear();
+                    self.currentPage = .Withdraw;
+                    self.focus = null;
+                    self.selected_index = 0;
+                },
+                .review_again => {
+                    if (self.wallet.withdrawal.retry_review_allowed and !self.wallet.reviewLive() and !self.wallet.pending) {
+                        _ = self.withdrawal_invoice.replace(self.wallet.withdrawal.invoice.slice());
+                        self.currentPage = .Withdraw;
+                        self.focus = null;
+                        self.selected_index = 0;
+                    }
+                },
+                .paste_withdrawal => {
+                    self.focus = .withdrawal_invoice;
+                    self.paste_requested = true;
+                },
+                .clear_withdrawal => {
+                    self.withdrawal_invoice.clear();
+                    self.focus = .withdrawal_invoice;
+                },
             },
             .text_input => |field| {
                 self.focus = field;
@@ -538,6 +617,15 @@ pub const Menu = struct {
     }
 
     fn applyTyping(self: *Menu, field: InputField, frame: input.FrameInput) void {
+        if (field == .withdrawal_invoice) {
+            if (frame.paste_shortcut) {
+                self.paste_requested = true;
+                return;
+            }
+            for (frame.characters[0..@min(frame.character_count, frame.characters.len)]) |cp| _ = self.withdrawal_invoice.appendCodepoint(cp);
+            if (frame.backspace) _ = self.withdrawal_invoice.backspace();
+            return;
+        }
         const text = self.textField(field);
         const count = @min(frame.character_count, frame.characters.len);
         var index: usize = 0;
@@ -545,6 +633,13 @@ pub const Menu = struct {
             _ = text.appendCodepoint(frame.characters[index]);
         }
         if (frame.backspace) _ = text.backspace();
+    }
+    pub fn pasteWithdrawal(self: *Menu, text: []const u8) bool {
+        if (!self.opened or self.currentPage != .Withdraw or self.focus != .withdrawal_invoice) return false;
+        const ok = self.withdrawal_invoice.replace(text);
+        if (!ok) _ = self.wallet.message.set("Paste refused: use a complete printable invoice of at most 4096 bytes.");
+        self.paste_requested = false;
+        return ok;
     }
 };
 
@@ -556,6 +651,40 @@ comptime {
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
+test "wallet withdrawal and explicit confirmation use the Withdraw label" {
+    try std.testing.expectEqualStrings("Withdraw", itemLabel(wallet_items[2]));
+    try std.testing.expect(wallet_items[2] == .navigate and wallet_items[2].navigate == .Withdraw);
+    try std.testing.expectEqualStrings("Withdraw", itemLabel(withdrawal_review_items[0]));
+}
+test "withdrawal paste is atomic UTF8 bounded and separate from deposit capacity" {
+    var state = Menu{ .opened = true, .currentPage = .Withdraw, .focus = .withdrawal_invoice };
+    const long = @as([4096]u8, @splat('x'));
+    try std.testing.expect(state.pasteWithdrawal(&long));
+    try std.testing.expect(!state.pasteWithdrawal(&@as([4097]u8, @splat('y'))));
+    try std.testing.expectEqualStrings(&long, state.withdrawal_invoice.slice());
+    for ([_][]const u8{ "a\nb", "a\x00b", "\xff", "a\x7fb" }) |bad| try std.testing.expect(!state.pasteWithdrawal(bad));
+    try std.testing.expect(state.pasteWithdrawal("aé😀"));
+    state.applyTyping(.withdrawal_invoice, .{ .backspace = true });
+    try std.testing.expectEqualStrings("aé", state.withdrawal_invoice.slice());
+    state.activate(.{ .action = .clear_withdrawal });
+    try std.testing.expectEqualStrings("", state.withdrawal_invoice.slice());
+    state.focus = .deposit_sats;
+    try std.testing.expect(!state.pasteWithdrawal("invoice"));
+    try std.testing.expectEqual(@as(usize, 129), state.deposit_sats.bytes.len);
+    state.close();
+    try std.testing.expectEqualStrings("", state.withdrawal_invoice.slice());
+}
+test "withdrawal field shares large wrapped geometry with hit testing on small viewports" {
+    for ([_]f32{ 640, 200, 64, 1 }) |size| {
+        const layout = calculateLayout(.Withdraw, size, size);
+        try std.testing.expect(layout.items[0].height > layout.items[1].height);
+        for (layout.items[0..layout.item_count], 0..) |rect, index| {
+            try expectInside(rect, layout.panel);
+            try std.testing.expect(rect.width > 0 and rect.height > 0);
+            try std.testing.expectEqual(@as(?usize, index), layout.hitTest(rect.centerX(), rect.centerY()));
+        }
+    }
+}
 
 fn itemCenter(layout: Layout, index: usize) struct { x: f32, y: f32 } {
     const rect = layout.items[index];
@@ -684,7 +813,7 @@ test "escape opens on Main and closes again" {
     try std.testing.expectEqual(MenuPage.Main, menu.currentPage);
 }
 
-test "Deposit leaves no hidden field focus, disables duplicates and Withdraw never requests work" {
+test "Deposit clears hidden focus and disables duplicates; Withdraw navigation requests no work" {
     var state = Menu{ .opened = true, .currentPage = .Deposit, .focus = .deposit_sats };
     state.wallet.available = true;
     for ("21") |c| _ = state.deposit_sats.appendCodepoint(c);
@@ -702,8 +831,13 @@ test "Deposit leaves no hidden field focus, disables duplicates and Withdraw nev
     try std.testing.expectEqualStrings("21", state.deposit_sats.slice());
     state.wallet.request = null;
     state.activate(.{ .navigate = .Wallet });
-    state.activate(.{ .action = .unavailable });
-    try std.testing.expectEqual(MenuPage.Wallet, state.currentPage);
+    state.activate(pageItems(.Wallet)[2]);
+    try std.testing.expectEqual(MenuPage.Withdraw, state.currentPage);
+    try std.testing.expectEqual(@as(?InputField, null), state.focus);
+    try typeText(&state, "9");
+    try std.testing.expectEqualStrings("21", state.deposit_sats.slice());
+    try std.testing.expectEqualStrings("", state.withdrawal_invoice.slice());
+    try std.testing.expectEqual(serial, state.wallet.serial);
     try std.testing.expect(state.wallet.request == null);
 }
 
@@ -1137,7 +1271,7 @@ test "invoice Back uses third row and expired Deposit navigation returns to amou
     try std.testing.expectEqual(MenuPage.Invoice, state.currentPage);
 }
 
-test "unsupported history activation retains History instead of showing the old invoice" {
+test "outgoing history opens only withdrawal detail and other mint activation retains History" {
     var state = Menu{ .opened = true, .currentPage = .History };
     state.wallet.available = true;
     state.wallet.row_count = 1;
@@ -1147,14 +1281,19 @@ test "unsupported history activation retains History instead of showing the old 
     _ = state.wallet.rows[0].mint.set(state.wallet.mint.slice());
     state.wallet.rows[0].outgoing = true;
     _ = state.applyInput(.{ .confirm = true });
-    try std.testing.expectEqual(MenuPage.History, state.currentPage);
+    try std.testing.expectEqual(MenuPage.Withdrawal, state.currentPage);
+    try std.testing.expect(state.wallet.operation == .saved_withdrawal);
+    try std.testing.expectEqualStrings("", state.wallet.invoice.slice());
+    state.wallet.request = null;
+    state.wallet.fail(state.wallet.serial, 0);
+    state.currentPage = .History;
     state.wallet.rows[0].outgoing = false;
     _ = state.wallet.rows[0].mint.set("https://other.example");
     const layout = state.layoutFor(1000, 640);
     _ = state.applyInput(frameFor(layout.content.centerX(), layout.content.y + layout.content.height / 16, 1000, 640));
     try std.testing.expectEqual(MenuPage.History, state.currentPage);
     try std.testing.expect(!state.wallet.pending);
-    try std.testing.expectEqualStrings("old-invoice", state.wallet.invoice.slice());
+    try std.testing.expectEqualStrings("", state.wallet.invoice.slice());
 }
 
 test "local deposit input and invoice copy remain active during background polling" {

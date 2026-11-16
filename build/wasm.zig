@@ -226,6 +226,15 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         wallet_ui_tests.step.dependOn(&mint.step);
         wallet_ui_tests.step.dependOn(browser_fixture);
         b.step("test-wallet-ui", "Test functional wallet deposits, clipboard and saved history with a gated local mint").dependOn(&wallet_ui_tests.step);
+        const withdrawal_ui_tests = b.addSystemCommand(&.{ "python3", "build-support/run-browser-tests.py", "--mint" });
+        withdrawal_ui_tests.addFileArg(mint_exe);
+        withdrawal_ui_tests.addArg("--directory");
+        withdrawal_ui_tests.addDirectoryArg(b.graph.path(.install_prefix, "wasm-test"));
+        withdrawal_ui_tests.addArg("--runner");
+        withdrawal_ui_tests.addFileArg(b.path("browser/withdrawal-ui-browser-test.mjs"));
+        withdrawal_ui_tests.step.dependOn(&mint.step);
+        withdrawal_ui_tests.step.dependOn(browser_fixture);
+        b.step("test-withdrawal-ui", "Test explicit withdrawal review, cancel, payment and local history in the real renderer").dependOn(&withdrawal_ui_tests.step);
         b.step("test-onboarding-regressions", "Run the onboarding baseline and eight negative regression cases").dependOn(onboarding_step);
         const test_step = b.step("test", "Build, start an ephemeral fake mint, run Chromium and stop the mint");
         test_step.dependOn(&browser_tests.step);
@@ -234,6 +243,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         test_step.dependOn(platform_hardening_step);
         test_step.dependOn(&database.step);
         test_step.dependOn(&wallet_ui_tests.step);
+        test_step.dependOn(&withdrawal_ui_tests.step);
         const run_mint = b.addRunFile(mint_exe);
         run_mint.addDirectoryArg(b.graph.path(.install_prefix, "wasm-test"));
         run_mint.step.dependOn(test_assets);

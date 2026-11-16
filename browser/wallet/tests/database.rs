@@ -104,7 +104,7 @@ fn large_history_bulk_read_loads_one_validated_store_and_preserves_records() {
     test_set_state(name, &raw);
     let db = open(name).unwrap();
     let before = db.test_load_count();
-    let (quotes, melts, metadata) = block_on(db.quote_history_data()).unwrap();
+    let (quotes, melts, metadata, _, _) = block_on(db.quote_history_data()).unwrap();
     assert_eq!(db.test_load_count() - before, 1);
     assert_eq!(quotes.len(), 1100);
     assert!(melts.is_empty());

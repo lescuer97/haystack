@@ -377,7 +377,7 @@ impl BrowserDatabase {
     /// One validated Store load, not a full reload for every quote's KV key.
     pub(crate) async fn quote_history_data(
         &self,
-    ) -> Result<(Vec<MintQuote>, Vec<MeltQuote>, HashMap<String, Vec<u8>>), Error> {
+    ) -> Result<(Vec<MintQuote>, Vec<MeltQuote>, HashMap<String, Vec<u8>>, Vec<WalletSaga>, Vec<Transaction>), Error> {
         self.read(|store| {
             let prefix = kv_key("cdk_wallet_ffi", "quote_created_v1", "");
             (
@@ -391,6 +391,8 @@ impl BrowserDatabase {
                             .map(|key| (key.to_owned(), value.clone()))
                     })
                     .collect(),
+                store.sagas.values().cloned().collect(),
+                store.transactions.values().cloned().collect(),
             )
         })
         .await

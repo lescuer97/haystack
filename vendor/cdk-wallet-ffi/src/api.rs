@@ -250,6 +250,13 @@ fn send_error(e: FfiErr) -> CdkSendResult {
 /// recover_deposit [mint] (local reconciliation only, never a quote POST).
 /// deposit_update [mint, check|poll|recover, id|cursor|empty] returns bounded application recovery metadata,
 /// saved_invoice [mint, id] reads one exact local Sat/BOLT11 quote without network or recovery.
+/// prepare_withdrawal [mint, invoice] reserves CDK proofs for review, never pays;
+/// confirm_withdrawal [mint, operation_uuid] consumes that review exactly once;
+/// cancel_withdrawal [mint, operation_uuid] releases the CDK reservation;
+/// saved_withdrawal [mint, quote_id] is an exact local-only withdrawal lookup;
+/// poll_withdrawals [mint, cursor] reconciles one submitted withdrawal cyclically.
+/// Withdrawal argument JSON is limited to 8192 bytes (others: 4096), exactly two
+/// strings. Invoice: 4096 ASCII bytes; IDs: 1024 bytes; replies: 128 KiB maximum.
 #[ffi_export]
 #[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_quotes(
@@ -268,11 +275,21 @@ pub fn cdk_wallet_quotes(
                     return Err(poisoned_handle());
                 }
                 let op = opt_cstr_to_string_bounded(operation, 32, "operation")?;
-                let args = opt_cstr_to_string_bounded(arguments, 4096, "arguments")?;
+                let withdrawal = crate::wallet::CdkWallet::is_withdrawal_operation(&op);
+                let args = opt_cstr_to_string_bounded(arguments, if withdrawal { 8192 } else { 4096 }, "arguments")?;
                 let args: Vec<String> = serde_json::from_str(&args).map_err(|_| {
                     FfiErr::new(CdkStatus::InvalidArgument, "expected string array")
                 })?;
                 crate::wallet::runtime().block_on(async {
+                    if withdrawal {
+                        return match args.as_slice() {
+                            [mint, argument] => h.withdrawal_request(&op, mint, argument).await,
+                            _ => Err(FfiErr::new(
+                                CdkStatus::InvalidArgument,
+                                "invalid quote operation",
+                            )),
+                        };
+                    }
                     match (op.as_str(), args.as_slice()) {
                         ("create_deposit", [mint, amount]) => h.create_deposit(mint, amount).await,
                         ("check_deposit", [mint, id]) => h.check_deposit(mint, id).await,
@@ -393,13 +410,16 @@ pub fn cdk_wallet_close(handle: Option<repr_c::Box<crate::wallet::CdkWallet>>) -
     guard(
         || CdkStatusResult::err(CdkStatus::InternalError, "internal panic during close"),
         || {
-            let handle = match handle {
+            let mut handle = match handle {
                 Some(h) => h,
                 None => return CdkStatusResult::ok(),
             };
             // Best-effort flush; `flush_rate_limits` cannot fail. The handle is
             // dropped (and its file lock released) regardless.
-            crate::wallet::runtime().block_on(handle.flush_rate_limits());
+            crate::wallet::runtime().block_on(async {
+                handle.cancel_withdrawal_on_close().await;
+                handle.flush_rate_limits().await;
+            });
             drop(handle);
             CdkStatusResult::ok()
         },

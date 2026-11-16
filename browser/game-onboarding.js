@@ -37,12 +37,15 @@ mergeInto(LibraryManager.library, {
           if (ptr) _free(ptr);
         }
       }
-      function deliver(text) {
+      function deliver(text, code) {
         var bytes, ptr = 0;
         try {
           if (typeof text !== 'string' || text.indexOf('\0') !== -1) return false;
           bytes = new TextEncoder().encode(text);
-          if (bytes.length > 1024) return false;
+          if (bytes.length > (code === 16 ? 4096 : 1024)) return false;
+          // Read-side focus is checked again after asynchronous clipboard reads.
+          var current = check(2, 0, 0);
+          if (!current || current.code !== code) return false;
           if (bytes.length) {
             ptr = _malloc(bytes.length);
             if (!ptr || ptr < 0 || ptr + bytes.length > HEAPU8.length) return false;
@@ -65,9 +68,9 @@ mergeInto(LibraryManager.library, {
             Promise.resolve(promise).then(function () {
               if (self.input === b) {{{ makeDynCall('vi', 'success') }}}(result.code);
             }, function () {});
-          } else if (result.code === 14 && navigator.clipboard && navigator.clipboard.readText) {
+          } else if ((result.code === 14 || result.code === 16) && navigator.clipboard && navigator.clipboard.readText) {
             Promise.resolve(navigator.clipboard.readText()).then(function (text) {
-              if (self.input === b) deliver(text);
+              if (self.input === b) deliver(text, result.code);
             }, function () {});
           }
         } catch (_) {}
@@ -88,7 +91,7 @@ mergeInto(LibraryManager.library, {
       b.paste = function (event) {
         if (!event.isTrusted || document.activeElement !== canvas || !event.clipboardData) return;
         var result = check(2, 0, 0);
-        if (result && result.code === 14 && deliver(event.clipboardData.getData('text/plain'))) event.preventDefault();
+        if (result && (result.code === 14 || result.code === 16) && deliver(event.clipboardData.getData('text/plain'), result.code)) event.preventDefault();
       };
       canvas.addEventListener('pointerdown', b.pointer);
       canvas.addEventListener('keydown', b.key);
@@ -175,7 +178,7 @@ mergeInto(LibraryManager.library, {
     walletRequest: function (generation, serial, operation, ptr, len, callback) {
       var self = this, s = self.session, argument;
       try {
-        if (!s || s.closing || s.generation !== generation || len > 1024 || ptr < 0 || ptr + len > HEAPU8.length) throw 0;
+        if (!s || s.closing || s.generation !== generation || len > 4096 || ptr < 0 || ptr + len > HEAPU8.length) throw 0;
         argument = new TextDecoder('utf-8', { fatal: true }).decode(HEAPU8.slice(ptr, ptr + len));
       } catch (_) {
         Promise.resolve().then(function () { self.deliver(callback, generation, serial, null, false, 131072); });
@@ -205,10 +208,17 @@ mergeInto(LibraryManager.library, {
             case 6: op = 'deposit_update'; args = [s.mint, 'recover', '']; break;
             case 7: op = 'deposit_update'; args = [s.mint, 'poll', argument]; break;
             case 8: op = 'saved_invoice'; args = [s.mint, argument]; break;
+            case 9: op = 'prepare_withdrawal'; args = [s.mint, argument]; break;
+            case 10: op = 'confirm_withdrawal'; args = [s.mint, argument]; break;
+            case 11: op = 'cancel_withdrawal'; args = [s.mint, argument]; break;
+            case 12: op = 'saved_withdrawal'; args = [s.mint, argument]; break;
+            case 13: op = 'poll_withdrawals'; args = [s.mint, argument]; break;
             default: throw 0;
           }
           var response = JSON.parse(await s.wallet.call(op, JSON.stringify(args)));
           if (response.status === 0 && typeof response.value === 'string') result = response.value;
+          else if (operation >= 9 && operation <= 13 && Number.isInteger(response.status) && response.status >= 1 && response.status <= 27)
+            result = JSON.stringify({operation_error:{status:response.status,message:'Withdrawal request failed'}});
         } catch (_) {}
         if (self.session === s && !s.closing) self.deliver(callback, generation, serial, result, false, 131072);
       }).catch(function () {});
@@ -226,6 +236,8 @@ mergeInto(LibraryManager.library, {
   haystack_onboarding_close__sig: 'vi',
   haystack_onboarding_close: function (generation) { haystackOnboarding.close(generation); },
   haystack_wallet_request__deps: ['$haystackOnboarding', 'malloc', 'free'],
+  haystack_wallet_unix_time__sig: 'd',
+  haystack_wallet_unix_time: function () { return Math.floor(Date.now() / 1000); },
   haystack_wallet_request__sig: 'viiiiii',
   haystack_wallet_request: function (generation, serial, operation, ptr, len, callback) {
     haystackOnboarding.walletRequest(generation, serial, operation, ptr, len, callback);

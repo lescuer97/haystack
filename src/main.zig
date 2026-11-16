@@ -94,12 +94,27 @@ fn walletCallback(ok: c_int, generation: u32, serial: u32, ptr: [*c]const u8, le
     wallet_result_ok = ok == 1 and wallet_mailbox.set(if (len == 0) "" else ptr[0..len]);
 }
 var clipboard_mailbox: browser_onboarding.ClipboardMailbox = .{};
+var withdrawal_clipboard: wallet_ui.Text(4096) = .{};
+var withdrawal_clipboard_pending = false;
+extern "c" fn haystack_wallet_unix_time() f64;
 extern "c" fn haystack_onboarding_bind_input(*const fn (c_int, c_int, c_int, [*]u8, u32) callconv(.c) c_int, *const fn ([*c]const u8, u32) callconv(.c) void, *const fn (c_int) callconv(.c) void) void;
 extern "c" fn haystack_onboarding_unbind_input() void;
 
 fn clipboardProbe(kind: c_int, x: c_int, y: c_int, ptr: [*]u8, cap: u32) callconv(.c) c_int {
     const ctx = browser_context orelse return 0;
     if (cap > 4097) return 0;
+    if (!ctx.model.isBlocking() and ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Withdraw) {
+        const state = &ctx.game_state.menu;
+        if (kind == 2) return if (state.focus == .withdrawal_invoice) 16 else 0;
+        const layout = state.layoutFor(@floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()));
+        const selected = if (kind == 1) state.selected_index else if (kind == 0)
+            layout.hitTest(@as(f32, @floatFromInt(x)) * @as(f32, @floatFromInt(rl.getScreenWidth())) / 1_000_000, @as(f32, @floatFromInt(y)) * @as(f32, @floatFromInt(rl.getScreenHeight())) / 1_000_000) orelse return 0
+        else
+            return 0;
+        if (selected != 1) return 0;
+        state.focus = .withdrawal_invoice;
+        return 16;
+    }
     if (!ctx.model.isBlocking() and ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Invoice) {
         const state = &ctx.game_state.menu;
         const layout = @import("menu.zig").calculateLayout(.Invoice, @floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()));
@@ -115,7 +130,15 @@ fn clipboardProbe(kind: c_int, x: c_int, y: c_int, ptr: [*]u8, cap: u32) callcon
     return browser_onboarding.probe(&ctx.model, kind, x, y, @floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()), ptr[0..cap]);
 }
 fn clipboardPaste(ptr: [*c]const u8, len: u32) callconv(.c) void {
-    if (browser_context == null or len > 1024 or (len > 0 and ptr == null)) return;
+    const ctx = browser_context orelse return;
+    if (len > 4096 or (len > 0 and ptr == null)) return;
+    if (!ctx.model.isBlocking()) {
+        if (ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Withdraw and ctx.game_state.menu.focus == .withdrawal_invoice) {
+            withdrawal_clipboard_pending = withdrawal_clipboard.set(if (len == 0) "" else ptr[0..len]);
+        }
+        return;
+    }
+    if (len > 1024) return;
     clipboard_mailbox.paste(if (len == 0) "" else ptr[0..len]);
 }
 fn clipboardCopied(code: c_int) callconv(.c) void {
@@ -229,6 +252,8 @@ fn startBrowser(settings: game_mod.Settings) !void {
 
     browser_context = ctx;
     clipboard_mailbox.clear();
+    withdrawal_clipboard = .{};
+    withdrawal_clipboard_pending = false;
     haystack_onboarding_bind_input(clipboardProbe, clipboardPaste, clipboardCopied);
     browser_onboarding.start() catch {
         ctx.onboarding_start_failed = true;
@@ -255,8 +280,16 @@ fn browserFrame() callconv(.c) void {
         browser_onboarding.deliver(&result, &ctx.model);
     }
     clipboard_mailbox.consume(&ctx.model, rl.getTime());
+    if (withdrawal_clipboard_pending) {
+        if (!ctx.model.isBlocking()) _ = ctx.game_state.menu.pasteWithdrawal(withdrawal_clipboard.slice());
+        withdrawal_clipboard = .{};
+        withdrawal_clipboard_pending = false;
+    }
     ctx.model.expire(rl.getTime());
     const wallet_model = &ctx.game_state.menu.wallet;
+    const unix = haystack_wallet_unix_time();
+    if (std.math.isFinite(unix) and unix >= 0 and unix < 253402300800) wallet_model.unix_now = @intFromFloat(unix);
+    ctx.game_state.menu.paste_requested = false; // Browser reads only in the trusted gesture handler.
     if (wallet_result_serial) |serial| {
         if (wallet_result_ok) wallet_model.accept(serial, wallet_mailbox.slice(), rl.getTime(), std.heap.c_allocator) else wallet_model.fail(serial, rl.getTime());
         wallet_result_serial = null;
@@ -321,6 +354,8 @@ fn stopBrowser() void {
 
     haystack_onboarding_unbind_input();
     clipboard_mailbox.clear();
+    withdrawal_clipboard = .{};
+    withdrawal_clipboard_pending = false;
 
     browser_onboarding.close();
     emscripten_cancel_main_loop();
@@ -647,6 +682,17 @@ fn pasteRecovery(model: *onboarding.Onboarding, allocator: std.mem.Allocator) vo
     const payload = allocator.dupe(u8, text[0..len]) catch return;
     model.receive(.{ .paste = payload });
 }
+fn pasteWithdrawal(state: *@import("menu.zig").Menu) void {
+    state.paste_requested = false;
+    const text = GetClipboardText() orelse return;
+    var len: usize = 0;
+    while (len <= 4096 and text[len] != 0) : (len += 1) {}
+    if (len > 4096) {
+        _ = state.wallet.message.set("Paste refused: invoice exceeds 4096 bytes.");
+        return;
+    }
+    _ = state.pasteWithdrawal(text[0..len]);
+}
 
 pub fn main() anyerror!void {
     // Browser builds enter through the exported `webMain` and never reach the
@@ -771,6 +817,9 @@ pub fn main() anyerror!void {
     var onboarding_hand_cursor = false;
 
     while (!rl.windowShouldClose()) {
+        const unix = std.Io.Clock.real.now(io).toSeconds();
+        if (unix >= 0) game_state.menu.wallet.unix_now = @intCast(unix);
+        if (!model.isBlocking() and game_state.menu.paste_requested) pasteWithdrawal(&game_state.menu);
         game_state.menu.wallet.tick(!model.isBlocking(), rl.getTime());
         if (game_state.menu.wallet.pending and game_state.menu.wallet.request != null and wallet_worker == null) {
             wallet_worker = wallet_service.Worker.start(wallet_paths) catch blk: {

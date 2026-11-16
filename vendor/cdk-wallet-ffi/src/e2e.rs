@@ -60,6 +60,7 @@ pub(crate) enum SwapFault {
     RejectQuoteOnce,
     StallQuoteOnce(Duration),
     UnpaidQuotes,
+    WithdrawalControl { quotes: Arc<AtomicUsize>, posts: Arc<AtomicUsize>, gets: Arc<AtomicUsize>, hold_pending: Arc<AtomicBool>, fail_get: Arc<AtomicBool> },
     DepositControl { fail_get: Arc<AtomicBool>, fail_mint: Arc<AtomicBool>, hold_unpaid: Arc<AtomicBool>, gets: Arc<AtomicUsize>, interrupt_mint: bool },
 }
 
@@ -137,6 +138,16 @@ pub(crate) async fn start_fake_mint_counted(
         let counter = counter.clone();
         async move {
             let path = req.uri().path().to_owned();
+            let withdrawal_get = path.starts_with("/v1/melt/quote/bolt11/") && req.method() == axum::http::Method::GET;
+            let withdrawal_post = path == "/v1/melt/bolt11" && req.method() == axum::http::Method::POST;
+            if let SwapFault::WithdrawalControl { quotes, posts, gets, fail_get, .. } = &fault {
+                if path == "/v1/melt/quote/bolt11" && req.method() == axum::http::Method::POST { quotes.fetch_add(1, Ordering::SeqCst); }
+                if withdrawal_post { posts.fetch_add(1, Ordering::SeqCst); }
+                if withdrawal_get {
+                    gets.fetch_add(1, Ordering::SeqCst);
+                    if fail_get.load(Ordering::SeqCst) { return Response::builder().status(500).body(Body::from("injected melt status failure")).unwrap(); }
+                }
+            }
             let is_swap = path.ends_with("/swap");
             let is_checkstate = path.ends_with("/checkstate");
             let is_mint = path == "/v1/mint/bolt11";
@@ -177,6 +188,20 @@ pub(crate) async fn start_fake_mint_counted(
                 }
             }
             let response = next.run(req).await;
+            if let SwapFault::WithdrawalControl { hold_pending, .. } = &fault {
+                if hold_pending.load(Ordering::SeqCst) && (withdrawal_get || withdrawal_post) {
+                    let (mut parts, body) = response.into_parts();
+                    let bytes = axum::body::to_bytes(body, 65536).await.unwrap();
+                    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    if value.get("state").is_some() {
+                        value["state"] = "PENDING".into();
+                        value["payment_preimage"] = serde_json::Value::Null;
+                        value["change"] = serde_json::Value::Null;
+                    }
+                    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                    return Response::from_parts(parts, Body::from(value.to_string()));
+                }
+            }
             let force_unpaid = matches!(&fault, SwapFault::UnpaidQuotes) || matches!(&fault, SwapFault::DepositControl { hold_unpaid, .. } if hold_unpaid.load(Ordering::SeqCst));
             if force_unpaid && (is_quote_get || is_quote) {
                 let (parts, body) = response.into_parts();
@@ -260,7 +285,7 @@ async fn open_repo(db_path: &Path, seed: [u8; 64]) -> cdk::wallet::WalletReposit
 ///
 /// The returned [`Wallet`] shares the database at `db_path` with the wrapper
 /// handle, so the minted proofs are visible to the wrapper.
-async fn fund_wallet(
+pub(crate) async fn fund_wallet(
     db_path: &Path,
     seed: [u8; 64],
     mint_url: &str,

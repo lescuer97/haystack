@@ -71,12 +71,17 @@ pub const Worker = struct {
             .saved_invoice => "saved_invoice",
             .history => "quote_history_page",
             .resume_saved => "resume_deposit",
+            .prepare_withdrawal => "prepare_withdrawal",
+            .confirm_withdrawal => "confirm_withdrawal",
+            .cancel_withdrawal => "cancel_withdrawal",
+            .saved_withdrawal => "saved_withdrawal",
+            .poll_withdrawals => "poll_withdrawals",
         };
         const args = if (self.request.operation == .check or self.request.operation == .poll or self.request.operation == .recover)
             try std.json.Stringify.valueAlloc(allocator, .{ wallet.cdk.app_mint, @tagName(self.request.operation), self.request.argument.slice() }, .{})
         else if (self.request.operation == .history)
             try std.json.Stringify.valueAlloc(allocator, .{self.request.argument.slice()}, .{})
-        else if (self.request.operation == .open or self.request.operation == .snapshot or self.request.operation == .recover or self.request.operation == .resume_saved)
+        else if (self.request.operation == .open or self.request.operation == .snapshot or self.request.operation == .resume_saved)
             try std.json.Stringify.valueAlloc(allocator, .{wallet.cdk.app_mint}, .{})
         else
             try std.json.Stringify.valueAlloc(allocator, .{ wallet.cdk.app_mint, self.request.argument.slice() }, .{});
@@ -85,6 +90,13 @@ pub const Worker = struct {
         defer allocator.free(args_z);
         var result = wallet.cdk.c.cdk_wallet_quotes(handle, operation.ptr, args_z.ptr);
         defer wallet.cdk.c.cdk_string_free(result.value);
+        if (self.request.operation.isWithdrawal() and result.status >= 1 and result.status <= 27) {
+            // check consumes only the Rust-owned error; the payload is freed by the defer above.
+            wallet.check(&result) catch {};
+            var buf: [256]u8 = undefined;
+            self.ok = self.result.set(try std.fmt.bufPrint(&buf, "{{\"operation_error\":{{\"status\":{d},\"message\":\"Withdrawal request failed\"}}}}", .{result.status}));
+            return;
+        }
         try wallet.check(&result);
         const value = result.value orelse return error.Unavailable;
         self.ok = self.result.set(std.mem.span(@as([*:0]const u8, @ptrCast(value))));

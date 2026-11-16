@@ -118,9 +118,29 @@ assert.deepEqual(pasted, ['phrase', 'read phrase']);
 code = 1;
 listeners.get('pointerdown')(pointer(true));
 bridge.unbindInput();
+alloc = 8192;
+code = 16;
+bridge.bindInput(probe, paste, success);
+const longInvoice = 'x'.repeat(4096);
+listeners.get('paste')(pasteEvent(longInvoice));
+assert.equal(pasted.at(-1), longInvoice, 'withdrawal paste keeps the entire 4096-byte value');
+const priorPastes = pasted.length;
+listeners.get('paste')(pasteEvent('x'.repeat(4097)));
+assert.equal(pasted.length, priorPastes, 'oversized invoice is refused atomically');
+code = 14;
+listeners.get('paste')(pasteEvent(longInvoice));
+assert.equal(pasted.length, priorPastes, 'onboarding still has its own 1024-byte limit');
+let resolveRead;
+context.navigator.clipboard.readText = () => new Promise(resolve => { resolveRead = resolve; });
+code = 16;
+listeners.get('pointerdown')(pointer(true));
+code = 14; // Focus changed to onboarding while the asynchronous read was pending.
+resolveRead(longInvoice); await tick();
+assert.equal(pasted.length, priorPastes, 'late clipboard data cannot cross the target focus boundary');
+bridge.unbindInput();
 const walletCalls = [];
 const walletArgs = [];
-let requestHeld = false, finishWallet;
+let requestHeld = false, finishWallet, walletStatus = 0;
 const walletBlocked = new Promise(resolve => { finishWallet = resolve; });
 const originalRequest = service.request;
 service.request = async (...args) => {
@@ -132,7 +152,7 @@ service.open_ready_wallet = async () => {
   assert.equal(requestHeld, false, 'temporary Ready request lock must have dropped');
   walletCalls.push('open');
   return {
-    async call(op,args) { walletCalls.push(op); walletArgs.push([op,JSON.parse(args)]); await walletBlocked; return JSON.stringify({status:0,value:'{}'}); },
+    async call(op,args) { walletCalls.push(op); walletArgs.push([op,JSON.parse(args)]); const status=walletStatus; await walletBlocked; return JSON.stringify({status,value:status===0?'{}':null,error:'untrusted secret invoice/proofs must not escape'}); },
     async close() { walletCalls.push('close'); },
     free() { walletCalls.push('free'); },
   };
@@ -151,12 +171,17 @@ bridge.walletRequest(4,5,6,0,0,callback);
 bridge.walletRequest(4,7,7,200,5,callback);
 bridge.walletRequest(4,8,8,200,5,callback);
 bridge.walletRequest(4,9,3,200,5,callback);
+heap.set(new TextEncoder().encode(longInvoice), 1000);
+bridge.walletRequest(4,10,9,1000,4096,callback);
+heap.fill(0,1000,5096); // Publication must have copied the argument.
+for (const operation of [10,11,12,13]) bridge.walletRequest(4,10+operation,operation,200,5,callback);
+bridge.walletRequest(4,30,9,1000,4097,callback); // Refused before any wallet call.
 bridge.walletRequest(4,6,99,0,0,callback);
 bridge.close(4);
 assert.equal(walletCalls.includes('close'), false);
 finishWallet(); await tick();
-assert.deepEqual(walletCalls, ['open', 'wallet_screen', 'wallet_screen', 'quote_history_page', 'resume_deposit', 'deposit_update', 'deposit_update', 'saved_invoice', 'deposit_update', 'close', 'free']);
-assert.deepEqual(walletArgs.slice(2),[['quote_history_page',['0']],['resume_deposit',['fixture']],['deposit_update',['fixture','recover','']],['deposit_update',['fixture','poll','after']],['saved_invoice',['fixture','after']],['deposit_update',['fixture','check','after']]]);
+assert.deepEqual(walletCalls, ['open', 'wallet_screen', 'wallet_screen', 'quote_history_page', 'resume_deposit', 'deposit_update', 'deposit_update', 'saved_invoice', 'deposit_update', 'prepare_withdrawal', 'confirm_withdrawal', 'cancel_withdrawal', 'saved_withdrawal', 'poll_withdrawals', 'close', 'free']);
+assert.deepEqual(walletArgs.slice(2),[['quote_history_page',['0']],['resume_deposit',['fixture']],['deposit_update',['fixture','recover','']],['deposit_update',['fixture','poll','after']],['saved_invoice',['fixture','after']],['deposit_update',['fixture','check','after']],['prepare_withdrawal',['fixture',longInvoice]],['confirm_withdrawal',['fixture','after']],['cancel_withdrawal',['fixture','after']],['saved_withdrawal',['fixture','after']],['poll_withdrawals',['fixture','after']]]);
 assert.equal(walletCalls.includes('check_deposit'),false,'unknown operation must not fall through to check');
 console.log('wallet service ownership and queue tests passed');
 resolveWrite(); await tick();
@@ -164,6 +189,23 @@ assert.deepEqual(copied, [1]);
 assert.equal(listeners.size, 0);
 bridge.bindInput(probe, paste, success);
 bridge.unbindInput();
+bridge.start(5, callback);await tick();
+bridge.walletRequest(5,1,0,0,0,callback);await tick();
+for(const [operation,status] of [[9,2],[10,14],[11,19],[12,13],[13,23]]) {
+  walletStatus=status;
+  bridge.walletRequest(5,operation,operation,0,0,callback);await tick();
+  assert.equal(events.at(-1)[0],1,'definite withdrawal errors are successful bounded JSON deliveries');
+  assert.deepEqual(JSON.parse(events.at(-1).at(-1)),{operation_error:{status,message:'Withdrawal request failed'}});
+}
+walletStatus=14;
+bridge.walletRequest(5,40,1,0,0,callback);await tick();
+assert.equal(events.at(-1)[0],0,'legacy operation errors retain the original failure path');
+for(const status of [28,1.5]) {
+  walletStatus=status;bridge.walletRequest(5,41,9,0,0,callback);await tick();
+  assert.equal(events.at(-1)[0],0,'malformed/out-of-range status is not a typed backend error');
+}
+bridge.close(5);await tick();
+console.log('typed withdrawal error transport tests passed');
 assert.equal(listeners.size, 0);
 console.log('onboarding input tests passed');
 code = 15; // Full invoice copy, distinct from seed/word feedback codes.

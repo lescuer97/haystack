@@ -1053,6 +1053,13 @@ cdk_wallet_post_swap (
  *  recover_deposit [mint] (local reconciliation only, never a quote POST).
  *  deposit_update [mint, check|poll|recover, id|cursor|empty] returns bounded application recovery metadata,
  *  saved_invoice [mint, id] reads one exact local Sat/BOLT11 quote without network or recovery.
+ *  prepare_withdrawal [mint, invoice] reserves CDK proofs for review, never pays;
+ *  confirm_withdrawal [mint, operation_uuid] consumes that review exactly once;
+ *  cancel_withdrawal [mint, operation_uuid] releases the CDK reservation;
+ *  saved_withdrawal [mint, quote_id] is an exact local-only withdrawal lookup;
+ *  poll_withdrawals [mint, cursor] reconciles one submitted withdrawal cyclically.
+ *  Withdrawal argument JSON is limited to 8192 bytes (others: 4096), exactly two
+ *  strings. Invoice: 4096 ASCII bytes; IDs: 1024 bytes; replies: 128 KiB maximum.
  */
 CdkStringResult_t
 cdk_wallet_quotes (

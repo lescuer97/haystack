@@ -366,10 +366,13 @@ impl BrowserWallet {
 
     /// Mutable async receiver rejects overlapping calls; JS facade queues them.
     pub async fn call(&mut self, operation: &str, arguments: &str) -> Result<String, JsValue> {
+        let withdrawal = CdkWallet::is_withdrawal_operation(operation);
+        if withdrawal && arguments.len() > 8192 { return Err(js_error("arguments exceed maximum size")); }
         if matches!(operation, "deposit_update" | "saved_invoice") && arguments.len() > 4096 {
             return Err(js_error("arguments exceed maximum size"));
         }
         let a = Args::new(arguments)?;
+        if withdrawal && a.0.len() != 2 { return Err(js_error("invalid withdrawal arguments")); }
         if (operation == "deposit_update" && a.0.len() != 3) || (operation == "saved_invoice" && a.0.len() != 2) {
             return Err(js_error("invalid quote operation arguments"));
         }
@@ -378,7 +381,12 @@ impl BrowserWallet {
             .as_mut()
             .ok_or_else(|| js_error("wallet is closed"))?;
         self.tasks.run_until(async {
-        let value=match operation {
+        let value=if withdrawal {
+            match h.withdrawal_request(operation, a.text(0)?, a.text(1)?).await {
+                Ok(v) => json!({"status":0,"value":v}),
+                Err(e) => failure(e),
+            }
+        } else { match operation {
             "create_deposit" => match h.create_deposit(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
             "check_deposit" => match h.check_deposit(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
             "saved_invoice" => match h.saved_invoice(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
@@ -417,15 +425,16 @@ impl BrowserWallet {
                 match h.receive_proofs(a.text(0)?,proofs,&a.keys(2)?).await { Ok(n) => json!({"status":0,"net_sats":n.to_string()}), Err(e) => failure(e) }
             }
             _ => return Err(js_error("unknown wallet operation")),
-        };
+        }};
         Ok(value.to_string())
         }).await
     }
 
     pub async fn close(&mut self) {
-        if let Some(h) = self.inner.take() {
+        if let Some(mut h) = self.inner.take() {
             self.tasks
                 .run_until(async {
+                    h.cancel_withdrawal_on_close().await;
                     h.flush_rate_limits().await;
                     drop(h);
                 })

@@ -19,6 +19,21 @@ commit.
 
 ## Build
 
+The shared [wallet menu](menu.md) supports explicitly authorized BOLT11
+withdrawals: paste a complete invoice (4096-byte limit), Review the CDK quote,
+then explicitly Withdraw. Review reserves funds but does not pay. Cancel/Back
+cancels only unsubmitted preparation; submitted payments keep CDK background
+checks across menu close/reload. Fee reserve plus Cashu fees form an estimate,
+not a guaranteed cap. History detail is local and cannot resubmit a payment.
+Browser clipboard reads require a focused field and a trusted Paste/Ctrl+V
+gesture; onboarding retains its independent 1024-byte phrase limit.
+
+`zig build test-withdrawal-ui -Dplatform=wasm -Doffline` runs the functional
+renderer/CDK withdrawal fixture in isolated Chromium, without screenshots or a
+public mint. The fixture also holds an actual CDK payment Pending across menu
+close/reload, then releases it to completion without another payment POST.
+Pure UI and backend tests cover additional recovery/error cases.
+
 Host prerequisites: Zig 0.17.0, Python 3 and Rustup/Cargo. For browser tests,
 Node 22+ and Chromium are also required. See
 [separate platform build graphs and options](build.md) for the full contract.

@@ -58,6 +58,10 @@ use zeroize::Zeroizing;
 
 use crate::status::CdkStatus;
 
+#[path = "withdrawal.rs"]
+mod withdrawal;
+use withdrawal::PreparedWithdrawal;
+
 fn unix_now() -> u64 {
     #[cfg(target_arch = "wasm32")]
     { (js_sys::Date::now() / 1000.0) as u64 }
@@ -221,6 +225,7 @@ pub struct CdkWallet {
     /// Mints with unresolved recovery state. Mutations against these mints are
     /// rejected with [`CdkStatus::RecoveryPending`] until recovery succeeds.
     unresolved: BTreeSet<MintUrl>,
+    prepared_withdrawal: Option<PreparedWithdrawal>,
     /// Set if a Rust panic was caught while servicing a call on this handle.
     ///
     /// A caught panic means the in-memory state may be inconsistent, so the
@@ -265,11 +270,25 @@ struct QuoteHistoryRow {
     amount: Option<String>,
     unit: String,
     state: String,
+    withdrawal: Option<serde_json::Value>,
+    expiry: u64,
+    expired: bool,
+    oversized: bool,
 }
 impl QuoteHistoryRow {
     fn view(self) -> serde_json::Value {
-        serde_json::json!({"created_at":self.time.map(|n|n.to_string()),"direction":self.direction,
-            "mint_url":if self.mint.is_empty(){None}else{Some(self.mint)},"id":self.id,"amount":self.amount,"unit":self.unit,"state":self.state})
+        if self.oversized {
+            return serde_json::json!({"direction":self.direction,"identity":CdkWallet::quote_key(self.direction, &self.mint, &self.id),"error":"Saved quote exceeds display limit; retained in wallet"});
+        }
+        let mut value = serde_json::json!({"created_at":self.time.map(|n|n.to_string()),"direction":self.direction,
+            "mint_url":if self.mint.is_empty(){None}else{Some(self.mint)},"id":self.id,"amount":self.amount,"unit":self.unit,"state":self.state,
+            "quote_expiry":self.expiry.to_string(),"expired":self.expired});
+        if let Some(w) = self.withdrawal {
+            for key in ["payment_status", "quote_expiry", "invoice_expiry", "expired"] {
+                value[key] = w[key].clone();
+            }
+        }
+        value
     }
 }
 
@@ -303,6 +322,7 @@ impl CdkWallet {
     }
 
     async fn deposit_wallet(&self, mint: &MintUrl) -> FfiResult<Wallet> {
+        self.guard_prepared_withdrawal(Some(mint))?;
         if self.is_poisoned() {
             return Err(crate::api::poisoned_handle());
         }
@@ -515,6 +535,8 @@ impl CdkWallet {
         &self,
         mint: &MintUrl,
     ) -> FfiResult<(&'static str, Option<cdk_common::wallet::MintQuote>)> {
+        // Local intent/timestamp cleanup never resumes CDK sagas or touches
+        // proofs. Prepared-review guards belong at actual wallet mutations.
         if self.is_poisoned() {
             return Err(crate::api::poisoned_handle());
         }
@@ -599,6 +621,7 @@ impl CdkWallet {
             return Err(crate::api::poisoned_handle());
         }
         let mint = parse_mint_url(mint)?;
+        self.guard_prepared_withdrawal(Some(&mint))?;
         let saved = self
             .db
             .get_mint_quote(id)
@@ -694,7 +717,8 @@ impl CdkWallet {
         if self.is_poisoned() {
             return Err(crate::api::poisoned_handle());
         }
-        let (mint_quotes, melt_quotes, metadata) = self.quote_history_data().await?;
+        let (mint_quotes, melt_quotes, metadata, sagas, transactions) = self.quote_history_data().await?;
+        let withdrawal_lookup = withdrawal::WithdrawalLookup::new(&sagas, &transactions);
         let created = |direction, mint: &str, id: &str| {
             metadata
                 .get(&Self::quote_key(direction, mint, id))
@@ -704,7 +728,12 @@ impl CdkWallet {
         let mut rows = Vec::new();
         for q in mint_quotes {
             let mint = q.mint_url.to_string();
+            let expired = quote_expired(&q, unix_now());
             rows.push(QuoteHistoryRow {
+                withdrawal: None,
+                oversized: q.request.len() > 4096,
+                expiry: q.expiry,
+                expired,
                 time: created("In", &mint, &q.id),
                 direction: "In",
                 mint,
@@ -715,8 +744,13 @@ impl CdkWallet {
             });
         }
         for q in melt_quotes {
+            let withdrawal = Self::project_withdrawal(&q, &withdrawal_lookup, unix_now());
             let mint = q.mint_url.map(|m| m.to_string()).unwrap_or_default();
             rows.push(QuoteHistoryRow {
+                withdrawal: Some(withdrawal),
+                oversized: q.request.len() > 4096,
+                expiry: q.expiry,
+                expired: false,
                 time: created("Out", &mint, &q.id),
                 direction: "Out",
                 mint,
@@ -831,6 +865,8 @@ impl CdkWallet {
         Vec<cdk_common::wallet::MintQuote>,
         Vec<cdk_common::wallet::MeltQuote>,
         HashMap<String, Vec<u8>>,
+        Vec<cdk_common::wallet::WalletSaga>,
+        Vec<cdk_common::wallet::Transaction>,
     )> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -848,6 +884,8 @@ impl CdkWallet {
                 self.db.get_mint_quotes().await.map_err(db_error)?,
                 self.db.get_melt_quotes().await.map_err(db_error)?,
                 metadata,
+                self.db.get_incomplete_sagas().await.map_err(db_error)?,
+                self.db.list_transactions(None, None, None).await.map_err(db_error)?,
             ))
         }
     }
@@ -882,7 +920,7 @@ impl CdkWallet {
             return Err(crate::api::poisoned_handle());
         }
         let mint = parse_mint_url(mint)?;
-        let (quotes, _, metadata) = self.quote_history_data().await?;
+        let (quotes, _, metadata, _, _) = self.quote_history_data().await?;
         let mut quotes = self.eligible_deposits(&mint, quotes).await?;
         let created = |q: &cdk_common::wallet::MintQuote| metadata.get(&Self::quote_key("In", &mint.to_string(), &q.id))
             .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok()).map(u64::from_le_bytes).unwrap_or(0);
@@ -908,6 +946,7 @@ impl CdkWallet {
             return Err(FfiErr::new(CdkStatus::InvalidArgument, "invalid poll cursor"));
         }
         let mint = parse_mint_url(mint)?;
+        self.guard_prepared_withdrawal(Some(&mint))?;
         let quotes = self.db.get_mint_quotes().await.map_err(db_error)?;
         let mut quotes = self.eligible_deposits(&mint, quotes).await?;
         quotes.sort_by(|a, b| a.id.cmp(&b.id));
@@ -977,6 +1016,7 @@ impl CdkWallet {
     pub(crate) async fn deposit_update(&mut self, mint: &str, kind: &str, argument: &str) -> FfiResult<String> {
         if self.is_poisoned() { return Err(crate::api::poisoned_handle()); }
         let selected = parse_mint_url(mint)?;
+        self.guard_prepared_withdrawal(Some(&selected))?;
         if !matches!(kind, "check" | "poll" | "recover") || argument.len() > 1024 || argument.contains('\0')
             || (kind == "check" && argument.is_empty()) || (kind == "recover" && !argument.is_empty()) {
             return Err(FfiErr::new(CdkStatus::InvalidArgument, "invalid deposit update arguments"));
@@ -2239,6 +2279,7 @@ impl CdkWallet {
             db_path: PathBuf::from(path_str),
             _lock: file,
             unresolved: BTreeSet::new(),
+            prepared_withdrawal: None,
             poisoned: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             test_network_deadline: None,
@@ -2341,6 +2382,7 @@ impl CdkWallet {
     /// Register (approve) a mint after validating its URL and advertised units.
     pub(crate) async fn add_mint(&mut self, url_str: &str) -> FfiResult<()> {
         let mint_url = parse_mint_url(url_str)?;
+        self.guard_prepared_withdrawal(Some(&mint_url))?;
 
         // Idempotent: an already-approved mint is a local no-op, no network.
         if self.repo.has_mint(&mint_url).await {
@@ -2388,6 +2430,7 @@ impl CdkWallet {
     /// even if a later batch fails or the deadline expires.
     pub(crate) async fn restore_seed(&mut self, url: &str) -> FfiResult<(u64, u64, u64)> {
         let mint = parse_mint_url(url)?;
+        self.guard_prepared_withdrawal(Some(&mint))?;
         self.add_mint(url).await?;
         let wallet = self.approved_wallet(&mint).await?;
         match timeout(SEED_RESTORE_DEADLINE, wallet.restore()).await {
@@ -2461,6 +2504,7 @@ impl CdkWallet {
                 "token references a mint that has not been approved",
             ));
         }
+        self.guard_prepared_withdrawal(Some(&mint_url))?;
         if self.unresolved.contains(&mint_url) {
             return Err(FfiErr::new(
                 CdkStatus::RecoveryPending,
@@ -2573,6 +2617,7 @@ impl CdkWallet {
                 "mint has not been approved",
             ));
         }
+        self.guard_prepared_withdrawal(Some(&mint_url))?;
         if self.unresolved.contains(&mint_url) {
             return Err(FfiErr::new(
                 CdkStatus::RecoveryPending,
@@ -2622,6 +2667,7 @@ impl CdkWallet {
                 "mint has not been approved",
             ));
         }
+        self.guard_prepared_withdrawal(Some(&mint_url))?;
         if self.unresolved.contains(&mint_url) {
             return Err(FfiErr::new(
                 CdkStatus::RecoveryPending,
@@ -2719,6 +2765,7 @@ impl CdkWallet {
                 "mint has not been approved",
             ));
         }
+        self.guard_prepared_withdrawal(Some(&mint_url))?;
         if self.unresolved.contains(&mint_url) {
             return Err(FfiErr::new(
                 CdkStatus::RecoveryPending,
@@ -2943,6 +2990,7 @@ impl CdkWallet {
         &mut self,
         mint: Option<&MintUrl>,
     ) -> FfiResult<Vec<MintRecoveryReport>> {
+        self.guard_prepared_withdrawal(mint)?;
         let wallets: Vec<Wallet> = self
             .repo
             .get_wallets()
