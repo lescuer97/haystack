@@ -89,6 +89,7 @@
         "browser/cdp-runner.mjs",
         "browser/cdp-runner-test.mjs",
         "browser/onboarding-browser-test.mjs",
+        "browser/wallet-ui-browser-test.mjs",
         "browser/platform-hardening-browser-test.mjs",
         "browser/onboarding-test.html",
         "browser/onboarding-test.js",

@@ -42,6 +42,13 @@ pub fn createWallet(seed: []const u8, db_path: [:0]const u8) error{CdkFailure}!W
     return .{ .wallet = result.handle orelse return error.CdkFailure };
 }
 
+fn openAppWallet(seed: []const u8, db_path: [:0]const u8) error{CdkFailure}!Wallet {
+    var result = cdk.c.cdk_wallet_open_selected(cdk.byteSlice(seed), db_path.ptr, cdk.app_mint.ptr);
+    defer cdk.c.cdk_recovery_reports_free(result.reports);
+    try check(&result);
+    return .{ .wallet = result.handle orelse return error.CdkFailure };
+}
+
 // ── fixed user wallet storage ───────────────────────────────────────────────
 
 /// Names inside the single Haystack-owned wallet directory.
@@ -223,7 +230,7 @@ pub fn inspect(
 
     return .{
         .state = .ready,
-        .wallet = try createWallet(&seed, db_path_z),
+        .wallet = try openAppWallet(&seed, db_path_z),
     };
 }
 

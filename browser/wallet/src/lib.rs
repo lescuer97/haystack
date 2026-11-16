@@ -55,7 +55,7 @@ pub fn onboarding_mint() -> Result<String, JsValue> {
     }
     #[cfg(not(feature = "local-mint-fixture"))]
     {
-        Ok("https://mint.minibits.cash/Bitcoin".to_owned())
+        Ok("https://testnut.cashu.space/".to_owned())
     }
 }
 fn failure(e: FfiErr) -> Value {
@@ -366,13 +366,30 @@ impl BrowserWallet {
 
     /// Mutable async receiver rejects overlapping calls; JS facade queues them.
     pub async fn call(&mut self, operation: &str, arguments: &str) -> Result<String, JsValue> {
+        if matches!(operation, "deposit_update" | "saved_invoice") && arguments.len() > 4096 {
+            return Err(js_error("arguments exceed maximum size"));
+        }
         let a = Args::new(arguments)?;
+        if (operation == "deposit_update" && a.0.len() != 3) || (operation == "saved_invoice" && a.0.len() != 2) {
+            return Err(js_error("invalid quote operation arguments"));
+        }
         let h = self
             .inner
             .as_mut()
             .ok_or_else(|| js_error("wallet is closed"))?;
         self.tasks.run_until(async {
         let value=match operation {
+            "create_deposit" => match h.create_deposit(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
+            "check_deposit" => match h.check_deposit(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
+            "saved_invoice" => match h.saved_invoice(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
+            "deposit_update" => match h.deposit_update(a.text(0)?,a.text(1)?,a.text(2)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
+            "unfinished_deposits" => match h.unfinished_deposits(a.text(0)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
+            "quote_history" => match h.quote_history().await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
+            "wallet_screen" => match h.wallet_screen(a.text(0)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
+            "quote_history_page" => match h.quote_history_page(a.text(0)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
+            "resume_deposit" => match h.resume_deposit(a.text(0)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
+            "poll_deposits" => match h.poll_deposits(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
+            "recover_deposit" => match h.recover_deposit(a.text(0)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
             "list_mints" => json!({"status":0,"mints":h.list_mints().await}),
             "list_balances" => match h.list_balances().await { Ok(b) => json!({"status":0,"balances":b.into_iter().map(|(mint,sats)| json!({"mint_url":mint,"sats":sats.to_string()})).collect::<Vec<_>>()}), Err(e) => failure(e) },
             "add_mint" => match h.add_mint(a.text(0)?).await { Ok(()) => json!({"status":0}), Err(e) => failure(e) },

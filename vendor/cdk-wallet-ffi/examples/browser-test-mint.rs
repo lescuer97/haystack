@@ -2,8 +2,11 @@
 //! cargo +stable run --locked --example browser-test-mint --manifest-path
 //! vendor/cdk-wallet-ffi/Cargo.toml -- zig-out/browser
 use axum::{
+    body::Body,
+    extract::Request,
     extract::State,
     http::{header, StatusCode, Uri},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -20,7 +23,10 @@ use cdk_fake_wallet::FakeWallet;
 use std::{
     collections::{HashMap, HashSet},
     path::{Component, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 #[derive(Clone)]
@@ -114,13 +120,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     mint.set_quote_ttl(QuoteTTL::new(10_000, 10_000)).await?;
     mint.start().await?;
     let router = cdk_axum::create_mint_router(Arc::new(mint), vec!["bolt11".to_owned()]).await?;
+    // Explicit test-only deterministic payment gate. Funding runs ungated; the
+    // gate closes immediately before the isolated renderer fixture is served.
+    let gated = std::env::var_os("BROWSER_TEST_PAYMENT_GATE").is_some();
+    let paid = Arc::new(AtomicBool::new(true));
+    let quotes = Arc::new(AtomicU64::new(0));
+    let claims = Arc::new(AtomicU64::new(0));
+    let unpaid_quote = Arc::new(tokio::sync::Mutex::new(None::<String>));
+    let gate = paid.clone();
+    let except = unpaid_quote.clone();
+    let quote_count = quotes.clone();
+    let claim_count = claims.clone();
+    let router = router.layer(middleware::from_fn(move |req: Request, next: Next| {
+        let paid = gate.clone();
+        let quotes = quote_count.clone();
+        let claims = claim_count.clone();
+        let except = except.clone();
+        async move {
+            let path = req.uri().path().to_owned();
+            let create =
+                req.method() == axum::http::Method::POST && path == "/v1/mint/quote/bolt11";
+            let claim = req.method() == axum::http::Method::POST && path == "/v1/mint/bolt11";
+            if create {
+                quotes.fetch_add(1, Ordering::SeqCst);
+            }
+            if claim {
+                claims.fetch_add(1, Ordering::SeqCst);
+            }
+            let response = next.run(req).await;
+            let held = except.lock().await.clone();
+            if gated && (!paid.load(Ordering::SeqCst) || held.as_deref() == Some(path.as_str())) && path.starts_with("/v1/mint/quote/bolt11") {
+                let (mut parts, body) = response.into_parts();
+                let bytes = axum::body::to_bytes(body, 65536).await.unwrap();
+                if let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    if value.get("state").is_some() {
+                        value["state"] = "UNPAID".into();
+                        value["amount_paid"] = 0.into();
+                        value["amount_issued"] = 0.into();
+                    }
+                    parts.headers.remove(header::CONTENT_LENGTH);
+                    return Response::from_parts(parts, Body::from(value.to_string()));
+                }
+                return Response::from_parts(parts, Body::from(bytes));
+            }
+            response
+        }
+    }));
+    let gate_ready = paid.clone();
+    let quote_ready = quotes.clone();
+    let claim_ready = claims.clone();
     let server = tokio::spawn(async move {
         // Funding happens after the listener begins accepting requests.
         let (sender, receiver) = tokio::sync::oneshot::channel::<App>();
         let shared = Arc::new(tokio::sync::OnceCell::<App>::new());
         let for_token = shared.clone();
         let for_asset = shared.clone();
+        let for_gate = paid.clone();
+        let for_except = unpaid_quote.clone();
+        let for_unpay = paid.clone();
+        let for_quotes = quotes.clone();
+        let for_claims = claims.clone();
         let extra = Router::new()
+            .route("/test-unpay", get(move || {
+                let paid = for_unpay.clone();
+                async move {
+                    if !gated { return StatusCode::NOT_FOUND; }
+                    paid.store(false, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }))
+            .route("/test-pay", get(move |axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>| {
+                let paid = for_gate.clone();
+                let except = for_except.clone();
+                async move {
+                    if !gated { return StatusCode::NOT_FOUND; }
+                    // Query decoding accepts URL-encoded quote IDs; compare the
+                    // exact quote path, never a substring or arbitrary suffix.
+                    *except.lock().await = query.get("except").map(|id| {
+                        let mut quote_url = url::Url::parse("http://127.0.0.1/v1/mint/quote/bolt11/").unwrap();
+                        quote_url.path_segments_mut().unwrap().pop_if_empty().push(id);
+                        quote_url.path().to_owned()
+                    });
+                    paid.store(true, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }))
+            .route("/test-deposit-counts", get(move || {
+                let quotes = for_quotes.clone();
+                let claims = for_claims.clone();
+                async move { Json(serde_json::json!({"quotes":quotes.load(Ordering::SeqCst),"claims":claims.load(Ordering::SeqCst)})) }
+            }))
             .route(
                 "/test-token",
                 get(move || {
@@ -181,6 +270,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     wallet.mint(&quote.id, SplitTarget::default(), None).await?;
+    quote_ready.store(0, Ordering::SeqCst);
+    claim_ready.store(0, Ordering::SeqCst);
+    if gated {
+        gate_ready.store(false, Ordering::SeqCst);
+    }
     server
         .0
         .send(App {

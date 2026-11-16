@@ -21,6 +21,7 @@ menu, without building the other application.
 | `zig build wallet-fixture -Dplatform=wasm` | Build the isolated local-mint fixture wallet under `zig-out/wasm-test` |
 | `zig build browser-fixture -Dplatform=wasm` | Build the isolated browser fixture application under `zig-out/wasm-test` |
 | `zig build test-onboarding -Dplatform=wasm` | Linux-only onboarding suite with a fake mint and fresh Chromium incognito contexts |
+| `zig build test-wallet-ui -Dplatform=wasm -Doffline` | Functional game wallet deposits, complete-invoice clipboard, exactly-once payment, closed-menu settlement and persisted history/selection/reload; gated ephemeral fake mint and isolated Chromium, no image checks |
 | `zig build test-qr-portability -Doffline` | C encoder object checks for Linux x86_64/aarch64 and macOS 15 ARM64; not ARM64 application/runtime verification |
 | `zig build setup -Dplatform=wasm` | Provision Rust + Wasm target, local wasm-bindgen and Emscripten without building the application |
 | `zig build test-build` | Test graph isolation, explicit setup/check contracts, the native target matrix and the upstream Emscripten adapter |
@@ -108,6 +109,11 @@ described below. macOS desktop requires a native arm64 shell on macOS 15.0 or
 newer, Xcode Command Line Tools and the macOS SDK. Browser tests require
 **Node 22+** and **Chromium** (`CHROMIUM=/path/to/browser` is supported). The
 build never uses sudo or attempts to install OS packages or the browser.
+
+Wallet UI tests do not verify rendered pixels, QR decoding or OCR. Native tests
+retain QR encoding unit checks; `test-qr-portability` checks C compilation only,
+not rendering or ARM64 runtime behavior. Production QR quiet-zone behavior is
+described in [menu.md](menu.md).
 
 Provision the selected platform explicitly, once:
 

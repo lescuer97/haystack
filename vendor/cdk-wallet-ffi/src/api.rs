@@ -240,6 +240,70 @@ fn send_error(e: FfiErr) -> CdkSendResult {
     }
 }
 
+/// Deposit/history adapter. Arguments and results are JSON strings containing
+/// decimal-string amounts; returned strings use the ordinary Rust string free.
+/// Operations: create_deposit [mint, sats], check_deposit [mint, quote_id] (expired-unpaid is local-only),
+/// unfinished_deposits [mint], quote_history [] (generic compatibility),
+/// wallet_screen [mint] (small selected balance/recovery status),
+/// quote_history_page [offset], resume_deposit [mint] (newest non-expired unfinished),
+/// poll_deposits [mint, after_id] (one background check, never creates),
+/// recover_deposit [mint] (local reconciliation only, never a quote POST).
+/// deposit_update [mint, check|poll|recover, id|cursor|empty] returns bounded application recovery metadata,
+/// saved_invoice [mint, id] reads one exact local Sat/BOLT11 quote without network or recovery.
+#[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cdk_wallet_quotes(
+    handle: Option<&mut crate::wallet::CdkWallet>,
+    operation: Option<char_p::Ref<'_>>,
+    arguments: Option<char_p::Ref<'_>>,
+) -> CdkStringResult {
+    let poison = handle.as_ref().map(|h| h.poison_flag());
+    guard_poison(
+        poison,
+        || CdkStringResult::err(CdkStatus::InternalError, "internal quote panic"),
+        || {
+            let run = || -> FfiResult<String> {
+                let h = handle.ok_or_else(null_handle)?;
+                if h.is_poisoned() {
+                    return Err(poisoned_handle());
+                }
+                let op = opt_cstr_to_string_bounded(operation, 32, "operation")?;
+                let args = opt_cstr_to_string_bounded(arguments, 4096, "arguments")?;
+                let args: Vec<String> = serde_json::from_str(&args).map_err(|_| {
+                    FfiErr::new(CdkStatus::InvalidArgument, "expected string array")
+                })?;
+                crate::wallet::runtime().block_on(async {
+                    match (op.as_str(), args.as_slice()) {
+                        ("create_deposit", [mint, amount]) => h.create_deposit(mint, amount).await,
+                        ("check_deposit", [mint, id]) => h.check_deposit(mint, id).await,
+                        ("saved_invoice", [mint, id]) => h.saved_invoice(mint, id).await,
+                        ("deposit_update", [mint, kind, argument]) => h.deposit_update(mint, kind, argument).await,
+                        ("unfinished_deposits", [mint]) => h.unfinished_deposits(mint).await,
+                        ("quote_history", []) => h.quote_history().await,
+                        ("wallet_screen", [mint]) => h.wallet_screen(mint).await,
+                        ("quote_history_page", [offset]) => h.quote_history_page(offset).await,
+                        ("resume_deposit", [mint]) => h.resume_deposit(mint).await,
+                        ("poll_deposits", [mint, after_id]) => h.poll_deposits(mint, after_id).await,
+                        ("recover_deposit", [mint]) => h.recover_deposit(mint).await,
+                        _ => Err(FfiErr::new(
+                            CdkStatus::InvalidArgument,
+                            "invalid quote operation",
+                        )),
+                    }
+                })
+            };
+            match run() {
+                Ok(value) => CdkStringResult {
+                    status: CdkStatus::Ok,
+                    error: None,
+                    value: string_to_box(value),
+                },
+                Err(e) => CdkStringResult::err(e.status, e.message),
+            }
+        },
+    )
+}
+
 /// Open (creating if needed) a wrapper-owned database.
 ///
 /// `seed` must be exactly 64 bytes. `db_path` must be a valid UTF-8 filesystem
@@ -250,6 +314,30 @@ fn send_error(e: FfiErr) -> CdkSendResult {
 pub fn cdk_wallet_open(
     seed: Option<c_slice::Ref<'_, u8>>,
     db_path: Option<char_p::Ref<'_>>,
+) -> CdkOpenResult {
+    open_with_selection(seed, db_path, None)
+}
+
+/// Open with startup recovery restricted to one mint, leaving other mints local.
+#[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cdk_wallet_open_selected(
+    seed: Option<c_slice::Ref<'_, u8>>,
+    db_path: Option<char_p::Ref<'_>>,
+    mint: Option<char_p::Ref<'_>>,
+) -> CdkOpenResult {
+    let mint = match opt_cstr_to_string(mint).and_then(|s| crate::wallet::parse_mint_url(&s)) {
+        Ok(mint) => mint,
+        Err(e) => return open_error(e.status, e.message),
+    };
+    open_with_selection(seed, db_path, Some(&mint))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_with_selection(
+    seed: Option<c_slice::Ref<'_, u8>>,
+    db_path: Option<char_p::Ref<'_>>,
+    mint: Option<&cdk::mint_url::MintUrl>,
 ) -> CdkOpenResult {
     // Borrow the caller's seed for the duration of the synchronous call rather
     // than copying it into an owned `Vec`.
@@ -264,9 +352,15 @@ pub fn cdk_wallet_open(
 
     guard(
         || open_error(CdkStatus::InternalError, "internal panic during open"),
-        || match crate::wallet::runtime()
-            .block_on(crate::wallet::CdkWallet::open(seed.as_slice(), &path))
-        {
+        || match crate::wallet::runtime().block_on(async {
+            match mint {
+                Some(mint) => {
+                    crate::wallet::CdkWallet::open_selected(seed.as_slice(), &path, Some(mint))
+                        .await
+                }
+                None => crate::wallet::CdkWallet::open(seed.as_slice(), &path).await,
+            }
+        }) {
             Ok((handle, reports)) => {
                 let handle: repr_c::Box<crate::wallet::CdkWallet> = Box::new(handle).into();
                 let (recovered, compensated, skipped, failed) =

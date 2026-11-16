@@ -1,8 +1,9 @@
 # Menu — modal UI and bounded text input
 
-The menu is a small, self-contained demonstration of a modal screen. It has no
-wallet, network, or payment integration: the wallet page only edits a local
-display-name buffer in memory.
+The native and browser game share a modal wallet UI. Production (including
+Debug) selects only `https://testnut.cashu.space/`: experimental test funds only.
+The generic wallet bridge remains multi-mint; the application does not refresh
+old mints automatically or rewrite their quotes, proofs, or balances.
 
 Open it with `Esc` on the keyboard or the Start button on controller 0. Opening
 always shows the **Main** page with its first row selected. While the menu is
@@ -24,8 +25,8 @@ it cannot move the world.
 | printable text | append to the focused field |
 | Backspace | delete the last codepoint in the focused field |
 
-`WASD` is **not** a menu direction: it stays a typing key, so entering a wallet
-name never moves the highlight. Held directions step once immediately and then
+`WASD` is **not** a menu direction: typing never moves the highlight. Amounts
+are validated separately as positive decimal integer sats. Held directions step once immediately and then
 repeat at the same shared 10 steps/s cadence as the camera. `Space` types a
 space; it is not a confirm key. Arrow keys, D-pad, and stick
 share the vertical list: up/left mean previous, down/right mean next, and at
@@ -41,8 +42,82 @@ field that was previously focused; the caret appears only after activation.
 Pages and rows:
 
 - **Main**: `Wallet` (navigation), `Resume` (close).
-- **Wallet**: `Wallet name` (editable text), `Clear name` (action), `Back to
-  Main` (navigation).
+- **Wallet**: selected-mint sat balance, `Deposit`, disabled `Withdraw - unavailable`,
+  `History`, `Back to Main`.
+- **Deposit**: custom positive integer sats, presets 21/42/100/1000, `Deposit`, `Back`.
+- **Invoice**: cached QR, bounded invoice preview, actual quote state,
+  `Copy invoice`, new `Deposit`, `Back`.
+- **History**: eight saved mint/melt quotes per page, `Previous`, `Next`, `Back`.
+  Rows show UTC creation time (or `Time unknown`), direction, amount/unit,
+  persisted state and mint identity. Legacy mints are marked `not refreshed`;
+  unknown melt owners stay unknown. Paid deposits are not completed deposits.
+  Rows are selectable by pointer, keyboard, and gamepad; activation opens the saved
+  invoice. Previous appears only with an earlier page, Next only with a later page;
+  a single page shows neither.
+
+Deposit navigation and the Deposit amount action use green text and rectangular
+outlines, never filled backgrounds or pills. Withdraw uses red and is intentionally not implemented; existing melt
+quotes still appear in history.
+
+Deposit disables duplicate requests until the persisted quote returns. Payment
+checks run serially, about two seconds after the previous completion, backing
+off after errors. A paid invoice must actually mint through CDK's saga before
+success; the displayed balance is reread, never incremented by the requested
+amount. A remote Issued response without CDK's completed local issuance is not
+reported as success. Unfinished invoices survive reload, including expired paid
+quotes. Opening automatically selects the newest non-expired unfinished deposit,
+ordered by saved creation time (unknown is zero), then descending quote id.
+There is no invoice-cycling button. Background monitoring continues while the
+menu is closed: displayed-invoice checks and saved-deposit sweeps alternate
+poll slots; without a displayed eligible invoice every slot sweeps one quote.
+
+Only UNPAID quotes with a nonzero expiry strictly before the current Unix time
+are expired: their checks are local-only and sweeps/resume skip them. Zero means
+no expiry. PAID and remotely ISSUED but locally unconfirmed deposits remain
+recoverable after expiry. An invoice that expires while displayed shows EXPIRED,
+hides its QR, and stops unpaid polling. Deposit returns to amount entry; no
+replacement invoice is created automatically.
+Automatic CDK recovery continues even when no eligible saved quotes remain; an
+expired UNPAID selection neither triggers an expired-quote GET nor blocks that
+recovery. Recovery outcomes invalidate balance and history so both are reread
+from the wallet library, never calculated in the UI from requested amounts.
+
+Creation intents record the original amount/mint/method and pre-request quote
+identities. A known saved result is reconciled and returned instead of creating
+another invoice. Definitive CDK rejections permit retry; timeouts/network/unknown
+outcomes remain blocked unless exact saved evidence resolves them. Optional
+creation-time metadata failure leaves a usable invoice with unknown time, not a
+permanent creation lock. Automatic reconciliation only checks local evidence,
+with bounded automatic retry/backoff on transient read failures; there is no
+manual recovery row. It never POSTs an invoice or blindly resets an unknown intent. Legacy `pending`
+intents cannot be associated with arbitrary old quotes and remain explicitly
+`legacy_unknown`. Saved invoices, balances and backups remain intact.
+
+Opening/balance responses are small and independent of history size. History is
+source-paginated in globally sorted pages of eight; resume returns one saved
+invoice without a cursor. An oversized newest invoice reports an explicit error
+and is retained, rather than silently falling through to an older invoice.
+The 128 KiB transport bound is unchanged. No quotes are silently dropped or
+financial fields truncated. History/resume errors do not disable the wallet.
+Browser history reads load one validated Store with all creation metadata,
+rather than reparsing it for every quote. Unchanged UNPAID polls fetch neither
+balance nor history; confirmed issuance rereads balance, and dirty history is
+fetched only while its page is active. History reads never contact a mint or
+mutate payments. No schema, persistent history index or global cache is added.
+Opening a history row reads its saved quote locally. The previous invoice and
+copy action are unavailable while that selection loads, including after an
+error, so selecting B cannot expose or copy stale invoice A.
+
+One native worker owns open/read/quote/claim/close; rendering never waits for its
+network requests. Browser calls use one asynchronous service queue and derive
+seeds in Rust only. Both owners survive menu close. Native shutdown joins its
+worker; browser service teardown drains the queue before closing handles.
+
+The QR encoder is the same vendored, pinned Nayuki C implementation on both
+platforms (see `vendor/qrcodegen/README.md`). It encodes once per invoice and
+renders integer pixels with four quiet-zone modules; oversized invoices or
+undersized viewports show an explicit QR-unavailable message. Copy transfers the
+complete invoice, not its bounded preview.
 
 ## Module responsibilities
 
@@ -53,6 +128,9 @@ Pages and rows:
 | `src/game.zig` | `GameState.update` gives the menu first refusal; a consumed frame never reaches the camera or debug toggles |
 | `src/rendering.zig` | reads menu state and draws the modal last, over the world, HUD, and minimap |
 | `src/main.zig` | calls `setExitKey(.null)` so `Esc` is a menu key, then passes the viewport size to `rendering.draw` |
+| `src/wallet_ui.zig` | Raylib-free request/state/polling model, checked amounts, bounded history pages |
+| `src/wallet_service.zig` | native single-owner worker and one-slot mailbox |
+| `browser/game-onboarding.js` | existing lifetime service queue, wallet adapter and trusted clipboard handling |
 
 `menu.zig` does not import Raylib. `FrameInput` defaults describe a 1000×640
 viewport, so tests can drive the whole menu without a window.
@@ -88,7 +166,8 @@ the caret stays visible, and scissors it to the input box.
 
 ## Layout and tests
 
-`menu.calculateLayout(page, viewport_w, viewport_h)` is the single source of
+`Menu.layoutFor(viewport_w, viewport_h)` (and the static-page wrapper
+`menu.calculateLayout(page, viewport_w, viewport_h)`) is the single source of
 rectangles for both hit testing and drawing. It centres the panel, then scales
 padding, title height, gaps, and row height down with it, so every title and
 item rectangle stays inside the panel even at tiny viewport sizes. There is no
@@ -101,3 +180,34 @@ a stationary pointer, focus blurring, Unicode editing and capacity,
 preservation of UI fields through `Reader.repeat`, the shared direction cadence,
 WASD filtering while the menu is open, and modal input blocking the camera and
 debug toggles.
+
+Wallet verification:
+
+```sh
+zig build test test-wallet header-check test-build -Doffline
+zig build test-wallet-ui -Dplatform=wasm -Doptimize=Debug -Doffline
+zig build test-wallet-ui -Dplatform=wasm -Doptimize=ReleaseSafe -Doffline
+node browser/game-onboarding-test.mjs
+zig build -Doffline
+zig build -Dplatform=wasm -Doffline
+zig fmt --check src/wallet_ui.zig src/menu.zig src/rendering.zig src/wallet_service.zig
+git diff --check
+```
+
+The browser UI command uses an
+ephemeral loopback fake mint with a deterministic payment gate and a disposable
+Chromium context. It drives functional wallet navigation through the actual
+game, verifies complete-invoice clipboard contents, exactly-once issuance,
+persisted history/selection/reload, and multiple deposits settling with the menu
+closed without replacing the selected invoice. It does not check rendered
+pixels, decode QR images or use OCR. QR encoding unit tests remain in the native
+test suite. Native architecture C compile checks are
+`zig build test-qr-portability -Doffline`; these do not verify rendering, and
+ARM64 Linux/macOS runtime validation still requires those actual platforms.
+
+For isolated native application fixtures, explicitly build with
+`-Dapp-fixture-mint=http://127.0.0.1:PORT`; optimization never selects a mint.
+Use isolated HOME/XDG directories when running that binary. New native recovery
+markers are mint-bearing v3. Legacy ambiguous v2 recovery markers/stages remain
+byte-for-byte preserved and blocked; ordinary v1 backup/complete wallets still
+work. A mismatched v3 mint is rejected before opening its recovery stage.

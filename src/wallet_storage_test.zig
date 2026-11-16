@@ -21,6 +21,40 @@ const recovery_phrase = "abandon abandon abandon abandon abandon abandon abandon
 const recovery_id = "0123456789abcdef0123456789abcdef".*;
 const other_recovery_id = "1123456789abcdef0123456789abcdef".*;
 
+test "application worker owns one locked handle across reads and joins before reopen" {
+    const service = @import("wallet_service.zig");
+    const ui = @import("wallet_ui.zig");
+    var h = try Harness.init();
+    defer h.deinit();
+    const created = try wallet.create(testing.io, testing.allocator, h.paths);
+    defer created.deinit(testing.allocator);
+    {
+        const worker = try service.Worker.start(h.paths);
+        defer worker.stop();
+        var model = ui.Model{};
+        model.tick(true, 0);
+        for (0..250) |_| {
+            worker.step(&model, 0);
+            if (!model.pending) break;
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        try testing.expect(model.available and !model.pending);
+        try testing.expectEqualStrings("0 sat", model.balance.slice());
+        try testing.expectError(error.CdkFailure, wallet.inspect(testing.io, testing.allocator, h.paths, true));
+        try testing.expect(model.enqueue(.snapshot, ""));
+        for (0..250) |_| {
+            worker.step(&model, 0);
+            if (!model.pending) break;
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        try testing.expect(model.available and !model.pending);
+        try testing.expectEqual(@as(usize, 0), model.total_rows);
+    }
+    var reopened = try wallet.inspect(testing.io, testing.allocator, h.paths, true);
+    defer reopened.close() catch {};
+    try testing.expect(reopened.state == .ready);
+}
+
 var sync_events: [3]wallet.TestSync = undefined;
 var sync_count: usize = 0;
 var sync_root: []const u8 = "";

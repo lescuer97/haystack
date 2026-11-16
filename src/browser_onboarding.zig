@@ -102,6 +102,9 @@ extern "c" fn haystack_onboarding_request(u32, u32, [*]const u8, u32, [*]const u
 extern "c" fn haystack_onboarding_close(u32) void;
 
 var generation: u32 = 0;
+pub fn currentGeneration() u32 {
+    return generation;
+}
 var token: u32 = 0;
 var pending: bool = false;
 var starting: bool = false;

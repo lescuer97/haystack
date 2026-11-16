@@ -20,20 +20,20 @@ mergeInto(LibraryManager.library, {
       function check(kind, x, y) {
         var ptr = 0, code = 0, text = '';
         try {
-          ptr = _malloc(1024);
-          if (!ptr || ptr < 0 || ptr + 1024 > HEAPU8.length) return null;
-          HEAPU8.fill(0, ptr, ptr + 1024);
-          code = {{{ makeDynCall('iiiiii', 'probe') }}}(kind, x, y, ptr, 1024);
-          if (code >= 1 && code <= 13) {
+          ptr = _malloc(4097);
+          if (!ptr || ptr < 0 || ptr + 4097 > HEAPU8.length) return null;
+          HEAPU8.fill(0, ptr, ptr + 4097);
+          code = {{{ makeDynCall('iiiiii', 'probe') }}}(kind, x, y, ptr, 4097);
+          if ((code >= 1 && code <= 13) || code === 15) {
             var end = ptr;
-            while (end < ptr + 1024 && HEAPU8[end]) end++;
+            while (end < ptr + 4097 && HEAPU8[end]) end++;
             if (end === ptr) return null;
             text = new TextDecoder('utf-8', { fatal: true }).decode(HEAPU8.subarray(ptr, end));
           }
           return { code: code, text: text };
         } catch (_) { return null; }
         finally {
-          if (ptr && ptr >= 0 && ptr + 1024 <= HEAPU8.length) HEAPU8.fill(0, ptr, ptr + 1024);
+          if (ptr && ptr >= 0 && ptr + 4097 <= HEAPU8.length) HEAPU8.fill(0, ptr, ptr + 4097);
           if (ptr) _free(ptr);
         }
       }
@@ -60,7 +60,7 @@ mergeInto(LibraryManager.library, {
       function activate(result) {
         if (!result) return;
         try {
-          if (result.code >= 1 && result.code <= 13 && navigator.clipboard && navigator.clipboard.writeText) {
+          if (((result.code >= 1 && result.code <= 13) || result.code === 15) && navigator.clipboard && navigator.clipboard.writeText) {
             var promise = navigator.clipboard.writeText(result.text);
             Promise.resolve(promise).then(function () {
               if (self.input === b) {{{ makeDynCall('vi', 'success') }}}(result.code);
@@ -98,12 +98,12 @@ mergeInto(LibraryManager.library, {
       if (typeof scriptDirectory !== 'string' || !scriptDirectory) throw 0;
       return import(new URL('../wallet/cdk_wallet_browser.js', scriptDirectory).href);
     },
-    deliver: function (callback, generation, token, text, startup) {
+    deliver: function (callback, generation, token, text, startup, limit) {
       var bytes, ptr = 0, status = 0;
       try {
         if (typeof text !== 'string') throw 0;
         bytes = new TextEncoder().encode(text);
-        if (bytes.length > 4096) throw 0;
+        if (bytes.length > (limit || 4096)) throw 0;
         if (bytes.length) {
           ptr = _malloc(bytes.length);
           if (!ptr) throw 0;
@@ -122,14 +122,15 @@ mergeInto(LibraryManager.library, {
         Promise.resolve().then(function () { self.deliver(callback, generation, 0, null, true); });
         return;
       }
-      var s = { generation: generation, closing: false, service: null, chain: null };
+      var s = { generation: generation, closing: false, service: null, wallet: null, mint: null, chain: null };
       self.session = s;
       s.chain = Promise.resolve().then(async function () {
         var result = null;
         try {
           var mod = await self.resolveModule();
           await mod.default();
-          s.service = await mod.start_onboarding(mod.onboarding_mint());
+          s.mint = mod.onboarding_mint();
+          s.service = await mod.start_onboarding(s.mint);
           result = await s.service.request('inspect', '{}');
         } catch (_) {}
         self.deliver(callback, generation, 0, result, true);
@@ -158,6 +159,11 @@ mergeInto(LibraryManager.library, {
       if (!s || s.generation !== generation || s.closing) return;
       s.closing = true;
       s.chain = s.chain.then(async function () {
+        if (s.wallet) {
+          try { await s.wallet.close(); } catch (_) {}
+          try { s.wallet.free(); } catch (_) {}
+          s.wallet = null;
+        }
         if (s.service) {
           try { await s.service.close(); } catch (_) {}
           try { s.service.free(); } catch (_) {}
@@ -165,6 +171,47 @@ mergeInto(LibraryManager.library, {
         }
         if (self.session === s) self.session = null;
       });
+    },
+    walletRequest: function (generation, serial, operation, ptr, len, callback) {
+      var self = this, s = self.session, argument;
+      try {
+        if (!s || s.closing || s.generation !== generation || len > 1024 || ptr < 0 || ptr + len > HEAPU8.length) throw 0;
+        argument = new TextDecoder('utf-8', { fatal: true }).decode(HEAPU8.slice(ptr, ptr + len));
+      } catch (_) {
+        Promise.resolve().then(function () { self.deliver(callback, generation, serial, null, false, 131072); });
+        return;
+      }
+      s.chain = s.chain.then(async function () {
+        var result = null;
+        try {
+          if (operation === 0) {
+            if (s.wallet || !s.service) throw 0;
+            // Separate call: request('inspect'/complete) has returned, dropping
+            // its temporary user lock. Rust audits Ready and derives the seed.
+            s.wallet = await s.service.open_ready_wallet();
+          }
+          if (!s.wallet) throw 0;
+          if (operation === 2) {
+            var added = JSON.parse(await s.wallet.call('add_mint', JSON.stringify([s.mint])));
+            if (added.status !== 0) throw 0;
+          }
+          var op, args;
+          switch (operation) {
+            case 0: case 1: op = 'wallet_screen'; args = [s.mint]; break;
+            case 2: op = 'create_deposit'; args = [s.mint, argument]; break;
+            case 3: op = 'deposit_update'; args = [s.mint, 'check', argument]; break;
+            case 4: op = 'quote_history_page'; args = [argument]; break;
+            case 5: op = 'resume_deposit'; args = [s.mint]; break;
+            case 6: op = 'deposit_update'; args = [s.mint, 'recover', '']; break;
+            case 7: op = 'deposit_update'; args = [s.mint, 'poll', argument]; break;
+            case 8: op = 'saved_invoice'; args = [s.mint, argument]; break;
+            default: throw 0;
+          }
+          var response = JSON.parse(await s.wallet.call(op, JSON.stringify(args)));
+          if (response.status === 0 && typeof response.value === 'string') result = response.value;
+        } catch (_) {}
+        if (self.session === s && !s.closing) self.deliver(callback, generation, serial, result, false, 131072);
+      }).catch(function () {});
     },
   },
   haystack_onboarding_start__deps: ['$haystackOnboarding', 'malloc', 'free'],
@@ -178,6 +225,11 @@ mergeInto(LibraryManager.library, {
   haystack_onboarding_close__deps: ['$haystackOnboarding'],
   haystack_onboarding_close__sig: 'vi',
   haystack_onboarding_close: function (generation) { haystackOnboarding.close(generation); },
+  haystack_wallet_request__deps: ['$haystackOnboarding', 'malloc', 'free'],
+  haystack_wallet_request__sig: 'viiiiii',
+  haystack_wallet_request: function (generation, serial, operation, ptr, len, callback) {
+    haystackOnboarding.walletRequest(generation, serial, operation, ptr, len, callback);
+  },
   haystack_onboarding_bind_input__deps: ['$haystackOnboarding', 'malloc', 'free'],
   haystack_onboarding_bind_input__sig: 'viii',
   haystack_onboarding_bind_input: function (probe, paste, success) { haystackOnboarding.bindInput(probe, paste, success); },

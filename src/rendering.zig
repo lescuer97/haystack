@@ -365,6 +365,18 @@ fn drawTextInput(
 }
 
 fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, state: *const menu.Menu, selected: bool) void {
+    const incoming = (item == .navigate and item.navigate == .Deposit) or (item == .action and item.action == .deposit);
+    const outgoing = item == .action and item.action == .unavailable;
+    if (incoming or outgoing) {
+        const color = if (outgoing) rl.Color.red else rl.Color.green;
+        rl.drawRectangleLinesEx(toRaylibRect(rect), if (selected) 3 else 1, color);
+        drawCenteredText(menu.itemLabel(item), rect, if (outgoing) 15 else 20, color);
+        return;
+    }
+    if (item == .action and item.action == .balance) {
+        drawCenteredText(if (state.wallet.balance.len > 0) state.wallet.balance.z() else "Balance unavailable", rect, 20, menu_text_color);
+        return;
+    }
     const text_field = menu.itemField(item);
     const focused = if (text_field) |field| state.isFocused(field) else false;
 
@@ -388,7 +400,7 @@ fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, state: *const menu.Menu, s
             selected,
         ),
         .navigate, .action => drawCenteredText(
-            menu.itemLabel(item),
+            if (item == .navigate and item.navigate == .Wallet and state.currentPage != .Main) "Back" else menu.itemLabel(item),
             rect,
             if (rect.height < 32) 14 else 20,
             menu_text_color,
@@ -403,7 +415,7 @@ fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, state: *const menu.Menu, s
 /// rather than a separate hover that can drift from the selection.
 fn drawMenu(game: *const game_mod.GameState, viewport_w: f32, viewport_h: f32) void {
     const state = &game.menu;
-    const layout = menu.calculateLayout(state.currentPage, viewport_w, viewport_h);
+    const layout = state.layoutFor(viewport_w, viewport_h);
 
     rl.drawRectangle(
         0,
@@ -416,12 +428,99 @@ fn drawMenu(game: *const game_mod.GameState, viewport_w: f32, viewport_h: f32) v
     drawSolidRect(layout.panel, menu_panel_bg);
     rl.drawRectangleLinesEx(toRaylibRect(layout.panel), 2.0, menu_panel_border);
     drawCenteredText(menu.pageTitle(state.currentPage), layout.title, 26, menu_title_color);
+    if (state.currentPage != .Main) drawWalletContent(state, layout.content);
 
-    const page_items = menu.pageItems(state.currentPage);
+    const page_items = state.items();
 
     var index: usize = 0;
     while (index < layout.item_count) : (index += 1) {
         drawMenuItem(layout.items[index], page_items[index], state, state.isSelected(index));
+    }
+}
+
+fn drawWalletContent(state: *const menu.Menu, rect: menu.Rect) void {
+    if (rect.width < 2 or rect.height < 2) return;
+    const model = &state.wallet;
+    const x: i32 = @intFromFloat(rect.x);
+    const y: i32 = @intFromFloat(rect.y);
+    rl.beginScissorMode(x, y, @intFromFloat(rect.width), @intFromFloat(rect.height));
+    defer rl.endScissorMode();
+    if (state.currentPage == .History) {
+        if (model.pending and model.operation == .history) {
+            rl.drawText("Loading history...", x, y, 18, menu_muted);
+        } else if (model.history_error) {
+            rl.drawText(if (model.available) "History read failed; saved quotes preserved. Back and retry." else "Wallet unavailable; data preserved. Restart app to retry.", x, y, 16, menu_muted);
+        } else if (!model.available) {
+            rl.drawText(if (model.pending) "Loading history..." else "History unavailable; data preserved", x, y, 18, menu_muted);
+        } else if (model.row_count == 0) {
+            rl.drawText("No saved quotes", x, y, 18, menu_muted);
+        } else {
+            const row_height = rect.height / 8;
+            for (model.rows[0..model.row_count], 0..) |*row, index| {
+                const top = rect.y + @as(f32, @floatFromInt(index)) * row_height;
+                if (state.isRowSelected(index)) rl.drawRectangleLinesEx(toRaylibRect(.{ .x = rect.x, .y = top, .width = rect.width, .height = row_height }), 2, menu_accent);
+                const label_rect = menu.Rect{ .x = rect.x + 2, .y = top + 2, .width = 82, .height = @max(1, @min(28, row_height - 4)) };
+                const color = if (row.outgoing) rl.Color.red else rl.Color.green;
+                rl.drawRectangleLinesEx(toRaylibRect(label_rect), 1, color);
+                drawCenteredText(if (row.outgoing) "Withdraw" else "Deposit", label_rect, 16, color);
+                const text_size: i32 = @intFromFloat(@max(1, @min(20, (row_height - 4) / 2)));
+                rl.drawText(row.text.z(), x + 90, @intFromFloat(top + 2), text_size, menu_text_color);
+            }
+        }
+        return;
+    }
+    if (state.currentPage == .Invoice and model.invoice.len != 0 and !model.expired) {
+        const pixels: u32 = @intFromFloat(@max(0, @min(rect.height - 46, rect.width * 0.48)));
+        if (model.qr.size() == 0 or model.qr.scale(pixels) == 0) {
+            rl.drawText(if (model.qr.size() == 0) "QR unavailable / invoice too long" else "Viewport too small for QR", x, y, 14, menu_muted);
+            return;
+        }
+    }
+    rl.drawText(model.message.z(), x, y, 13, menu_muted);
+    if (state.currentPage != .Invoice) {
+        rl.drawText(model.mint.z(), x, y + 23, 13, menu_muted);
+        return;
+    }
+    if (model.selection_loading) {
+        rl.drawText("Loading selected saved invoice...", x, y + 20, 16, menu_muted);
+        return;
+    }
+    if (!model.canCopyInvoice()) return;
+    rl.drawText(if (model.expired) "EXPIRED" else model.quote_state.z(), x, y + 20, 16, menu_text_color);
+    if (model.expired) {
+        rl.drawText("Invoice expired. Create a new deposit.", x, y + 44, 14, menu_muted);
+        return;
+    }
+    if (model.issued) rl.drawText(model.balance.z(), x + 120, y + 20, 16, menu_text_color);
+    const max_pixels: u32 = @intFromFloat(@max(0, @min(rect.height - 46, rect.width * 0.48)));
+    const scale = model.qr.scale(max_pixels);
+    if (model.invoice.len != 0 and scale > 0) {
+        const size: i32 = model.qr.size();
+        const pixel: i32 = @intCast(scale);
+        const top = y + 44;
+        rl.drawRectangle(x, top, (size + 8) * pixel, (size + 8) * pixel, rl.Color.white);
+        var row: i32 = 0;
+        while (row < size) : (row += 1) {
+            var col: i32 = 0;
+            while (col < size) : (col += 1) if (model.qr.dark(col, row)) {
+                rl.drawRectangle(x + (col + 4) * pixel, top + (row + 4) * pixel, pixel, pixel, rl.Color.black);
+            };
+        }
+    } else {
+        rl.drawText(if (model.qr.size() == 0) "QR unavailable / invoice too long" else "Viewport too small for QR", x, y + 44, 14, menu_muted);
+    }
+    const text_x = x + @as(i32, @intFromFloat(rect.width * 0.5));
+    rl.drawText("Invoice (bounded preview):", text_x, y + 44, 14, menu_text_color);
+    const width: usize = @intFromFloat(@max(1, rect.width * 0.5 / 8));
+    const lines: usize = @intFromFloat(@max(0, (rect.height - 70) / 16));
+    var start: usize = 0;
+    var line: usize = 0;
+    while (start < model.invoice.len and line < lines) : (line += 1) {
+        var buf: [129:0]u8 = @splat(0);
+        const count = @min(@min(width, 128), model.invoice.len - start);
+        @memcpy(buf[0..count], model.invoice.slice()[start..][0..count]);
+        rl.drawText(buf[0..count :0], text_x, y + 65 + @as(i32, @intCast(line)) * 16, 14, menu_text_color);
+        start += count;
     }
 }
 

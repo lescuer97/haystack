@@ -302,6 +302,8 @@ impl Store {
 
 #[derive(Debug)]
 pub struct BrowserDatabase {
+    #[cfg(test)]
+    test_loads: std::sync::atomic::AtomicUsize,
     name: String,
     fingerprint: String,
     seed_hash: sha256::Hash,
@@ -372,6 +374,27 @@ pub(crate) fn initial_onboarding_store(fingerprint: String) -> Result<String, Db
 }
 
 impl BrowserDatabase {
+    /// One validated Store load, not a full reload for every quote's KV key.
+    pub(crate) async fn quote_history_data(
+        &self,
+    ) -> Result<(Vec<MintQuote>, Vec<MeltQuote>, HashMap<String, Vec<u8>>), Error> {
+        self.read(|store| {
+            let prefix = kv_key("cdk_wallet_ffi", "quote_created_v1", "");
+            (
+                store.mint_quotes.values().cloned().collect(),
+                store.melt_quotes.values().cloned().collect(),
+                store
+                    .kv
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        key.strip_prefix(&prefix)
+                            .map(|key| (key.to_owned(), value.clone()))
+                    })
+                    .collect(),
+            )
+        })
+        .await
+    }
     /// Open an existing provisioned wallet. Never creates or rewrites records.
     pub async fn open(name: String, fingerprint: String, seed: [u8; 64]) -> Result<Self, DbError> {
         let records: Records =
@@ -389,6 +412,8 @@ impl BrowserDatabase {
         }
         parse_store(&state.data, &fingerprint)?;
         Ok(Self {
+            #[cfg(test)]
+            test_loads: std::sync::atomic::AtomicUsize::new(0),
             name,
             fingerprint,
             seed_hash: sha256::Hash::hash(&seed),
@@ -452,6 +477,9 @@ impl BrowserDatabase {
     }
 
     async fn load(&self) -> Result<(u64, Store), DbError> {
+        #[cfg(test)]
+        self.test_loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let records: Records =
             serde_json::from_str(&backend::load(&self.name).await.map_err(read_error)?)
                 .map_err(|_| DbError::Corrupt)?;
@@ -473,6 +501,11 @@ impl BrowserDatabase {
     async fn read<T>(&self, f: impl FnOnce(&Store) -> T) -> Result<T, Error> {
         let (_, store) = self.load().await.map_err(internal)?;
         Ok(f(&store))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_load_count(&self) -> usize {
+        self.test_loads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn write<T>(&self, f: impl FnOnce(&mut Store) -> Result<T, Error>) -> Result<T, Error> {

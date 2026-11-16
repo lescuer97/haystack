@@ -33,7 +33,7 @@ async function run() {
   let remoteFetch = false;
   window.fetch = (...args) => { remoteFetch = true; return Promise.reject(new Error()); };
   let rejected = false;
-  try { const remote = await start_onboarding('https://mint.minibits.cash/Bitcoin'); remote.close(); }
+  try { const remote = await start_onboarding('https://testnut.cashu.space/'); remote.close(); }
   catch (_) { rejected = true; }
   finally { window.fetch = originalFetch; }
   check('remote mint rejected before network', rejected && !remoteFetch);

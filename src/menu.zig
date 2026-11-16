@@ -15,19 +15,20 @@
 
 const std = @import("std");
 const input = @import("input.zig");
+const wallet_ui = @import("wallet_ui.zig");
 
-/// Upper bound on a wallet display name, in UTF-8 bytes. The extra byte in the
+/// Upper bound on editable text, in UTF-8 bytes. The extra byte in the
 /// backing array is the sentinel that makes `cString` possible.
-pub const max_wallet_name_bytes: usize = 128;
+pub const max_text_bytes: usize = 128;
 
-pub const MenuPage = enum { Main, Wallet };
+pub const MenuPage = enum { Main, Wallet, Deposit, Invoice, History };
 
 /// Local menu actions. None of these touch a wallet, payment, or network layer;
 /// they only change menu-local UI state.
-pub const Action = enum { close_menu, clear_wallet_name };
+pub const Action = enum { close_menu, unavailable, balance, preset21, preset42, preset100, preset1000, deposit, previous, next, copy_invoice };
 
 /// Editable fields. A field is a data key; its runtime value lives in `Menu`.
-pub const InputField = enum { wallet_name };
+pub const InputField = enum { deposit_sats };
 
 /// One menu row. The tag decides what activation does, so adding a new kind
 /// makes the exhaustive switches below require a decision.
@@ -42,7 +43,7 @@ pub const MenuItem = union(enum) {
 /// Bounded UTF-8 text with no allocation. Appends and backspaces operate on
 /// whole codepoints; `bytes[len]` is always the sentinel 0.
 pub const TextField = struct {
-    bytes: [max_wallet_name_bytes + 1]u8 = @splat(0),
+    bytes: [max_text_bytes + 1]u8 = @splat(0),
     len: usize = 0,
 
     pub fn slice(self: *const TextField) []const u8 {
@@ -66,7 +67,7 @@ pub const TextField = struct {
 
         var encoded: [4]u8 = undefined;
         const encoded_len: usize = std.unicode.utf8Encode(codepoint, &encoded) catch return false;
-        if (self.len + encoded_len > max_wallet_name_bytes) return false;
+        if (self.len + encoded_len > max_text_bytes) return false;
 
         @memcpy(self.bytes[self.len..][0..encoded_len], encoded[0..encoded_len]);
         self.len += encoded_len;
@@ -104,15 +105,32 @@ const main_items = [_]MenuItem{
 };
 
 const wallet_items = [_]MenuItem{
-    .{ .text_input = .wallet_name },
-    .{ .action = .clear_wallet_name },
+    .{ .action = .balance },
+    .{ .navigate = .Deposit },
+    .{ .action = .unavailable },
+    .{ .navigate = .History },
     .{ .navigate = .Main },
 };
+const deposit_items = [_]MenuItem{
+    .{ .text_input = .deposit_sats },
+    .{ .action = .preset21 },
+    .{ .action = .preset42 },
+    .{ .action = .preset100 },
+    .{ .action = .preset1000 },
+    .{ .action = .deposit },
+    .{ .navigate = .Wallet },
+};
+const invoice_items = [_]MenuItem{ .{ .action = .copy_invoice }, .{ .navigate = .Deposit }, .{ .navigate = .Wallet } };
+const history_items = [_]MenuItem{ .{ .action = .previous }, .{ .action = .next }, .{ .navigate = .Wallet } };
+const history_previous_items = [_]MenuItem{ .{ .action = .previous }, .{ .navigate = .Wallet } };
 
 pub fn pageTitle(page: MenuPage) [:0]const u8 {
     return switch (page) {
         .Main => "Main",
         .Wallet => "Wallet",
+        .Deposit => "Deposit - sats",
+        .Invoice => "Deposit - invoice",
+        .History => "History",
     };
 }
 
@@ -120,6 +138,9 @@ pub fn pageItems(page: MenuPage) []const MenuItem {
     return switch (page) {
         .Main => &main_items,
         .Wallet => &wallet_items,
+        .Deposit => &deposit_items,
+        .Invoice => &invoice_items,
+        .History => &history_items,
     };
 }
 
@@ -128,13 +149,25 @@ pub fn itemLabel(item: MenuItem) [:0]const u8 {
         .navigate => |page| switch (page) {
             .Main => "Back to Main",
             .Wallet => "Wallet",
+            .Deposit => "Deposit",
+            .Invoice => "Saved invoice",
+            .History => "History",
         },
         .action => |action| switch (action) {
             .close_menu => "Resume",
-            .clear_wallet_name => "Clear name",
+            .balance => "Balance (sat)",
+            .unavailable => "Withdraw - unavailable",
+            .preset21 => "21 sat",
+            .preset42 => "42 sat",
+            .preset100 => "100 sat",
+            .preset1000 => "1000 sat",
+            .deposit => "Deposit",
+            .previous => "Previous",
+            .next => "Next",
+            .copy_invoice => "Copy invoice",
         },
         .text_input => |field| switch (field) {
-            .wallet_name => "Wallet name",
+            .deposit_sats => "Custom sats",
         },
     };
 }
@@ -186,6 +219,7 @@ const item_gap: f32 = 10;
 pub const Layout = struct {
     panel: Rect = .{},
     title: Rect = .{},
+    content: Rect = .{},
     items: [max_items_per_page]Rect = @splat(.{}),
     item_count: usize = 0,
 
@@ -211,8 +245,10 @@ fn viewportDimension(value: f32) f32 {
 /// gaps, and row height all scale down with the panel, so every rectangle stays
 /// inside the panel even on very small viewports. No scrolling is involved.
 pub fn calculateLayout(page: MenuPage, viewport_w: f32, viewport_h: f32) Layout {
-    const page_items = pageItems(page);
-    const count = @min(page_items.len, max_items_per_page);
+    return calculateLayoutCount(page, viewport_w, viewport_h, pageItems(page).len);
+}
+fn calculateLayoutCount(page: MenuPage, viewport_w: f32, viewport_h: f32, item_count: usize) Layout {
+    const count = @min(item_count, max_items_per_page);
     const vw = viewportDimension(viewport_w);
     const vh = viewportDimension(viewport_h);
 
@@ -223,13 +259,20 @@ pub fn calculateLayout(page: MenuPage, viewport_w: f32, viewport_h: f32) Layout 
         @as(f32, @floatFromInt(count - 1)) * item_gap
     else
         0;
-    const desired_h = panel_padding * 2 + title_height +
+    const content_height: f32 = switch (page) {
+        .Main => 0,
+        .Wallet, .Deposit => 62,
+        .Invoice => 340,
+        .History => 352,
+    };
+    const desired_width: f32 = if (page == .Invoice or page == .History) 760 else desired_panel_width;
+    const desired_h = panel_padding * 2 + title_height + content_height +
         item_count_f * desired_item_height + gap_total;
 
     const panel = Rect{
-        .x = (vw - @min(desired_panel_width, available_w)) / 2,
+        .x = (vw - @min(desired_width, available_w)) / 2,
         .y = (vh - @min(desired_h, available_h)) / 2,
-        .width = @min(desired_panel_width, available_w),
+        .width = @min(desired_width, available_w),
         .height = @min(desired_h, available_h),
     };
 
@@ -242,7 +285,7 @@ pub fn calculateLayout(page: MenuPage, viewport_w: f32, viewport_h: f32) Layout 
     const title_h = @min(title_height, inner_h * 0.4);
     const rows_height = @max(inner_h - title_h, 0);
 
-    const desired_rows = item_count_f * desired_item_height + gap_total;
+    const desired_rows = item_count_f * desired_item_height + gap_total + content_height;
     const row_scale = if (desired_rows > 0)
         @min(rows_height / desired_rows, 1)
     else
@@ -251,7 +294,7 @@ pub fn calculateLayout(page: MenuPage, viewport_w: f32, viewport_h: f32) Layout 
     const row_gap = item_gap * row_scale;
     const item_x = panel.x + pad_x;
     const item_w = @max(panel.width - pad_x * 2, 0);
-    const first_item_y = panel.y + pad_y + title_h;
+    const first_item_y = panel.y + pad_y + title_h + content_height * row_scale;
 
     var result = Layout{
         .panel = panel,
@@ -262,6 +305,7 @@ pub fn calculateLayout(page: MenuPage, viewport_w: f32, viewport_h: f32) Layout 
             .height = title_h,
         },
         .item_count = count,
+        .content = .{ .x = item_x, .y = panel.y + pad_y + title_h, .width = item_w, .height = content_height * row_scale },
     };
 
     var index: usize = 0;
@@ -280,10 +324,11 @@ pub fn calculateLayout(page: MenuPage, viewport_w: f32, viewport_h: f32) Layout 
 // ── runtime menu state ───────────────────────────────────────────────────────
 
 pub const Menu = struct {
+    wallet: wallet_ui.Model = .{},
     opened: bool = false,
     currentPage: MenuPage = .Main,
     focus: ?InputField = null,
-    wallet_name: TextField = .{},
+    deposit_sats: TextField = .{},
 
     /// Persistent row highlight. Opening a page selects its first row; it then
     /// moves only when a menu direction step or moving pointer selects another
@@ -316,8 +361,7 @@ pub const Menu = struct {
         }
         if (!self.opened) return false;
 
-        const layout = calculateLayout(self.currentPage, frame.viewport_w, frame.viewport_h);
-        const items = pageItems(self.currentPage);
+        const layout = self.layoutFor(frame.viewport_w, frame.viewport_h);
         self.clampSelection();
 
         // 1. Directional navigation wins over pointer movement on the same
@@ -329,7 +373,7 @@ pub const Menu = struct {
         //    direction was requested this frame. Once the pointer stops, the
         //    stored selection stays put even if it sits over another row.
         if (!navigated and pointer_moved) {
-            if (layout.hitTest(frame.pointer_x, frame.pointer_y)) |index| {
+            if (self.hitTest(layout, frame.pointer_x, frame.pointer_y)) |index| {
                 if (index != self.selected_index) {
                     self.selected_index = index;
                     self.focus = null;
@@ -341,14 +385,14 @@ pub const Menu = struct {
         //    blurs the field without clearing the highlight. A confirm edge
         //    activates the currently selected row through the same handler.
         if (frame.clicked) {
-            if (layout.hitTest(frame.pointer_x, frame.pointer_y)) |index| {
+            if (self.hitTest(layout, frame.pointer_x, frame.pointer_y)) |index| {
                 self.selected_index = index;
-                self.activate(items[index]);
+                self.activateIndex(index);
             } else {
                 self.focus = null;
             }
         } else if (frame.confirm) {
-            self.activate(items[self.selected_index]);
+            self.activateIndex(self.selected_index);
         }
 
         if (self.focus) |field| self.applyTyping(field, frame);
@@ -356,6 +400,7 @@ pub const Menu = struct {
     }
 
     pub fn open(self: *Menu) void {
+        self.wallet.history_active = false;
         self.opened = true;
         self.currentPage = .Main;
         self.focus = null;
@@ -363,6 +408,7 @@ pub const Menu = struct {
     }
 
     pub fn close(self: *Menu) void {
+        self.wallet.history_active = false;
         self.opened = false;
         self.focus = null;
     }
@@ -373,7 +419,42 @@ pub const Menu = struct {
     }
 
     pub fn isSelected(self: *const Menu, index: usize) bool {
-        return index == self.selected_index and index < pageItems(self.currentPage).len;
+        return index + self.rowCount() == self.selected_index and index < self.items().len;
+    }
+    pub fn rowCount(self: *const Menu) usize {
+        return if (self.currentPage == .History) self.wallet.row_count else 0;
+    }
+    pub fn items(self: *const Menu) []const MenuItem {
+        if (self.currentPage != .History) return pageItems(self.currentPage);
+        const previous = self.wallet.total_rows > 8 and self.wallet.desired_offset > 0;
+        const next = @as(u64, self.wallet.desired_offset) + 8 < self.wallet.total_rows;
+        return if (previous and next) &history_items else if (previous) &history_previous_items else if (next) history_items[1..] else history_items[2..];
+    }
+    pub fn itemCount(self: *const Menu) usize {
+        return self.rowCount() + self.items().len;
+    }
+    pub fn layoutFor(self: *const Menu, w: f32, h: f32) Layout {
+        return calculateLayoutCount(self.currentPage, w, h, self.items().len);
+    }
+    pub fn isRowSelected(self: *const Menu, row: usize) bool {
+        return row < self.rowCount() and row == self.selected_index;
+    }
+    fn hitTest(self: *const Menu, layout: Layout, x: f32, y: f32) ?usize {
+        if (layout.hitTest(x, y)) |index| return self.rowCount() + index;
+        if (self.currentPage == .History and layout.content.height > 0 and layout.content.contains(x, y)) {
+            const row: usize = @intFromFloat((y - layout.content.y) / (layout.content.height / 8));
+            if (row < self.rowCount()) return row;
+        }
+        return null;
+    }
+    pub fn activateIndex(self: *Menu, index: usize) void {
+        if (index < self.rowCount()) {
+            if (self.wallet.openRow(index)) {
+                self.currentPage = .Invoice;
+                self.wallet.history_active = false;
+                self.selected_index = 0;
+            }
+        } else if (index - self.rowCount() < self.items().len) self.activate(self.items()[index - self.rowCount()]);
     }
 
     /// Move the highlight by one row. Up/Left request the previous row and
@@ -386,7 +467,7 @@ pub const Menu = struct {
         const next = frame.right or frame.down;
         if (previous == next) return false; // no request, or two opposing ones
 
-        const item_count = pageItems(self.currentPage).len;
+        const item_count = self.itemCount();
         if (item_count == 0) return false;
 
         self.selected_index = if (previous)
@@ -398,32 +479,57 @@ pub const Menu = struct {
     }
 
     fn clampSelection(self: *Menu) void {
-        const item_count = pageItems(self.currentPage).len;
+        const item_count = self.itemCount();
         if (item_count == 0 or self.selected_index >= item_count) self.selected_index = 0;
     }
 
     pub fn textField(self: *Menu, field: InputField) *TextField {
         return switch (field) {
-            .wallet_name => &self.wallet_name,
+            .deposit_sats => &self.deposit_sats,
         };
     }
 
     pub fn textFieldConst(self: *const Menu, field: InputField) *const TextField {
         return switch (field) {
-            .wallet_name => &self.wallet_name,
+            .deposit_sats => &self.deposit_sats,
         };
     }
 
     fn activate(self: *Menu, item: MenuItem) void {
         switch (item) {
             .navigate => |page| {
-                self.currentPage = page;
+                if (page == .Deposit and self.wallet.invoice.len != 0 and !self.wallet.issued and !self.wallet.expired and self.currentPage == .Wallet) {
+                    self.currentPage = .Invoice;
+                } else self.currentPage = page;
+                self.wallet.visit(self.currentPage == .History, page == .Wallet);
                 self.focus = null;
                 self.selected_index = 0;
             },
             .action => |action| switch (action) {
                 .close_menu => self.close(),
-                .clear_wallet_name => self.wallet_name.clear(),
+                .unavailable, .balance => {},
+                .preset21, .preset42, .preset100, .preset1000 => {
+                    self.deposit_sats.clear();
+                    const text = switch (action) {
+                        .preset21 => "21",
+                        .preset42 => "42",
+                        .preset100 => "100",
+                        else => "1000",
+                    };
+                    for (text) |c| _ = self.deposit_sats.appendCodepoint(c);
+                    self.focus = null;
+                },
+                .deposit => {
+                    self.focus = null;
+                    if (self.wallet.create(self.deposit_sats.slice())) {
+                        self.currentPage = .Invoice;
+                        self.wallet.history_active = false;
+                        self.selected_index = 0;
+                    }
+                },
+                .previous => self.wallet.changePage(-1, std.heap.page_allocator),
+                .next => self.wallet.changePage(1, std.heap.page_allocator),
+                .copy_invoice => self.wallet.copy_requested = self.wallet.canCopyInvoice(),
             },
             .text_input => |field| {
                 self.focus = field;
@@ -551,7 +657,7 @@ test "layout centres a page and keeps every rect inside the panel" {
     }
 
     try std.testing.expectEqual(@as(usize, 2), calculateLayout(.Main, 1000, 640).item_count);
-    try std.testing.expectEqual(@as(usize, 3), calculateLayout(.Wallet, 1000, 640).item_count);
+    try std.testing.expectEqual(@as(usize, 5), calculateLayout(.Wallet, 1000, 640).item_count);
 }
 
 test "escape opens on Main and closes again" {
@@ -578,6 +684,29 @@ test "escape opens on Main and closes again" {
     try std.testing.expectEqual(MenuPage.Main, menu.currentPage);
 }
 
+test "Deposit leaves no hidden field focus, disables duplicates and Withdraw never requests work" {
+    var state = Menu{ .opened = true, .currentPage = .Deposit, .focus = .deposit_sats };
+    state.wallet.available = true;
+    for ("21") |c| _ = state.deposit_sats.appendCodepoint(c);
+    state.activate(.{ .action = .deposit });
+    try std.testing.expectEqual(MenuPage.Invoice, state.currentPage);
+    try std.testing.expectEqual(@as(?InputField, null), state.focus);
+    try std.testing.expectEqual(@as(usize, 0), state.selected_index);
+    const serial = state.wallet.serial;
+    state.activate(.{ .action = .deposit });
+    try std.testing.expectEqual(serial, state.wallet.serial);
+    try typeText(&state, "7");
+    try std.testing.expectEqualStrings("21", state.deposit_sats.slice());
+    state.wallet.fail(serial, 0);
+    try typeText(&state, "8");
+    try std.testing.expectEqualStrings("21", state.deposit_sats.slice());
+    state.wallet.request = null;
+    state.activate(.{ .navigate = .Wallet });
+    state.activate(.{ .action = .unavailable });
+    try std.testing.expectEqual(MenuPage.Wallet, state.currentPage);
+    try std.testing.expect(state.wallet.request == null);
+}
+
 test "Main navigates to Wallet and Back returns to Main" {
     var menu = Menu{};
     _ = menu.applyInput(.{ .escape_clicked = true });
@@ -594,7 +723,7 @@ test "Main navigates to Wallet and Back returns to Main" {
     try std.testing.expectEqual(MenuPage.Main, menu.currentPage);
 }
 
-test "Resume closes and Clear name empties the field" {
+test "Resume closes and preset replaces custom sats" {
     var menu = Menu{};
     _ = menu.applyInput(.{ .escape_clicked = true });
 
@@ -608,15 +737,16 @@ test "Resume closes and Clear name empties the field" {
     const wallet_button = itemCenter(calculateLayout(.Main, 1000, 640), 0);
     _ = menu.applyInput(frameFor(wallet_button.x, wallet_button.y, 1000, 640));
 
-    const wallet_layout = calculateLayout(.Wallet, 1000, 640);
+    menu.currentPage = .Deposit;
+    const wallet_layout = calculateLayout(.Deposit, 1000, 640);
     const field_point = itemCenter(wallet_layout, 0);
     _ = menu.applyInput(frameFor(field_point.x, field_point.y, 1000, 640));
     try typeText(&menu, "Ada");
-    try std.testing.expectEqualStrings("Ada", menu.wallet_name.slice());
+    try std.testing.expectEqualStrings("Ada", menu.deposit_sats.slice());
 
     const clear_point = itemCenter(wallet_layout, 1);
     _ = menu.applyInput(frameFor(clear_point.x, clear_point.y, 1000, 640));
-    try std.testing.expectEqualStrings("", menu.wallet_name.slice());
+    try std.testing.expectEqualStrings("21", menu.deposit_sats.slice());
     try std.testing.expect(menu.opened);
 }
 
@@ -626,28 +756,29 @@ test "typing only reaches a focused input field" {
 
     // No focus on Main: keystrokes are consumed but ignored.
     try typeText(&menu, "ignored");
-    try std.testing.expectEqualStrings("", menu.wallet_name.slice());
+    try std.testing.expectEqualStrings("", menu.deposit_sats.slice());
 
     // Navigating to Wallet still leaves fields unfocused.
     const main_layout = calculateLayout(.Main, 1000, 640);
     const wallet_point = itemCenter(main_layout, 0);
     _ = menu.applyInput(frameFor(wallet_point.x, wallet_point.y, 1000, 640));
     try typeText(&menu, "still-ignored");
-    try std.testing.expectEqualStrings("", menu.wallet_name.slice());
+    try std.testing.expectEqualStrings("", menu.deposit_sats.slice());
 
     // Clicking the field gives it focus.
-    const wallet_layout = calculateLayout(.Wallet, 1000, 640);
+    menu.currentPage = .Deposit;
+    const wallet_layout = calculateLayout(.Deposit, 1000, 640);
     const field_point = itemCenter(wallet_layout, 0);
     _ = menu.applyInput(frameFor(field_point.x, field_point.y, 1000, 640));
-    try std.testing.expectEqual(@as(?InputField, .wallet_name), menu.focus);
+    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
     try typeText(&menu, "Ada");
-    try std.testing.expectEqualStrings("Ada", menu.wallet_name.slice());
+    try std.testing.expectEqualStrings("Ada", menu.deposit_sats.slice());
 
     // Clicking outside every item blurs; later typing is ignored.
     _ = menu.applyInput(frameFor(1, 1, 1000, 640));
     try std.testing.expectEqual(@as(?InputField, null), menu.focus);
     try typeText(&menu, "zzz");
-    try std.testing.expectEqualStrings("Ada", menu.wallet_name.slice());
+    try std.testing.expectEqualStrings("Ada", menu.deposit_sats.slice());
 }
 
 test "Unicode text appends, backspaces, and respects capacity" {
@@ -671,12 +802,12 @@ test "Unicode text appends, backspaces, and respects capacity" {
     // corrupting the existing text.
     var full = TextField{};
     var index: usize = 0;
-    while (index < max_wallet_name_bytes) : (index += 1) {
+    while (index < max_text_bytes) : (index += 1) {
         try std.testing.expect(full.appendCodepoint('x'));
     }
-    try std.testing.expectEqual(max_wallet_name_bytes, full.len);
+    try std.testing.expectEqual(max_text_bytes, full.len);
     try std.testing.expect(!full.appendCodepoint('y'));
-    try std.testing.expectEqual(max_wallet_name_bytes, full.len);
+    try std.testing.expectEqual(max_text_bytes, full.len);
     try std.testing.expect(full.backspace());
     try std.testing.expect(full.appendCodepoint('y'));
 
@@ -697,17 +828,19 @@ test "focus resets on navigation and close" {
     const wallet_point = itemCenter(main_layout, 0);
     _ = menu.applyInput(frameFor(wallet_point.x, wallet_point.y, 1000, 640));
 
-    const wallet_layout = calculateLayout(.Wallet, 1000, 640);
+    menu.currentPage = .Deposit;
+    const wallet_layout = calculateLayout(.Deposit, 1000, 640);
     const field_point = itemCenter(wallet_layout, 0);
     _ = menu.applyInput(frameFor(field_point.x, field_point.y, 1000, 640));
-    try std.testing.expectEqual(@as(?InputField, .wallet_name), menu.focus);
+    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
 
     // Navigation blurs.
-    const back_point = itemCenter(wallet_layout, pageItems(.Wallet).len - 1);
+    const back_point = itemCenter(wallet_layout, pageItems(.Deposit).len - 1);
     _ = menu.applyInput(frameFor(back_point.x, back_point.y, 1000, 640));
     try std.testing.expectEqual(@as(?InputField, null), menu.focus);
 
     // Resume also blurs; reopening starts on Main with nothing focused.
+    menu.activate(.{ .navigate = .Main });
     const resume_point = itemCenter(calculateLayout(.Main, 1000, 640), 1);
     _ = menu.applyInput(frameFor(resume_point.x, resume_point.y, 1000, 640));
     try std.testing.expect(!menu.opened);
@@ -723,7 +856,8 @@ test "non-input frames leave menu state untouched but stay consumed" {
 
     const wallet_point = itemCenter(calculateLayout(.Main, 1000, 640), 0);
     _ = menu.applyInput(frameFor(wallet_point.x, wallet_point.y, 1000, 640));
-    const field_point = itemCenter(calculateLayout(.Wallet, 1000, 640), 0);
+    menu.currentPage = .Deposit;
+    const field_point = itemCenter(calculateLayout(.Deposit, 1000, 640), 0);
     _ = menu.applyInput(frameFor(field_point.x, field_point.y, 1000, 640));
     try typeText(&menu, "Ada");
 
@@ -733,9 +867,9 @@ test "non-input frames leave menu state untouched but stay consumed" {
         try std.testing.expect(menu.applyInput(idle));
     }
     try std.testing.expect(menu.opened);
-    try std.testing.expectEqual(MenuPage.Wallet, menu.currentPage);
-    try std.testing.expectEqual(@as(?InputField, .wallet_name), menu.focus);
-    try std.testing.expectEqualStrings("Ada", menu.wallet_name.slice());
+    try std.testing.expectEqual(MenuPage.Deposit, menu.currentPage);
+    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
+    try std.testing.expectEqualStrings("Ada", menu.deposit_sats.slice());
 
     // A closed menu does not consume unrelated frames.
     _ = menu.applyInput(.{ .escape_clicked = true });
@@ -823,10 +957,11 @@ test "confirm navigates, runs actions, and focuses a text input" {
     try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
 
     // Selected row 0 is the text input: confirm focuses it.
+    menu.currentPage = .Deposit;
     _ = menu.applyInput(.{ .confirm = true });
-    try std.testing.expectEqual(@as(?InputField, .wallet_name), menu.focus);
+    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
     try typeText(&menu, "Ada");
-    try std.testing.expectEqualStrings("Ada", menu.wallet_name.slice());
+    try std.testing.expectEqualStrings("Ada", menu.deposit_sats.slice());
 
     // Moving away blurs the field.
     _ = menu.applyInput(.{ .down = true });
@@ -835,12 +970,11 @@ test "confirm navigates, runs actions, and focuses a text input" {
 
     // Selected action clears the name and leaves the menu open.
     _ = menu.applyInput(.{ .confirm = true });
-    try std.testing.expectEqualStrings("", menu.wallet_name.slice());
+    try std.testing.expectEqualStrings("21", menu.deposit_sats.slice());
     try std.testing.expect(menu.opened);
 
     // Back to Main, then Resume closes through the same action handler.
-    _ = menu.applyInput(.{ .down = true }); // 1 -> 2 (Back to Main)
-    _ = menu.applyInput(.{ .confirm = true });
+    menu.activate(.{ .navigate = .Main });
     try std.testing.expectEqual(MenuPage.Main, menu.currentPage);
     try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
     _ = menu.applyInput(.{ .down = true }); // 0 -> 1 (Resume)
@@ -872,14 +1006,15 @@ test "mouse movement selects a row and clicks activate it" {
 
     // Clicking the field focuses it; clicking outside blurs but keeps the
     // highlight.
-    const wallet_layout = calculateLayout(.Wallet, 1000, 640);
+    menu.currentPage = .Deposit;
+    const wallet_layout = calculateLayout(.Deposit, 1000, 640);
     const field = itemCenter(wallet_layout, 0);
     _ = menu.applyInput(.{
         .pointer_x = field.x,
         .pointer_y = field.y,
         .clicked = true,
     });
-    try std.testing.expectEqual(@as(?InputField, .wallet_name), menu.focus);
+    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
     _ = menu.applyInput(.{ .pointer_x = 1, .pointer_y = 1, .clicked = true });
     try std.testing.expectEqual(@as(?InputField, null), menu.focus);
     try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
@@ -920,13 +1055,14 @@ test "typing letters do not navigate and moving away clears focus" {
     var menu = Menu{};
     _ = menu.applyInput(.{ .escape_clicked = true });
     _ = menu.applyInput(.{ .confirm = true }); // Wallet navigation
+    menu.currentPage = .Deposit;
     _ = menu.applyInput(.{ .confirm = true }); // focus the name field
-    try std.testing.expectEqual(@as(?InputField, .wallet_name), menu.focus);
+    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
 
     // WASD and space type normally and never move the highlight.
     try typeText(&menu, "wasd xyz");
     try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
-    try std.testing.expectEqualStrings("wasd xyz", menu.wallet_name.slice());
+    try std.testing.expectEqualStrings("wasd xyz", menu.deposit_sats.slice());
 
     // A direction step blurs the field; later typing goes nowhere and still
     // does not move the highlight.
@@ -934,6 +1070,112 @@ test "typing letters do not navigate and moving away clears focus" {
     try std.testing.expectEqual(@as(?InputField, null), menu.focus);
     try std.testing.expectEqual(@as(usize, 1), menu.selected_index);
     try typeText(&menu, "ignored");
-    try std.testing.expectEqualStrings("wasd xyz", menu.wallet_name.slice());
+    try std.testing.expectEqualStrings("wasd xyz", menu.deposit_sats.slice());
     try std.testing.expectEqual(@as(usize, 1), menu.selected_index);
+}
+
+test "history pagination only shows existing pages and rows precede Back" {
+    var state = Menu{ .opened = true, .currentPage = .History };
+    for ([_]struct { total: usize, offset: u32, previous: bool, next: bool }{
+        .{ .total = 0, .offset = 0, .previous = false, .next = false },
+        .{ .total = 9, .offset = 0, .previous = false, .next = true },
+        .{ .total = 9, .offset = 8, .previous = true, .next = false },
+        .{ .total = 17, .offset = 8, .previous = true, .next = true },
+    }) |case| {
+        state.wallet.total_rows = case.total;
+        state.wallet.desired_offset = case.offset;
+        const items = state.items();
+        try std.testing.expectEqual(@as(usize, 1) + @intFromBool(case.previous) + @intFromBool(case.next), items.len);
+        var previous = false;
+        var next = false;
+        for (items) |item| if (item == .action) {
+            previous = previous or item.action == .previous;
+            next = next or item.action == .next;
+        };
+        try std.testing.expectEqual(case.previous, previous);
+        try std.testing.expectEqual(case.next, next);
+    }
+    state.wallet.row_count = 1;
+    state.wallet.total_rows = 1;
+    state.wallet.desired_offset = 0;
+    state.selected_index = 1;
+    _ = state.applyInput(.{ .confirm = true });
+    try std.testing.expectEqual(MenuPage.Wallet, state.currentPage);
+    try std.testing.expectEqual(@as(usize, 5), wallet_items.len);
+    try std.testing.expectEqual(@as(usize, 3), invoice_items.len);
+}
+
+test "history keyboard and pointer selection open a saved invoice" {
+    var state = Menu{ .opened = true, .currentPage = .History };
+    state.wallet.available = true;
+    state.wallet.row_count = 1;
+    _ = state.wallet.mint.set("https://testnut.cashu.space");
+    _ = state.wallet.rows[0].mint.set(state.wallet.mint.slice());
+    _ = state.wallet.rows[0].id.set("saved");
+    _ = state.applyInput(.{ .confirm = true });
+    try std.testing.expectEqual(MenuPage.Invoice, state.currentPage);
+    try std.testing.expect(state.wallet.pending and state.wallet.operation == .saved_invoice);
+    try std.testing.expectEqualStrings("saved", state.wallet.request.?.argument.slice());
+    state.wallet.pending = false;
+    state.currentPage = .History;
+    const layout = state.layoutFor(1000, 640);
+    _ = state.applyInput(frameFor(layout.content.centerX(), layout.content.y + layout.content.height / 16, 1000, 640));
+    try std.testing.expectEqual(MenuPage.Invoice, state.currentPage);
+}
+
+test "invoice Back uses third row and expired Deposit navigation returns to amount entry" {
+    var state = Menu{ .opened = true, .currentPage = .Invoice, .selected_index = 2 };
+    _ = state.applyInput(.{ .confirm = true });
+    try std.testing.expectEqual(MenuPage.Wallet, state.currentPage);
+    _ = state.wallet.invoice.set("lnbc-saved");
+    state.wallet.expired = true;
+    state.activate(.{ .navigate = .Deposit });
+    try std.testing.expectEqual(MenuPage.Deposit, state.currentPage);
+    state.currentPage = .Wallet;
+    state.wallet.expired = false;
+    state.activate(.{ .navigate = .Deposit });
+    try std.testing.expectEqual(MenuPage.Invoice, state.currentPage);
+}
+
+test "unsupported history activation retains History instead of showing the old invoice" {
+    var state = Menu{ .opened = true, .currentPage = .History };
+    state.wallet.available = true;
+    state.wallet.row_count = 1;
+    _ = state.wallet.mint.set("https://testnut.cashu.space");
+    _ = state.wallet.invoice.set("old-invoice");
+    _ = state.wallet.rows[0].id.set("saved");
+    _ = state.wallet.rows[0].mint.set(state.wallet.mint.slice());
+    state.wallet.rows[0].outgoing = true;
+    _ = state.applyInput(.{ .confirm = true });
+    try std.testing.expectEqual(MenuPage.History, state.currentPage);
+    state.wallet.rows[0].outgoing = false;
+    _ = state.wallet.rows[0].mint.set("https://other.example");
+    const layout = state.layoutFor(1000, 640);
+    _ = state.applyInput(frameFor(layout.content.centerX(), layout.content.y + layout.content.height / 16, 1000, 640));
+    try std.testing.expectEqual(MenuPage.History, state.currentPage);
+    try std.testing.expect(!state.wallet.pending);
+    try std.testing.expectEqualStrings("old-invoice", state.wallet.invoice.slice());
+}
+
+test "local deposit input and invoice copy remain active during background polling" {
+    var state = Menu{ .opened = true, .currentPage = .Deposit };
+    state.wallet.available = true;
+    try std.testing.expect(state.wallet.enqueue(.poll, ""));
+    state.activate(.{ .action = .preset42 });
+    try std.testing.expectEqualStrings("42", state.deposit_sats.slice());
+    state.activate(.{ .text_input = .deposit_sats });
+    try std.testing.expectEqual(@as(?InputField, .deposit_sats), state.focus);
+    try typeText(&state, "1");
+    try std.testing.expectEqualStrings("421", state.deposit_sats.slice());
+    state.applyTyping(.deposit_sats, .{ .backspace = true });
+    try std.testing.expectEqualStrings("42", state.deposit_sats.slice());
+    _ = state.wallet.invoice.set("lnbc-saved");
+    state.activate(.{ .action = .copy_invoice });
+    try std.testing.expect(state.wallet.copy_requested);
+    state.activate(.{ .action = .deposit });
+    try std.testing.expectEqual(MenuPage.Invoice, state.currentPage);
+    try std.testing.expect(state.wallet.queued.?.operation == .create);
+    state.currentPage = .Deposit;
+    state.activate(.{ .action = .deposit });
+    try std.testing.expectEqual(MenuPage.Deposit, state.currentPage);
 }

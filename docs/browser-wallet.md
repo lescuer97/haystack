@@ -127,11 +127,14 @@ The build tracks configure-time reads of all three JS bridges, so JS-only edits
 invalidate the combined library and both renderer links. This was checked for
 each bridge independently; repeated unchanged builds keep the links cached.
 
-The renderer explicitly reserves a **1 MiB Emscripten stack** for both production
+The renderer explicitly reserves a **2 MiB Emscripten stack** for both production
 and fixture links. Its bounded, scrubbed JSON decoder needs 64 KiB of scratch;
 nested frame/result copies exceeded the default 64 KiB stack and corrupted the
 onboarding mailbox, freezing the game at `Loading wallet...` despite passing the
-Rust-only fixture. Stack-overflow checks are enabled (level 2 in safety builds).
+Rust-only fixture. Bounded wallet/history state and unoptimized aggregate-return
+copies also overflowed the former 1 MiB budget in Debug. The actual Debug
+renderer/payment/QR suite verifies the 2 MiB budget. Stack-overflow checks remain
+enabled (level 2 in safety builds).
 
 For manual interaction or browser MCP, start a persistent fake-mint server with
 `zig build test-mint -Dplatform=wasm`. It binds **127.0.0.1:18787**.
@@ -443,7 +446,7 @@ field is secret material; never log it. Generated TypeScript declarations expose
   Rust `BrowserOnboarding`; renderer and wallet are separate Wasm modules with
   separate linear memories. Copy and paste require trusted browser input, and copy
   feedback is shown only after a successful clipboard write.
-- Production recovery uses exactly `https://mint.minibits.cash/Bitcoin`. The
+- Production recovery uses exactly `https://testnut.cashu.space/`. The
   test-only `local-mint-fixture` feature accepts only a same-origin root loopback
   mint. Recovery failures preserve the stage and offer Retry only. Generate
   requires three zero totals, a clean Store audit, and a fresh transactional CAS;

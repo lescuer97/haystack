@@ -1025,6 +1025,15 @@ cdk_wallet_open (
     char const * db_path);
 
 /** \brief
+ *  Open with startup recovery restricted to one mint, leaving other mints local.
+ */
+CdkOpenResult_t
+cdk_wallet_open_selected (
+    slice_ref_uint8_t seed,
+    char const * db_path,
+    char const * mint);
+
+/** \brief
  *  Post a raw NUT-03 swap request to a mint, returning the raw response JSON.
  */
 CdkStringResult_t
@@ -1032,6 +1041,24 @@ cdk_wallet_post_swap (
     CdkWallet_t const * handle,
     char const * mint_url,
     char const * swap_request_json);
+
+/** \brief
+ *  Deposit/history adapter. Arguments and results are JSON strings containing
+ *  decimal-string amounts; returned strings use the ordinary Rust string free.
+ *  Operations: create_deposit [mint, sats], check_deposit [mint, quote_id] (expired-unpaid is local-only),
+ *  unfinished_deposits [mint], quote_history [] (generic compatibility),
+ *  wallet_screen [mint] (small selected balance/recovery status),
+ *  quote_history_page [offset], resume_deposit [mint] (newest non-expired unfinished),
+ *  poll_deposits [mint, after_id] (one background check, never creates),
+ *  recover_deposit [mint] (local reconciliation only, never a quote POST).
+ *  deposit_update [mint, check|poll|recover, id|cursor|empty] returns bounded application recovery metadata,
+ *  saved_invoice [mint, id] reads one exact local Sat/BOLT11 quote without network or recovery.
+ */
+CdkStringResult_t
+cdk_wallet_quotes (
+    CdkWallet_t * handle,
+    char const * operation,
+    char const * arguments);
 
 /** \brief
  *  Receive a token, returning the net Sat amount credited.

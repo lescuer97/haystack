@@ -73,6 +73,51 @@ fn assert_rejected_without_overwrite(key: &str, raw: &str, what: &str) {
 }
 
 #[test]
+fn large_history_bulk_read_loads_one_validated_store_and_preserves_records() {
+    use cdk_common::nuts::{CurrencyUnit, MintQuoteState};
+    use cdk_common::wallet::MintQuote;
+    use cdk_common::{Amount, PaymentMethod};
+    let name = "history-bulk-large";
+    let mut store: serde_json::Value = serde_json::from_str(&valid_record(name)).unwrap();
+    let mint: cdk_common::mint_url::MintUrl = "http://127.0.0.1:9".parse().unwrap();
+    for i in 0..1100 {
+        let id = format!("quote-{i:04}");
+        let mut quote = MintQuote::new(
+            id.clone(),
+            mint.clone(),
+            PaymentMethod::BOLT11,
+            Some(Amount::from(21)),
+            CurrencyUnit::Sat,
+            "a".repeat(1024),
+            0,
+            None,
+        );
+        if i < 800 {
+            quote.state = MintQuoteState::Issued;
+        }
+        store["mint_quotes"][&id] = serde_json::to_value(quote).unwrap();
+        store["kv"][format!("cdk_wallet_ffi\u{1f}quote_created_v1\u{1f}{i:064x}")] =
+            serde_json::json!(123u64.to_le_bytes());
+    }
+    let raw = store.to_string();
+    assert!(raw.len() > 128 * 1024);
+    test_set_state(name, &raw);
+    let db = open(name).unwrap();
+    let before = db.test_load_count();
+    let (quotes, melts, metadata) = block_on(db.quote_history_data()).unwrap();
+    assert_eq!(db.test_load_count() - before, 1);
+    assert_eq!(quotes.len(), 1100);
+    assert!(melts.is_empty());
+    assert_eq!(metadata.len(), 1100);
+    assert_eq!(test_state(name).unwrap().1, raw);
+    store["fingerprint"] = serde_json::json!("wrong");
+    let corrupt = store.to_string();
+    test_set_state(name, &corrupt);
+    assert!(block_on(db.quote_history_data()).is_err());
+    assert_eq!(test_state(name).unwrap().1, corrupt);
+}
+
+#[test]
 fn abandonment_audits_fresh_raw_snapshot_and_identity() {
     use cdk_common::nuts::{CurrencyUnit, Id, Proof, SecretKey, State};
     use cdk_common::secret::Secret;

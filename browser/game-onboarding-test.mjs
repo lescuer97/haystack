@@ -6,7 +6,7 @@ const source = readFileSync(new URL('./game-onboarding.js', import.meta.url), 'u
   .replace(/\{\{\{ makeDynCall\('viiii', 'callback'\) \}\}\}/g, 'callback')
   .replace(/\{\{\{ makeDynCall\('viiiii', 'callback'\) \}\}\}/g, 'callback')
   .replace(/\{\{\{ makeDynCall\('[iv]+', '(probe|paste|success)'\) \}\}\}/g, '$1');
-const heap = new Uint8Array(16384), library = {};
+const heap = new Uint8Array(131072), library = {};
 let alloc = 8192;
 const context = vm.createContext({ LibraryManager: { library }, mergeInto: Object.assign,
   HEAPU8: heap, TextEncoder, TextDecoder, URL, Promise,
@@ -85,7 +85,7 @@ context.navigator = { clipboard: {
 } };
 alloc = 8192;
 const probe = (kind, x, y, ptr, cap) => {
-  assert.equal(cap, 1024);
+  assert.equal(cap, 4097);
   if (kind === 0) assert.deepEqual([x, y], [500000, 500000]);
   heap.set(new TextEncoder().encode('secret'), ptr);
   return code;
@@ -99,7 +99,7 @@ assert.equal(writes.length, 0);
 listeners.get('pointerdown')(pointer(true));
 assert.deepEqual(writes, ['secret']); // invoked before handler returns
 assert.deepEqual(copied, []);
-assert.ok(heap.slice(8192, 9216).every(x => x === 0));
+assert.ok(heap.slice(8192, 12289).every(x => x === 0));
 resolveWrite(); await tick();
 assert.deepEqual(copied, [1]);
 code = 14;
@@ -118,6 +118,47 @@ assert.deepEqual(pasted, ['phrase', 'read phrase']);
 code = 1;
 listeners.get('pointerdown')(pointer(true));
 bridge.unbindInput();
+const walletCalls = [];
+const walletArgs = [];
+let requestHeld = false, finishWallet;
+const walletBlocked = new Promise(resolve => { finishWallet = resolve; });
+const originalRequest = service.request;
+service.request = async (...args) => {
+  requestHeld = true;
+  try { return await originalRequest(...args); }
+  finally { requestHeld = false; }
+};
+service.open_ready_wallet = async () => {
+  assert.equal(requestHeld, false, 'temporary Ready request lock must have dropped');
+  walletCalls.push('open');
+  return {
+    async call(op,args) { walletCalls.push(op); walletArgs.push([op,JSON.parse(args)]); await walletBlocked; return JSON.stringify({status:0,value:'{}'}); },
+    async close() { walletCalls.push('close'); },
+    free() { walletCalls.push('free'); },
+  };
+};
+bridge.start(4, callback);
+await tick();
+bridge.walletRequest(4, 1, 0, 0, 0, callback);
+await tick();
+assert.deepEqual(walletCalls, ['open', 'wallet_screen']);
+bridge.walletRequest(4, 2, 1, 0, 0, callback);
+heap.set(new TextEncoder().encode('0'),100);
+bridge.walletRequest(4,3,4,100,1,callback);
+heap.set(new TextEncoder().encode('after'),200);
+bridge.walletRequest(4,4,5,200,5,callback);
+bridge.walletRequest(4,5,6,0,0,callback);
+bridge.walletRequest(4,7,7,200,5,callback);
+bridge.walletRequest(4,8,8,200,5,callback);
+bridge.walletRequest(4,9,3,200,5,callback);
+bridge.walletRequest(4,6,99,0,0,callback);
+bridge.close(4);
+assert.equal(walletCalls.includes('close'), false);
+finishWallet(); await tick();
+assert.deepEqual(walletCalls, ['open', 'wallet_screen', 'wallet_screen', 'quote_history_page', 'resume_deposit', 'deposit_update', 'deposit_update', 'saved_invoice', 'deposit_update', 'close', 'free']);
+assert.deepEqual(walletArgs.slice(2),[['quote_history_page',['0']],['resume_deposit',['fixture']],['deposit_update',['fixture','recover','']],['deposit_update',['fixture','poll','after']],['saved_invoice',['fixture','after']],['deposit_update',['fixture','check','after']]]);
+assert.equal(walletCalls.includes('check_deposit'),false,'unknown operation must not fall through to check');
+console.log('wallet service ownership and queue tests passed');
 resolveWrite(); await tick();
 assert.deepEqual(copied, [1]);
 assert.equal(listeners.size, 0);
@@ -125,3 +166,10 @@ bridge.bindInput(probe, paste, success);
 bridge.unbindInput();
 assert.equal(listeners.size, 0);
 console.log('onboarding input tests passed');
+code = 15; // Full invoice copy, distinct from seed/word feedback codes.
+bridge.bindInput(probe, paste, success);
+listeners.get('pointerdown')(pointer(true));
+assert.equal(writes.at(-1), 'secret');
+resolveWrite(); await tick();
+assert.equal(copied.at(-1), 15);
+bridge.unbindInput();

@@ -19,6 +19,7 @@ const std = @import("std");
 
 /// The generated C header, translated to Zig by the build system.
 pub const c = @import("cdk_c");
+pub const app_mint: [:0]const u8 = @import("app_options").mint ++ "";
 
 /// The seed length, in bytes, required by `cdk_wallet_open`.
 pub const seed_len = 64;

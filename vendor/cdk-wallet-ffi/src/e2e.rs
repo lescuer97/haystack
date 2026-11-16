@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,7 +43,7 @@ fn block_on<F: Future>(fut: F) -> F::Output {
 
 /// Fault to inject into the fake mint's HTTP layer.
 #[derive(Clone)]
-enum SwapFault {
+pub(crate) enum SwapFault {
     /// No fault injection.
     None,
     /// Return a malformed body for the *first* `/v1/swap` response (the mint
@@ -55,21 +55,35 @@ enum SwapFault {
     /// Return HTTP 500 for every `/v1/checkstate` request, so proof-state checks
     /// (used by recovery) fail deterministically without killing the server.
     FailCheckState,
+    MalformedMintOnce,
+    MalformedQuoteOnce,
+    RejectQuoteOnce,
+    StallQuoteOnce(Duration),
+    UnpaidQuotes,
+    DepositControl { fail_get: Arc<AtomicBool>, fail_mint: Arc<AtomicBool>, hold_unpaid: Arc<AtomicBool>, gets: Arc<AtomicUsize>, interrupt_mint: bool },
 }
 
 /// Start a fake mint on a random loopback port and return its URL.
 ///
 /// `input_fee_ppk` is applied to the Sat keyset so that every send pays a
 /// non-zero fee (one sat per input).
-async fn start_fake_mint(input_fee_ppk: u64) -> String {
+pub(crate) async fn start_fake_mint(input_fee_ppk: u64) -> String {
     start_fake_mint_ctl(input_fee_ppk, SwapFault::None).await.0
 }
 
 /// Start a fake mint with fault injection, returning its URL and server handle.
-async fn start_fake_mint_ctl(
+pub(crate) async fn start_fake_mint_ctl(
     input_fee_ppk: u64,
     fault: SwapFault,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    let (url, handle, _) = start_fake_mint_counted(input_fee_ppk, fault).await;
+    (url, handle)
+}
+
+pub(crate) async fn start_fake_mint_counted(
+    input_fee_ppk: u64,
+    fault: SwapFault,
+) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
     let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
     let mut builder = MintBuilder::new(db.clone());
     builder
@@ -112,20 +126,90 @@ async fn start_fake_mint_ctl(
         .await
         .unwrap();
 
-    // Wrap the router so a fault can be injected. The middleware always lets the
-    // inner handler run first, so the mint still processes (and NUT-19-caches)
-    // the request before we rewrite the response.
+    // Mutation-response faults run after processing/NUT-19 caching. The quote
+    // rejection fault instead rejects before processing, proving a safe retry.
     let swap_seen = Arc::new(AtomicBool::new(false));
+    let quote_posts = Arc::new(AtomicUsize::new(0));
+    let counter = quote_posts.clone();
     let router = router.layer(middleware::from_fn(move |req: Request, next: Next| {
         let fault = fault.clone();
         let swap_seen = swap_seen.clone();
+        let counter = counter.clone();
         async move {
             let path = req.uri().path().to_owned();
             let is_swap = path.ends_with("/swap");
             let is_checkstate = path.ends_with("/checkstate");
+            let is_mint = path == "/v1/mint/bolt11";
+            if is_mint || path.ends_with("/restore") {
+                if let SwapFault::DepositControl { fail_mint, .. } = &fault {
+                    if fail_mint.load(Ordering::SeqCst) {
+                        return Response::builder().status(500).body(Body::from("injected mint recovery failure")).unwrap();
+                    }
+                }
+            }
+            let is_quote_get = path.starts_with("/v1/mint/quote/bolt11/") && req.method() == axum::http::Method::GET;
+            if path.starts_with("/v1/mint/quote/bolt11/") && req.method() == axum::http::Method::GET {
+                if let SwapFault::DepositControl { fail_get, gets, interrupt_mint, .. } = &fault {
+                    if !interrupt_mint || path.ends_with("/B") { gets.fetch_add(1, Ordering::SeqCst); }
+                    if fail_get.load(Ordering::SeqCst) {
+                        return Response::builder().status(500).body(Body::from("injected quote GET failure")).unwrap();
+                    }
+                }
+            }
+            let is_quote =
+                path == "/v1/mint/quote/bolt11" && req.method() == axum::http::Method::POST;
+            if is_quote {
+                counter.fetch_add(1, Ordering::SeqCst);
+                match fault {
+                    SwapFault::RejectQuoteOnce if !swap_seen.swap(true, Ordering::SeqCst) => {
+                        return Response::builder()
+                            .status(400)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                r#"{"code":20003,"detail":"injected definitive rejection"}"#,
+                            ))
+                            .unwrap()
+                    }
+                    SwapFault::StallQuoteOnce(delay) if !swap_seen.swap(true, Ordering::SeqCst) => {
+                        tokio::time::sleep(delay).await
+                    }
+                    _ => {}
+                }
+            }
             let response = next.run(req).await;
+            let force_unpaid = matches!(&fault, SwapFault::UnpaidQuotes) || matches!(&fault, SwapFault::DepositControl { hold_unpaid, .. } if hold_unpaid.load(Ordering::SeqCst));
+            if force_unpaid && (is_quote_get || is_quote) {
+                let (parts, body) = response.into_parts();
+                let bytes = axum::body::to_bytes(body, 65536).await.unwrap();
+                let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                value["state"] = serde_json::json!("UNPAID");
+                value["amount_paid"] = serde_json::json!(0);
+                value["amount_issued"] = serde_json::json!(0);
+                let mut response = Response::from_parts(parts, Body::from(value.to_string()));
+                response.headers_mut().remove(axum::http::header::CONTENT_LENGTH);
+                return response;
+            }
             match fault {
+                SwapFault::DepositControl { interrupt_mint: true, .. } if is_mint && !swap_seen.swap(true, Ordering::SeqCst) => {
+                    Response::builder().status(200).body(Body::from("invalid mint response")).unwrap()
+                }
                 SwapFault::None => response,
+                SwapFault::MalformedMintOnce
+                    if is_mint && !swap_seen.swap(true, Ordering::SeqCst) =>
+                {
+                    Response::builder()
+                        .status(200)
+                        .body(Body::from("invalid mint response"))
+                        .unwrap()
+                }
+                SwapFault::MalformedQuoteOnce
+                    if is_quote && !swap_seen.swap(true, Ordering::SeqCst) =>
+                {
+                    Response::builder()
+                        .status(200)
+                        .body(Body::from("invalid quote response"))
+                        .unwrap()
+                }
                 SwapFault::MalformedSwapOnce
                     if is_swap && !swap_seen.swap(true, Ordering::SeqCst) =>
                 {
@@ -154,7 +238,7 @@ async fn start_fake_mint_ctl(
     let handle = runtime().spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    (format!("http://{addr}"), handle)
+    (format!("http://{addr}"), handle, quote_posts)
 }
 
 /// Open a [`WalletRepository`](cdk::wallet::WalletRepository) over `db_path`.
@@ -851,6 +935,58 @@ fn take_string(result: crate::status::CdkStringResult) -> String {
     let out = value.to_str().to_owned();
     crate::api::cdk_string_free(Some(value));
     out
+}
+
+#[test]
+fn ffi_resume_and_background_poll_check_a_real_saved_quote() {
+    let mint = block_on(start_fake_mint(0));
+    let dir = tempfile::tempdir().unwrap();
+    let (mut wallet, _) = block_on(CdkWallet::open(&[93;64], dir.path().join("wallet.sqlite").to_str().unwrap())).unwrap();
+    block_on(wallet.add_mint(&mint)).unwrap();
+    let mut call = |op: &str, args: serde_json::Value| -> serde_json::Value {
+        let raw = take_string(crate::api::cdk_wallet_quotes(Some(&mut wallet), Some(cstr_ref(&with_nul(op))), Some(cstr_ref(&with_nul(&args.to_string())))));
+        serde_json::from_str(&raw).unwrap()
+    };
+    let created = call("create_deposit", serde_json::json!([mint,"21"]));
+    assert_eq!(created["state"], "UNPAID");
+    assert_eq!(created["expired"], false);
+    let local = call("saved_invoice", serde_json::json!([mint,created["id"]]));
+    assert_eq!(local, created);
+    let resumed = call("resume_deposit", serde_json::json!([mint]));
+    assert_eq!(resumed["invoice"]["id"], created["id"]);
+    assert!(resumed.get("cursor").is_none());
+    let mut polled = call("poll_deposits", serde_json::json!([mint,""]));
+    assert_eq!(polled["cursor"], created["id"]);
+    assert_eq!(polled["invoice"]["id"], created["id"]);
+    assert!(polled.get("error").is_none());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while polled["invoice"]["state"] != "ISSUED" {
+        assert!(Instant::now() < deadline, "poll must check and issue, not just return local unpaid data");
+        std::thread::sleep(Duration::from_millis(20));
+        polled = call("poll_deposits", serde_json::json!([mint,""]));
+        assert!(polled.get("error").is_none());
+        assert_eq!(polled["cursor"], created["id"]);
+    }
+    assert_eq!(polled["invoice"]["confirmed"], true);
+    let local = call("saved_invoice", serde_json::json!([mint,created["id"]]));
+    assert_eq!(local["confirmed"],true);
+    let checked = call("deposit_update",serde_json::json!([mint,"check",created["id"]]));
+    assert_eq!(checked["wallet_changed"],false);
+    assert_eq!(checked["recovery_pending"],false);
+    assert_eq!(checked["invoice"]["confirmed"],true);
+    assert!(checked["error"].is_null());
+    for kind in ["poll","recover"] {
+        let update=call("deposit_update",serde_json::json!([mint,kind,""]));
+        assert!(update["invoice"].is_null());
+        assert!(update["cursor"].is_null());
+        assert_eq!(update["wallet_changed"],false);
+    }
+    for (op,args) in [("deposit_update",serde_json::json!([mint,"unsupported",""])),("saved_invoice",serde_json::json!([mint,""]))] {
+        let result=crate::api::cdk_wallet_quotes(Some(&mut wallet),Some(cstr_ref(&with_nul(op))),Some(cstr_ref(&with_nul(&args.to_string()))));
+        assert_eq!(result.status,CdkStatus::InvalidArgument);
+        crate::api::cdk_string_free(result.error);
+        crate::api::cdk_string_free(result.value);
+    }
 }
 
 fn take_keypair(result: crate::status::CdkSpilmanKeypairResult) -> (String, String) {

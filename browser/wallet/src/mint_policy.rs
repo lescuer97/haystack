@@ -2,7 +2,7 @@
 
 #[cfg(not(feature = "local-mint-fixture"))]
 pub(crate) fn allowed(mint: &str, _origin: &str) -> bool {
-    mint == "https://mint.minibits.cash/Bitcoin"
+    mint == "https://testnut.cashu.space/" || mint == "https://testnut.cashu.space"
 }
 
 #[cfg(feature = "local-mint-fixture")]

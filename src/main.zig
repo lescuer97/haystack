@@ -34,6 +34,8 @@ const onboarding = @import("onboarding.zig");
 const browser_onboarding = @import("browser_onboarding.zig");
 const native_onboarding = if (builtin.os.tag != .emscripten) @import("onboarding_native.zig") else struct {};
 const native_wallet = if (builtin.os.tag != .emscripten) @import("wallet.zig") else struct {};
+const wallet_ui = @import("wallet_ui.zig");
+const wallet_service = if (builtin.os.tag != .emscripten) @import("wallet_service.zig") else struct {};
 
 // `zig build test` collects tests from files referenced by this root module.
 // Import every source file explicitly so no test file is silently skipped.
@@ -81,13 +83,35 @@ const BrowserContext = struct {
 };
 
 var browser_context: ?*BrowserContext = null;
+var wallet_mailbox: wallet_ui.Text(128 * 1024) = .{};
+var wallet_result_serial: ?u32 = null;
+var wallet_result_ok = false;
+extern "c" fn haystack_wallet_request(u32, u32, c_int, [*]const u8, u32, *const fn (c_int, u32, u32, [*c]const u8, u32) callconv(.c) void) void;
+fn walletCallback(ok: c_int, generation: u32, serial: u32, ptr: [*c]const u8, len: u32) callconv(.c) void {
+    if (browser_context == null or generation != browser_onboarding.currentGeneration()) return;
+    if (len > 128 * 1024 or (len != 0 and ptr == null)) return;
+    wallet_result_serial = serial;
+    wallet_result_ok = ok == 1 and wallet_mailbox.set(if (len == 0) "" else ptr[0..len]);
+}
 var clipboard_mailbox: browser_onboarding.ClipboardMailbox = .{};
 extern "c" fn haystack_onboarding_bind_input(*const fn (c_int, c_int, c_int, [*]u8, u32) callconv(.c) c_int, *const fn ([*c]const u8, u32) callconv(.c) void, *const fn (c_int) callconv(.c) void) void;
 extern "c" fn haystack_onboarding_unbind_input() void;
 
 fn clipboardProbe(kind: c_int, x: c_int, y: c_int, ptr: [*]u8, cap: u32) callconv(.c) c_int {
     const ctx = browser_context orelse return 0;
-    if (cap > 1024) return 0;
+    if (cap > 4097) return 0;
+    if (!ctx.model.isBlocking() and ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Invoice) {
+        const state = &ctx.game_state.menu;
+        const layout = @import("menu.zig").calculateLayout(.Invoice, @floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()));
+        const selected = if (kind == 1) state.selected_index else if (kind == 0)
+            layout.hitTest(@as(f32, @floatFromInt(x)) * @as(f32, @floatFromInt(rl.getScreenWidth())) / 1_000_000, @as(f32, @floatFromInt(y)) * @as(f32, @floatFromInt(rl.getScreenHeight())) / 1_000_000) orelse return 0
+        else
+            return 0;
+        if (selected != 0 or !state.wallet.canCopyInvoice() or state.wallet.invoice.len >= cap) return 0;
+        @memset(ptr[0..cap], 0);
+        @memcpy(ptr[0..state.wallet.invoice.len], state.wallet.invoice.slice());
+        return 15;
+    }
     return browser_onboarding.probe(&ctx.model, kind, x, y, @floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()), ptr[0..cap]);
 }
 fn clipboardPaste(ptr: [*c]const u8, len: u32) callconv(.c) void {
@@ -232,6 +256,16 @@ fn browserFrame() callconv(.c) void {
     }
     clipboard_mailbox.consume(&ctx.model, rl.getTime());
     ctx.model.expire(rl.getTime());
+    const wallet_model = &ctx.game_state.menu.wallet;
+    if (wallet_result_serial) |serial| {
+        if (wallet_result_ok) wallet_model.accept(serial, wallet_mailbox.slice(), rl.getTime(), std.heap.c_allocator) else wallet_model.fail(serial, rl.getTime());
+        wallet_result_serial = null;
+    }
+    wallet_model.tick(!ctx.model.isBlocking(), rl.getTime());
+    if (wallet_model.request) |request| {
+        haystack_wallet_request(browser_onboarding.currentGeneration(), request.serial, @intCast(@backingInt(request.operation)), request.argument.slice().ptr, @intCast(request.argument.len), walletCallback);
+        wallet_model.request = null;
+    }
     const effect = stepFrame(
         &ctx.game_state,
         &ctx.input_reader,
@@ -482,11 +516,12 @@ test "paste shortcut routes only in phrase entry and consumes its character" {
 
 // ── native entry point ──────────────────────────────────────────────────────
 
+const NativeOperation = enum { start, create, restore, retry, complete, generate, finish_restore };
 const ScanJob = if (builtin.os.tag != .emscripten) struct {
     native: native_onboarding.Native,
     phrase: []u8,
     attempt_id: u64,
-    operation: enum { restore, retry },
+    operation: NativeOperation,
     done: std.atomic.Value(bool) = .init(false),
     result: onboarding.Event = .blocked,
     thread: std.Thread = undefined,
@@ -497,36 +532,107 @@ const ScanJob = if (builtin.os.tag != .emscripten) struct {
         var native_copy = job.native;
         native_copy.io = threaded.io();
         native_copy.allocator = std.heap.page_allocator;
-        job.result = (switch (job.operation) {
-            .restore => native_copy.restore(job.phrase, job.attempt_id),
-            .retry => native_copy.retry(job.attempt_id),
-        }) catch |err| if (err == error.InvalidMnemonic)
+        job.result = job.perform(&native_copy) catch |err| if (err == error.InvalidMnemonic)
             .{ .invalid_phrase = job.attempt_id }
+        else if (job.operation == .complete or job.operation == .finish_restore)
+            .complete_fail
         else
             .blocked;
         std.crypto.secureZero(u8, job.phrase);
         job.done.store(true, .release);
     }
 
+    fn perform(job: *@This(), native_copy: *native_onboarding.Native) anyerror!onboarding.Event {
+        return switch (job.operation) {
+            .start => native_copy.start(),
+            .create => native_copy.createNew(),
+            .restore => native_copy.restore(job.phrase, job.attempt_id),
+            .retry => native_copy.retry(job.attempt_id),
+            .complete => blk: {
+                try native_copy.complete();
+                break :blk onboarding.Event.complete_success;
+            },
+            .generate => native_copy.generateNew(),
+            .finish_restore => blk: {
+                try native_copy.finishRestore();
+                break :blk onboarding.Event.complete_success;
+            },
+        };
+    }
+
     fn destroy(job: *@This()) void {
+        if (job.result == .backup) {
+            std.crypto.secureZero(u8, job.result.backup);
+            std.heap.page_allocator.free(job.result.backup);
+        }
         std.crypto.secureZero(u8, job.phrase);
         std.heap.page_allocator.free(job.phrase);
         std.heap.page_allocator.destroy(job);
     }
+
+    fn deliver(job: *@This(), model: *onboarding.Onboarding) void {
+        if (job.result == .backup) {
+            // Worker and model allocators differ. Transfer a scrubbed copy,
+            // never a page-allocator buffer into the UI's allocator ownership.
+            if (model.allocator.dupe(u8, job.result.backup)) |phrase| model.receive(.{ .backup = phrase }) else |_| model.receive(.blocked);
+        } else model.receive(job.result);
+    }
 } else struct {};
 
-fn startScan(native: native_onboarding.Native, model: *onboarding.Onboarding, is_retry: bool) !*ScanJob {
+fn startScan(native: native_onboarding.Native, model: *onboarding.Onboarding, operation: NativeOperation) !*ScanJob {
     const allocator = std.heap.page_allocator;
     const job = try allocator.create(ScanJob);
     errdefer allocator.destroy(job);
-    const phrase = try allocator.dupe(u8, if (is_retry) "" else model.recoveryPhrase());
+    const phrase = try allocator.dupe(u8, if (operation == .restore) model.recoveryPhrase() else "");
     errdefer {
         std.crypto.secureZero(u8, phrase);
         allocator.free(phrase);
     }
-    job.* = .{ .native = native, .phrase = phrase, .attempt_id = model.attempt_id, .operation = if (is_retry) .retry else .restore };
+    job.* = .{ .native = native, .phrase = phrase, .attempt_id = model.attempt_id, .operation = operation };
     job.thread = try std.Thread.spawn(.{}, ScanJob.run, .{job});
     return job;
+}
+
+test "native onboarding jobs transfer backup ownership and finish before Ready" {
+    if (builtin.os.tag == .emscripten) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const config_dir = try std.fs.path.join(a, &.{ root, "config" });
+    defer a.free(config_dir);
+    try storage_fs.ensureOwnedDir(io, config_dir);
+    const wallet_dir = try std.fs.path.join(a, &.{ root, "data", "wallet" });
+    defer a.free(wallet_dir);
+    const wallet_paths = try native_wallet.Paths.init(a, wallet_dir);
+    defer wallet_paths.deinit(a);
+    const native = native_onboarding.Native{ .io = io, .allocator = a, .config_dir = config_dir, .paths = wallet_paths };
+    var model = onboarding.Onboarding.init(a);
+    defer model.deinit();
+    const created = try startScan(native, &model, .create);
+    created.thread.join();
+    defer created.destroy();
+    created.deliver(&model);
+    try std.testing.expectEqual(onboarding.Phase.backup, model.phase);
+    try std.testing.expect(model.mnemonic().?.ptr != created.result.backup.ptr);
+    try std.testing.expect(std.mem.eql(u8, created.result.backup, model.mnemonic().?));
+    model.saved = true;
+    _ = model.activateAction(.complete_backup);
+    const complete = try startScan(native, &model, .complete);
+    complete.thread.join();
+    defer complete.destroy();
+    complete.deliver(&model);
+    try std.testing.expectEqual(onboarding.Phase.inactive, model.phase);
+    try std.testing.expect(model.mnemonic() == null);
+    var resumed = onboarding.Onboarding.init(a);
+    defer resumed.deinit();
+    const inspected = try startScan(native, &resumed, .start);
+    inspected.thread.join();
+    defer inspected.destroy();
+    inspected.deliver(&resumed);
+    try std.testing.expectEqual(onboarding.Phase.inactive, resumed.phase);
 }
 
 extern "c" fn GetClipboardText() ?[*:0]const u8;
@@ -637,7 +743,7 @@ pub fn main() anyerror!void {
     defer model.deinit();
     const wallet_paths = try native_wallet.Paths.init(allocator, locations.wallet_dir);
     defer wallet_paths.deinit(allocator);
-    var native = native_onboarding.Native{
+    const native = native_onboarding.Native{
         .io = io,
         .allocator = allocator,
         .config_dir = locations.config_dir,
@@ -646,6 +752,8 @@ pub fn main() anyerror!void {
     };
     var started = false;
     var scan_job: ?*ScanJob = null;
+    var wallet_worker: ?*wallet_service.Worker = null;
+    defer if (wallet_worker) |worker| worker.stop();
     // Never detach: shutdown may wait for the Rust scan timeout (up to 30 minutes).
     defer if (scan_job) |job| {
         job.thread.join();
@@ -663,10 +771,23 @@ pub fn main() anyerror!void {
     var onboarding_hand_cursor = false;
 
     while (!rl.windowShouldClose()) {
+        game_state.menu.wallet.tick(!model.isBlocking(), rl.getTime());
+        if (game_state.menu.wallet.pending and game_state.menu.wallet.request != null and wallet_worker == null) {
+            wallet_worker = wallet_service.Worker.start(wallet_paths) catch blk: {
+                game_state.menu.wallet.fail(game_state.menu.wallet.serial, rl.getTime());
+                game_state.menu.wallet.request = null;
+                break :blk null;
+            };
+        }
+        if (wallet_worker) |worker| worker.step(&game_state.menu.wallet, rl.getTime());
+        if (game_state.menu.wallet.copy_requested) {
+            game_state.menu.wallet.copy_requested = false;
+            if (game_state.menu.wallet.canCopyInvoice()) rl.setClipboardText(game_state.menu.wallet.invoice.z());
+        }
         model.expire(rl.getTime());
         if (scan_job) |job| if (job.done.load(.acquire)) {
             job.thread.join();
-            model.receive(job.result);
+            job.deliver(&model);
             job.destroy();
             scan_job = null;
         };
@@ -681,11 +802,10 @@ pub fn main() anyerror!void {
 
         if (!started) {
             started = true;
-            const event = native.start() catch blk: {
-                std.log.err("wallet setup failed; startup blocked", .{});
-                break :blk onboarding.Event.blocked;
+            scan_job = startScan(native, &model, .start) catch blk: {
+                model.receive(.blocked);
+                break :blk null;
             };
-            model.receive(event);
         }
         if (effect) |action| switch (action) {
             .copy_requested => if (model.mnemonic()) |secret| {
@@ -710,27 +830,23 @@ pub fn main() anyerror!void {
                     std.log.warn("wallet: clipboard request unavailable", .{});
                 };
             },
-            .complete_requested => {
-                if (native.complete()) |_| {
-                    model.receive(.complete_success);
-                } else |_| {
-                    std.log.err("wallet setup completion failed; retry available", .{});
-                    model.receive(.complete_fail);
-                }
-            },
-            .create_requested => model.receive(native.createNew() catch .blocked),
             .paste_requested => pasteRecovery(&model, allocator),
-            .restore_requested, .retry_requested => {
+            .complete_requested, .create_requested, .restore_requested, .retry_requested, .generate_requested, .finish_restore_requested => {
                 if (scan_job == null) {
-                    scan_job = startScan(native, &model, std.meta.activeTag(action) == .retry_requested) catch blk: {
-                        model.receive(.blocked);
+                    const operation: NativeOperation = switch (action) {
+                        .complete_requested => .complete,
+                        .create_requested => .create,
+                        .restore_requested => .restore,
+                        .retry_requested => .retry,
+                        .generate_requested => .generate,
+                        .finish_restore_requested => .finish_restore,
+                        else => unreachable,
+                    };
+                    scan_job = startScan(native, &model, operation) catch blk: {
+                        model.receive(if (operation == .complete or operation == .finish_restore) .complete_fail else .blocked);
                         break :blk null;
                     };
                 }
-            },
-            .generate_requested => model.receive(native.generateNew() catch .blocked),
-            .finish_restore_requested => {
-                if (native.finishRestore()) |_| model.receive(.complete_success) else |_| model.receive(.complete_fail);
             },
         };
 

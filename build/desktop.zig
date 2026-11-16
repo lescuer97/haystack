@@ -63,6 +63,16 @@ pub fn build(b: *std.Build, options_in: common.Options) !void {
     translate.addIncludePath(b.path("vendor/cdk-wallet-ffi/include"));
     if (preflight) |step| translate.step.dependOn(&step.step);
     const cdk = b.addModule("cdk", .{ .root_source_file = b.path("src/cdk.zig"), .target = target });
+    const app_options = b.addOptions();
+    const fixture = b.option([]const u8, "app-fixture-mint", "Explicit local fake mint URL for isolated application tests");
+    if (fixture) |url| {
+        if (!std.mem.startsWith(u8, url, "http://127.0.0.1:")) return error.InvalidFixtureMint;
+        const port_text = if (std.mem.endsWith(u8, url, "/")) url[17 .. url.len - 1] else url[17..];
+        const port = std.fmt.parseInt(u16, port_text, 10) catch return error.InvalidFixtureMint;
+        if (port == 0 or !std.mem.eql(u8, port_text, b.fmt("{d}", .{port}))) return error.InvalidFixtureMint;
+    }
+    app_options.addOption([]const u8, "mint", fixture orelse "https://testnut.cashu.space/");
+    cdk.addOptions("app_options", app_options);
     cdk.addImport("cdk_c", translate.addModule("cdk_c"));
     const mod = b.addModule("haystack_game", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = options.optimize });
     const shared = @import("shared.zig").create(b, target, options.optimize);

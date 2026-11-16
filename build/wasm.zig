@@ -49,10 +49,10 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     if (options.optimize.runtimeSafety()) try flags.put("-fsanitize=undefined", {});
     var settings = rlz.emsdk.emccDefaultSettings(b.allocator, .{ .optimize = options.optimize });
     try settings.put("EXIT_RUNTIME", "0");
-    // The bounded onboarding decoder alone uses 64 KiB of scrubbed scratch.
-    // Nested frame/result copies exceed Emscripten's default 64 KiB stack.
-    // Both renderer links share this budget; never silently overwrite globals.
-    try settings.put("STACK_SIZE", "1048576");
+    // Bounded history/invoice state and Debug aggregate-return copies exceed
+    // 1 MiB alongside onboarding scratch. Both renderer links share the tested
+    // 2 MiB budget; keep overflow checks rather than silently overwriting globals.
+    try settings.put("STACK_SIZE", "2097152");
     try settings.put("STACK_OVERFLOW_CHECK", if (options.optimize.runtimeSafety()) "2" else "1");
     try settings.put("EXPORTED_FUNCTIONS", "['_main','_haystack_onboarding_link']");
     // Emscripten accepts a single `--js-library` path here. Combine the startup
@@ -216,6 +216,16 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         // runner owns its local mint and disposable Chromium contexts.
         const onboarding_step = b.step("test-onboarding", "Run onboarding and negative regression tests with local fake mints");
         onboarding_step.dependOn(&onboarding_regressions.step);
+        const wallet_ui_tests = b.addSystemCommand(&.{ "python3", "build-support/run-browser-tests.py", "--mint" });
+        wallet_ui_tests.addFileArg(mint_exe);
+        wallet_ui_tests.addArg("--directory");
+        wallet_ui_tests.addDirectoryArg(b.graph.path(.install_prefix, "wasm-test"));
+        wallet_ui_tests.addArg("--runner");
+        wallet_ui_tests.addFileArg(b.path("browser/wallet-ui-browser-test.mjs"));
+        wallet_ui_tests.setEnvironmentVariable("BROWSER_TEST_PAYMENT_GATE", "1");
+        wallet_ui_tests.step.dependOn(&mint.step);
+        wallet_ui_tests.step.dependOn(browser_fixture);
+        b.step("test-wallet-ui", "Test functional wallet deposits, clipboard and saved history with a gated local mint").dependOn(&wallet_ui_tests.step);
         b.step("test-onboarding-regressions", "Run the onboarding baseline and eight negative regression cases").dependOn(onboarding_step);
         const test_step = b.step("test", "Build, start an ephemeral fake mint, run Chromium and stop the mint");
         test_step.dependOn(&browser_tests.step);
@@ -223,6 +233,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         test_step.dependOn(storage_step);
         test_step.dependOn(platform_hardening_step);
         test_step.dependOn(&database.step);
+        test_step.dependOn(&wallet_ui_tests.step);
         const run_mint = b.addRunFile(mint_exe);
         run_mint.addDirectoryArg(b.graph.path(.install_prefix, "wasm-test"));
         run_mint.step.dependOn(test_assets);

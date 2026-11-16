@@ -55,11 +55,11 @@ pub const Native = struct {
         const opened = try file.stat(self.io);
         try sf.verifyFile(opened);
         try sf.verifyNoExtendedAcl(file);
-        if (opened.size == 0 or opened.size > 256) return error.InvalidOnboardingRecord;
-        var buf: [257]u8 = undefined;
+        if (opened.size == 0 or opened.size > 512) return error.InvalidOnboardingRecord;
+        var buf: [513]u8 = undefined;
         var reader = file.reader(self.io, &.{});
         const n = try reader.interface.readSliceShort(&buf);
-        if (n == 0 or n > 256) return error.InvalidOnboardingRecord;
+        if (n == 0 or n > 512) return error.InvalidOnboardingRecord;
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, buf[0..n], .{ .parse_numbers = false }) catch return error.InvalidOnboardingRecord;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidOnboardingRecord;
@@ -73,14 +73,17 @@ pub const Native = struct {
             if (std.mem.eql(u8, step.string, "complete")) return .{ .version = 1, .step = .complete };
             return error.InvalidOnboardingRecord;
         }
-        if (v != 2) return error.InvalidOnboardingRecord;
+        // Legacy v2 omitted mint identity: never open its stage or rewrite it.
+        if (v != 3) return error.InvalidOnboardingRecord;
+        const mint = parsed.value.object.get("mint") orelse return error.InvalidOnboardingRecord;
+        if (mint != .string or !std.mem.eql(u8, mint.string, wallet.cdk.app_mint)) return error.InvalidOnboardingRecord;
         const id = parsed.value.object.get("id") orelse return error.InvalidOnboardingRecord;
         if (id != .string or id.string.len != 32) return error.InvalidOnboardingRecord;
         for (id.string) |c| if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return error.InvalidOnboardingRecord;
         const s = std.meta.stringToEnum(@FieldType(Record, "step"), step.string) orelse return error.InvalidOnboardingRecord;
         if (s == .backup_seed or s == .complete) return error.InvalidOnboardingRecord;
-        if (parsed.value.object.count() != (if (s == .result or s == .committing) @as(usize, 6) else 3)) return error.InvalidOnboardingRecord;
-        var result = Record{ .version = 2, .step = s, .id = id.string[0..32].* };
+        if (parsed.value.object.count() != (if (s == .result or s == .committing) @as(usize, 7) else 4)) return error.InvalidOnboardingRecord;
+        var result = Record{ .version = 3, .step = s, .id = id.string[0..32].* };
         if (s == .result or s == .committing) {
             result.spent_sats = try number(parsed.value.object.get("spent_sats") orelse return error.InvalidOnboardingRecord);
             result.pending_sats = try number(parsed.value.object.get("pending_sats") orelse return error.InvalidOnboardingRecord);
@@ -126,11 +129,11 @@ pub const Native = struct {
     }
 
     fn writeRecord(self: *Native, dir: Io.Dir, r: Record) !void {
-        var buf: [256]u8 = undefined;
+        var buf: [512]u8 = undefined;
         const data = if (r.step == .result or r.step == .committing)
-            try std.fmt.bufPrint(&buf, "{{\"version\":2,\"step\":\"{s}\",\"id\":\"{s}\",\"spent_sats\":{d},\"pending_sats\":{d},\"spendable_sats\":{d}}}", .{ @tagName(r.step), r.id, r.spent_sats, r.pending_sats, r.spendable_sats })
+            try std.fmt.bufPrint(&buf, "{{\"version\":3,\"mint\":\"{s}\",\"step\":\"{s}\",\"id\":\"{s}\",\"spent_sats\":{d},\"pending_sats\":{d},\"spendable_sats\":{d}}}", .{ wallet.cdk.app_mint, @tagName(r.step), r.id, r.spent_sats, r.pending_sats, r.spendable_sats })
         else
-            try std.fmt.bufPrint(&buf, "{{\"version\":2,\"step\":\"{s}\",\"id\":\"{s}\"}}", .{ @tagName(r.step), r.id });
+            try std.fmt.bufPrint(&buf, "{{\"version\":3,\"mint\":\"{s}\",\"step\":\"{s}\",\"id\":\"{s}\"}}", .{ wallet.cdk.app_mint, @tagName(r.step), r.id });
         try sf.writeAtomicIn(dir, self.io, name, data);
         try self.syncAncestry();
     }
@@ -148,7 +151,7 @@ pub const Native = struct {
         var dir = try self.config();
         defer dir.close(self.io);
         const state = try self.record(dir);
-        if (state) |r| if (r.version == 2) {
+        if (state) |r| if (r.version == 3) {
             if (r.step == .committing) {
                 try self.finishCommitting(dir, r);
                 return .ready;
@@ -209,12 +212,12 @@ pub const Native = struct {
         defer dir.close(self.io);
         if (try self.exists(self.paths.dir) or try self.stageExists()) return error.WalletUnavailable;
         const previous = try self.record(dir);
-        if (previous) |r| if (r.version != 2 or r.step != .preparing) return error.WalletUnavailable;
+        if (previous) |r| if (r.version != 3 or r.step != .preparing) return error.WalletUnavailable;
         try wallet.validateRecoveryPhrase(phrase);
         var r = previous orelse blk: {
             var random: [16]u8 = undefined;
             self.io.random(&random);
-            break :blk Record{ .version = 2, .step = .preparing, .id = std.fmt.bytesToHex(random, .lower) };
+            break :blk Record{ .version = 3, .step = .preparing, .id = std.fmt.bytesToHex(random, .lower) };
         };
         try self.writeRecord(dir, r);
         try wallet.prepareRecovery(self.io, self.allocator, self.paths, phrase, r.id);
@@ -228,7 +231,7 @@ pub const Native = struct {
         var dir = try self.config();
         defer dir.close(self.io);
         var r = try self.record(dir) orelse return error.WalletUnavailable;
-        if (r.version != 2 or (r.step != .preparing and r.step != .scanning and r.step != .failed and r.step != .result)) return error.WalletUnavailable;
+        if (r.version != 3 or (r.step != .preparing and r.step != .scanning and r.step != .failed and r.step != .result)) return error.WalletUnavailable;
         var inspection = try wallet.inspectRecovery(self.io, self.allocator, self.paths, r.id, true);
         try inspection.close();
         try wallet.syncDurability(self.io, self.paths);
@@ -241,7 +244,7 @@ pub const Native = struct {
         var inspection = try wallet.inspectRecovery(self.io, self.allocator, self.paths, input.id, true);
         const handle = if (inspection.wallet) |w| w.wallet else return error.WalletUnavailable;
         const outcome: ScanOutcome = if (builtin.is_test) test_scan orelse .failed else blk: {
-            const mint = if (builtin.mode == .debug) "http://127.0.0.1:18787" else "https://mint.minibits.cash/Bitcoin";
+            const mint = wallet.cdk.app_mint;
             const result = wallet.cdk.c.cdk_wallet_restore_seed(handle, mint);
             wallet.cdk.c.cdk_string_free(result.@"error");
             break :blk if (result.status != wallet.cdk.c.CDK_STATUS_OK or result.incomplete != 0) .failed else .{ .success = .{ .spendable = result.unspent_sats, .pending = result.pending_sats, .spent = result.spent_sats } };
@@ -297,7 +300,7 @@ pub const Native = struct {
         var dir = try self.config();
         defer dir.close(self.io);
         var r = try self.record(dir) orelse return error.WalletUnavailable;
-        if (r.version != 2 or (r.step != .result and r.step != .committing) or !hasHistory(r)) return error.WalletUnavailable;
+        if (r.version != 3 or (r.step != .result and r.step != .committing) or !hasHistory(r)) return error.WalletUnavailable;
         if (r.step == .result) {
             if (try self.exists(self.paths.dir)) return error.WalletUnavailable;
             var inspection = try wallet.inspectRecovery(self.io, self.allocator, self.paths, r.id, true);
@@ -336,7 +339,7 @@ pub const Native = struct {
         var dir = try self.config();
         defer dir.close(self.io);
         var r = try self.record(dir) orelse return error.WalletUnavailable;
-        if (r.version != 2) return error.WalletUnavailable;
+        if (r.version != 3) return error.WalletUnavailable;
         if (r.step == .abandoning) return self.finishAbandoning(dir, r);
         if (r.step != .result or hasHistory(r)) return error.WalletUnavailable;
         if (try self.exists(self.paths.dir)) return error.WalletUnavailable;
@@ -550,19 +553,19 @@ test "preparing stage resumes without replacing ownership" {
     defer f.deinit();
     var native = f.native();
     const id = "0123456789abcdef0123456789abcdef".*;
-    try f.marker("{\"version\":2,\"step\":\"preparing\",\"id\":\"0123456789abcdef0123456789abcdef\"}");
+    try f.marker("{\"version\":3,\"mint\":\"" ++ wallet.cdk.app_mint ++ "\",\"step\":\"preparing\",\"id\":\"0123456789abcdef0123456789abcdef\"}");
     try testing.expect((try native.start()) == .resume_phrase_entry);
     defer test_scan = null;
     test_scan = .failed;
     _ = try native.restore("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", 1);
     var inspected = try wallet.inspectRecovery(testing.io, testing.allocator, f.paths, id, true);
     try inspected.close();
-    try f.marker("{\"version\":2,\"step\":\"preparing\",\"id\":\"0123456789abcdef0123456789abcdef\"}");
+    try f.marker("{\"version\":3,\"mint\":\"" ++ wallet.cdk.app_mint ++ "\",\"step\":\"preparing\",\"id\":\"0123456789abcdef0123456789abcdef\"}");
     try testing.expect((try native.start()) == .resume_failed);
     try testing.expect((try native.retry(2)) == .restore_failed);
 }
 
-test "v2 markers reject malformed fields and incomplete stages" {
+test "legacy v2 markers are blocked and v3 incomplete stages fail closed" {
     var f = try Fixture.init();
     defer f.deinit();
     var native = f.native();
@@ -576,9 +579,9 @@ test "v2 markers reject malformed fields and incomplete stages" {
         try f.marker(bad);
         try testing.expectError(error.InvalidOnboardingRecord, native.start());
     }
-    try f.marker("{\"version\":2,\"step\":\"scanning\",\"id\":\"0123456789abcdef0123456789abcdef\"}");
+    try f.marker("{\"version\":3,\"mint\":\"" ++ wallet.cdk.app_mint ++ "\",\"step\":\"scanning\",\"id\":\"0123456789abcdef0123456789abcdef\"}");
     try testing.expectError(error.WalletUnavailable, native.start());
-    try f.marker("{\"version\":2,\"step\":\"preparing\",\"id\":\"0123456789abcdef0123456789abcdef\"}");
+    try f.marker("{\"version\":3,\"mint\":\"" ++ wallet.cdk.app_mint ++ "\",\"step\":\"preparing\",\"id\":\"0123456789abcdef0123456789abcdef\"}");
     const paths = try wallet.recoveryPaths(testing.allocator, f.paths);
     defer {
         paths.deinit(testing.allocator);
@@ -587,6 +590,44 @@ test "v2 markers reject malformed fields and incomplete stages" {
     try sf.ensureOwnedDir(testing.io, paths.dir);
     try testing.expectError(error.RecoveryStageUnavailable, native.start());
     try testing.expectError(error.WalletUnavailable, native.restore("invalid", 1));
+}
+
+test "legacy and wrong-mint recovery preserve marker and stage byte for byte" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var native = f.native();
+    const id = "0123456789abcdef0123456789abcdef".*;
+    try wallet.prepareRecovery(testing.io, testing.allocator, f.paths, "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", id);
+    const stage_paths = try wallet.recoveryPaths(testing.allocator, f.paths);
+    defer {
+        stage_paths.deinit(testing.allocator);
+        testing.allocator.free(stage_paths.dir);
+    }
+    var stage = try Io.Dir.openDirAbsolute(testing.io, stage_paths.dir, .{});
+    defer stage.close(testing.io);
+    var config = try Io.Dir.openDirAbsolute(testing.io, f.config_dir, .{});
+    defer config.close(testing.io);
+    const before = try stage.readFileAlloc(testing.io, wallet.db_file_name, testing.allocator, .limited(4 * 1024 * 1024));
+    defer testing.allocator.free(before);
+    defer test_scan = null;
+    test_scan = .{ .success = .{ .spendable = 100, .pending = 0, .spent = 0 } };
+    for ([_][]const u8{
+        "{\"version\":2,\"step\":\"scanning\",\"id\":\"0123456789abcdef0123456789abcdef\"}",
+        "{\"version\":3,\"mint\":\"https://legacy.example/\",\"step\":\"scanning\",\"id\":\"0123456789abcdef0123456789abcdef\"}",
+    }) |record_bytes| {
+        try f.marker(record_bytes);
+        try testing.expectError(error.InvalidOnboardingRecord, native.start());
+        try testing.expectError(error.InvalidOnboardingRecord, native.retry(1));
+        try testing.expectError(error.WalletUnavailable, native.restore("invalid", 1));
+        try testing.expectError(error.InvalidOnboardingRecord, native.finishRestore());
+        try testing.expectError(error.InvalidOnboardingRecord, native.generateNew());
+        const marker_bytes = try config.readFileAlloc(testing.io, name, testing.allocator, .limited(512));
+        defer testing.allocator.free(marker_bytes);
+        try testing.expectEqualStrings(record_bytes, marker_bytes);
+        const after = try stage.readFileAlloc(testing.io, wallet.db_file_name, testing.allocator, .limited(4 * 1024 * 1024));
+        defer testing.allocator.free(after);
+        try testing.expectEqualSlices(u8, before, after);
+    }
 }
 
 test "finish recovery commits history and reconciles interrupted rename" {
