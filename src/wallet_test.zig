@@ -52,10 +52,14 @@ test "wallet helper opens and closes an FFI wallet" {
     const seed: [cdk.seed_len]u8 = @splat(7);
     var opened = try wallet.createWallet(&seed, path);
     defer opened.close() catch {};
-    try std.testing.expect(!opened.closed);
+    try std.testing.expect(opened.wallet != null);
+    try std.testing.expectEqual(opened.wallet.?, try opened.borrowHandle());
     try opened.close();
-    try std.testing.expect(opened.closed);
+    try std.testing.expect(opened.wallet == null);
+    try std.testing.expectError(error.WalletClosed, opened.borrowHandle());
     try opened.close();
+    try std.testing.expect(opened.wallet == null);
+    try std.testing.expectError(error.WalletClosed, opened.borrowHandle());
 }
 
 test "C ABI lifecycle: open, list, lock, close, reopen" {

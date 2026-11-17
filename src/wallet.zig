@@ -22,14 +22,19 @@ pub fn check(result: anytype) error{CdkFailure}!void {
 
 pub const Wallet = struct {
     /// Do not copy: the handle has a single owner.
-    wallet: *cdk.c.CdkWallet_t,
-    closed: bool = false,
+    wallet: ?*cdk.c.CdkWallet_t,
+
+    /// The borrowed pointer expires on close. Calls on the same handle,
+    /// including close, must remain serialized; owning wrappers must not be copied.
+    pub fn borrowHandle(self: *const Wallet) error{WalletClosed}!*cdk.c.CdkWallet_t {
+        return self.wallet orelse error.WalletClosed;
+    }
 
     /// Close consumes the handle even if the ABI reports an error.
     pub fn close(self: *Wallet) error{CdkFailure}!void {
-        if (self.closed) return;
-        self.closed = true;
-        var result = cdk.c.cdk_wallet_close(self.wallet);
+        const handle = self.wallet orelse return;
+        self.wallet = null;
+        var result = cdk.c.cdk_wallet_close(handle);
         try check(&result);
     }
 };
@@ -519,7 +524,7 @@ pub fn commitRecovery(io: Io, allocator: std.mem.Allocator, final_paths: Paths, 
 /// Advisory only; this neither proves ownership beyond the receipt nor deletes.
 pub fn recoveryCanAbandon(io: Io, allocator: std.mem.Allocator, final_paths: Paths, id: [32]u8) !bool {
     var inspection = try inspectRecovery(io, allocator, final_paths, id, true);
-    const handle = if (inspection.wallet) |w| w.wallet else return error.RecoveryStageUnavailable;
+    const handle = if (inspection.wallet) |*w| try w.borrowHandle() else return error.RecoveryStageUnavailable;
     const result = cdk.c.cdk_wallet_restore_can_abandon(handle);
     cdk.c.cdk_string_free(result.@"error");
     const safe = result.status == cdk.c.CDK_STATUS_OK and result.safe_to_abandon == 1;

@@ -242,7 +242,7 @@ pub const Native = struct {
 
     fn scan(self: *Native, dir: Io.Dir, input: Record, attempt_id: u64) !onboarding.Event {
         var inspection = try wallet.inspectRecovery(self.io, self.allocator, self.paths, input.id, true);
-        const handle = if (inspection.wallet) |w| w.wallet else return error.WalletUnavailable;
+        const handle = if (inspection.wallet) |*w| try w.borrowHandle() else return error.WalletUnavailable;
         const outcome: ScanOutcome = if (builtin.is_test) test_scan orelse .failed else blk: {
             const mint = wallet.cdk.app_mint;
             const result = wallet.cdk.c.cdk_wallet_restore_seed(handle, mint);

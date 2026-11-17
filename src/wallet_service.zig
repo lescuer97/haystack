@@ -59,7 +59,7 @@ pub const Worker = struct {
             const inspection = try wallet.inspect(io, allocator, self.paths, true);
             owner.* = inspection.wallet orelse return error.Unavailable;
         }
-        const handle = (owner.* orelse return error.Unavailable).wallet;
+        const handle = if (owner.*) |*w| try w.borrowHandle() else return error.Unavailable;
         if (self.request.operation == .create) {
             var added = wallet.cdk.c.cdk_wallet_add_mint(handle, wallet.cdk.app_mint.ptr);
             try wallet.check(&added);

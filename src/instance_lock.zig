@@ -16,11 +16,14 @@ const sf = @import("storage_fs.zig");
 
 pub const file_name = "haystack.lock";
 
+/// Single owner of the lock file. An owning Lock must not be copied.
 pub const Lock = struct {
-    file: Io.File,
+    file: ?Io.File,
 
-    pub fn release(self: Lock, io: Io) void {
-        self.file.close(io);
+    pub fn release(self: *Lock, io: Io) void {
+        const file = self.file orelse return;
+        self.file = null;
+        file.close(io);
     }
 };
 
@@ -82,7 +85,7 @@ test "the lock is exclusive and can be reacquired after release" {
     const io = testing.io;
 
     var held: ?Lock = try acquire(io, dir);
-    defer if (held) |lock| lock.release(io);
+    defer if (held) |*lock| lock.release(io);
 
     try testing.expectError(error.AlreadyRunning, acquire(io, dir));
 
@@ -96,8 +99,34 @@ test "the lock is exclusive and can be reacquired after release" {
     const persisted = try Io.Dir.cwd().statFile(io, lock_path, .{ .follow_symlinks = false });
     try testing.expectEqual(stat.inode, persisted.inode);
 
-    const second = try acquire(io, dir);
+    var second = try acquire(io, dir);
     second.release(io);
+}
+
+test "repeated release leaves a replacement lock live and exclusive" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tempConfigDir(&tmp);
+    defer testing.allocator.free(dir);
+    const io = testing.io;
+
+    var original = try acquire(io, dir);
+    defer original.release(io);
+    try testing.expect(original.file != null);
+    original.release(io);
+    try testing.expect(original.file == null);
+    original.release(io);
+    try testing.expect(original.file == null);
+
+    var second = try acquire(io, dir);
+    defer second.release(io);
+    original.release(io);
+    _ = try second.file.?.stat(io);
+    try testing.expectError(error.AlreadyRunning, acquire(io, dir));
+
+    second.release(io);
+    var reacquired = try acquire(io, dir);
+    defer reacquired.release(io);
 }
 
 test "broad or symlinked lock files are rejected" {
@@ -151,7 +180,7 @@ test "macOS lock file ACL is rejected" {
     const io = testing.io;
     const dir = try tempConfigDir(&tmp);
     defer testing.allocator.free(dir);
-    const lock = try acquire(io, dir);
+    var lock = try acquire(io, dir);
     lock.release(io);
     const path = try std.fs.path.join(testing.allocator, &.{ dir, file_name });
     defer testing.allocator.free(path);
