@@ -364,9 +364,15 @@ artifacts remain untouched apart from a warning in their README:
 `/tmp/opencode/binary-server-post-b6pSj2MI`. The first capture contains the original
 uncommitted working tree, not HEAD; original source fingerprints remain preserved.
 
-Use the opt-in Python 3 standard-library driver (Linux `findmnt` for metadata),
-never a production dependency. Compile first, then run sequentially; do not run
-compilers alongside the timed pairs. Generate the current manifest before timing:
+The following commands document the historical paired comparison, not a
+reproducible workflow in this checkout: `build-support/server_bench_dataset.zig`
+and `build-support/compare_server_bench.py` (and their driver tests) were not
+tracked in the server baseline and are absent here. They have not been restored.
+The historical driver used Python 3's standard library and Linux `findmnt`, with
+sequential timed pairs after compilation. No new timing claim follows from this
+integration. Only `zig build build-bench-server -Dgame=false
+-Doptimize=ReleaseSafe` below is a current build command; the missing-helper
+commands are retained solely as a record of the old procedure:
 
 ```sh
 zig build build-bench-server -Dgame=false -Doptimize=ReleaseSafe
@@ -461,7 +467,7 @@ zig build test --summary all
 zig build test -Doptimize=ReleaseSafe --summary all
 zig build
 python3 -B -m unittest discover -s build-support -p 'test_*.py' -v
-zig fmt --check build.zig build.zig.zon shared server build-support/server_bench_dataset.zig src/world.zig
+zig fmt --check build.zig build.zig.zon build shared server src/world.zig
 git diff --check
 ```
 

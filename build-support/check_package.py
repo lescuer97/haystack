@@ -18,6 +18,17 @@ PRUNED = {
     ".profiles", "chromium-profile", "secrets", ".secrets",
 }
 REQUIRED = (
+    "shared/root.zig", "shared/world.zig", "shared/protocol.zig", "shared/wire.zig",
+    "server/main.zig", "server/tests.zig", "server/ws_memory_tests.zig", "server/bench.zig",
+    "server/actions.zig", "server/app.zig", "server/fixture.zig", "server/memory.zig",
+    "server/sessions.zig", "server/sessions_tests.zig", "server/sqlite_runtime.zig",
+    "server/storage.zig", "server/storage_tests.zig", "server/transport.zig",
+    "server/transport_tests.zig", "server/ws_config.zig",
+    "build/server.zig", "build/shared.zig",
+    "vendor/websocket/build.zig", "vendor/websocket/build.zig.zon",
+    "vendor/websocket/src/websocket.zig", "vendor/websocket/src/bounded_tests.zig",
+    "vendor/zig-sqlite/build.zig", "vendor/zig-sqlite/build.zig.zon",
+    "vendor/zig-sqlite/sqlite.zig", "vendor/zig-sqlite/c/sqlite3_c.h",
     "browser/game-ui.js", "browser/wallet-integration.js",
     "browser/wallet-test.html", "browser/app.js",
     "build.zig", "build.zig.zon", "README.md", "docs/build.md",
@@ -42,7 +53,7 @@ def excluded(path):
         part in PRUNED or part == ".env" or part.startswith(".env.")
         or part.startswith(":memory")
         or part.endswith((".log", ".sqlite", ".sqlite3", ".db", ".db-wal",
-                          ".db-shm", ".sqlite-wal", ".sqlite-shm", ".pyc", ".pyo",
+                          ".db-shm", ".sqlite-wal", ".sqlite-shm", ".sqlite3-wal", ".sqlite3-shm", ".pyc", ".pyo",
                           ".prof", ".profraw", ".pem", ".key"))
         for part in Path(path).parts
     )
@@ -164,12 +175,13 @@ def check(args):
         common = ["--system", str(pkg_dir), "-Doffline", f"-Drust-toolchain={args.rust_toolchain}"]
         commands = [
             ["--help"], ["--help", "-Dplatform=wasm"],
+            ["--help", "-Dgame=false"], ["server", "test-server", "-Dgame=false"],
             ["test-build"], ["test-storage", "-Dplatform=wasm"],
             ["browser", "-Dplatform=wasm", f"-Dwasm-bindgen={bindgen}"],
         ]
         for command in commands:
             run([args.zig, "build", *command, *common], workspace, env=env)
-    print("package check: PASS (filtered sources, configuration, build tests, Node tests, production browser)")
+    print("package check: PASS (filtered sources, configuration, server build/tests, build tests, Node tests, production browser)")
 
 
 def main():

@@ -1,9 +1,12 @@
 # Separate desktop and Wasm builds
 
-The root `build.zig` selects **one** platform graph. Normal application builds do
+The root `build.zig` selects **one** application platform graph. Native
+configurations also expose the independent server graph in `build/server.zig`;
+the default install/run remains desktop-only. Normal application builds do
 not run a Python application builder, invoke another `zig build`, or configure
 the other platform. The graph-isolation test queries each configuration's help
-menu, without building the other application.
+menu, without building the other application; server-only regressions also build
+the socket-free server without checking Rust.
 
 | Command | Output / action |
 | --- | --- |
@@ -13,6 +16,11 @@ menu, without building the other application.
 | `zig build run` | Build, install, then run the installed desktop binary next to its installed raylib |
 | `zig build run -Dplatform=wasm` | Build/serve the browser application at `http://127.0.0.1:8000` |
 | `zig build test` | Desktop application tests |
+| `zig build server -Dgame=false` | Build/install only `zig-out/bin/haystack_server`, without desktop policy, Rust, C ABI, Raylib or browser setup/check steps |
+| `zig build run-server -Dgame=false -- ...` | Explicitly run the standalone local server |
+| `zig build test-server -Dgame=false` | Four socket-free test legs: server, shared, bounded WebSocket and application WebSocket memory tests |
+| `zig build build-bench-server -Dgame=false -Doptimize=ReleaseSafe` | Build/install the opt-in benchmark without running it |
+| `zig build bench-server -Dgame=false -Doptimize=ReleaseSafe -- ...` | Explicit opt-in benchmark execution; never part of default builds/tests |
 | `zig build test-wallet` | Native Rust suite, C-header check, Zig wallet/Spilman ABI tests |
 | `zig build test -Dplatform=wasm` | Isolated browser fixture, database conformance and Node tests, ephemeral fake mint and Chromium tests; exits nonzero for three known send/swap recovery assertions |
 | `zig build test-storage -Dplatform=wasm` | Node-only settings/content bridge tests against an in-memory IndexedDB (no Chromium) |
@@ -26,7 +34,7 @@ menu, without building the other application.
 | `zig build test-qr-portability -Doffline` | C encoder object checks for Linux x86_64/aarch64 and macOS 15 ARM64; not ARM64 application/runtime verification |
 | `zig build setup -Dplatform=wasm` | Provision Rust + Wasm target, local wasm-bindgen and Emscripten without building the application |
 | `zig build test-build` | Test graph isolation, explicit setup/check contracts, the native target matrix and the upstream Emscripten adapter |
-| `zig build test-package -Dplatform=wasm -Doffline` | Explicit offline Zig-filtered source-package regression (warmed browser caches required; also available in the desktop graph) |
+| `zig build test-package -Dplatform=wasm -Doffline` | Explicit offline Zig-filtered source-package regression, including server-only build/tests and production browser (warmed dependencies/tools required; also available in the desktop graph) |
 
 `zig build -Dtarget=wasm32-emscripten` **does not** select the Wasm graph. Browser
 builds require the explicit platform flag: `zig build -Dplatform=wasm` (optionally
@@ -38,6 +46,19 @@ unambiguous commands above. The misleading native `wallet-wasm-check` step has
 been removed; the browser has its own Rust package.
 
 ## What stays separate
+
+`-Dgame=false` returns before either application helper is invoked. Its selected
+`-Dtarget` is independent of the native-only desktop wallet policy. It is invalid
+with `-Dplatform=wasm`, which has no server steps. Server steps remain available
+in ordinary native desktop configurations without an additional opt-in, but
+only explicit server steps install or run server artifacts. See [server.md](server.md).
+
+`build/shared.zig` creates the dependency-free terrain/protocol module for each
+consumer's target and optimization. Desktop creates it after macOS deployment
+target normalization, importing it into both application roots and testing it
+explicitly. The Wasm renderer imports its own Wasm-targeted instance; no native
+server or SQLite module enters either client graph. Server tests also explicitly
+run the shared tests. Client residency remains separate from server persistence.
 
 | | Desktop | Wasm |
 | --- | --- | --- |

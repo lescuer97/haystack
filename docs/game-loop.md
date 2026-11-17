@@ -21,11 +21,15 @@ extension points.
 | `src/onboarding.zig` | platform-neutral onboarding model, modal input, effects, and layout | **no** |
 | `src/onboarding_native.zig` | native wallet startup and completion adapter | **no** |
 | `src/camera.zig` | camera movement, world→screen transform, visible chunk range, bounds checks | yes |
-| `src/world.zig` | tiles, chunks, deterministic generation, residency, streaming, stats | **no** |
+| `shared/world.zig` | tile/chunk types and deterministic terrain generation, shared with the standalone server | **no** |
+| `src/world.zig` | client resident cache, drawable bounds, streaming, stats, and unused private-yield primitive | **no** |
 | `src/rendering.zig` | draws world, marker, HUD, minimap, menu, and optional onboarding overlay from read-only state | yes |
 
 `world.zig` and `menu.zig` are intentionally Raylib-free. That keeps them
-headless-testable and ready for a future server or simulation.
+headless-testable. The standalone [server](server.md) already uses shared terrain
+and persists cuts separately; this client does not connect to it or apply deltas.
+The client's pixel-safe drawable chunk bounds intentionally differ from the
+server's full tile-coordinate bounds.
 
 ## One frame, in order
 
@@ -196,8 +200,8 @@ The menu's runtime UI values (open page, selected row, focused field, wallet-nam
 text, last pointer position) are persistent state because they must survive
 frames. Page and item definitions are static data in `menu.zig`.
 
-The world itself is authoritative but its *residency* is a cache. A non-resident
-chunk still exists conceptually; the deterministic generator can recreate it.
+Shared terrain defines the generated world, while client *residency* is only a
+cache. A non-resident chunk still exists conceptually; the deterministic generator can recreate it.
 `World.get` returns `null` only because the cache does not contain it yet.
 
 ## A concrete trace: press and hold D

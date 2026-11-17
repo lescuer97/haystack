@@ -1,7 +1,10 @@
 # Memory ownership and streaming
 
-The authoritative world model lives in `src/world.zig`. `src/game.zig` owns it
-as part of `GameState`. Read `game-loop.md` first for the frame order.
+The client resident world cache lives in `src/world.zig`. `src/game.zig` owns it
+as part of `GameState`. Terrain types and generation live in `shared/world.zig`;
+the standalone server owns its own bounded caches and SQLite cut state (see
+[server.md](server.md)). No server cache, SQL dependency or network/delta
+application is part of client residency. Read `game-loop.md` first for the frame order.
 
 ## Ownership
 

@@ -19,7 +19,7 @@ class PackageTests(unittest.TestCase):
                      ".git/config", ".zig-cache/tools/a", "zig-out/a", "zig-out-release/a",
                      "zig-pkg/a", "node_modules/a", "build-support/__pycache__/a.pyc",
                      "repros/a", "profiles/a", ".env", ".env.local", "wallet.sqlite",
-                     "wallet.db-wal", "private.key", "run.log"):
+                     "wallet.db-wal", "haystack.sqlite3-wal", "haystack.sqlite3-shm", "private.key", "run.log"):
             with self.subTest(name=name):
                 self.assertTrue(package.excluded(name))
         for name in (*package.REQUIRED, "assets/real.png", "untracked-source.js"):
@@ -71,12 +71,14 @@ class PackageTests(unittest.TestCase):
 
             # Mutate only this disposable fixture's actual manifest, then fetch
             # again: a fake/manual allowlist copy cannot satisfy this regression.
-            write_manifest(name for name in package.REQUIRED if name != "browser/game-onboarding.js")
-            scratch = root / "bad"
-            scratch.mkdir()
-            archive, hash_value = package.fetch_filtered(source, scratch, zig, cache)
-            with self.assertRaisesRegex(RuntimeError, "missing required package inputs: browser/game-onboarding.js"):
-                package.validate_package(archive, hash_value)
+            for index, missing in enumerate(("browser/game-onboarding.js", "shared/world.zig", "server/main.zig")):
+                with self.subTest(missing=missing):
+                    write_manifest(name for name in package.REQUIRED if name != missing)
+                    scratch = root / f"bad-{index}"
+                    scratch.mkdir()
+                    archive, hash_value = package.fetch_filtered(source, scratch, zig, cache)
+                    with self.assertRaisesRegex(RuntimeError, f"missing required package inputs: {missing}"):
+                        package.validate_package(archive, hash_value)
 
     def test_output_membership_rejects_artifacts_before_build(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -92,6 +94,20 @@ class PackageTests(unittest.TestCase):
         for missing in ("browser/game-ui.js", "browser/wallet-integration.js",
                         "browser/wallet-test.html", "browser/app.js"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temporary:
+                self.assertIn(missing, package.REQUIRED)
+                archive = Path(temporary) / "missing.tar"
+                with tarfile.open(archive, "w") as output:
+                    for name in package.REQUIRED:
+                        if name != missing:
+                            output.addfile(tarfile.TarInfo(f"hash/{name}"))
+                with self.assertRaisesRegex(RuntimeError, f"missing required package inputs: {missing}"):
+                    package.validate_package(archive, "hash")
+
+    def test_missing_shared_server_and_vendor_inputs_are_rejected(self):
+        base = Path("/tmp/opencode")
+        for missing in ("shared/world.zig", "server/main.zig", "build/server.zig", "build/shared.zig",
+                        "vendor/websocket/src/websocket.zig", "vendor/zig-sqlite/sqlite.zig"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory(dir=base if base.is_dir() else None) as temporary:
                 self.assertIn(missing, package.REQUIRED)
                 archive = Path(temporary) / "missing.tar"
                 with tarfile.open(archive, "w") as output:
@@ -129,6 +145,7 @@ class PackageTests(unittest.TestCase):
         script = (ROOT / "build-support/check_package.py").read_text(encoding="utf-8")
         self.assertNotIn('["test-package"', script)
         self.assertIn('["browser", "-Dplatform=wasm"', script)
+        self.assertIn('["server", "test-server", "-Dgame=false"]', script)
         self.assertIn('"--system", str(pkg_dir)', script)
 
 

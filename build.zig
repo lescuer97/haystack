@@ -29,17 +29,23 @@ pub fn build(b: *std.Build) !void {
         .fast => .fast,
     };
     const game = b.option(bool, "game", "Configure the game and wallet (default true)") orelse true;
+    const toolchain = b.option([]const u8, "rust-toolchain", b.fmt("Rustup toolchain (default: pinned {s})", .{common.default_toolchain})) orelse common.default_toolchain;
+    const offline = b.option(bool, "offline", "Forbid tool downloads and Cargo network access") orelse false;
     if (platform == .wasm and !game) {
         std.log.err("-Dplatform=wasm requires -Dgame=true; server-only builds use the native desktop configuration", .{});
         return error.ServerOnlyRequiresNativePlatform;
+    }
+    if (platform == .desktop and target.result.cpu.arch.isWasm()) {
+        std.log.err("native desktop/server builds cannot target Wasm; browser builds require -Dplatform=wasm and -Dgame=true", .{});
+        return error.UnsupportedDesktopTarget;
     }
     if (platform == .desktop) @import("build/server.zig").build(b, target, optimize);
     if (!game) return;
     const options: common.Options = .{
         .target = target,
         .optimize = optimize,
-        .toolchain = b.option([]const u8, "rust-toolchain", b.fmt("Rustup toolchain (default: pinned {s})", .{common.default_toolchain})) orelse common.default_toolchain,
-        .offline = b.option(bool, "offline", "Forbid tool downloads and Cargo network access") orelse false,
+        .toolchain = toolchain,
+        .offline = offline,
     };
     const build_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "build-support", "-p", "test_*.py" });
     build_tests.setCwd(b.path("."));
@@ -78,7 +84,7 @@ pub fn build(b: *std.Build) !void {
     package_check.addDirectoryArg(b.graph.path(.local_cache, ""));
     package_check.setCwd(b.path("."));
     package_check.has_side_effects = true;
-    b.step("test-package", "Check Zig-filtered source package and build the production browser offline (warmed caches required)").dependOn(&package_check.step);
+    b.step("test-package", "Check Zig-filtered source package and build server/browser offline (warmed caches required)").dependOn(&package_check.step);
 
     // Deliberately configure ONE graph. Desktop never initializes browser
     // toolchains; Wasm never translates/links the native C ABI or desktop raylib.

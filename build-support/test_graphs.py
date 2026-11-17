@@ -1,9 +1,10 @@
-"""Query configuration only: these tests never build either application."""
+"""Check platform isolation; only the socket-free server build is executed."""
 from pathlib import Path
 import os
 import platform
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -27,9 +28,72 @@ class GraphIsolationTests(unittest.TestCase):
         cls.desktop = desktop.stdout
         cls.wasm = wasm.stdout
 
+    def test_server_only_exposes_only_native_server_steps(self):
+        result = configure("-Dgame=false", "-Doffline", "-Drust-toolchain=9.99.0-missing-server-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        step_help = result.stdout.split("Steps:\n", 1)[1].split("\nProject-Specific Options:", 1)[0]
+        steps = {line.split()[0] for line in step_help.splitlines() if line.split()}
+        for step in ("server", "run-server", "test-server", "build-bench-server", "bench-server"):
+            self.assertIn(step, steps)
+        for step in ("desktop", "run", "test", "wallet", "setup", "header-check", "test-wallet",
+                     "test-spilman", "browser", "renderer", "test-mint", "test-build", "test-package",
+                     "wasm", "test-storage", "browser-fixture", "wallet-fixture", "test-onboarding",
+                     "test-wallet-ui", "test-withdrawal-ui", "test-qr-portability", "test-platform"):
+            self.assertNotIn(step, steps)
+
+    def test_server_only_build_does_not_check_the_selected_rust_toolchain(self):
+        result = subprocess.run(
+            ["zig", "build", "server", "-Dgame=false", "-Doffline",
+             "-Drust-toolchain=9.99.0-missing-server-only"],
+            cwd=ROOT, capture_output=True, text=True, timeout=180,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("check installed Rust", result.stdout + result.stderr)
+
+    def test_server_only_target_is_not_restricted_by_desktop_policy(self):
+        result = configure("-Dgame=false", "-Dtarget=aarch64-linux-gnu")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_explicit_desktop_server_only_rejects_wasm_targets(self):
+        for target in ("wasm32-emscripten", "wasm64-emscripten", "wasm32-wasi"):
+            with self.subTest(target=target):
+                result = configure("-Dplatform=desktop", "-Dgame=false", f"-Dtarget={target}")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("UnsupportedDesktopTarget", result.stderr)
+                self.assertIn("native desktop/server builds cannot target Wasm", result.stderr)
+                self.assertIn("-Dplatform=wasm and -Dgame=true", result.stderr)
+
+    def test_wasm_does_not_expose_native_server_steps(self):
+        for step in ("server", "run-server", "test-server", "build-bench-server", "bench-server"):
+            self.assertNotRegex(self.wasm, rf"(?m)^  {step}\s")
+
+    def test_wasm_server_only_is_explicitly_rejected(self):
+        result = configure("-Dplatform=wasm", "-Dgame=false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ServerOnlyRequiresNativePlatform", result.stderr)
+        self.assertIn("-Dplatform=wasm requires -Dgame=true", result.stderr)
+
+    def test_default_install_does_not_install_server(self):
+        # No game means the default install should be empty, even though all
+        # five explicit server steps are available. Never run the server.
+        base = Path("/tmp/opencode")
+        with tempfile.TemporaryDirectory(dir=base if base.is_dir() else None) as prefix:
+            result = subprocess.run(
+                ["zig", "build", "-Dgame=false", "-Doffline", "--prefix", prefix],
+                cwd=ROOT, capture_output=True, text=True, timeout=180,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse((Path(prefix) / "bin" / "haystack_server").exists())
+        source = (ROOT / "build" / "server.zig").read_text(encoding="utf-8")
+        self.assertNotIn("getInstallStep", source)
+        self.assertNotIn("b.installArtifact", source)
+        self.assertNotIn('"build/server.zig"', (ROOT / "build" / "desktop.zig").read_text())
+
     @unittest.skipUnless(SUPPORTED_DESKTOP_HOST, "desktop host is not supported")
     def test_desktop_does_not_expose_browser_tools(self):
         self.assertIn("header-check", self.desktop)
+        for step in ("server", "run-server", "test-server", "build-bench-server", "bench-server"):
+            self.assertRegex(self.desktop, rf"(?m)^  {step}\s")
         self.assertNotIn("-Dwasm-bindgen", self.desktop)
         self.assertNotIn("test-mint", self.desktop)
         self.assertNotIn("Provision pinned Rust, Wasm target", self.desktop)

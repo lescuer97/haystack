@@ -7,6 +7,11 @@ zig build                       # native desktop: Linux x86_64/aarch64 or macOS 
 zig build -Dplatform=wasm        # complete browser application
 ```
 
+The independent [local server](docs/server.md) builds with
+`zig build server -Dgame=false` and has socket-free tests via `test-server`.
+Native desktop configurations expose these explicit steps without adding the
+server to the default install; the game client does not connect to it yet.
+
 The browser graph is selected **only** by `-Dplatform=wasm`. A Wasm
 `-Dtarget` alone (including `-Dtarget=wasm32-emscripten`, `wasm64-*` or WASI)
 is rejected with an explanation; it never infers the browser build. An explicit
