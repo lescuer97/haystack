@@ -32,6 +32,10 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        .websocket = .{
+            .path = "vendor/websocket",
+        },
+        .sqlite = .{ .path = "vendor/zig-sqlite" },
         .raylib_zig = .{
             .url = "git+https://github.com/raylib-zig/raylib-zig?ref=devel#28bbe30112f605da918db00eff53a75ce1aa9180",
             .hash = "raylib_zig-6.2.0-KE8RELGmBQDX1v1DqBN57pNxJ-b-MIa1S-M7NXT9Eplr",
@@ -42,6 +46,11 @@
         "build.zig.zon",
         "src",
         "assets",
+        "shared",
+        "server",
+        "docs",
+        "vendor",
+        "build-support",
         // For example...
         //"LICENSE",
         //"README.md",

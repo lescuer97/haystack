@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  create:
+  push:
+    branches:
+      - master
+      - zig-0.16
+    paths:
+      - '**.zig'
+  pull_request:
+  schedule:
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig fmt --check *.zig
+
+  test-in-memory:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # use-cache defaults to true, so setup-zig restores and saves the Zig
+      # cache itself. It also repoints ZIG_GLOBAL_CACHE_DIR and
+      # ZIG_LOCAL_CACHE_DIR at .zig-cache, which is where the cache lives on
+      # the runner rather than in ~/.cache/zig.
+      - name: Setup zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install qemu
+        if: ${{ matrix.os == 'ubuntu-24.04' }}
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y qemu-user-binfmt
+
+      - name: Run Tests in memory
+        if: ${{ matrix.os == 'ubuntu-24.04' }}
+        run: zig build test -Dci=true -Din_memory=true --summary all -fqemu -fwine
+
+      - name: Run Tests in memory
+        if: ${{ matrix.os != 'ubuntu-24.04' }}
+        run: zig build test -Dci=true -Din_memory=true --summary all

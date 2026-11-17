@@ -6,7 +6,7 @@ Bare-bones reference for how the world is addressed, generated, and changed.
 
 ## 0. Status: implemented vs planned
 
-Implemented today in `src/world.zig`:
+Implemented today in `shared/world.zig`, `src/world.zig`, and `server/`:
 
 - 32×32 px tiles, 16×16-tile chunks (512×512 px).
 - A `Tile` enum (`grass`, `dirt`, `rock`, `tree`, in that ordinal order), rendered
@@ -21,18 +21,23 @@ Implemented today in `src/world.zig`:
   unloads everything outside a 2-chunk prefetch ring, then loads visible chunks
   first and the rest of the ring second.
 - Memory stats, allocation-free eviction scratch, and retry-after-OOM support.
-- No tile deltas, no dirty flags, no characters, no network, and no gameplay
-  mutation yet.
+- Standalone loopback WebSocket server with binary v1, permanent grass/tree cuts,
+  fixed heap budgets, SQLite persistence, durable opaque-ID replay, and complete
+  64-chunk bitmap area snapshots.
+  See [server.md](server.md) for the implemented wire contract and limits.
+- The game client has no networking, delta/input/render integration, dirty
+  flags, or characters yet. Its resident chunks still contain generated terrain.
 
-Sections 2–6 below are **planned**. The seed types and both hash helpers exist
-in `world.zig`, but the client/server split, server-side private-seed handling,
-delta storage, and action flow are design notes, not current code.
+Sections 2–6 below describe **future rewardful gameplay**, not the current
+rewardless server contract. Terrain and coordinate types are shared now; the
+private-yield primitive stays unused in the client world module. The current
+server needs **no private seed**, loot, player identity, or tool state.
 
 Future gameplay edits must survive chunk eviction: resident `Chunk`s are a cache
 and may be regenerated at any time, so changes cannot live only inside a
 resident chunk. They need an authoritative state/delta layer keyed by world
-coordinates with a resync path. That layer is **not implemented**, and no wire
-format should be invented until it is.
+coordinates with a resync path. That layer exists on the standalone server;
+applying its snapshots to the game client is **not implemented**.
 
 The unused starter draft also mentioned a `TileEntity` union
 (`Tree`/`Grass`/`Character` with `CutStatus`), per-chunk `dirty` flags, and a
@@ -91,7 +96,7 @@ the v1 region checksum test locks the current output.
 
 ---
 
-## 2. The two seeds (**server integration planned**)
+## 2. The two seeds (**rewardful gameplay planned**)
 
 Both seeds are 32 bytes and independent. Never derive one from the other.
 
@@ -163,7 +168,7 @@ It must **never** predict loot.
 
 ---
 
-## 4. How changes are stored on the server (**planned**)
+## 4. Future extended storage design (**planned**, not current SQLite schema)
 
 ```
 real_tile = generate(public_seed, x, y)   default
@@ -194,12 +199,13 @@ ChunkRecord {
 
 ---
 
-## 5. Action flow (**planned**)
+## 5. Client integration and rewardful action flow (**planned**)
 
-Not implemented. When networking is added, incoming messages are collected
-without blocking and applied at the frame update boundary, before the local
+Not implemented in the client. When game networking is added, incoming messages
+are collected without blocking and applied at the frame update boundary, before the local
 action for that frame; callbacks only enqueue. See `game-loop.md` for the loop
-ordering. No wire protocol exists yet.
+ordering. The standalone rewardless binary v1 protocol exists in `server.md`;
+the diagram below is a future rewardful flow, not that protocol.
 
 ```
 client                          server
@@ -221,4 +227,5 @@ client                          server
 3. Anything derivable from the public seed is public — do not put secrets there.
 4. Deltas are absolute state, not toggles, so retries are safe.
 5. Duplicate `(player, seq)` returns the stored result; it never rolls again.
-6. The server starts only if the private seed is present.
+6. A future rewardful server would require a private seed; the implemented
+   rewardless cut server neither requires nor uses one.

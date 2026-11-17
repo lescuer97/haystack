@@ -1,10 +1,9 @@
-//! Authoritative world model: tiles, chunks, deterministic generation, storage,
-//! streaming, ownership, and statistics.
+//! Client resident world cache: shared terrain, streaming, ownership, and stats.
 //!
 //! This module deliberately does not import Raylib. Anything that needs a
 //! window, a camera transform, or draw calls belongs in `camera.zig` or
-//! `rendering.zig`. That keeps the world headless-testable and ready for a
-//! future server or simulation that never opens a window.
+//! `rendering.zig`. That keeps this cache headless-testable and independent of
+//! the server or a window.
 //!
 //! The world is infinite. A chunk that is not resident simply does not exist
 //! until the camera gets close enough to ask for it. Residency is therefore a
@@ -13,19 +12,20 @@
 //! memory.
 
 const std = @import("std");
+const terrain = @import("shared").world;
 
 // ── world constants ──────────────────────────────────────────────────────────
 
 /// One tile is 32×32 world pixels. Debug rendering draws a terrain letter at
 /// each tile centre, plus optional grid lines and chunk borders in this space.
-pub const TILE_PX: i32 = 32;
+pub const TILE_PX = terrain.TILE_PX;
 
 /// A chunk is 16×16 tiles (512×512 pixels).
-pub const CHUNK_TILES: i32 = 16;
-pub const CHUNK_PX: i32 = TILE_PX * CHUNK_TILES;
+pub const CHUNK_TILES = terrain.CHUNK_TILES;
+pub const CHUNK_PX = terrain.CHUNK_PX;
 
 /// Same value as `CHUNK_TILES`, typed for array indexing.
-pub const CT: usize = @intCast(CHUNK_TILES);
+pub const CT = terrain.CT;
 
 /// How many chunks beyond the visible range stay loaded.
 pub const PREFETCH_MARGIN_CHUNKS: i32 = 2;
@@ -37,47 +37,13 @@ pub const MIN_PREHEATED_CHUNKS: usize = 64;
 // ── tiles / chunks ───────────────────────────────────────────────────────────
 
 /// Generated terrain. Gameplay state (cut, tilled, ownership, …) is not stored
-/// here yet; see `docs/world.md` for the planned delta model.
-pub const Tile = enum(u8) { grass, dirt, rock, tree };
+/// here; the standalone server persists absolute cut state separately.
+pub const Tile = terrain.Tile;
 
-pub const Chunk = struct {
-    cx: i32 = 0,
-    cy: i32 = 0,
-    tiles: [CT * CT]Tile = undefined,
-};
+pub const Chunk = terrain.Chunk;
 
 /// An inclusive rectangular range of chunk indices.
-pub const ChunkRange = struct {
-    cx0: i32,
-    cy0: i32,
-    cx1: i32,
-    cy1: i32,
-
-    pub fn cols(self: ChunkRange) i32 {
-        return self.cx1 - self.cx0 + 1;
-    }
-
-    pub fn rows(self: ChunkRange) i32 {
-        return self.cy1 - self.cy0 + 1;
-    }
-
-    pub fn count(self: ChunkRange) i32 {
-        return self.cols() * self.rows();
-    }
-
-    pub fn contains(self: ChunkRange, cx: i32, cy: i32) bool {
-        return cx >= self.cx0 and cx <= self.cx1 and cy >= self.cy0 and cy <= self.cy1;
-    }
-
-    pub fn expanded(self: ChunkRange, margin: i32) ChunkRange {
-        return .{
-            .cx0 = self.cx0 - margin,
-            .cy0 = self.cy0 - margin,
-            .cx1 = self.cx1 + margin,
-            .cy1 = self.cy1 + margin,
-        };
-    }
-};
+pub const ChunkRange = terrain.ChunkRange;
 
 // ── coordinate validation ────────────────────────────────────────────────────
 
@@ -110,96 +76,7 @@ pub fn validateChunkRange(range: ChunkRange, margin: i32) CoordinateError!void {
     if (cols * rows > std.math.maxInt(i32)) return error.CoordinateOutOfBounds;
 }
 
-// ── deterministic generation ─────────────────────────────────────────────────
-
-/// Deterministic, non-cryptographic 32-bit hash of tile coordinates and the
-/// public world seed. Both a client and a future server can compute the same
-/// chunk from the same inputs because the result is platform-independent.
-///
-/// `public_seed` is the shareable layout seed, exactly 32 bytes. `privateYield`
-/// uses a separate, independently generated server-only secret; never reuse
-/// `public_seed` as `private_seed`.
-///
-/// The seed is consumed as eight consecutive four-byte words in array order:
-/// `public_seed[0..4]` is the first word and `public_seed[28..32]` the last,
-/// and each word is read little-endian. Each word is XORed into the state and
-/// mixed, so every seed bit participates. The seed array itself is never
-/// endian-converted; only those word reads and the byte order above matter.
-/// This is a public layout hash, not a secure PRF: do not use it for private
-/// data or to derive gameplay yields.
-fn hash2(public_seed: [32]u8, x: i32, y: i32) u32 {
-    // Mix the coordinate contributions in order rather than folding them
-    // together first: folding before mixing makes sign-mirrored coordinate
-    // pairs collide.
-    var h: u32 = @as(u32, @bitCast(x)) *% 0x9E3779B1;
-    h = mix32(h);
-    h ^= @as(u32, @bitCast(y)) *% 0x85EBCA77;
-    h = mix32(h);
-
-    inline for (0..8) |i| {
-        h ^= std.mem.readInt(u32, public_seed[4 * i ..][0..4], .little);
-        h = mix32(h);
-    }
-    return h;
-}
-
-/// Avalanching 32-bit finalizer used between inputs: invertible for an
-/// individual u32 state, so any change that reaches this state survives to
-/// the output. That does not make `hash2` collision-free — its full input is
-/// far wider than its u32 output.
-fn mix32(value: u32) u32 {
-    var h = value;
-    h ^= h >> 15;
-    h *%= 0x2545F491;
-    h ^= h >> 13;
-    return h;
-}
-
-const forest_spacing = 32;
-const rock_spacing = 16;
-const dirt_spacing = 8;
-const forest_threshold = 32000;
-const rock_threshold = 51000;
-const dirt_threshold = 55000;
-
-fn layoutHash(seed: [32]u8, domain: u8, x: i32, y: i32) u32 {
-    var derived = seed;
-    derived[0] ^= domain;
-    return hash2(derived, x, y);
-}
-
-// Fixed point uses 65536 as one; all divisions round down.
-fn smoothFraction(remainder: i32, comptime spacing: i32) u64 {
-    const t = @as(u64, @intCast(remainder)) * 65536 / @as(u64, spacing);
-    return (t * t * (3 * 65536 - 2 * t)) >> 32;
-}
-
-fn interpolate(a: u64, b: u64, t: u64) u64 {
-    return (a * (65536 - t) + b * t) >> 16;
-}
-
-fn valueNoise(seed: [32]u8, domain: u8, x: i32, y: i32, comptime spacing: i32) u32 {
-    const gx = @divFloor(x, spacing);
-    const gy = @divFloor(y, spacing);
-    const tx = smoothFraction(@mod(x, spacing), spacing);
-    const ty = smoothFraction(@mod(y, spacing), spacing);
-    // Lattice coordinates are divided by at least eight, so +1 fits even at i32 limits.
-    const top = interpolate(layoutHash(seed, domain, gx, gy) >> 16, layoutHash(seed, domain, gx + 1, gy) >> 16, tx);
-    const bottom = interpolate(layoutHash(seed, domain, gx, gy + 1) >> 16, layoutHash(seed, domain, gx + 1, gy + 1) >> 16, tx);
-    return @intCast(interpolate(top, bottom, ty));
-}
-
-fn sampleTile(seed: [32]u8, x: i32, y: i32) Tile {
-    // ponytail: one smooth field per feature; add octaves only if terrain needs finer detail.
-    if (valueNoise(seed, 2, x, y, rock_spacing) >= rock_threshold) return .rock;
-    const forest = valueNoise(seed, 1, x, y, forest_spacing);
-    if (forest >= forest_threshold) {
-        const density = @min(56000, 22000 + forest - forest_threshold);
-        if (layoutHash(seed, 4, x, y) >> 16 < density) return .tree;
-    }
-    if (valueNoise(seed, 3, x, y, dirt_spacing) >= dirt_threshold) return .dirt;
-    return .grass;
-}
+// Deterministic terrain generation lives in shared/world.zig.
 
 // ── private yield ────────────────────────────────────────────────────────────
 
@@ -253,18 +130,7 @@ pub fn privateYield(private_seed: [32]u8, x: i32, y: i32) u64 {
     return std.mem.readInt(u64, &out, .little);
 }
 
-fn generate(chunk: *Chunk) void {
-    // Placeholder public world seed. Seed plumbing belongs to the world
-    // configuration; all zeros keeps generation deterministic for now.
-    const public_seed: [32]u8 = @splat(0);
-    for (0..CT) |ly| {
-        for (0..CT) |lx| {
-            const x = chunk.cx * CHUNK_TILES + @as(i32, @intCast(lx));
-            const y = chunk.cy * CHUNK_TILES + @as(i32, @intCast(ly));
-            chunk.tiles[ly * CT + lx] = sampleTile(public_seed, x, y);
-        }
-    }
-}
+const generate = terrain.generate;
 
 // ── resident storage and streaming ───────────────────────────────────────────
 
@@ -463,77 +329,6 @@ pub const StreamError = std.mem.Allocator.Error || CoordinateError;
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
-test "terrain v1 distribution correlation and fixed region checksum" {
-    const side = 512;
-    const total = side * side;
-    var tiles: [total]Tile = undefined;
-    var counts: [4]u64 = @splat(0);
-    var neighbors: [4]u64 = @splat(0);
-    var forest_grass: usize = 0;
-    var forest_trees: usize = 0;
-    var checksum: u64 = 0xcbf29ce484222325;
-    for (&tiles, 0..) |*tile, i| {
-        const x = @as(i32, @intCast(i % side)) - side / 2;
-        const y = @as(i32, @intCast(i / side)) - side / 2;
-        tile.* = sampleTile(zero_seed, x, y);
-        counts[@backingInt(tile.*)] += 1;
-        checksum = (checksum ^ @backingInt(tile.*)) *% 0x100000001b3;
-        if (valueNoise(zero_seed, 1, x, y, forest_spacing) >= forest_threshold) {
-            if (tile.* == .grass) forest_grass += 1;
-            if (tile.* == .tree) forest_trees += 1;
-        }
-    }
-    for (tiles, 0..) |tile, i| {
-        if (i % side + 1 < side and tile == tiles[i + 1]) neighbors[@backingInt(tile)] += 1;
-        if (i / side + 1 < side and tile == tiles[i + side]) neighbors[@backingInt(tile)] += 1;
-    }
-    const grass = counts[@backingInt(Tile.grass)];
-    const trees = counts[@backingInt(Tile.tree)];
-    const rocks = counts[@backingInt(Tile.rock)];
-    const dirt = counts[@backingInt(Tile.dirt)];
-    try std.testing.expect(grass > total / 2 and grass > trees and trees > rocks and rocks > dirt and dirt > 0);
-    for ([_]Tile{ .tree, .rock, .dirt }) |tile| {
-        const i = @backingInt(tile);
-        // Conditional neighbor match must exceed independent tiles' baseline by 30%.
-        try std.testing.expect(neighbors[i] * total * 10 > counts[i] * counts[i] * 26);
-    }
-    try std.testing.expect(forest_trees > 0 and forest_grass > forest_trees / 4);
-    try std.testing.expectEqual(@as(u64, 0xec04d88c8e6885e5), checksum);
-}
-
-test "terrain absolute sampling crosses negative seams and drawable bounds" {
-    inline for (.{
-        .{ .domain = 1, .spacing = forest_spacing },
-        .{ .domain = 2, .spacing = rock_spacing },
-        .{ .domain = 3, .spacing = dirt_spacing },
-    }) |field| {
-        for ([_]i32{ -1, 0, 1 }) |gy| {
-            for ([_]i32{ -1, 0, 1 }) |gx| {
-                const x = gx * field.spacing;
-                const y = gy * field.spacing;
-                const corner = layoutHash(zero_seed, field.domain, gx, gy) >> 16;
-                try std.testing.expectEqual(corner, valueNoise(zero_seed, field.domain, x, y, field.spacing));
-                for ([_][2]i32{ .{ -1, 0 }, .{ 1, 0 }, .{ 0, -1 }, .{ 0, 1 } }) |offset| {
-                    const nearby = valueNoise(zero_seed, field.domain, x + offset[0], y + offset[1], field.spacing);
-                    try std.testing.expect(@abs(@as(i64, nearby) - corner) <= 4096);
-                }
-            }
-        }
-    }
-    for ([_]i32{ -2, -1, 0, 1, MIN_DRAWABLE_CHUNK, MAX_DRAWABLE_CHUNK }) |cy| {
-        for ([_]i32{ -2, -1, 0, 1, MIN_DRAWABLE_CHUNK, MAX_DRAWABLE_CHUNK }) |cx| {
-            var chunk = Chunk{ .cx = cx, .cy = cy };
-            generate(&chunk);
-            for (chunk.tiles, 0..) |tile, i| {
-                try std.testing.expectEqual(sampleTile(zero_seed, cx * CHUNK_TILES + @as(i32, @intCast(i % CT)), cy * CHUNK_TILES + @as(i32, @intCast(i / CT))), tile);
-            }
-        }
-    }
-    // Even sampling beyond drawable pixels has safe adjacent lattice corners.
-    _ = sampleTile(zero_seed, std.math.minInt(i32), std.math.maxInt(i32));
-    _ = sampleTile(zero_seed, std.math.maxInt(i32), std.math.minInt(i32));
-}
-
 test "terrain survives eviction regeneration and reversed load order" {
     var first = try World.init(std.testing.allocator, 4);
     defer first.deinit();
@@ -547,6 +342,9 @@ test "terrain survives eviction regeneration and reversed load order" {
     }
     for (coords) |c| {
         const expected = first.get(c[0], c[1]).?.tiles;
+        var shared_chunk = terrain.Chunk{ .cx = c[0], .cy = c[1] };
+        terrain.generate(&shared_chunk);
+        try std.testing.expectEqualSlices(Tile, &shared_chunk.tiles, &expected);
         try std.testing.expectEqualSlices(Tile, &expected, &second.get(c[0], c[1]).?.tiles);
         first.unload(World.keyOf(c[0], c[1]));
         try std.testing.expect(first.get(c[0], c[1]) == null);
@@ -750,94 +548,11 @@ test "stream rejects malformed and oversized ranges before mutating the world" {
 // the same little-endian bytes, so all expected vectors below are unchanged.
 const zero_seed: [32]u8 = @splat(0);
 
-const one_seed: [32]u8 = blk: {
-    var seed: [32]u8 = @splat(0);
-    seed[0] = 1;
-    break :blk seed;
-};
-
 const top_bit_seed: [32]u8 = blk: {
     var seed: [32]u8 = @splat(0);
     seed[31] = 0x80;
     break :blk seed;
 };
-
-const hash_seed = [32]u8{
-    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-    0x78, 0x69, 0x5A, 0x4B, 0x3C, 0x2D, 0x1E, 0x0F,
-    0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE,
-    0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01,
-};
-
-test "hash2 is repeatable including negative and extreme coordinates" {
-    const coords = [_]struct { x: i32, y: i32 }{
-        .{ .x = 0, .y = 0 },
-        .{ .x = 7, .y = -3 },
-        .{ .x = -3, .y = 7 },
-        .{ .x = std.math.minInt(i32), .y = std.math.maxInt(i32) },
-        .{ .x = std.math.maxInt(i32), .y = std.math.minInt(i32) },
-        .{ .x = std.math.minInt(i32), .y = std.math.minInt(i32) },
-    };
-    for (coords) |c| {
-        try std.testing.expectEqual(hash2(hash_seed, c.x, c.y), hash2(hash_seed, c.x, c.y));
-    }
-}
-
-test "hash2 fixed vectors stay stable" {
-    try std.testing.expectEqual(@as(u32, 0x00000000), hash2(zero_seed, 0, 0));
-    try std.testing.expectEqual(@as(u32, 0x4419CA0F), hash2(zero_seed, 7, -3));
-    try std.testing.expectEqual(@as(u32, 0x799AA099), hash2(one_seed, 7, -3));
-    try std.testing.expectEqual(@as(u32, 0xDA013E35), hash2(zero_seed, std.math.minInt(i32), std.math.maxInt(i32)));
-    try std.testing.expectEqual(@as(u32, 0xEA89E056), hash2(hash_seed, 37, -91));
-}
-
-test "hash2 changes when either coordinate changes" {
-    const base = hash2(hash_seed, 7, -3);
-    try std.testing.expect(base != hash2(hash_seed, 8, -3));
-    try std.testing.expect(base != hash2(hash_seed, 7, -2));
-}
-
-test "mirrored coordinates do not collide" {
-    const pairs = [_][2]i32{
-        .{ 7, -3 },
-        .{ 5, 9 },
-        .{ 37, -91 },
-        .{ -7, -3 },
-        .{ 1, 0 },
-        .{ 0, 1 },
-        .{ 4194302, -4194304 },
-    };
-    for ([_][32]u8{ zero_seed, hash_seed }) |seed| {
-        for (pairs) |p| {
-            try std.testing.expect(hash2(seed, p[0], p[1]) != hash2(seed, -p[0], -p[1]));
-        }
-    }
-}
-
-test "every seed bit participates in hash2" {
-    const x: i32 = 37;
-    const y: i32 = -91;
-    const bases = [_][32]u8{ zero_seed, hash_seed };
-    for (bases) |base| {
-        const expected = hash2(base, x, y);
-        var bit: usize = 0;
-        while (bit < 256) : (bit += 1) {
-            var mutated = base;
-            mutated[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
-            try std.testing.expect(hash2(mutated, x, y) != expected);
-        }
-    }
-}
-
-test "seed limb order is not a plain xor fold" {
-    // Reverse the eight four-byte words, leaving bytes within each word in
-    // place: a limb reorder, not a byte reversal.
-    var reversed: [32]u8 = undefined;
-    inline for (0..8) |i| {
-        @memcpy(reversed[4 * (7 - i) ..][0..4], hash_seed[4 * i ..][0..4]);
-    }
-    try std.testing.expect(hash2(hash_seed, 5, 9) != hash2(reversed, 5, 9));
-}
 
 // Test-only secret seeds; production code must never embed a private seed.
 const yield_seed = [32]u8{
