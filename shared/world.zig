@@ -1,12 +1,12 @@
-//! Public terrain v1. Independent of rendering, transport, and persistence.
+//! Public terrain v2. Independent of rendering, transport, and persistence.
 const std = @import("std");
 pub const TILE_PX: i32 = 32;
 pub const CHUNK_TILES: i32 = 16;
 pub const CHUNK_PX: i32 = TILE_PX * CHUNK_TILES;
 pub const CT: usize = CHUNK_TILES;
 pub const public_seed: [32]u8 = @splat(0);
-pub const generator_version = 1;
-pub const Tile = enum(u8) { grass, dirt, rock, tree };
+pub const generator_version = 2;
+pub const Tile = enum(u8) { grass, dirt, rock, tree, water };
 pub const Chunk = struct {
     cx: i32 = 0,
     cy: i32 = 0,
@@ -60,6 +60,8 @@ fn hash2(seed: [32]u8, x: i32, y: i32) u32 {
 const forest_spacing = 32;
 const rock_spacing = 16;
 const dirt_spacing = 8;
+const water_spacing = 32;
+const water_threshold = 16000;
 const forest_threshold = 32000;
 const rock_threshold = 51000;
 const dirt_threshold = 55000;
@@ -85,6 +87,7 @@ fn valueNoise(seed: [32]u8, domain: u8, x: i32, y: i32, comptime spacing: i32) u
     return @intCast(interpolate(top, bottom, ty));
 }
 pub fn sampleTile(seed: [32]u8, x: i32, y: i32) Tile {
+    if (valueNoise(seed, 5, x, y, water_spacing) < water_threshold) return .water;
     if (valueNoise(seed, 2, x, y, rock_spacing) >= rock_threshold) return .rock;
     const forest = valueNoise(seed, 1, x, y, forest_spacing);
     if (forest >= forest_threshold) {
@@ -163,7 +166,7 @@ test "seed limb order is not a plain xor fold" {
     try std.testing.expect(hash2(hash_seed, 5, 9) != hash2(reversed, 5, 9));
 }
 test "terrain absolute sampling crosses negative seams" {
-    inline for (.{ .{ .domain = 1, .spacing = forest_spacing }, .{ .domain = 2, .spacing = rock_spacing }, .{ .domain = 3, .spacing = dirt_spacing } }) |field| {
+    inline for (.{ .{ .domain = 1, .spacing = forest_spacing }, .{ .domain = 2, .spacing = rock_spacing }, .{ .domain = 3, .spacing = dirt_spacing }, .{ .domain = 5, .spacing = water_spacing } }) |field| {
         for ([_]i32{ -1, 0, 1 }) |gy| {
             for ([_]i32{ -1, 0, 1 }) |gx| {
                 const x = gx * field.spacing;
@@ -179,12 +182,12 @@ test "terrain absolute sampling crosses negative seams" {
     }
 }
 
-test "terrain v1 distribution correlation and fixed region checksum" {
+test "terrain v2 distribution correlation and fixed region checksum" {
     const side = 512;
     const total = side * side;
     var tiles: [total]Tile = undefined;
-    var counts: [4]u64 = @splat(0);
-    var neighbors: [4]u64 = @splat(0);
+    var counts: [5]u64 = @splat(0);
+    var neighbors: [counts.len]u64 = @splat(0);
     var forest_grass: usize = 0;
     var forest_trees: usize = 0;
     var checksum: u64 = 0xcbf29ce484222325;
@@ -207,13 +210,37 @@ test "terrain v1 distribution correlation and fixed region checksum" {
     const trees = counts[@backingInt(Tile.tree)];
     const rocks = counts[@backingInt(Tile.rock)];
     const dirt = counts[@backingInt(Tile.dirt)];
+    const water = counts[@backingInt(Tile.water)];
+    try std.testing.expect(water * 100 > total * 10 and water * 100 < total * 18);
+    try std.testing.expectEqualSlices(u64, &.{ 140315, 8281, 27388, 49919, 36241 }, &counts);
     try std.testing.expect(grass > total / 2 and grass > trees and trees > rocks and rocks > dirt and dirt > 0);
-    for ([_]Tile{ .tree, .rock, .dirt }) |tile| {
+    for ([_]Tile{ .tree, .rock, .dirt, .water }) |tile| {
         const i = @backingInt(tile);
         try std.testing.expect(neighbors[i] * total * 10 > counts[i] * counts[i] * 26);
     }
     try std.testing.expect(forest_trees > 0 and forest_grass > forest_trees / 4);
-    try std.testing.expectEqual(@as(u64, 0xec04d88c8e6885e5), checksum);
+    try std.testing.expectEqual(@as(u64, 0x2beaf359deeea5bb), checksum);
+}
+
+// Test-only v1 classification: water is the only change to terrain selection.
+fn legacyTile(seed: [32]u8, x: i32, y: i32) Tile {
+    if (valueNoise(seed, 2, x, y, rock_spacing) >= rock_threshold) return .rock;
+    const forest = valueNoise(seed, 1, x, y, forest_spacing);
+    if (forest >= forest_threshold and layoutHash(seed, 4, x, y) >> 16 < @min(56000, 22000 + forest - forest_threshold)) return .tree;
+    if (valueNoise(seed, 3, x, y, dirt_spacing) >= dirt_threshold) return .dirt;
+    return .grass;
+}
+test "water takes precedence and preserves v1 classification elsewhere" {
+    for ([_][32]u8{ public_seed, hash_seed }) |seed| {
+        for (0..256) |iy| for (0..256) |ix| {
+            const x = @as(i32, @intCast(ix)) - 128;
+            const y = @as(i32, @intCast(iy)) - 128;
+            const expected = if (valueNoise(seed, 5, x, y, water_spacing) < water_threshold) Tile.water else legacyTile(seed, x, y);
+            try std.testing.expectEqual(expected, sampleTile(seed, x, y));
+        };
+    }
+    try std.testing.expect(sampleTile(public_seed, 0, 0) != .water);
+    try std.testing.expectEqual(Tile.water, sampleTile(public_seed, 26, 0));
 }
 
 test "negative seams chunk parity and full i32 tile coordinates" {

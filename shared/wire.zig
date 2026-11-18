@@ -158,7 +158,7 @@ test "reply decoding rejects invalid boolean enum flags lengths and metadata" {
     out[29] = 2;
     try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..30], &snapshot));
     out[29] = 1;
-    out[28] = 4;
+    out[28] = 5;
     try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..30], &snapshot));
     out[28] = 2;
     out[3] = 3;
@@ -177,11 +177,23 @@ test "reply decoding rejects invalid boolean enum flags lengths and metadata" {
     var source = p.Snapshot{ .area = .{ .cx0 = -1, .cy0 = -1, .cx1 = -1, .cy1 = -1 }, .count = 1 };
     _ = encode(&out, .{ .request_id = null, .result = .{ .snapshot = &source } });
     try std.testing.expectEqual(@as(u16, 1), (try decodeResponse(out[0..106], &snapshot)).result.snapshot.count);
+    put(u32, &out, 36, 1);
+    try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..106], &snapshot));
+    put(u32, &out, 36, world.generator_version);
     out[40] ^= 1;
     try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..106], &snapshot));
     out[40] ^= 1;
     out[72] = 0;
     try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..106], &snapshot));
+}
+test "water state encoding and decoding preserves appended ordinal" {
+    var out: [30]u8 = undefined;
+    var snapshot: p.Snapshot = undefined;
+    const response = p.Response{ .request_id = @splat(0), .result = .{ .cut = .{ .x = 26, .y = 0, .terrain = .water, .cut = false } } };
+    const bytes = encode(&out, response);
+    try std.testing.expectEqual(@as(u8, 4), bytes[28]);
+    try std.testing.expectEqual(@as(u8, 0), bytes[29]);
+    try std.testing.expectEqualDeep(response, try decodeResponse(bytes, &snapshot));
 }
 test "binary golden zero ID extreme coordinates request and success" {
     var buf: [36]u8 = undefined;

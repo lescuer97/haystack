@@ -6,6 +6,7 @@ const world = shared.world;
 pub const c = @import("sqlite").c;
 const rules = @import("actions.zig");
 pub const busy_timeout_ms = 250;
+const schema_version = 4;
 pub const DbError = error{ DatabaseBusy, DatabaseFailure, SqliteOutOfMemory, IncompatibleDatabase, PoisonedConnection };
 pub const WriteStage = enum { begin, replay, rules, chunk_upsert, result_insert, commit, cleanup };
 const Unobserved = struct {
@@ -70,16 +71,16 @@ pub const Storage = struct {
             break :blk c.sqlite3_column_int(existing, 0) == 0;
         };
         if (fresh) try self.exec("CREATE TABLE metadata(id INTEGER PRIMARY KEY CHECK(id=1),schema_version INTEGER NOT NULL,generator_version INTEGER NOT NULL,public_seed BLOB NOT NULL CHECK(length(public_seed)=32)) STRICT;" ++
-            "INSERT INTO metadata VALUES(1,3,1,zeroblob(32));" ++
+            std.fmt.comptimePrint("INSERT INTO metadata VALUES(1,{d},{d},zeroblob(32));", .{ schema_version, world.generator_version }) ++
             "CREATE TABLE chunk_state(cx INTEGER NOT NULL CHECK(cx BETWEEN -134217728 AND 134217727),cy INTEGER NOT NULL CHECK(cy BETWEEN -134217728 AND 134217727),cuts BLOB NOT NULL CHECK(length(cuts)=32),PRIMARY KEY(cx,cy)) STRICT, WITHOUT ROWID;" ++
-            "CREATE TABLE action_results(request_id BLOB PRIMARY KEY CHECK(length(request_id)=16),version INTEGER NOT NULL,operation INTEGER NOT NULL CHECK(operation=1),x INTEGER NOT NULL,y INTEGER NOT NULL,result INTEGER NOT NULL CHECK(result BETWEEN 0 AND 2),terrain INTEGER NOT NULL CHECK(terrain BETWEEN 0 AND 3)) STRICT;");
+            "CREATE TABLE action_results(request_id BLOB PRIMARY KEY CHECK(length(request_id)=16),version INTEGER NOT NULL,operation INTEGER NOT NULL CHECK(operation=1),x INTEGER NOT NULL,y INTEGER NOT NULL,result INTEGER NOT NULL CHECK(result BETWEEN 0 AND 2),terrain INTEGER NOT NULL CHECK(terrain BETWEEN 0 AND 4)) STRICT;");
         const meta = self.prepare("SELECT schema_version,generator_version,public_seed FROM metadata WHERE id=1") catch |err| {
             if (err == error.SqliteOutOfMemory) return err;
             return error.IncompatibleDatabase;
         };
         {
             defer _ = c.sqlite3_finalize(meta);
-            if (c.sqlite3_step(meta) != c.SQLITE_ROW or c.sqlite3_column_int(meta, 0) != 3 or c.sqlite3_column_int(meta, 1) != world.generator_version) return error.IncompatibleDatabase;
+            if (c.sqlite3_step(meta) != c.SQLITE_ROW or c.sqlite3_column_int(meta, 0) != schema_version or c.sqlite3_column_int(meta, 1) != world.generator_version) return error.IncompatibleDatabase;
             if (c.sqlite3_column_bytes(meta, 2) != 32) return error.IncompatibleDatabase;
             const bytes: [*]const u8 = @ptrCast(c.sqlite3_column_blob(meta, 2) orelse return error.IncompatibleDatabase);
             if (!std.mem.eql(u8, bytes[0..32], &world.public_seed)) return error.IncompatibleDatabase;

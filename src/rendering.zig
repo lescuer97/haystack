@@ -27,6 +27,10 @@ const dirt_asset = "assets/Tiles/Path_Tile.png";
 const dirt_sheet_width = 48;
 const dirt_sheet_height = 96;
 const dirt_source = rl.Rectangle{ .x = 16, .y = 16, .width = 16, .height = 16 };
+const water_asset = "assets/Tiles/Water_Tile.png";
+const water_sheet_width = 48;
+const water_sheet_height = 96;
+const water_source = rl.Rectangle{ .x = 0, .y = 80, .width = 16, .height = 16 };
 const oak_asset = "assets/Outdoor decoration/Oak_Tree.png";
 const oak_sheet_width = 64;
 const oak_sheet_height = 80;
@@ -54,12 +58,19 @@ const dirt_quadrants = [4][5][2]f32{
     .{ .{ 8, 32 }, .{ 16, 32 }, .{ 8, 24 }, .{ 20, 52 }, .{ 16, 24 } },
     .{ .{ 32, 32 }, .{ 24, 32 }, .{ 32, 24 }, .{ 4, 52 }, .{ 24, 24 } },
 };
+// Water banks are thicker: concave crops shift inward to keep blue connected.
+const water_quadrants = [4][5][2]f32{
+    .{ .{ 8, 8 }, .{ 16, 8 }, .{ 8, 16 }, .{ 22, 70 }, .{ 16, 16 } },
+    .{ .{ 32, 8 }, .{ 24, 8 }, .{ 32, 16 }, .{ 2, 70 }, .{ 24, 16 } },
+    .{ .{ 8, 32 }, .{ 16, 32 }, .{ 8, 24 }, .{ 22, 50 }, .{ 16, 24 } },
+    .{ .{ 32, 32 }, .{ 24, 32 }, .{ 32, 24 }, .{ 2, 50 }, .{ 24, 24 } },
+};
 // Neighbor order NW, N, NE, W, E, SW, S, SE.
-const dirt_neighbor_offsets = [8][2]i32{
+const terrain_neighbor_offsets = [8][2]i32{
     .{ -1, -1 }, .{ 0, -1 }, .{ 1, -1 }, .{ -1, 0 },
     .{ 1, 0 },   .{ -1, 1 }, .{ 0, 1 },  .{ 1, 1 },
 };
-const dirt_quadrant_neighbors = [4][3]usize{
+const quadrant_neighbors = [4][3]usize{
     .{ 1, 3, 0 }, .{ 1, 4, 2 }, .{ 6, 3, 5 }, .{ 6, 4, 7 },
 };
 
@@ -67,35 +78,35 @@ fn isGrassGround(tile: world.Tile) bool {
     return tile == .grass or tile == .tree or tile == .rock;
 }
 
-fn isDirt(w: *const world.World, x: i32, y: i32) bool {
+fn isTerrain(w: *const world.World, x: i32, y: i32, kind: world.Tile) bool {
     if (w.get(@divFloor(x, world.CHUNK_TILES), @divFloor(y, world.CHUNK_TILES))) |chunk| {
         const lx: usize = @intCast(@mod(x, world.CHUNK_TILES));
         const ly: usize = @intCast(@mod(y, world.CHUNK_TILES));
-        return chunk.tiles[ly * world.CT + lx] == .dirt;
+        return chunk.tiles[ly * world.CT + lx] == kind;
     }
     // Prefetch normally supplies neighbors; missing residents need no allocation.
-    return terrain.sampleTile(terrain.public_seed, x, y) == .dirt;
+    return terrain.sampleTile(terrain.public_seed, x, y) == kind;
 }
 
-fn dirtNeighbors(w: *const world.World, x: i32, y: i32) [8]bool {
+fn terrainNeighbors(w: *const world.World, x: i32, y: i32, kind: world.Tile) [8]bool {
     var neighbors: [8]bool = undefined;
-    for (dirt_neighbor_offsets, 0..) |offset, i| {
-        neighbors[i] = isDirt(w, x + offset[0], y + offset[1]);
+    for (terrain_neighbor_offsets, 0..) |offset, i| {
+        neighbors[i] = isTerrain(w, x + offset[0], y + offset[1], kind);
     }
     return neighbors;
 }
 
-fn dirtQuadrantSource(quadrant: usize, neighbors: [8]bool) rl.Rectangle {
-    const indices = dirt_quadrant_neighbors[quadrant];
+fn shoreQuadrantSource(quadrant: usize, neighbors: [8]bool, material: world.Tile) rl.Rectangle {
+    const indices = quadrant_neighbors[quadrant];
     const v = neighbors[indices[0]];
     const h = neighbors[indices[1]];
     const d = neighbors[indices[2]];
     const kind: usize = if (!v and !h) 0 else if (!v) 1 else if (!h) 2 else if (!d) 3 else 4;
-    const xy = dirt_quadrants[quadrant][kind];
+    const xy = if (material == .water) water_quadrants[quadrant][kind] else dirt_quadrants[quadrant][kind];
     return .{ .x = xy[0], .y = xy[1], .width = 8, .height = 8 };
 }
 
-fn dirtQuadrantDest(x: f32, y: f32, quadrant: usize) rl.Rectangle {
+fn quadrantDest(x: f32, y: f32, quadrant: usize) rl.Rectangle {
     const half: f32 = @floatFromInt(@divExact(world.TILE_PX, 2));
     return .{
         .x = x + @as(f32, @floatFromInt(quadrant % 2)) * half,
@@ -130,6 +141,7 @@ pub const Resources = struct {
     dirt: rl.Texture2D,
     oak: rl.Texture2D,
     rock: rl.Texture2D,
+    water: rl.Texture2D,
 
     pub fn init(allocator: std.mem.Allocator) !Resources {
         const grass = try loadAtlas(allocator, grass_asset, grass_sheet_width, grass_sheet_height);
@@ -138,11 +150,14 @@ pub const Resources = struct {
         errdefer rl.unloadTexture(dirt);
         const oak = try loadAtlas(allocator, oak_asset, oak_sheet_width, oak_sheet_height);
         errdefer rl.unloadTexture(oak);
+        const rock = try loadAtlas(allocator, rock_asset, rock_sheet_width, rock_sheet_height);
+        errdefer rl.unloadTexture(rock);
         return .{
             .grass = grass,
             .dirt = dirt,
             .oak = oak,
-            .rock = try loadAtlas(allocator, rock_asset, rock_sheet_width, rock_sheet_height),
+            .rock = rock,
+            .water = try loadAtlas(allocator, water_asset, water_sheet_width, water_sheet_height),
         };
     }
 
@@ -151,6 +166,7 @@ pub const Resources = struct {
         rl.unloadTexture(self.dirt);
         rl.unloadTexture(self.oak);
         rl.unloadTexture(self.rock);
+        rl.unloadTexture(self.water);
     }
 };
 
@@ -223,35 +239,38 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
         }
     }
 
-    // Dirt crops include opaque grass corners, so need no grass underdraw.
-    var dirt_cy = vis.cy0;
-    while (dirt_cy <= vis.cy1) : (dirt_cy += 1) {
-        var dirt_cx = vis.cx0;
-        while (dirt_cx <= vis.cx1) : (dirt_cx += 1) {
-            const chunk = w.get(dirt_cx, dirt_cy) orelse continue;
-            for (chunk.tiles, 0..) |tile, i| {
-                if (tile != .dirt) continue;
-                const tx = chunk.cx * world.CHUNK_TILES + @as(i32, @intCast(i % world.CT));
-                const ty = chunk.cy * world.CHUNK_TILES + @as(i32, @intCast(i / world.CT));
-                const x: f32 = @floatFromInt(tx * world.TILE_PX);
-                const y: f32 = @floatFromInt(ty * world.TILE_PX);
-                const neighbors = dirtNeighbors(w, tx, ty);
-                if (std.mem.allEqual(bool, &neighbors, true)) {
-                    rl.drawTexturePro(resources.dirt, dirt_source, .{
-                        .x = x,
-                        .y = y,
-                        .width = world.TILE_PX,
-                        .height = world.TILE_PX,
-                    }, .{ .x = 0, .y = 0 }, 0, .white);
-                } else {
-                    for (0..4) |quadrant| {
-                        rl.drawTexturePro(resources.dirt, dirtQuadrantSource(quadrant, neighbors), dirtQuadrantDest(x, y, quadrant), .{ .x = 0, .y = 0 }, 0, .white);
+    // Both shore atlases include opaque grass corners; batch dirt, then water.
+    for ([_]world.Tile{ .dirt, .water }) |kind| {
+        const texture = if (kind == .dirt) resources.dirt else resources.water;
+        const source = if (kind == .dirt) dirt_source else water_source;
+        var cy = vis.cy0;
+        while (cy <= vis.cy1) : (cy += 1) {
+            var cx = vis.cx0;
+            while (cx <= vis.cx1) : (cx += 1) {
+                const chunk = w.get(cx, cy) orelse continue;
+                for (chunk.tiles, 0..) |tile, i| {
+                    if (tile != kind) continue;
+                    const tx = chunk.cx * world.CHUNK_TILES + @as(i32, @intCast(i % world.CT));
+                    const ty = chunk.cy * world.CHUNK_TILES + @as(i32, @intCast(i / world.CT));
+                    const x: f32 = @floatFromInt(tx * world.TILE_PX);
+                    const y: f32 = @floatFromInt(ty * world.TILE_PX);
+                    const neighbors = terrainNeighbors(w, tx, ty, kind);
+                    if (std.mem.allEqual(bool, &neighbors, true)) {
+                        rl.drawTexturePro(texture, source, .{
+                            .x = x,
+                            .y = y,
+                            .width = world.TILE_PX,
+                            .height = world.TILE_PX,
+                        }, .{ .x = 0, .y = 0 }, 0, .white);
+                    } else {
+                        for (0..4) |quadrant| {
+                            rl.drawTexturePro(texture, shoreQuadrantSource(quadrant, neighbors, kind), quadrantDest(x, y, quadrant), .{ .x = 0, .y = 0 }, 0, .white);
+                        }
                     }
                 }
             }
         }
     }
-
     // Shadows and canopies reach beyond their anchor chunk. Resident reads only.
     const sprite_range = vis.expanded(1);
     var rock_cy = sprite_range.cy0;
@@ -913,35 +932,46 @@ test "grass is a whole tile at 2x beneath grass trees and rocks" {
     try std.testing.expect(isGrassGround(.tree));
     try std.testing.expect(!isGrassGround(.dirt));
     try std.testing.expect(isGrassGround(.rock));
+    try std.testing.expect(!isGrassGround(.water));
 }
 
-test "all dirt neighbor patterns select bounded atlas quadrants at 2x" {
+test "all 256 dirt and water neighbor patterns share bounded shore quadrants at 2x" {
     try std.testing.expectEqualDeep(rl.Rectangle{ .x = 16, .y = 16, .width = 16, .height = 16 }, dirt_source);
     try std.testing.expect(dirt_source.x + dirt_source.width <= dirt_sheet_width);
     try std.testing.expect(dirt_source.y + dirt_source.height <= dirt_sheet_height);
     try std.testing.expectEqual(@as(f32, world.TILE_PX), dirt_source.width * 2);
     try std.testing.expectEqual(@as(f32, world.TILE_PX), dirt_source.height * 2);
+    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 0, .y = 80, .width = 16, .height = 16 }, water_source);
+    try std.testing.expect(water_source.x + water_source.width <= water_sheet_width);
+    try std.testing.expect(water_source.y + water_source.height <= water_sheet_height);
+    try std.testing.expectEqual(@as(f32, world.TILE_PX), water_source.width * 2);
+    try std.testing.expectEqual(@as(f32, world.TILE_PX), water_source.height * 2);
     const expected_kinds = [_]usize{ 0, 2, 1, 3, 0, 2, 1, 4 };
     for (0..256) |mask| {
         var neighbors: [8]bool = undefined;
         for (&neighbors, 0..) |*present, i| present.* = (mask & (@as(usize, 1) << @intCast(i))) != 0;
-        for (dirt_quadrant_neighbors, 0..) |indices, q| {
-            const bits = @as(usize, @intFromBool(neighbors[indices[0]])) |
-                (@as(usize, @intFromBool(neighbors[indices[1]])) << 1) |
-                (@as(usize, @intFromBool(neighbors[indices[2]])) << 2);
-            const expected = dirt_quadrants[q][expected_kinds[bits]];
-            const src = dirtQuadrantSource(q, neighbors);
-            try std.testing.expectEqual(expected[0], src.x);
-            try std.testing.expectEqual(expected[1], src.y);
-            try std.testing.expect(src.x >= 0 and src.x + src.width <= dirt_sheet_width);
-            try std.testing.expect(src.y >= 0 and src.y + src.height <= dirt_sheet_height);
-            const dest = dirtQuadrantDest(-32, -32, q);
-            try std.testing.expectEqual(@as(f32, 8), src.width);
-            try std.testing.expectEqual(@as(f32, 8), src.height);
-            try std.testing.expectEqual(src.width * 2, dest.width);
-            try std.testing.expectEqual(src.height * 2, dest.height);
-            try std.testing.expectEqual(@as(f32, -32) + @as(f32, @floatFromInt(q % 2)) * 16, dest.x);
-            try std.testing.expectEqual(@as(f32, -32) + @as(f32, @floatFromInt(q / 2)) * 16, dest.y);
+        for ([_]world.Tile{ .dirt, .water }) |material| {
+            const quadrants = if (material == .water) water_quadrants else dirt_quadrants;
+            for (quadrant_neighbors, 0..) |indices, q| {
+                const bits = @as(usize, @intFromBool(neighbors[indices[0]])) |
+                    (@as(usize, @intFromBool(neighbors[indices[1]])) << 1) |
+                    (@as(usize, @intFromBool(neighbors[indices[2]])) << 2);
+                const expected = quadrants[q][expected_kinds[bits]];
+                const src = shoreQuadrantSource(q, neighbors, material);
+                try std.testing.expectEqual(expected[0], src.x);
+                try std.testing.expectEqual(expected[1], src.y);
+                try std.testing.expect(src.x >= 0 and src.x + src.width <= dirt_sheet_width);
+                try std.testing.expect(src.y >= 0 and src.y + src.height <= dirt_sheet_height);
+                try std.testing.expect(src.x >= 0 and src.x + src.width <= water_sheet_width);
+                try std.testing.expect(src.y >= 0 and src.y + src.height <= water_sheet_height);
+                const dest = quadrantDest(-32, -32, q);
+                try std.testing.expectEqual(@as(f32, 8), src.width);
+                try std.testing.expectEqual(@as(f32, 8), src.height);
+                try std.testing.expectEqual(src.width * 2, dest.width);
+                try std.testing.expectEqual(src.height * 2, dest.height);
+                try std.testing.expectEqual(@as(f32, -32) + @as(f32, @floatFromInt(q % 2)) * 16, dest.x);
+                try std.testing.expectEqual(@as(f32, -32) + @as(f32, @floatFromInt(q / 2)) * 16, dest.y);
+            }
         }
     }
 }
@@ -956,67 +986,88 @@ test "dirt concaves use the measured opaque crops" {
     for (cases, 0..) |case, quadrant| {
         var neighbors: [8]bool = @splat(true);
         neighbors[case.diagonal] = false;
-        try std.testing.expectEqualDeep(case.expected, dirtQuadrantSource(quadrant, neighbors));
+        try std.testing.expectEqualDeep(case.expected, shoreQuadrantSource(quadrant, neighbors, .dirt));
     }
 }
 
-test "dirt neighbors cross negative chunk boundaries and match fallback terrain" {
+test "water concaves shift inside thicker banks to preserve connected blue" {
+    const expected = [4][2]f32{ .{ 22, 70 }, .{ 2, 70 }, .{ 22, 50 }, .{ 2, 50 } };
+    for (quadrant_neighbors, expected, 0..) |indices, xy, q| {
+        var neighbors: [8]bool = @splat(true);
+        neighbors[indices[2]] = false;
+        try std.testing.expectEqualDeep(rl.Rectangle{ .x = xy[0], .y = xy[1], .width = 8, .height = 8 }, shoreQuadrantSource(q, neighbors, .water));
+        try std.testing.expectEqualDeep(xy, water_quadrants[q][3]);
+    }
+}
+
+test "dirt and water neighbors cross negative chunk boundaries and match fallback terrain" {
     var resident = try world.World.init(std.testing.allocator, 36);
     defer resident.deinit();
     try resident.stream(.{ .cx0 = -1, .cy0 = -1, .cx1 = 0, .cy1 = 0 });
     var absent = try world.World.init(std.testing.allocator, 0);
     defer absent.deinit();
     var found_dirt = false;
+    var found_water = false;
     var y: i32 = -64;
     while (y <= 64) : (y += 1) {
         var x: i32 = -64;
         while (x <= 64) : (x += 1) {
             const sampled = terrain.sampleTile(terrain.public_seed, x, y);
             found_dirt = found_dirt or sampled == .dirt;
-            try std.testing.expectEqual(sampled == .dirt, isDirt(&resident, x, y));
-            try std.testing.expectEqual(isDirt(&resident, x, y), isDirt(&absent, x, y));
-            try std.testing.expectEqualDeep(dirtNeighbors(&resident, x, y), dirtNeighbors(&absent, x, y));
+            found_water = found_water or sampled == .water;
+            for ([_]world.Tile{ .dirt, .water }) |kind| {
+                try std.testing.expectEqual(sampled == kind, isTerrain(&resident, x, y, kind));
+                try std.testing.expectEqual(isTerrain(&resident, x, y, kind), isTerrain(&absent, x, y, kind));
+                try std.testing.expectEqualDeep(terrainNeighbors(&resident, x, y, kind), terrainNeighbors(&absent, x, y, kind));
+            }
         }
     }
     try std.testing.expect(found_dirt);
+    try std.testing.expect(found_water);
 
     // Owned fixture chunks: (-1,-1)'s east/south/diagonal cross chunk zero.
-    var it = resident.by_key.valueIterator();
-    while (it.next()) |chunk| @memset(&chunk.*.tiles, .dirt);
-    var neighbors = dirtNeighbors(&resident, -1, -1);
-    try std.testing.expect(std.mem.allEqual(bool, &neighbors, true));
-    for (0..4) |q| {
-        const src = dirtQuadrantSource(q, neighbors);
-        try std.testing.expectEqual(dirt_quadrants[q][4][0], src.x);
-        try std.testing.expectEqual(dirt_quadrants[q][4][1], src.y);
-    }
-    it = resident.by_key.valueIterator();
-    while (it.next()) |chunk| {
-        if (chunk.*.cx == 0 and chunk.*.cy == 0) chunk.*.tiles[0] = .grass;
-    }
-    neighbors = dirtNeighbors(&resident, -1, -1);
-    for (0..4) |q| {
-        const src = dirtQuadrantSource(q, neighbors);
-        const expected = dirt_quadrants[q][if (q == 3) 3 else 4];
-        try std.testing.expectEqual(expected[0], src.x);
-        try std.testing.expectEqual(expected[1], src.y);
-    }
-    it = resident.by_key.valueIterator();
-    while (it.next()) |chunk| {
-        if (chunk.*.cx == 0 and chunk.*.cy == -1) chunk.*.tiles[15 * world.CT] = .tree;
-    }
-    neighbors = dirtNeighbors(&resident, -1, -1);
-    try std.testing.expect(!neighbors[4]); // Trees never connect to dirt.
-    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 32, .y = 16, .width = 8, .height = 8 }, dirtQuadrantSource(1, neighbors));
-    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 32, .y = 24, .width = 8, .height = 8 }, dirtQuadrantSource(3, neighbors));
-    it = resident.by_key.valueIterator();
-    while (it.next()) |chunk| @memset(&chunk.*.tiles, .grass);
-    neighbors = dirtNeighbors(&resident, -1, -1);
-    try std.testing.expect(std.mem.allEqual(bool, &neighbors, false));
-    for (0..4) |q| {
-        const src = dirtQuadrantSource(q, neighbors);
-        try std.testing.expectEqual(dirt_quadrants[q][0][0], src.x);
-        try std.testing.expectEqual(dirt_quadrants[q][0][1], src.y);
+    for ([_]world.Tile{ .dirt, .water }) |kind| {
+        const quadrants = if (kind == .water) water_quadrants else dirt_quadrants;
+        var it = resident.by_key.valueIterator();
+        while (it.next()) |chunk| @memset(&chunk.*.tiles, kind);
+        var neighbors = terrainNeighbors(&resident, -1, -1, kind);
+        try std.testing.expect(std.mem.allEqual(bool, &neighbors, true));
+        const other: world.Tile = if (kind == .dirt) .water else .dirt;
+        const other_neighbors = terrainNeighbors(&resident, -1, -1, other);
+        try std.testing.expect(std.mem.allEqual(bool, &other_neighbors, false));
+        for (0..4) |q| {
+            const src = shoreQuadrantSource(q, neighbors, kind);
+            try std.testing.expectEqual(quadrants[q][4][0], src.x);
+            try std.testing.expectEqual(quadrants[q][4][1], src.y);
+        }
+        it = resident.by_key.valueIterator();
+        while (it.next()) |chunk| {
+            if (chunk.*.cx == 0 and chunk.*.cy == 0) chunk.*.tiles[0] = .grass;
+        }
+        neighbors = terrainNeighbors(&resident, -1, -1, kind);
+        for (0..4) |q| {
+            const src = shoreQuadrantSource(q, neighbors, kind);
+            const expected = quadrants[q][if (q == 3) 3 else 4];
+            try std.testing.expectEqual(expected[0], src.x);
+            try std.testing.expectEqual(expected[1], src.y);
+        }
+        it = resident.by_key.valueIterator();
+        while (it.next()) |chunk| {
+            if (chunk.*.cx == 0 and chunk.*.cy == -1) chunk.*.tiles[15 * world.CT] = .tree;
+        }
+        neighbors = terrainNeighbors(&resident, -1, -1, kind);
+        try std.testing.expect(!neighbors[4]); // Trees never connect to dirt or water.
+        try std.testing.expectEqualDeep(rl.Rectangle{ .x = 32, .y = 16, .width = 8, .height = 8 }, shoreQuadrantSource(1, neighbors, kind));
+        try std.testing.expectEqualDeep(rl.Rectangle{ .x = 32, .y = 24, .width = 8, .height = 8 }, shoreQuadrantSource(3, neighbors, kind));
+        it = resident.by_key.valueIterator();
+        while (it.next()) |chunk| @memset(&chunk.*.tiles, .grass);
+        neighbors = terrainNeighbors(&resident, -1, -1, kind);
+        try std.testing.expect(std.mem.allEqual(bool, &neighbors, false));
+        for (0..4) |q| {
+            const src = shoreQuadrantSource(q, neighbors, kind);
+            try std.testing.expectEqual(quadrants[q][0][0], src.x);
+            try std.testing.expectEqual(quadrants[q][0][1], src.y);
+        }
     }
 }
 

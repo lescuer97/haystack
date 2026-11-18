@@ -20,16 +20,24 @@ test "BLOB id persistence replays original successes terminal errors conflicts a
     var fixture = try Fixture.init();
     defer fixture.deinit();
     const db = &fixture.application.contexts[0].db;
-    var original: [4]p.CutResult = undefined;
-    var requests: [4]p.Request = undefined;
-    for ([_]world.Tile{ .grass, .tree, .rock, .dirt }, 0..) |terrain, i| {
+    const terrains = [_]world.Tile{ .grass, .tree, .rock, .dirt, .water };
+    var original: [terrains.len]p.CutResult = undefined;
+    var requests: [terrains.len]p.Request = undefined;
+    var before_water: p.Snapshot = undefined;
+    var after_water: p.Snapshot = undefined;
+    for (terrains, 0..) |terrain, i| {
         const tile = find(terrain);
+        if (terrain == .water) try db.readArea(tileArea(tile), &before_water);
         requests[i] = request(i, tile.x, tile.y);
         original[i] = try db.cut(requests[i]);
         if (terrain == .grass or terrain == .tree) {
             try std.testing.expect(original[i].success.cut);
             try std.testing.expectEqual(terrain, original[i].success.terrain);
         } else try std.testing.expectEqual(p.ErrorCode.not_cuttable, original[i].failure.code);
+        if (terrain == .water) {
+            try db.readArea(tileArea(tile), &after_water);
+            try std.testing.expectEqualDeep(before_water, after_water);
+        }
     }
     const tile = find(.grass);
     const already = try db.cut(request(100, tile.x, tile.y));
@@ -38,6 +46,8 @@ test "BLOB id persistence replays original successes terminal errors conflicts a
     fixture.application = try App.init(fixture.io, fixture.path, fixture.buffers);
     const reopened = &fixture.application.contexts[0].db;
     for (original, requests) |result, req| try std.testing.expectEqualDeep(result, try reopened.cut(req));
+    try reopened.readArea(tileArea(find(.water)), &after_water);
+    try std.testing.expectEqualDeep(before_water, after_water);
     try std.testing.expectEqualDeep(already, try reopened.cut(request(100, tile.x, tile.y)));
     try std.testing.expectEqual(p.ErrorCode.request_id_conflict, (try reopened.cut(request(0, tile.x + 1, tile.y))).failure.code);
     var changed = requests[0];
@@ -385,6 +395,56 @@ test "post-ready codec rules storage have no upstream allocator capability" {
     const area = p.Request{ .request_id = @splat(0), .operation = .{ .read_area = .{ .cx0 = -4, .cy0 = -4, .cx1 = 3, .cy1 = 3 } } };
     for (0..64) |_| try std.testing.expectEqual(@as(usize, 2122), context.handle(area).len);
     std.debug.print("BUDGET,sqlite_highwater={d},app_context_bytes={d}\n", .{ fixture.runtime.highWater(), @sizeOf([4]Context) });
+}
+
+test "fresh database has schema 4 generator 2 and public zero seed" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const db = &fixture.application.contexts[0].db;
+    var stmt: ?*c.sqlite3_stmt = null;
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db.db, "SELECT id,schema_version,generator_version,public_seed FROM metadata", -1, &stmt, null));
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 0));
+    try std.testing.expectEqual(@as(i64, 4), c.sqlite3_column_int64(stmt, 1));
+    try std.testing.expectEqual(@as(i64, 2), c.sqlite3_column_int64(stmt, 2));
+    try std.testing.expectEqual(@as(c_int, 32), c.sqlite3_column_bytes(stmt, 3));
+    const seed: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 3).?);
+    try std.testing.expectEqualSlices(u8, &world.public_seed, seed[0..32]);
+    try std.testing.expectEqual(c.SQLITE_DONE, c.sqlite3_step(stmt));
+}
+
+test "old and independently mismatched versions reject while retaining metadata chunks and IDs" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const db = &fixture.application.contexts[0].db;
+    const tile = find(.grass);
+    const req = request(88, tile.x, tile.y);
+    try std.testing.expect((try db.cut(req)) == .success);
+    const versions = [_][2]i32{ .{ 3, 1 }, .{ 4, 1 }, .{ 3, 2 }, .{ 4, 3 }, .{ 5, 2 } };
+    for (versions) |version| {
+        var sql_buffer: [128]u8 = undefined;
+        try db.exec(try std.fmt.bufPrintSentinel(&sql_buffer, "UPDATE metadata SET schema_version={d},generator_version={d}", .{ version[0], version[1] }, 0));
+        var reopened = try storage.Storage.open(fixture.path);
+        defer reopened.close();
+        try std.testing.expectError(error.IncompatibleDatabase, reopened.initialize());
+        var stmt: ?*c.sqlite3_stmt = null;
+        try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(db.db, "SELECT schema_version,generator_version,(SELECT count(*) FROM chunk_state),(SELECT count(*) FROM action_results),cuts FROM metadata,chunk_state", -1, &stmt, null));
+        defer _ = c.sqlite3_finalize(stmt);
+        try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+        try std.testing.expectEqual(@as(i64, version[0]), c.sqlite3_column_int64(stmt, 0));
+        try std.testing.expectEqual(@as(i64, version[1]), c.sqlite3_column_int64(stmt, 1));
+        try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 2));
+        try std.testing.expectEqual(@as(i64, 1), c.sqlite3_column_int64(stmt, 3));
+        const bitmap: [*]const u8 = @ptrCast(c.sqlite3_column_blob(stmt, 4).?);
+        var expected: [32]u8 = @splat(0);
+        const bit: usize = @intCast(@mod(tile.y, 16) * 16 + @mod(tile.x, 16));
+        expected[bit / 8] |= @as(u8, 1) << @as(u3, @intCast(bit % 8));
+        try std.testing.expectEqual(@as(c_int, 32), c.sqlite3_column_bytes(stmt, 4));
+        try std.testing.expectEqualSlices(u8, &expected, bitmap[0..32]);
+        try std.testing.expectEqual(c.SQLITE_DONE, c.sqlite3_step(stmt));
+        try std.testing.expect((try db.cut(req)) == .success);
+    }
 }
 
 test "schema 2 is rejected without rewriting existing data" {

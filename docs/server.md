@@ -12,9 +12,9 @@ zig build run-server -Dgame=false -- /absolute/local/path/world.sqlite3
 
 Default database: `haystack.sqlite3`, local filesystem only. Standalone endpoint:
 **ws://127.0.0.1:9224/?pubkey=<66 hex characters>**. The process bind address
-and database-path CLI argument are unchanged. Game/Raylib targets and terrain checksum
-`0xec04d88c8e6885e5` are unchanged. No client networking/rendering changes,
-authentication, rewards, private gameplay, regrowth or inventory are included.
+and database-path CLI argument are unchanged. Terrain generator v2 adds water;
+its region checksum is `0x2beaf359deeea5bb` (see [world.md](world.md)). No client
+networking, authentication, rewards, private gameplay, regrowth or inventory are included.
 Loopback is not authentication: local processes and browsers may modify this
 world. Do not expose it as a production security boundary.
 
@@ -79,7 +79,7 @@ failures may close the connection without a structured reply.
 | 131 location_updated | none; flags=1 and echoed request ID required | 20 |
 | 255 error | code:u16, current_present:u8, optional state:10 | 23 or 33 |
 
-Terrain values: grass=0, dirt=1, rock=2, tree=3. Booleans are strictly 0/1.
+Terrain values: grass=0, dirt=1, rock=2, tree=3, water=4. Booleans are strictly 0/1.
 Only `already_cut` carries current state (the same ten-byte layout as kind 129's
 payload). Error numbers are frozen, never silently renumbered:
 
@@ -91,7 +91,8 @@ payload). Error numbers are frozen, never silently renumbered:
 Snapshots contain **every chunk**, including empty chunks, in increasing cy then
 cx. Rectangle is inclusive, valid size 1..64 chunks. Metadata offsets are
 rectangle=20, generator version=36, public seed=40, chunk count=72, bitmaps=74.
-Generator v1 uses the public all-zero 32-byte seed. Each chunk has exactly
+Generator v2 uses the public all-zero 32-byte seed; v1 snapshots are rejected.
+Wire framing and protocol version remain v1. Each chunk has exactly
 32 bytes: bit `local_y*16+local_x`, least-significant bit first. One means cut;
 zero is authoritative uncut, not an omitted update. Replace the rectangle's
 previous delta view. One consistent SELECT fills a zeroed fixed snapshot;
@@ -109,21 +110,25 @@ lengths; reply decoding also checks snapshot metadata, count and rectangle.
 ## Rules and durability
 
 Only generated grass/tree can be cut, permanently preserving terrain with
-`cut:true`. Dirt/rock reject; another ID for a cut tile gets `already_cut`.
+`cut:true`. Dirt/rock/water reject with `not_cuttable`; another ID for a cut tile gets `already_cut`.
 A valid typed cut ID binds `(version,operation,x,y)`. A sixteen-byte SQL BLOB key
 stores the original typed terminal success or game error, not encoded bytes.
 Same ID/payload replays that original result after restart; an original success
 does not become `already_cut`. Changed valid payload conflicts before mutation.
 Reads, malformed requests and transient DB/internal errors are not cached.
 
-Development schema **v3** has version/seed metadata, `chunk_state(cx,cy,cuts)`
-and unchanged BLOB-ID action results. `chunk_state` is STRICT, WITHOUT ROWID,
+Development schema **v4**, generator **v2**, has version/seed metadata,
+`chunk_state(cx,cy,cuts)` and BLOB-ID action results accepting terrain ordinals 0..4.
+`chunk_state` is STRICT, WITHOUT ROWID,
 with primary key `(cx,cy)`, bounded integer chunk coordinates and exactly 32 BLOB
 bytes per occupied chunk. Missing rows mean all-zero uncut bitmaps. There is no
-authoritative per-tile cuts table or separate area index. Existing schema v2
-databases refuse startup with IncompatibleDatabase: no migration, conversion,
-deletion or rewrite is performed. Keep old databases separately; use a new path
-for development v3. Retained chunks/IDs still have uncapped disk growth.
+authoritative per-tile cuts table or separate area index. Existing schema v2/v3,
+generator v1, or independently mismatched schema/generator versions refuse startup
+with IncompatibleDatabase: no automatic migration, relabeling, deletion or reset
+is performed. Existing metadata and gameplay rows are preserved; initialization
+may still enable WAL before checking compatibility, so the database files are not
+promised byte-immutable. Keep old databases separately; use a fresh database path
+for schema v4/generator v2. Retained chunks/IDs still have uncapped disk growth.
 
 WAL, `synchronous=FULL`, 250 ms busy timeout. `BEGIN IMMEDIATE`, chunk bitmap
 read/modify/upsert and terminal result insertion are atomic; the write transaction

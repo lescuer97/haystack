@@ -16,8 +16,8 @@ const terrain = @import("shared").world;
 
 // ── world constants ──────────────────────────────────────────────────────────
 
-/// One tile is 32×32 world pixels. Debug rendering draws a terrain letter at
-/// each tile centre, plus optional grid lines and chunk borders in this space.
+/// One tile is 32×32 world pixels, rendered as terrain art with optional debug
+/// grid lines and chunk borders in this space.
 pub const TILE_PX = terrain.TILE_PX;
 
 /// A chunk is 16×16 tiles (512×512 pixels).
