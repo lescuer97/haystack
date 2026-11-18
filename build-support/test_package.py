@@ -106,7 +106,7 @@ class PackageTests(unittest.TestCase):
     def test_missing_shared_server_and_vendor_inputs_are_rejected(self):
         base = Path("/tmp/opencode")
         for missing in ("shared/world.zig", "server/main.zig", "build/server.zig", "build/shared.zig",
-                        "server/ws_auth.zig", "vendor/zig-sqlite/sqlite.zig"):
+                        "server/ws_auth.zig", "server/world_state.zig", "server/world_state_tests.zig"):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory(dir=base if base.is_dir() else None) as temporary:
                 self.assertIn(missing, package.REQUIRED)
                 archive = Path(temporary) / "missing.tar"

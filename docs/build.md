@@ -18,9 +18,7 @@ a selected missing Rust toolchain fails the server build without provisioning it
 | `zig build test` | Desktop application tests |
 | `zig build server -Dgame=false` | Build/install only `zig-out/bin/haystack_server`; requires the native Rust/CDK toolchain, C ABI and native target policy, but no Raylib or browser checks (see [server prerequisites](server.md)) |
 | `zig build run-server -Dgame=false -- ...` | Explicitly run the standalone local server |
-| `zig build test-server -Dgame=false` | Five socket-free test legs: server core (including real-wallet coexistence), shared, native-storage helpers, bounded WebSocket and application WebSocket memory tests; also audits the SQLite namespace |
-| `zig build build-bench-server -Dgame=false -Doptimize=ReleaseSafe` | Build/install the opt-in benchmark without running it |
-| `zig build bench-server -Dgame=false -Doptimize=ReleaseSafe -- ...` | Explicit opt-in benchmark execution; never part of default builds/tests |
+| `zig build test-server -Dgame=false` | Socket-free server core (including real-wallet ownership and volatile world), shared, native-storage helpers and bounded WebSocket memory tests |
 | `zig build test-wallet` | Native Rust suite, C-header check, Zig wallet/Spilman ABI tests |
 | `zig build test -Dplatform=wasm` | Isolated browser fixture, database conformance and Node tests, ephemeral fake mint and Chromium tests; exits nonzero for three known send/swap recovery assertions |
 | `zig build test-storage -Dplatform=wasm` | Node-only settings/content bridge tests against an in-memory IndexedDB (no Chromium) |
@@ -60,7 +58,7 @@ but only explicit server steps install or run server artifacts. See
 consumer's target and optimization. Desktop creates it after macOS deployment
 target normalization, importing it into both application roots and testing it
 explicitly. The Wasm renderer imports its own Wasm-targeted instance; no native
-server or SQLite module enters either client graph. Server tests also explicitly
+server world module enters either client graph. Server tests also explicitly
 run the shared tests. Client residency remains separate from server persistence.
 
 | | Desktop | Wasm |

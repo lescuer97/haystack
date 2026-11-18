@@ -33,12 +33,13 @@ class GraphIsolationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         step_help = result.stdout.split("Steps:\n", 1)[1].split("\nProject-Specific Options:", 1)[0]
         steps = {line.split()[0] for line in step_help.splitlines() if line.split()}
-        for step in ("server", "run-server", "test-server", "build-bench-server", "bench-server", "setup"):
+        for step in ("server", "run-server", "test-server", "setup"):
             self.assertIn(step, steps)
         for step in ("desktop", "run", "test", "wallet", "header-check", "test-wallet",
                      "test-spilman", "browser", "renderer", "test-mint", "test-build", "test-package",
                      "wasm", "test-storage", "browser-fixture", "wallet-fixture", "test-onboarding",
-                     "test-wallet-ui", "test-withdrawal-ui", "test-qr-portability", "test-platform"):
+                     "test-wallet-ui", "test-withdrawal-ui", "test-qr-portability", "test-platform",
+                     "build-bench-server", "bench-server"):
             self.assertNotIn(step, steps)
 
     def test_server_only_build_requires_selected_rust_toolchain_without_provisioning(self):
@@ -80,7 +81,7 @@ class GraphIsolationTests(unittest.TestCase):
 
     def test_default_install_does_not_install_server(self):
         # No game means the default install should be empty, even though all
-        # five explicit server steps are available. Never run the server.
+        # three explicit server steps are available. Never run the server.
         base = Path("/tmp/opencode")
         with tempfile.TemporaryDirectory(dir=base if base.is_dir() else None) as prefix:
             result = subprocess.run(
@@ -97,8 +98,10 @@ class GraphIsolationTests(unittest.TestCase):
     @unittest.skipUnless(SUPPORTED_DESKTOP_HOST, "desktop host is not supported")
     def test_desktop_does_not_expose_browser_tools(self):
         self.assertIn("header-check", self.desktop)
-        for step in ("server", "run-server", "test-server", "build-bench-server", "bench-server"):
+        for step in ("server", "run-server", "test-server"):
             self.assertRegex(self.desktop, rf"(?m)^  {step}\s")
+        for step in ("build-bench-server", "bench-server"):
+            self.assertNotRegex(self.desktop, rf"(?m)^  {step}\s")
         self.assertNotIn("-Dwasm-bindgen", self.desktop)
         self.assertNotIn("test-mint", self.desktop)
         self.assertNotIn("Provision pinned Rust, Wasm target", self.desktop)

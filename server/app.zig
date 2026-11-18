@@ -2,39 +2,34 @@
 const std = @import("std");
 const shared = @import("shared");
 const p = shared.protocol;
-const Storage = @import("storage.zig").Storage;
+const WorldState = @import("world_state.zig").WorldState;
 const actions = @import("actions.zig");
 const sessions = @import("sessions.zig");
 pub const default_budget = 64 * 1024;
 pub const Context = struct {
     leased: bool = false,
-    db: Storage,
+    state: WorldState = .{},
     response: [p.max_response_bytes]u8 = undefined,
     snapshot: p.Snapshot = undefined,
     pub fn handle(self: *Context, req: p.Request) []const u8 {
-        return shared.wire.encode(&self.response, actions.handle(&self.db, &self.snapshot, req));
+        return shared.wire.encode(&self.response, actions.handle(&self.state, &self.snapshot, req));
     }
 };
 pub const Layout = struct { context: Context, registry: sessions.Registry };
 pub const App = struct {
     /// Borrowed from main, never closed here; fixtures need not provision one.
     wallet: ?*const @import("wallet.zig").Wallet = null,
-    database_path: [:0]const u8,
     context: *Context,
     registry: *sessions.Registry,
-    pub fn init(io: std.Io, path: [:0]const u8, buffers: []align(@alignOf(Layout)) u8) !App {
+    pub fn init(io: std.Io, buffers: []align(@alignOf(Layout)) u8) !App {
         if (buffers.len < @sizeOf(Layout)) return error.InsufficientApplicationBudget;
         const layout: *Layout = @ptrCast(buffers.ptr);
         layout.registry = .{ .io = io };
         const context = &layout.context;
-        context.* = .{ .db = try Storage.open(path) };
-        errdefer context.db.close();
-        try context.db.initialize();
-        try context.db.ready();
-        return .{ .database_path = path, .context = context, .registry = &layout.registry };
+        context.* = .{};
+        return .{ .context = context, .registry = &layout.registry };
     }
     pub fn deinit(self: *App) void {
-        self.context.db.close();
         // The server drains callbacks before destroying the application.
         self.registry.slots = @splat(.{});
     }
@@ -46,23 +41,10 @@ pub const App = struct {
     pub fn lease(self: *App) ?*Context {
         const context = self.context;
         if (@cmpxchgStrong(bool, &context.leased, false, true, .acquire, .monotonic) != null) return null;
-        if (context.db.poisoned) {
-            self.release(context);
-            return null;
-        }
         return context;
     }
     pub fn release(self: *App, context: *Context) void {
-        if (context.db.poisoned) {
-            context.db.close();
-            context.db = Storage.open(self.database_path) catch {
-                @atomicStore(bool, &context.leased, false, .release);
-                return;
-            };
-            context.db.ready() catch {
-                context.db.close();
-            };
-        }
+        _ = self;
         @atomicStore(bool, &context.leased, false, .release);
     }
 };

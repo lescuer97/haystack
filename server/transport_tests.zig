@@ -7,7 +7,6 @@ const p = shared.protocol;
 const Handler = @import("transport.zig").Handler;
 const Fixture = @import("fixture.zig").Fixture;
 const sessions = @import("sessions.zig");
-const c = @import("storage.zig").c;
 const upgrade_headers = "Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
 const many_headers = blk: {
     var bytes: [29 * 6]u8 = undefined;
@@ -207,12 +206,9 @@ test "fixed buffer authentication challenge proof ACK claims and failure cleanup
     try std.testing.expect(auth_deadline.compare(.gt, handler.deadline));
     try transport.checkDeadline(std.testing.io, auth_deadline);
 }
-fn rows(f: *Fixture) !i64 {
-    var stmt: ?*c.sqlite3_stmt = null;
-    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(f.application.context.db.db, "SELECT (SELECT count(*) FROM action_results)+(SELECT count(*) FROM chunk_state)", -1, &stmt, null));
-    defer _ = c.sqlite3_finalize(stmt);
-    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
-    return c.sqlite3_column_int64(stmt, 0);
+fn stateCount(f: *Fixture) usize {
+    const state = &f.application.context.state;
+    return state.chunk_count + state.replay_count;
 }
 test "production nonce initialization reserves no identity and cleanup is idempotent" {
     var fixture = try Fixture.init();
@@ -229,11 +225,11 @@ test "production nonce initialization reserves no identity and cleanup is idempo
     fresh.close();
     for (fixture.application.registry.slots) |slot| try std.testing.expect(!slot.occupied);
 }
-test "production location helper bypasses sole leased database no replay cache or durable state" {
+test "production location helper bypasses sole leased world with no replay state" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     const app = &fixture.application;
-    const before = try rows(&fixture);
+    const before = stateCount(&fixture);
     const held = app.lease().?;
     const handle = try app.registry.claim(@splat(0));
     var buf: [33]u8 = undefined;
@@ -250,21 +246,21 @@ test "production location helper bypasses sole leased database no replay cache o
     app.release(held);
     const reused = app.lease().?;
     app.release(reused);
-    try std.testing.expectEqual(before, try rows(&fixture));
+    try std.testing.expectEqual(before, stateCount(&fixture));
     const wrong = p.Request{ .request_id = @splat(0), .operation = .{ .cut = .{ .x = 0, .y = 0 } } };
     try std.testing.expectEqual(p.ErrorCode.invalid_request, app.handleLocation(handle, wrong).result.failure.code);
     const loc = p.Request{ .request_id = @splat(0), .operation = .{ .update_location = .{ .x = 1, .y = 2 } } };
-    // Accidental DB dispatch must reject without touching even undefined DB/snapshot storage.
-    var db: @import("storage.zig").Storage = undefined;
-    try std.testing.expectEqual(p.ErrorCode.invalid_request, @import("actions.zig").handle(&db, &snapshot, loc).result.failure.code);
+    // Accidental world dispatch rejects without inspecting undefined state.
+    var state: @import("world_state.zig").WorldState = undefined;
+    try std.testing.expectEqual(p.ErrorCode.invalid_request, @import("actions.zig").handle(&state, &snapshot, loc).result.failure.code);
     app.registry.release(handle);
     try std.testing.expectEqual(p.ErrorCode.invalid_request, app.handleLocation(handle, loc).result.failure.code);
-    try std.testing.expectEqual(before, try rows(&fixture));
+    try std.testing.expectEqual(before, stateCount(&fixture));
 }
 test "production proof codec rejects malformed first messages without gameplay or claims" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const before = try rows(&fixture);
+    const before = stateCount(&fixture);
     var dummy: ws = undefined;
     var handler = try Handler.init(&dummy, &fixture.application);
     handler.deadline = transport.freshDeadline(std.testing.io);
@@ -279,13 +275,13 @@ test "production proof codec rejects malformed first messages without gameplay o
     proof[0] = 0xf1;
     try std.testing.expectError(error.InvalidAuthentication, handler.clientMessage(proof[0..98], .text));
     // Invalid compressed prefix/point, no
-    // connection lifecycle access, no wallet, no DB work or identity admission.
+    // connection lifecycle access, no wallet, no world work or identity admission.
     try std.testing.expectError(error.InvalidAuthentication, handler.clientMessage(proof[0..98], .binary));
     proof[1] = 2;
     @memset(proof[2..34], 0xff);
     try std.testing.expectError(error.InvalidAuthentication, handler.clientMessage(proof[0..98], .binary));
     for (fixture.application.registry.slots) |slot| try std.testing.expect(!slot.occupied);
-    try std.testing.expectEqual(before, try rows(&fixture));
+    try std.testing.expectEqual(before, stateCount(&fixture));
     // Failure after provisional admission (e.g. ACK write/expiry) uses the
     // ordinary close hook and clears exactly once; stale close cannot evict.
     handler.session = try fixture.application.registry.claim(@splat(2));
@@ -313,7 +309,7 @@ test "frozen startup allocator admits updates reads and releases all 64 sessions
     };
     var guard = Guard{};
     const allocator = std.mem.Allocator{ .ptr = &guard, .vtable = &.{ .alloc = Guard.alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = Guard.free } };
-    var fixture = try Fixture.initWith(allocator, std.testing.io, @import("sqlite_runtime.zig").default_budget);
+    var fixture = try Fixture.initWith(allocator, std.testing.io, @import("app.zig").default_budget);
     defer {
         guard.frozen = false;
         fixture.deinit();
@@ -327,9 +323,10 @@ test "frozen startup allocator admits updates reads and releases all 64 sessions
         try std.testing.expect(fixture.application.handleLocation(handle.*, req).result == .location_updated);
         try std.testing.expectEqual(@as(i32, @intCast(i)), fixture.application.registry.get(handle.*).?.location.?.x);
         var snapshot: p.Snapshot = undefined;
-        try fixture.application.context.db.readArea(.{ .cx0 = 0, .cy0 = 0, .cx1 = 7, .cy1 = 7 }, &snapshot);
+        _ = try fixture.application.context.state.cut(@import("world_state.zig").request(i, @intCast(i), -1));
+        try fixture.application.context.state.readArea(.{ .cx0 = 0, .cy0 = 0, .cx1 = 7, .cy1 = 7 }, &snapshot);
     }
     for (handles) |handle| fixture.application.registry.release(handle);
     try std.testing.expect(@sizeOf(@import("app.zig").Layout) <= @import("app.zig").default_budget);
-    std.debug.print("BUDGET,app_layout_bytes={d},session_registry_bytes={d},sqlite_highwater={d}\n", .{ @sizeOf(@import("app.zig").Layout), @sizeOf(sessions.Registry), fixture.runtime.highWater() });
+    std.debug.print("BUDGET,app_layout_bytes={d},session_registry_bytes={d},world_state_bytes={d},context_bytes={d}\n", .{ @sizeOf(@import("app.zig").Layout), @sizeOf(sessions.Registry), @sizeOf(@import("world_state.zig").WorldState), @sizeOf(@import("app.zig").Context) });
 }

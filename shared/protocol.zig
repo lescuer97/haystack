@@ -29,7 +29,7 @@ pub const ErrorCode = enum(u16) {
     not_cuttable = 9,
     already_cut = 10,
     request_id_conflict = 11,
-    database_busy = 12,
+    server_busy = 12,
     internal_error = 13,
 };
 pub const State = struct { x: i32, y: i32, terrain: world.Tile, cut: bool };

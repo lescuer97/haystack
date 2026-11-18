@@ -156,7 +156,7 @@ pub const Handler = struct {
                     return;
                 }
                 const context = self.app.lease() orelse {
-                    try self.conn.writeMessage(wire.encode(&error_storage, wire.failure(req.request_id, .database_busy)), .binary);
+                    try self.conn.writeMessage(wire.encode(&error_storage, wire.failure(req.request_id, .server_busy)), .binary);
                     return;
                 };
                 defer self.app.release(context);

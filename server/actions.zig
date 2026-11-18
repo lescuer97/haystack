@@ -3,7 +3,7 @@ const std = @import("std");
 const shared = @import("shared");
 const p = shared.protocol;
 const world = shared.world;
-const Storage = @import("storage.zig").Storage;
+const WorldState = @import("world_state.zig").WorldState;
 
 pub fn cutRule(state: p.State) p.CutResult {
     if (state.cut) return .{ .failure = .{ .code = .already_cut, .current = state } };
@@ -22,11 +22,11 @@ pub fn validateArea(r: world.ChunkRange) ?p.ErrorCode {
     return null;
 }
 
-pub fn handle(db: *Storage, snapshot: *p.Snapshot, req: p.Request) p.Response {
+pub fn handle(state: *WorldState, snapshot: *p.Snapshot, req: p.Request) p.Response {
     const result: @FieldType(p.Response, "result") = switch (req.operation) {
         .update_location => .{ .failure = .{ .code = .invalid_request } },
         .cut => blk: {
-            const outcome = db.cut(req) catch |err| break :blk .{ .failure = dbFailure(err) };
+            const outcome = state.cut(req) catch break :blk .{ .failure = .{ .code = .server_busy } };
             break :blk switch (outcome) {
                 .success => |s| .{ .cut = s },
                 .failure => |f| .{ .failure = f },
@@ -34,15 +34,11 @@ pub fn handle(db: *Storage, snapshot: *p.Snapshot, req: p.Request) p.Response {
         },
         .read_area => |area| blk: {
             if (validateArea(area)) |code| break :blk .{ .failure = .{ .code = code } };
-            db.readArea(area, snapshot) catch |err| break :blk .{ .failure = dbFailure(err) };
+            state.readArea(area, snapshot) catch unreachable;
             break :blk .{ .snapshot = snapshot };
         },
     };
     return .{ .request_id = req.request_id, .result = result };
-}
-
-fn dbFailure(err: anyerror) p.Failure {
-    return .{ .code = if (err == error.DatabaseBusy) .database_busy else .internal_error };
 }
 
 test "pure cut rules preserve terrain and reject rock dirt and already cut" {

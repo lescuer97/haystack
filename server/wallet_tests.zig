@@ -1,8 +1,7 @@
-//! Real CDK + real world DB, isolated filesystem only, no mint operations.
+//! Real persistent CDK wallet and volatile world, isolated filesystem only.
 const std = @import("std");
 const native = @import("native_storage");
 const server_wallet = @import("wallet.zig");
-const sql = @import("sqlite_runtime.zig");
 const app = @import("app.zig");
 const t = std.testing;
 const sf = native.storage_fs;
@@ -51,7 +50,7 @@ const Home = struct {
     }
 };
 
-test "headless fresh restart borrowed owner and independent SQLite lifetimes coexist" {
+test "headless fresh world restart preserves borrowed wallet owner" {
     var home = try Home.init();
     defer home.deinit();
     var lock = try native.instance_lock.acquire(t.io, home.locations.config_dir);
@@ -64,11 +63,6 @@ test "headless fresh restart borrowed owner and independent SQLite lifetimes coe
         sync_home = "";
     }
     try t.expectError(error.AlreadyRunning, native.instance_lock.acquire(t.io, home.locations.config_dir));
-    const heap = try t.allocator.alignedAlloc(u8, .fromByteUnits(8), sql.default_budget);
-    defer t.allocator.free(heap);
-    var runtime = try sql.Runtime.start(heap);
-    var running = true;
-    defer if (running) runtime.stop();
     var wallet = try server_wallet.open(t.io, t.allocator, home.locations);
     defer wallet.close() catch {};
     try t.expectEqual(@as(u8, 31), sync_seen);
@@ -76,35 +70,26 @@ test "headless fresh restart borrowed owner and independent SQLite lifetimes coe
     const paths = try native.wallet.Paths.init(t.allocator, home.locations.wallet_dir);
     defer paths.deinit(t.allocator);
     const inode = (try std.Io.Dir.cwd().statFile(t.io, paths.db_path, .{})).inode;
-    const world = try home.tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
-    defer t.allocator.free(world);
-    const world_path = try std.fmt.allocPrintSentinel(t.allocator, "{s}/world.sqlite3", .{world}, 0);
-    defer t.allocator.free(world_path);
     const buffers = try t.allocator.alignedAlloc(u8, .fromByteUnits(@alignOf(app.Layout)), app.default_budget);
     defer t.allocator.free(buffers);
     {
-        var application = try app.App.init(t.io, world_path, buffers);
+        var application = try app.App.init(t.io, buffers);
         defer application.deinit();
         try t.expect(application.wallet == null);
         application.wallet = &wallet;
         try t.expectEqual(try wallet.borrowHandle(), try application.wallet.?.borrowHandle());
-        try application.context.db.exec("BEGIN IMMEDIATE; INSERT INTO chunk_state VALUES(0,0,zeroblob(32)); COMMIT;");
-        try t.expect(runtime.highWater() > 0 and runtime.highWater() <= heap.len);
-        try t.expectEqualStrings("3.54.0", std.mem.span(sql.c.sqlite3_libversion()));
-        try t.expectEqualStrings("3.54.0", std.mem.sliceTo(&sql.c.haystack_world_sqlite3_version, 0));
+        _ = try application.context.state.cut(@import("world_state.zig").request(0, 0, 0));
+        try t.expectEqual(@as(usize, 1), application.context.state.replay_count);
     }
     _ = try wallet.borrowHandle(); // App did not close its borrowed wallet.
-    runtime.stop();
-    running = false;
-    // Wallet remains locked and usable while the independent world heap is down.
+    // Wallet remains locked and usable after application teardown.
     try t.expectError(error.CdkFailure, server_wallet.open(t.io, t.allocator, home.locations));
-    runtime = try sql.Runtime.start(heap); // reverse initialization order
-    running = true;
-    try wallet.close(); // CDK shutdown must not shut down world SQLite.
+    try wallet.close();
     {
-        var application = try app.App.init(t.io, world_path, buffers);
+        var application = try app.App.init(t.io, buffers);
         defer application.deinit();
-        try application.context.db.exec("BEGIN IMMEDIATE; DELETE FROM chunk_state; COMMIT;");
+        try t.expectEqual(@as(usize, 0), application.context.state.chunk_count);
+        try t.expectEqual(@as(usize, 0), application.context.state.replay_count);
     }
     sync_seen = 0;
     wallet = try server_wallet.open(t.io, t.allocator, home.locations);

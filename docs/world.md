@@ -21,8 +21,8 @@ Implemented today in `shared/world.zig`, `src/world.zig`, and `server/`:
   unloads everything outside a 2-chunk prefetch ring, then loads visible chunks
   first and the rest of the ring second.
 - Memory stats, allocation-free eviction scratch, and retry-after-OOM support.
-- Standalone loopback WebSocket server with binary v1, permanent grass/tree cuts,
-  fixed heap budgets, SQLite persistence, durable opaque-ID replay, and complete
+- Standalone loopback WebSocket server with binary v1, process-lifetime grass/tree cuts,
+  fixed RAM budgets, volatile opaque-ID replay, and complete
   64-chunk bitmap area snapshots.
   See [server.md](server.md) for the implemented wire contract and limits.
 - The game client has no networking, delta/input/render integration, dirty
@@ -168,7 +168,7 @@ It must **never** predict loot.
 
 ---
 
-## 4. Future extended storage design (**planned**, not current SQLite schema)
+## 4. Future extended storage design (**planned**, not current RAM state)
 
 ```
 real_tile = generate(public_seed, x, y)   default

@@ -203,7 +203,7 @@ test "reply decoding rejects invalid boolean enum flags lengths and metadata" {
     out[3] = 0;
     out[4] = 1;
     try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..30], &snapshot));
-    _ = encode(&out, failure(null, .database_busy));
+    _ = encode(&out, failure(null, .server_busy));
     out[20] = 14;
     try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..23], &snapshot));
     out[20] = 12;
@@ -230,7 +230,7 @@ test "binary golden zero ID extreme coordinates request and success" {
     var out: [p.max_response_bytes]u8 = undefined;
     const success = encode(&out, .{ .request_id = req.request_id, .result = .{ .cut = .{ .x = -1, .y = 0, .terrain = .tree, .cut = true } } });
     try std.testing.expectEqualSlices(u8, &.{ 1, 0, 129, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 3, 1 }, success);
-    const err = encode(&out, failure(null, .database_busy));
+    const err = encode(&out, failure(null, .server_busy));
     try std.testing.expectEqualSlices(u8, &.{ 1, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0 }, err);
 }
 test "binary malformed flags lengths unknown operations versions and cap" {

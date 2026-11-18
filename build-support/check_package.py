@@ -19,15 +19,13 @@ PRUNED = {
 }
 REQUIRED = (
     "shared/root.zig", "shared/world.zig", "shared/protocol.zig", "shared/wire.zig",
-    "server/main.zig", "server/tests.zig", "server/ws_memory_tests.zig", "server/bench.zig",
+    "server/main.zig", "server/tests.zig", "server/ws_memory_tests.zig",
     "server/actions.zig", "server/app.zig", "server/fixture.zig", "server/memory.zig",
-    "server/sessions.zig", "server/sessions_tests.zig", "server/sqlite_runtime.zig",
-    "server/storage.zig", "server/storage_tests.zig", "server/transport.zig",
+    "server/sessions.zig", "server/sessions_tests.zig", "server/world_state.zig",
+    "server/world_state_tests.zig", "server/transport.zig",
     "server/transport_tests.zig", "server/ws_config.zig",
     "server/ws_auth.zig", "build/secp256k1.zig",
     "build/server.zig", "build/shared.zig",
-    "vendor/zig-sqlite/build.zig", "vendor/zig-sqlite/build.zig.zon",
-    "vendor/zig-sqlite/sqlite.zig", "vendor/zig-sqlite/c/sqlite3_c.h",
     "browser/game-ui.js", "browser/wallet-integration.js",
     "browser/wallet-test.html", "browser/app.js",
     "build.zig", "build.zig.zon", "README.md", "docs/build.md",
