@@ -77,6 +77,7 @@ comptime {
 /// `webMain` stack frame that has already returned.
 const BrowserContext = struct {
     game_state: game_mod.GameState,
+    resources: rendering.Resources,
     input_reader: input.Reader,
     model: onboarding.Onboarding,
     onboarding_start_failed: bool = false,
@@ -234,10 +235,13 @@ fn startBrowser(settings: game_mod.Settings) !void {
     rl.setExitKey(.null);
 
     const allocator = std.heap.c_allocator;
+    const resources = try rendering.Resources.init(allocator);
+    errdefer resources.deinit();
     const ctx = try allocator.create(BrowserContext);
     errdefer allocator.destroy(ctx);
 
     ctx.* = .{
+        .resources = resources,
         .game_state = try game_mod.GameState.initWithSettings(
             allocator,
             @floatFromInt(rl.getScreenWidth()),
@@ -301,6 +305,7 @@ fn browserFrame() callconv(.c) void {
     }
     const effect = stepFrame(
         &ctx.game_state,
+        &ctx.resources,
         &ctx.input_reader,
         null,
         browser_settings_persister,
@@ -361,6 +366,7 @@ fn stopBrowser() void {
     emscripten_cancel_main_loop();
     ctx.model.deinit();
     ctx.game_state.deinit();
+    ctx.resources.deinit();
     std.heap.c_allocator.destroy(ctx);
     rl.closeWindow();
 }
@@ -417,6 +423,7 @@ const browser_settings_persister: SettingsPersister = .{
 /// (before presentation) so the image is not a post-swap black frame.
 fn stepFrame(
     game_state: *game_mod.GameState,
+    resources: *const rendering.Resources,
     input_reader: *input.Reader,
     shot_path: ?[:0]const u8,
     persister: ?SettingsPersister,
@@ -452,7 +459,7 @@ fn stepFrame(
 
     // 5. render read-only state. The caller owns presentation timing.
     rl.beginDrawing();
-    rendering.draw(game_state, view, vw, vh, model);
+    rendering.draw(game_state, view, vw, vh, model, resources);
     // Capture after drawing and before `endDrawing` swaps/presents, otherwise
     // the framebuffer read is the cleared back buffer (a black screenshot).
     // The 2D overlay (HUD/minimap) is still batched at this point;
@@ -768,6 +775,8 @@ pub fn main() anyerror!void {
         return error.WindowInitializationFailed;
     }
     defer rl.closeWindow();
+    const resources = try rendering.Resources.init(allocator);
+    defer resources.deinit();
     rl.setTargetFPS(rendering.target_fps);
 
     // Escape toggles the menu, so it must not also be Raylib's quit key.
@@ -843,6 +852,7 @@ pub fn main() anyerror!void {
         // Capture on the last requested frame, inside stepFrame's drawing pass.
         const effect = try stepFrame(
             &game_state,
+            &resources,
             &input_reader,
             if (shot_frames == 0) shot_path else null,
             persister,
