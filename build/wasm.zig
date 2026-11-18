@@ -84,16 +84,26 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     const libraries_js = try std.mem.concat(b.allocator, u8, &.{ ui_js, "\n", storage_js, "\n", onboarding_js });
     const write_files = b.addWriteFiles();
     const combined_library = write_files.add("haystack-game-libraries.js", libraries_js);
-    const grass_sheet = b.path("assets/Tileset/Tileset Grass Spring.png");
-    const maple_sheet = b.path("assets/Objects/Maple Tree.png");
+    const grass_sheet = b.path("assets/Tiles/Grass_Middle.png");
+    const dirt_sheet = b.path("assets/Tiles/Path_Tile.png");
+    const oak_sheet = b.path("assets/Outdoor decoration/Oak_Tree.png");
+    const rock_sheet = b.path("assets/Outdoor decoration/Outdoor_Decor_Free.png");
     const preload_paths: []const rlz.emsdk.ResourceFile = &.{
         .{
             .src_path = grass_sheet,
-            .virtual_path = "/assets/Tileset/Tileset Grass Spring.png",
+            .virtual_path = "/assets/Tiles/Grass_Middle.png",
         },
         .{
-            .src_path = maple_sheet,
-            .virtual_path = "/assets/Objects/Maple Tree.png",
+            .src_path = dirt_sheet,
+            .virtual_path = "/assets/Tiles/Path_Tile.png",
+        },
+        .{
+            .src_path = oak_sheet,
+            .virtual_path = "/assets/Outdoor decoration/Oak_Tree.png",
+        },
+        .{
+            .src_path = rock_sheet,
+            .virtual_path = "/assets/Outdoor decoration/Outdoor_Decor_Free.png",
         },
     };
     const linked = try rlz.emsdk.emccStep(b, &.{}, &.{renderer}, .{
@@ -135,7 +145,9 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         const emcc = install.dependencies.items[0].cast(std.Build.Step.Run) orelse
             return error.UnexpectedEmccInstallGraph;
         emcc.addFileInput(grass_sheet);
-        emcc.addFileInput(maple_sheet);
+        emcc.addFileInput(dirt_sheet);
+        emcc.addFileInput(oak_sheet);
+        emcc.addFileInput(rock_sheet);
     }
     const browser_fixture = b.step("browser-fixture", "Build and install the isolated browser fixture application");
     browser_fixture.dependOn(&install_fixture.step);
