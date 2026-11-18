@@ -84,6 +84,18 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     const libraries_js = try std.mem.concat(b.allocator, u8, &.{ ui_js, "\n", storage_js, "\n", onboarding_js });
     const write_files = b.addWriteFiles();
     const combined_library = write_files.add("haystack-game-libraries.js", libraries_js);
+    const grass_sheet = b.path("assets/Tileset/Tileset Grass Spring.png");
+    const maple_sheet = b.path("assets/Objects/Maple Tree.png");
+    const preload_paths: []const rlz.emsdk.ResourceFile = &.{
+        .{
+            .src_path = grass_sheet,
+            .virtual_path = "/assets/Tileset/Tileset Grass Spring.png",
+        },
+        .{
+            .src_path = maple_sheet,
+            .virtual_path = "/assets/Objects/Maple Tree.png",
+        },
+    };
     const linked = try rlz.emsdk.emccStep(b, &.{}, &.{renderer}, .{
         .optimize = options.optimize,
         .flags = flags,
@@ -92,6 +104,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         .install_dir = .{ .custom = "wasm/renderer" },
         .out_file_name = "index.html",
         .js_library_path = combined_library,
+        .preload_paths = preload_paths,
     });
     b.getInstallStep().dependOn(linked);
     b.step("renderer", "Build the browser renderer without the wallet").dependOn(linked);
@@ -108,7 +121,22 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         .install_dir = .{ .custom = "wasm-test/renderer" },
         .out_file_name = "index.html",
         .js_library_path = combined_library,
+        .preload_paths = preload_paths,
     });
+    // The pinned helper passes preload paths as raw arguments, not tracked
+    // file inputs. Its InstallDir depends only on the emcc Run (possibly twice).
+    // Fail closed if that graph changes rather than silently caching stale data.
+    for ([_]*std.Build.Step{ linked, fixture_linked }) |install| {
+        if (install.cast(std.Build.Step.InstallDir) == null or install.dependencies.items.len == 0)
+            return error.UnexpectedEmccInstallGraph;
+        for (install.dependencies.items) |dependency| {
+            if (dependency != install.dependencies.items[0]) return error.UnexpectedEmccInstallGraph;
+        }
+        const emcc = install.dependencies.items[0].cast(std.Build.Step.Run) orelse
+            return error.UnexpectedEmccInstallGraph;
+        emcc.addFileInput(grass_sheet);
+        emcc.addFileInput(maple_sheet);
+    }
     const browser_fixture = b.step("browser-fixture", "Build and install the isolated browser fixture application");
     browser_fixture.dependOn(&install_fixture.step);
     browser_fixture.dependOn(fixture_linked);
