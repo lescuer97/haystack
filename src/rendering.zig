@@ -19,69 +19,83 @@ const terrain = @import("shared").world;
 /// Frame-rate target. The HUD's FPS colour thresholds are derived from it.
 pub const target_fps: i32 = 120;
 
-const grass_asset = "assets/Tileset/Tileset Grass Spring.png";
-const grass_sheet_width = 192;
-const grass_sheet_height = 64;
-const grass_source = rl.Rectangle{ .x = 144, .y = 32, .width = 16, .height = 16 };
-const maple_asset = "assets/Objects/Maple Tree.png";
-const maple_sheet_width = 160;
-const maple_sheet_height = 48;
-const maple_source = rl.Rectangle{ .x = 96, .y = 0, .width = 32, .height = 48 };
+const grass_asset = "assets/Tiles/Grass_Middle.png";
+const grass_sheet_width = 16;
+const grass_sheet_height = 16;
+const grass_source = rl.Rectangle{ .x = 0, .y = 0, .width = 16, .height = 16 };
+const dirt_asset = "assets/Tiles/Path_Tile.png";
+const dirt_sheet_width = 48;
+const dirt_sheet_height = 96;
+const dirt_source = rl.Rectangle{ .x = 16, .y = 16, .width = 16, .height = 16 };
+const oak_asset = "assets/Outdoor decoration/Oak_Tree.png";
+const oak_sheet_width = 64;
+const oak_sheet_height = 80;
+const oak_source = rl.Rectangle{ .x = 0, .y = 0, .width = 64, .height = 80 };
+const rock_asset = "assets/Outdoor decoration/Outdoor_Decor_Free.png";
+const rock_sheet_width = 112;
+const rock_sheet_height = 192;
+const rock_source = rl.Rectangle{ .x = 32, .y = 32, .width = 16, .height = 16 };
 
-fn mapleDest(x: f32, y: f32) rl.Rectangle {
-    return .{ .x = x - 16, .y = y - 64, .width = 64, .height = 96 };
+fn rockDest(x: f32, y: f32) rl.Rectangle {
+    // Source baseline (8,12) meets the ground tile bottom; shadow extends below.
+    return .{ .x = x, .y = y + 8, .width = 32, .height = 32 };
+}
+
+fn oakDest(x: f32, y: f32) rl.Rectangle {
+    // Opaque root at source (32,64); the shadow extends below the ground tile.
+    return .{ .x = x - 48, .y = y - 96, .width = 128, .height = 160 };
 }
 
 // Quadrants TL, TR, BL, BR; columns convex, horizontal boundary, vertical
 // boundary, concave, solid. Each measured atlas crop is 8x8, drawn at 2x.
-const grass_quadrants = [4][5][2]f32{
-    .{ .{ 128, 0 }, .{ 32, 0 }, .{ 128, 16 }, .{ 112, 0 }, .{ 144, 32 } },
-    .{ .{ 184, 0 }, .{ 40, 0 }, .{ 120, 16 }, .{ 72, 0 }, .{ 152, 32 } },
-    .{ .{ 128, 56 }, .{ 144, 56 }, .{ 128, 24 }, .{ 64, 8 }, .{ 144, 40 } },
-    .{ .{ 184, 56 }, .{ 152, 56 }, .{ 120, 24 }, .{ 120, 8 }, .{ 152, 40 } },
+const dirt_quadrants = [4][5][2]f32{
+    .{ .{ 8, 8 }, .{ 16, 8 }, .{ 8, 16 }, .{ 20, 68 }, .{ 16, 16 } },
+    .{ .{ 32, 8 }, .{ 24, 8 }, .{ 32, 16 }, .{ 4, 68 }, .{ 24, 16 } },
+    .{ .{ 8, 32 }, .{ 16, 32 }, .{ 8, 24 }, .{ 20, 52 }, .{ 16, 24 } },
+    .{ .{ 32, 32 }, .{ 24, 32 }, .{ 32, 24 }, .{ 4, 52 }, .{ 24, 24 } },
 };
 // Neighbor order NW, N, NE, W, E, SW, S, SE.
-const grass_neighbor_offsets = [8][2]i32{
+const dirt_neighbor_offsets = [8][2]i32{
     .{ -1, -1 }, .{ 0, -1 }, .{ 1, -1 }, .{ -1, 0 },
     .{ 1, 0 },   .{ -1, 1 }, .{ 0, 1 },  .{ 1, 1 },
 };
-const grass_quadrant_neighbors = [4][3]usize{
+const dirt_quadrant_neighbors = [4][3]usize{
     .{ 1, 3, 0 }, .{ 1, 4, 2 }, .{ 6, 3, 5 }, .{ 6, 4, 7 },
 };
 
 fn isGrassGround(tile: world.Tile) bool {
-    return tile == .grass or tile == .tree;
+    return tile == .grass or tile == .tree or tile == .rock;
 }
 
-fn isGrass(w: *const world.World, x: i32, y: i32) bool {
+fn isDirt(w: *const world.World, x: i32, y: i32) bool {
     if (w.get(@divFloor(x, world.CHUNK_TILES), @divFloor(y, world.CHUNK_TILES))) |chunk| {
         const lx: usize = @intCast(@mod(x, world.CHUNK_TILES));
         const ly: usize = @intCast(@mod(y, world.CHUNK_TILES));
-        return isGrassGround(chunk.tiles[ly * world.CT + lx]);
+        return chunk.tiles[ly * world.CT + lx] == .dirt;
     }
     // Prefetch normally supplies neighbors; missing residents need no allocation.
-    return isGrassGround(terrain.sampleTile(terrain.public_seed, x, y));
+    return terrain.sampleTile(terrain.public_seed, x, y) == .dirt;
 }
 
-fn grassNeighbors(w: *const world.World, x: i32, y: i32) [8]bool {
+fn dirtNeighbors(w: *const world.World, x: i32, y: i32) [8]bool {
     var neighbors: [8]bool = undefined;
-    for (grass_neighbor_offsets, 0..) |offset, i| {
-        neighbors[i] = isGrass(w, x + offset[0], y + offset[1]);
+    for (dirt_neighbor_offsets, 0..) |offset, i| {
+        neighbors[i] = isDirt(w, x + offset[0], y + offset[1]);
     }
     return neighbors;
 }
 
-fn grassQuadrantSource(quadrant: usize, neighbors: [8]bool) rl.Rectangle {
-    const indices = grass_quadrant_neighbors[quadrant];
+fn dirtQuadrantSource(quadrant: usize, neighbors: [8]bool) rl.Rectangle {
+    const indices = dirt_quadrant_neighbors[quadrant];
     const v = neighbors[indices[0]];
     const h = neighbors[indices[1]];
     const d = neighbors[indices[2]];
     const kind: usize = if (!v and !h) 0 else if (!v) 1 else if (!h) 2 else if (!d) 3 else 4;
-    const xy = grass_quadrants[quadrant][kind];
+    const xy = dirt_quadrants[quadrant][kind];
     return .{ .x = xy[0], .y = xy[1], .width = 8, .height = 8 };
 }
 
-fn grassQuadrantDest(x: f32, y: f32, quadrant: usize) rl.Rectangle {
+fn dirtQuadrantDest(x: f32, y: f32, quadrant: usize) rl.Rectangle {
     const half: f32 = @floatFromInt(@divExact(world.TILE_PX, 2));
     return .{
         .x = x + @as(f32, @floatFromInt(quadrant % 2)) * half,
@@ -113,20 +127,30 @@ fn loadAtlas(allocator: std.mem.Allocator, comptime asset: []const u8, width: i3
 /// Window-owned GPU resources, separate from persistent game/world state.
 pub const Resources = struct {
     grass: rl.Texture2D,
-    maple: rl.Texture2D,
+    dirt: rl.Texture2D,
+    oak: rl.Texture2D,
+    rock: rl.Texture2D,
 
     pub fn init(allocator: std.mem.Allocator) !Resources {
         const grass = try loadAtlas(allocator, grass_asset, grass_sheet_width, grass_sheet_height);
         errdefer rl.unloadTexture(grass);
+        const dirt = try loadAtlas(allocator, dirt_asset, dirt_sheet_width, dirt_sheet_height);
+        errdefer rl.unloadTexture(dirt);
+        const oak = try loadAtlas(allocator, oak_asset, oak_sheet_width, oak_sheet_height);
+        errdefer rl.unloadTexture(oak);
         return .{
             .grass = grass,
-            .maple = try loadAtlas(allocator, maple_asset, maple_sheet_width, maple_sheet_height),
+            .dirt = dirt,
+            .oak = oak,
+            .rock = try loadAtlas(allocator, rock_asset, rock_sheet_width, rock_sheet_height),
         };
     }
 
     pub fn deinit(self: *const Resources) void {
         rl.unloadTexture(self.grass);
-        rl.unloadTexture(self.maple);
+        rl.unloadTexture(self.dirt);
+        rl.unloadTexture(self.oak);
+        rl.unloadTexture(self.rock);
     }
 };
 
@@ -135,7 +159,6 @@ pub const Resources = struct {
 const grid_color = rl.Color.init(255, 255, 255, 55);
 const border_color = rl.Color.init(220, 60, 55, 255);
 const hud_bg = rl.Color.init(0, 0, 0, 170);
-const tile_letter_color = rl.Color.init(235, 235, 240, 255);
 
 const menu_backdrop = rl.Color.init(0, 0, 0, 165);
 const menu_panel_bg = rl.Color.init(28, 28, 34, 250);
@@ -148,32 +171,9 @@ const menu_title_color = rl.Color.init(245, 245, 250, 255);
 const menu_text_color = rl.Color.init(225, 228, 235, 255);
 const menu_muted = rl.Color.init(150, 155, 170, 255);
 
-/// Default-font size for dirt and rock terrain labels.
-const tile_letter_size: i32 = 20;
-
 // ── drawing ──────────────────────────────────────────────────────────────────
 
-/// Dirt and rock terrain labels; grass and trees use sprites. The switch is
-/// exhaustive so a new `world.Tile` variant forces a rendering decision.
-fn tileLetter(tile: world.Tile) ?u8 {
-    return switch (tile) {
-        .grass, .tree => null,
-        .dirt => 'D',
-        .rock => 'R',
-    };
-}
-
-/// Top-left corner that centres a `text_w`×`text_h` label inside the tile whose
-/// top-left corner is (`tx`, `ty`). Pure maths so the centring is testable
-/// without a window or a loaded font.
-fn centeredTextPos(tx: i32, ty: i32, text_w: i32, text_h: i32) struct { x: i32, y: i32 } {
-    return .{
-        .x = tx + @divTrunc(world.TILE_PX - text_w, 2),
-        .y = ty + @divTrunc(world.TILE_PX - text_h, 2),
-    };
-}
-
-fn drawChunk(chunk: *const world.Chunk, settings: game_mod.DebugSettings) void {
+fn drawChunkDebug(chunk: *const world.Chunk, settings: game_mod.DebugSettings) void {
     const ox = chunk.cx * world.CHUNK_PX;
     const oy = chunk.cy * world.CHUNK_PX;
 
@@ -198,26 +198,6 @@ fn drawChunk(chunk: *const world.Chunk, settings: game_mod.DebugSettings) void {
             border_color,
         );
     }
-
-    // Dirt and rock terrain letters render independent of the optional debug
-    // overlays above. `measureText` and `drawText` use the same default font
-    // and size, and the default font's glyph height matches `fontSize`.
-    var ty: usize = 0;
-    while (ty < world.CT) : (ty += 1) {
-        var tx: usize = 0;
-        while (tx < world.CT) : (tx += 1) {
-            const letter = tileLetter(chunk.tiles[ty * world.CT + tx]) orelse continue;
-            var text: [2:0]u8 = .{ letter, 0 };
-            const text_w = rl.measureText(&text, tile_letter_size);
-            const pos = centeredTextPos(
-                ox + @as(i32, @intCast(tx)) * world.TILE_PX,
-                oy + @as(i32, @intCast(ty)) * world.TILE_PX,
-                text_w,
-                tile_letter_size,
-            );
-            rl.drawText(&text, pos.x, pos.y, tile_letter_size, tile_letter_color);
-        }
-    }
 }
 
 fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.DebugSettings, resources: *const Resources) void {
@@ -233,9 +213,31 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
                 const ty = chunk.cy * world.CHUNK_TILES + @as(i32, @intCast(i / world.CT));
                 const x: f32 = @floatFromInt(tx * world.TILE_PX);
                 const y: f32 = @floatFromInt(ty * world.TILE_PX);
-                const neighbors = grassNeighbors(w, tx, ty);
+                rl.drawTexturePro(resources.grass, grass_source, .{
+                    .x = x,
+                    .y = y,
+                    .width = world.TILE_PX,
+                    .height = world.TILE_PX,
+                }, .{ .x = 0, .y = 0 }, 0, .white);
+            }
+        }
+    }
+
+    // Dirt crops include opaque grass corners, so need no grass underdraw.
+    var dirt_cy = vis.cy0;
+    while (dirt_cy <= vis.cy1) : (dirt_cy += 1) {
+        var dirt_cx = vis.cx0;
+        while (dirt_cx <= vis.cx1) : (dirt_cx += 1) {
+            const chunk = w.get(dirt_cx, dirt_cy) orelse continue;
+            for (chunk.tiles, 0..) |tile, i| {
+                if (tile != .dirt) continue;
+                const tx = chunk.cx * world.CHUNK_TILES + @as(i32, @intCast(i % world.CT));
+                const ty = chunk.cy * world.CHUNK_TILES + @as(i32, @intCast(i / world.CT));
+                const x: f32 = @floatFromInt(tx * world.TILE_PX);
+                const y: f32 = @floatFromInt(ty * world.TILE_PX);
+                const neighbors = dirtNeighbors(w, tx, ty);
                 if (std.mem.allEqual(bool, &neighbors, true)) {
-                    rl.drawTexturePro(resources.grass, grass_source, .{
+                    rl.drawTexturePro(resources.dirt, dirt_source, .{
                         .x = x,
                         .y = y,
                         .width = world.TILE_PX,
@@ -243,38 +245,52 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
                     }, .{ .x = 0, .y = 0 }, 0, .white);
                 } else {
                     for (0..4) |quadrant| {
-                        rl.drawTexturePro(resources.grass, grassQuadrantSource(quadrant, neighbors), grassQuadrantDest(x, y, quadrant), .{ .x = 0, .y = 0 }, 0, .white);
+                        rl.drawTexturePro(resources.dirt, dirtQuadrantSource(quadrant, neighbors), dirtQuadrantDest(x, y, quadrant), .{ .x = 0, .y = 0 }, 0, .white);
                     }
                 }
             }
         }
     }
 
-    // Canopies reach beyond their anchor chunk. Read only resident neighbors.
-    const tree_range = vis.expanded(1);
-    var tree_cy = tree_range.cy0;
-    while (tree_cy <= tree_range.cy1) : (tree_cy += 1) {
+    // Shadows and canopies reach beyond their anchor chunk. Resident reads only.
+    const sprite_range = vis.expanded(1);
+    var rock_cy = sprite_range.cy0;
+    while (rock_cy <= sprite_range.cy1) : (rock_cy += 1) {
+        var rock_cx = sprite_range.cx0;
+        while (rock_cx <= sprite_range.cx1) : (rock_cx += 1) {
+            const chunk = w.get(rock_cx, rock_cy) orelse continue;
+            for (chunk.tiles, 0..) |tile, i| {
+                if (tile != .rock) continue;
+                const x: f32 = @floatFromInt((rock_cx * world.CHUNK_TILES + @as(i32, @intCast(i % world.CT))) * world.TILE_PX);
+                const y: f32 = @floatFromInt((rock_cy * world.CHUNK_TILES + @as(i32, @intCast(i / world.CT))) * world.TILE_PX);
+                rl.drawTexturePro(resources.rock, rock_source, rockDest(x, y), .{ .x = 0, .y = 0 }, 0, .white);
+            }
+        }
+    }
+
+    var tree_cy = sprite_range.cy0;
+    while (tree_cy <= sprite_range.cy1) : (tree_cy += 1) {
         for (0..world.CT) |row| {
-            var tree_cx = tree_range.cx0;
-            while (tree_cx <= tree_range.cx1) : (tree_cx += 1) {
+            var tree_cx = sprite_range.cx0;
+            while (tree_cx <= sprite_range.cx1) : (tree_cx += 1) {
                 const chunk = w.get(tree_cx, tree_cy) orelse continue;
                 for (0..world.CT) |col| {
                     if (chunk.tiles[row * world.CT + col] != .tree) continue;
                     const x: f32 = @floatFromInt((tree_cx * world.CHUNK_TILES + @as(i32, @intCast(col))) * world.TILE_PX);
                     const y: f32 = @floatFromInt((tree_cy * world.CHUNK_TILES + @as(i32, @intCast(row))) * world.TILE_PX);
-                    rl.drawTexturePro(resources.maple, maple_source, mapleDest(x, y), .{ .x = 0, .y = 0 }, 0, .white);
+                    rl.drawTexturePro(resources.oak, oak_source, oakDest(x, y), .{ .x = 0, .y = 0 }, 0, .white);
                 }
             }
         }
     }
 
-    // ponytail: debug overlays and D/R labels may cover canopies.
+    // ponytail: debug overlays may cover canopies.
     var cy = vis.cy0;
     while (cy <= vis.cy1) : (cy += 1) {
         var cx = vis.cx0;
         while (cx <= vis.cx1) : (cx += 1) {
             const chunk = w.get(cx, cy) orelse continue;
-            drawChunk(chunk, settings);
+            drawChunkDebug(chunk, settings);
         }
     }
 
@@ -885,33 +901,41 @@ fn drawOnboarding(model: *const onboarding.Onboarding, vw: f32, vh: f32) void {
     }
 }
 
-test "all grass neighbor patterns select bounded atlas quadrants at 2x" {
-    try std.testing.expectEqual(192, grass_sheet_width);
-    try std.testing.expectEqual(64, grass_sheet_height);
-    try std.testing.expectEqual(@as(f32, 144), grass_source.x);
-    try std.testing.expectEqual(@as(f32, 32), grass_source.y);
-    try std.testing.expectEqual(@as(f32, 16), grass_source.width);
-    try std.testing.expectEqual(@as(f32, 16), grass_source.height);
+test "grass is a whole tile at 2x beneath grass trees and rocks" {
+    try std.testing.expectEqual(16, grass_sheet_width);
+    try std.testing.expectEqual(16, grass_sheet_height);
+    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 0, .y = 0, .width = 16, .height = 16 }, grass_source);
     try std.testing.expect(grass_source.x + grass_source.width <= grass_sheet_width);
     try std.testing.expect(grass_source.y + grass_source.height <= grass_sheet_height);
     try std.testing.expectEqual(@as(f32, world.TILE_PX), grass_source.width * 2);
     try std.testing.expectEqual(@as(f32, world.TILE_PX), grass_source.height * 2);
+    try std.testing.expect(isGrassGround(.grass));
+    try std.testing.expect(isGrassGround(.tree));
+    try std.testing.expect(!isGrassGround(.dirt));
+    try std.testing.expect(isGrassGround(.rock));
+}
 
+test "all dirt neighbor patterns select bounded atlas quadrants at 2x" {
+    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 16, .y = 16, .width = 16, .height = 16 }, dirt_source);
+    try std.testing.expect(dirt_source.x + dirt_source.width <= dirt_sheet_width);
+    try std.testing.expect(dirt_source.y + dirt_source.height <= dirt_sheet_height);
+    try std.testing.expectEqual(@as(f32, world.TILE_PX), dirt_source.width * 2);
+    try std.testing.expectEqual(@as(f32, world.TILE_PX), dirt_source.height * 2);
     const expected_kinds = [_]usize{ 0, 2, 1, 3, 0, 2, 1, 4 };
     for (0..256) |mask| {
         var neighbors: [8]bool = undefined;
         for (&neighbors, 0..) |*present, i| present.* = (mask & (@as(usize, 1) << @intCast(i))) != 0;
-        for (grass_quadrant_neighbors, 0..) |indices, q| {
+        for (dirt_quadrant_neighbors, 0..) |indices, q| {
             const bits = @as(usize, @intFromBool(neighbors[indices[0]])) |
                 (@as(usize, @intFromBool(neighbors[indices[1]])) << 1) |
                 (@as(usize, @intFromBool(neighbors[indices[2]])) << 2);
-            const expected = grass_quadrants[q][expected_kinds[bits]];
-            const src = grassQuadrantSource(q, neighbors);
+            const expected = dirt_quadrants[q][expected_kinds[bits]];
+            const src = dirtQuadrantSource(q, neighbors);
             try std.testing.expectEqual(expected[0], src.x);
             try std.testing.expectEqual(expected[1], src.y);
-            try std.testing.expect(src.x >= 0 and src.x + src.width <= grass_sheet_width);
-            try std.testing.expect(src.y >= 0 and src.y + src.height <= grass_sheet_height);
-            const dest = grassQuadrantDest(-32, -32, q);
+            try std.testing.expect(src.x >= 0 and src.x + src.width <= dirt_sheet_width);
+            try std.testing.expect(src.y >= 0 and src.y + src.height <= dirt_sheet_height);
+            const dest = dirtQuadrantDest(-32, -32, q);
             try std.testing.expectEqual(@as(f32, 8), src.width);
             try std.testing.expectEqual(@as(f32, 8), src.height);
             try std.testing.expectEqual(src.width * 2, dest.width);
@@ -922,95 +946,116 @@ test "all grass neighbor patterns select bounded atlas quadrants at 2x" {
     }
 }
 
-test "grass neighbors cross negative chunk boundaries and match fallback terrain" {
-    try std.testing.expect(isGrassGround(.grass));
-    try std.testing.expect(isGrassGround(.tree));
-    try std.testing.expect(!isGrassGround(.dirt));
-    try std.testing.expect(!isGrassGround(.rock));
+test "dirt concaves use the measured opaque crops" {
+    const cases = [_]struct { diagonal: usize, expected: rl.Rectangle }{
+        .{ .diagonal = 0, .expected = .{ .x = 20, .y = 68, .width = 8, .height = 8 } },
+        .{ .diagonal = 2, .expected = .{ .x = 4, .y = 68, .width = 8, .height = 8 } },
+        .{ .diagonal = 5, .expected = .{ .x = 20, .y = 52, .width = 8, .height = 8 } },
+        .{ .diagonal = 7, .expected = .{ .x = 4, .y = 52, .width = 8, .height = 8 } },
+    };
+    for (cases, 0..) |case, quadrant| {
+        var neighbors: [8]bool = @splat(true);
+        neighbors[case.diagonal] = false;
+        try std.testing.expectEqualDeep(case.expected, dirtQuadrantSource(quadrant, neighbors));
+    }
+}
+
+test "dirt neighbors cross negative chunk boundaries and match fallback terrain" {
     var resident = try world.World.init(std.testing.allocator, 36);
     defer resident.deinit();
     try resident.stream(.{ .cx0 = -1, .cy0 = -1, .cx1 = 0, .cy1 = 0 });
     var absent = try world.World.init(std.testing.allocator, 0);
     defer absent.deinit();
-    var found_tree = false;
-    var y: i32 = -18;
-    while (y <= 18) : (y += 1) {
-        var x: i32 = -18;
-        while (x <= 18) : (x += 1) {
+    var found_dirt = false;
+    var y: i32 = -64;
+    while (y <= 64) : (y += 1) {
+        var x: i32 = -64;
+        while (x <= 64) : (x += 1) {
             const sampled = terrain.sampleTile(terrain.public_seed, x, y);
-            found_tree = found_tree or sampled == .tree;
-            try std.testing.expectEqual(sampled == .grass or sampled == .tree, isGrass(&resident, x, y));
-            try std.testing.expectEqual(isGrass(&resident, x, y), isGrass(&absent, x, y));
-            try std.testing.expectEqualDeep(grassNeighbors(&resident, x, y), grassNeighbors(&absent, x, y));
+            found_dirt = found_dirt or sampled == .dirt;
+            try std.testing.expectEqual(sampled == .dirt, isDirt(&resident, x, y));
+            try std.testing.expectEqual(isDirt(&resident, x, y), isDirt(&absent, x, y));
+            try std.testing.expectEqualDeep(dirtNeighbors(&resident, x, y), dirtNeighbors(&absent, x, y));
         }
     }
-    try std.testing.expect(found_tree);
+    try std.testing.expect(found_dirt);
 
     // Owned fixture chunks: (-1,-1)'s east/south/diagonal cross chunk zero.
     var it = resident.by_key.valueIterator();
-    while (it.next()) |chunk| @memset(&chunk.*.tiles, .grass);
-    it = resident.by_key.valueIterator();
-    while (it.next()) |chunk| {
-        if (chunk.*.cx == 0 and chunk.*.cy == -1) chunk.*.tiles[15 * world.CT] = .tree;
-    }
-    var neighbors = grassNeighbors(&resident, -1, -1);
+    while (it.next()) |chunk| @memset(&chunk.*.tiles, .dirt);
+    var neighbors = dirtNeighbors(&resident, -1, -1);
     try std.testing.expect(std.mem.allEqual(bool, &neighbors, true));
     for (0..4) |q| {
-        const src = grassQuadrantSource(q, neighbors);
-        try std.testing.expectEqual(grass_quadrants[q][4][0], src.x);
-        try std.testing.expectEqual(grass_quadrants[q][4][1], src.y);
+        const src = dirtQuadrantSource(q, neighbors);
+        try std.testing.expectEqual(dirt_quadrants[q][4][0], src.x);
+        try std.testing.expectEqual(dirt_quadrants[q][4][1], src.y);
     }
     it = resident.by_key.valueIterator();
     while (it.next()) |chunk| {
-        if (chunk.*.cx == 0 and chunk.*.cy == 0) chunk.*.tiles[0] = .dirt;
+        if (chunk.*.cx == 0 and chunk.*.cy == 0) chunk.*.tiles[0] = .grass;
     }
-    neighbors = grassNeighbors(&resident, -1, -1);
+    neighbors = dirtNeighbors(&resident, -1, -1);
     for (0..4) |q| {
-        const src = grassQuadrantSource(q, neighbors);
-        const expected = grass_quadrants[q][if (q == 3) 3 else 4];
+        const src = dirtQuadrantSource(q, neighbors);
+        const expected = dirt_quadrants[q][if (q == 3) 3 else 4];
         try std.testing.expectEqual(expected[0], src.x);
         try std.testing.expectEqual(expected[1], src.y);
     }
     it = resident.by_key.valueIterator();
     while (it.next()) |chunk| {
-        if (chunk.*.cx == 0 and chunk.*.cy == -1) chunk.*.tiles[15 * world.CT] = .rock;
+        if (chunk.*.cx == 0 and chunk.*.cy == -1) chunk.*.tiles[15 * world.CT] = .tree;
     }
-    neighbors = grassNeighbors(&resident, -1, -1);
-    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 120, .y = 16, .width = 8, .height = 8 }, grassQuadrantSource(1, neighbors));
-    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 120, .y = 24, .width = 8, .height = 8 }, grassQuadrantSource(3, neighbors));
-}
-
-test "only dirt and rock terrain types have uppercase labels" {
-    try std.testing.expectEqual(null, tileLetter(.grass));
-    try std.testing.expectEqual(null, tileLetter(.tree));
-    const cases = [_]struct { tile: world.Tile, letter: u8 }{
-        .{ .tile = .dirt, .letter = 'D' },
-        .{ .tile = .rock, .letter = 'R' },
-    };
-    for (cases) |c| {
-        try std.testing.expectEqual(c.letter, tileLetter(c.tile).?);
-        try std.testing.expect(c.letter >= 'A' and c.letter <= 'Z');
+    neighbors = dirtNeighbors(&resident, -1, -1);
+    try std.testing.expect(!neighbors[4]); // Trees never connect to dirt.
+    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 32, .y = 16, .width = 8, .height = 8 }, dirtQuadrantSource(1, neighbors));
+    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 32, .y = 24, .width = 8, .height = 8 }, dirtQuadrantSource(3, neighbors));
+    it = resident.by_key.valueIterator();
+    while (it.next()) |chunk| @memset(&chunk.*.tiles, .grass);
+    neighbors = dirtNeighbors(&resident, -1, -1);
+    try std.testing.expect(std.mem.allEqual(bool, &neighbors, false));
+    for (0..4) |q| {
+        const src = dirtQuadrantSource(q, neighbors);
+        try std.testing.expectEqual(dirt_quadrants[q][0][0], src.x);
+        try std.testing.expectEqual(dirt_quadrants[q][0][1], src.y);
     }
 }
 
-test "mature maple crop doubles around the ground tile bottom center" {
-    try std.testing.expectEqual(160, maple_sheet_width);
-    try std.testing.expectEqual(48, maple_sheet_height);
-    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 96, .y = 0, .width = 32, .height = 48 }, maple_source);
-    try std.testing.expect(maple_source.x + maple_source.width <= maple_sheet_width);
-    try std.testing.expect(maple_source.y + maple_source.height <= maple_sheet_height);
+test "rock crop doubles with its baseline at the ground tile bottom center" {
+    try std.testing.expectEqual(112, rock_sheet_width);
+    try std.testing.expectEqual(192, rock_sheet_height);
+    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 32, .y = 32, .width = 16, .height = 16 }, rock_source);
+    try std.testing.expect(rock_source.x >= 0 and rock_source.x + rock_source.width <= rock_sheet_width);
+    try std.testing.expect(rock_source.y >= 0 and rock_source.y + rock_source.height <= rock_sheet_height);
     for ([_]f32{ 0, -32 }) |pixel| {
-        const dest = mapleDest(pixel, pixel);
-        try std.testing.expectEqual(pixel - 16, dest.x);
-        try std.testing.expectEqual(pixel - 64, dest.y);
-        try std.testing.expectEqual(maple_source.width * 2, dest.width);
-        try std.testing.expectEqual(maple_source.height * 2, dest.height);
-        try std.testing.expectEqual(pixel + world.TILE_PX / 2, dest.x + dest.width / 2);
-        try std.testing.expectEqual(pixel + world.TILE_PX, dest.y + dest.height);
+        const dest = rockDest(pixel, pixel);
+        try std.testing.expectEqual(pixel, dest.x);
+        try std.testing.expectEqual(pixel + 8, dest.y);
+        try std.testing.expectEqual(rock_source.width * 2, dest.width);
+        try std.testing.expectEqual(rock_source.height * 2, dest.height);
+        try std.testing.expectEqual(@as(f32, world.TILE_PX), dest.width);
+        try std.testing.expectEqual(pixel + world.TILE_PX / 2, dest.x + 8 * 2);
+        try std.testing.expectEqual(pixel + world.TILE_PX, dest.y + 12 * 2);
     }
 }
 
-test "maple anchor ring includes adjacent offscreen canopies at negative coordinates" {
+test "oak root doubles around the ground tile bottom center" {
+    try std.testing.expectEqual(64, oak_sheet_width);
+    try std.testing.expectEqual(80, oak_sheet_height);
+    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 0, .y = 0, .width = 64, .height = 80 }, oak_source);
+    try std.testing.expect(oak_source.x + oak_source.width <= oak_sheet_width);
+    try std.testing.expect(oak_source.y + oak_source.height <= oak_sheet_height);
+    for ([_]f32{ 0, -32 }) |pixel| {
+        const dest = oakDest(pixel, pixel);
+        try std.testing.expectEqual(pixel - 48, dest.x);
+        try std.testing.expectEqual(pixel - 96, dest.y);
+        try std.testing.expectEqual(oak_source.width * 2, dest.width);
+        try std.testing.expectEqual(oak_source.height * 2, dest.height);
+        try std.testing.expectEqual(pixel + world.TILE_PX / 2, dest.x + 32 * 2);
+        try std.testing.expectEqual(pixel + world.TILE_PX, dest.y + 64 * 2);
+    }
+}
+
+test "sprite anchor ring includes adjacent offscreen canopies and shadows at negative coordinates" {
     for ([_]i32{ 0, -2 }) |chunk_coord| {
         const vis = world.ChunkRange{ .cx0 = chunk_coord, .cy0 = chunk_coord, .cx1 = chunk_coord, .cy1 = chunk_coord };
         const anchors = vis.expanded(1);
@@ -1021,29 +1066,15 @@ test "maple anchor ring includes adjacent offscreen canopies at negative coordin
         const left: f32 = @floatFromInt(chunk_coord * world.CHUNK_PX);
         const right = left + world.CHUNK_PX;
         // The first anchor below the viewport still paints its canopy inside it.
-        const below = mapleDest(left, right);
-        try std.testing.expect(below.y < right and below.y + below.height > right);
-        const east = mapleDest(right, left);
-        try std.testing.expect(east.x < right);
-        const west = mapleDest(left - world.TILE_PX, left);
-        try std.testing.expect(west.x + west.width > left);
-    }
-}
-
-test "tile labels are centred on the tile in both axes" {
-    const cases = [_]struct { tx: i32, ty: i32, w: i32, h: i32 }{
-        .{ .tx = 0, .ty = 0, .w = 11, .h = 20 },
-        .{ .tx = 32, .ty = 64, .w = 20, .h = 20 },
-        .{ .tx = -96, .ty = -32, .w = 7, .h = 16 },
-    };
-    for (cases) |c| {
-        const pos = centeredTextPos(c.tx, c.ty, c.w, c.h);
-        const tile_cx = c.tx + @divTrunc(world.TILE_PX, 2);
-        const tile_cy = c.ty + @divTrunc(world.TILE_PX, 2);
-        const text_cx = pos.x + @divTrunc(c.w, 2);
-        const text_cy = pos.y + @divTrunc(c.h, 2);
-        // Integer division can leave the label one pixel off centre.
-        try std.testing.expect(@abs(tile_cx - text_cx) <= 1);
-        try std.testing.expect(@abs(tile_cy - text_cy) <= 1);
+        const below = oakDest(left, right);
+        try std.testing.expect(below.y + 9 * 2 < right and below.y + 72 * 2 > right);
+        const east = oakDest(right, left);
+        try std.testing.expect(east.x + 11 * 2 < right);
+        const west = oakDest(left - world.TILE_PX, left);
+        try std.testing.expect(west.x + 52 * 2 > left);
+        const above = oakDest(left, left - world.TILE_PX);
+        try std.testing.expect(above.y + 72 * 2 > left);
+        const rock_above = rockDest(left, left - world.TILE_PX);
+        try std.testing.expectEqual(left + 4, rock_above.y + 14 * 2);
     }
 }

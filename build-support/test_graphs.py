@@ -128,22 +128,25 @@ class GraphIsolationTests(unittest.TestCase):
         self.assertNotIn("macos-preflight.py", wasm_source)
         self.assertNotIn("macos_deployment_target", wasm_source)
 
-    def test_both_browser_links_preload_only_grass_and_maple_sheets_and_track_their_contents(self):
+    def test_both_browser_links_preload_only_grass_dirt_oak_rock_sheets_and_track_their_contents(self):
         source = (ROOT / "build" / "wasm.zig").read_text(encoding="utf-8")
-        self.assertIn('const grass_sheet = b.path("assets/Tileset/Tileset Grass Spring.png");', source)
-        self.assertIn('const maple_sheet = b.path("assets/Objects/Maple Tree.png");', source)
-        self.assertIn('.src_path = grass_sheet,', source)
-        self.assertIn('.src_path = maple_sheet,', source)
-        self.assertIn('.virtual_path = "/assets/Tileset/Tileset Grass Spring.png",', source)
-        self.assertIn('.virtual_path = "/assets/Objects/Maple Tree.png",', source)
+        for sheet, path in (
+            ("grass_sheet", "assets/Tiles/Grass_Middle.png"),
+            ("dirt_sheet", "assets/Tiles/Path_Tile.png"),
+            ("oak_sheet", "assets/Outdoor decoration/Oak_Tree.png"),
+            ("rock_sheet", "assets/Outdoor decoration/Outdoor_Decor_Free.png"),
+        ):
+            with self.subTest(sheet=sheet):
+                self.assertIn(f'const {sheet} = b.path("{path}");', source)
+                self.assertIn(f'.src_path = {sheet},', source)
+                self.assertIn(f'.virtual_path = "/{path}",', source)
+                self.assertIn(f"emcc.addFileInput({sheet});", source)
         self.assertEqual(source.count(".preload_paths = preload_paths,"), 2)
-        self.assertEqual(source.count(".src_path ="), 2)
-        self.assertEqual(source.count(".virtual_path ="), 2)
+        self.assertEqual(source.count(".src_path ="), 4)
+        self.assertEqual(source.count(".virtual_path ="), 4)
         self.assertIn("for ([_]*std.Build.Step{ linked, fixture_linked })", source)
         self.assertIn(".cast(std.Build.Step.Run)", source)
-        self.assertIn("emcc.addFileInput(grass_sheet);", source)
-        self.assertIn("emcc.addFileInput(maple_sheet);", source)
-        self.assertEqual(source.count("emcc.addFileInput("), 2)
+        self.assertEqual(source.count("emcc.addFileInput("), 4)
 
     def test_explicit_wasm_platform_and_target_select_the_complete_browser_graph(self):
         result = configure("-Dplatform=wasm", "-Dtarget=wasm32-emscripten")
