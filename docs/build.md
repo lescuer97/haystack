@@ -5,8 +5,8 @@ configurations also expose the independent server graph in `build/server.zig`;
 the default install/run remains desktop-only. Normal application builds do
 not run a Python application builder, invoke another `zig build`, or configure
 the other platform. The graph-isolation test queries each configuration's help
-menu, without building the other application; server-only regressions also build
-the socket-free server without checking Rust.
+menu, without building the other application; server-only regressions verify that
+a selected missing Rust toolchain fails the server build without provisioning it.
 
 | Command | Output / action |
 | --- | --- |
@@ -16,9 +16,9 @@ the socket-free server without checking Rust.
 | `zig build run` | Build, install, then run the installed desktop binary next to its installed raylib |
 | `zig build run -Dplatform=wasm` | Build/serve the browser application at `http://127.0.0.1:8000` |
 | `zig build test` | Desktop application tests |
-| `zig build server -Dgame=false` | Build/install only `zig-out/bin/haystack_server`, without desktop policy, Rust, C ABI, Raylib or browser setup/check steps |
+| `zig build server -Dgame=false` | Build/install only `zig-out/bin/haystack_server`; requires the native Rust/CDK toolchain, C ABI and native target policy, but no Raylib or browser checks (see [server prerequisites](server.md)) |
 | `zig build run-server -Dgame=false -- ...` | Explicitly run the standalone local server |
-| `zig build test-server -Dgame=false` | Four socket-free test legs: server, shared, bounded WebSocket and application WebSocket memory tests |
+| `zig build test-server -Dgame=false` | Five socket-free test legs: server core (including real-wallet coexistence), shared, native-storage helpers, bounded WebSocket and application WebSocket memory tests; also audits the SQLite namespace |
 | `zig build build-bench-server -Dgame=false -Doptimize=ReleaseSafe` | Build/install the opt-in benchmark without running it |
 | `zig build bench-server -Dgame=false -Doptimize=ReleaseSafe -- ...` | Explicit opt-in benchmark execution; never part of default builds/tests |
 | `zig build test-wallet` | Native Rust suite, C-header check, Zig wallet/Spilman ABI tests |
@@ -47,11 +47,14 @@ been removed; the browser has its own Rust package.
 
 ## What stays separate
 
-`-Dgame=false` returns before either application helper is invoked. Its selected
-`-Dtarget` is independent of the native-only desktop wallet policy. It is invalid
-with `-Dplatform=wasm`, which has no server steps. Server steps remain available
-in ordinary native desktop configurations without an additional opt-in, but
-only explicit server steps install or run server artifacts. See [server.md](server.md).
+`-Dgame=false` configures the shared UI-free `build/native_wallet.zig` graph and
+applies its native CDK target policy before returning without invoking either
+the desktop game or browser helper. Desktop and server share this native wallet
+graph; provision server-only tools with `zig build setup -Dgame=false`. The flag
+is invalid with `-Dplatform=wasm`, which has no server steps. Server steps remain
+available in ordinary native desktop configurations without an additional opt-in,
+but only explicit server steps install or run server artifacts. See
+[server.md](server.md) for prerequisites.
 
 `build/shared.zig` creates the dependency-free terrain/protocol module for each
 consumer's target and optimization. Desktop creates it after macOS deployment
@@ -102,7 +105,7 @@ configuration.
 
 One shared resolver (`build/platform.zig`) validates Zig's detected host and the
 resolved target, then returns the Rust target triple, Zig target, native library
-set and rpath that the desktop graph consumes. Validation happens before preflight,
+set and rpath that the desktop and server graphs consume. Validation happens before preflight,
 Rust tool checks or compilation.
 
 | Host / target | Result |

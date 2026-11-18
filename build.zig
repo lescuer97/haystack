@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) !void {
         .safe => .safe,
         .fast => .fast,
     };
-    const game = b.option(bool, "game", "Configure the game and wallet (default true)") orelse true;
+    const game = b.option(bool, "game", "Configure the game (default true; native server wallet is always configured)") orelse true;
     const toolchain = b.option([]const u8, "rust-toolchain", b.fmt("Rustup toolchain (default: pinned {s})", .{common.default_toolchain})) orelse common.default_toolchain;
     const offline = b.option(bool, "offline", "Forbid tool downloads and Cargo network access") orelse false;
     if (platform == .wasm and !game) {
@@ -39,14 +39,15 @@ pub fn build(b: *std.Build) !void {
         std.log.err("native desktop/server builds cannot target Wasm; browser builds require -Dplatform=wasm and -Dgame=true", .{});
         return error.UnsupportedDesktopTarget;
     }
-    if (platform == .desktop) @import("build/server.zig").build(b, target, optimize);
-    if (!game) return;
     const options: common.Options = .{
         .target = target,
         .optimize = optimize,
         .toolchain = toolchain,
         .offline = offline,
     };
+    const native = if (platform == .desktop) try @import("build/native_wallet.zig").create(b, options) else null;
+    if (native) |graph| @import("build/server.zig").build(b, graph);
+    if (!game) return;
     const build_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "build-support", "-p", "test_*.py" });
     build_tests.setCwd(b.path("."));
     const platform_tests = b.addTest(.{
@@ -89,7 +90,7 @@ pub fn build(b: *std.Build) !void {
     // Deliberately configure ONE graph. Desktop never initializes browser
     // toolchains; Wasm never translates/links the native C ABI or desktop raylib.
     switch (platform) {
-        .desktop => try @import("build/desktop.zig").build(b, options),
+        .desktop => try @import("build/desktop.zig").build(b, native.?),
         .wasm => try @import("build/wasm.zig").build(b, options),
     }
 }

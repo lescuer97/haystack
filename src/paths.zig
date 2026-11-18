@@ -3,7 +3,8 @@
 //! The policy is intentionally small and explicit:
 //! * Linux follows `XDG_CONFIG_HOME` and `XDG_DATA_HOME` when they contain a
 //!   non-empty absolute path; otherwise the XDG defaults under `$HOME` apply.
-//! * macOS always uses `~/Library/Application Support/haystack`.
+//! * macOS always uses `~/Library/Application Support/<identity>`.
+//! * Client identity is `haystack`; server identity is `haystack-server`.
 //! * There is no cache directory.
 //!
 //! Path resolution is a pure function so the policy can be tested without
@@ -13,6 +14,17 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const Platform = enum { linux, macos };
+pub const Identity = enum {
+    client,
+    server,
+
+    fn directory(self: Identity) []const u8 {
+        return switch (self) {
+            .client => "haystack",
+            .server => "haystack-server",
+        };
+    }
+};
 
 pub const Locations = struct {
     config_dir: []u8,
@@ -49,21 +61,33 @@ pub const ResolveError = error{
 /// they are empty or relative. `home` must be absolute.
 pub fn resolve(
     allocator: std.mem.Allocator,
-    platform: Platform,
+    comptime platform: Platform,
     xdg_config_home: ?[]const u8,
     xdg_data_home: ?[]const u8,
     home: []const u8,
 ) ResolveError!Locations {
+    return resolveIdentity(allocator, .client, platform, xdg_config_home, xdg_data_home, home);
+}
+
+pub fn resolveIdentity(
+    allocator: std.mem.Allocator,
+    identity: Identity,
+    comptime platform: Platform,
+    xdg_config_home: ?[]const u8,
+    xdg_data_home: ?[]const u8,
+    home: []const u8,
+) ResolveError!Locations {
+    const name = identity.directory();
     if (home.len == 0 or !std.fs.path.isAbsolute(home)) return error.InvalidHome;
 
     const config_dir = switch (platform) {
         .linux => blk: {
             if (validXdg(xdg_config_home)) |base| {
-                break :blk try std.fs.path.join(allocator, &.{ base, "haystack" });
+                break :blk try std.fs.path.join(allocator, &.{ base, name });
             }
-            break :blk try std.fs.path.join(allocator, &.{ home, ".config", "haystack" });
+            break :blk try std.fs.path.join(allocator, &.{ home, ".config", name });
         },
-        .macos => try std.fs.path.join(allocator, &.{ home, "Library", "Application Support", "haystack" }),
+        .macos => try std.fs.path.join(allocator, &.{ home, "Library", "Application Support", name }),
     };
     errdefer allocator.free(config_dir);
 
@@ -73,22 +97,22 @@ pub fn resolve(
     const content_dir = switch (platform) {
         .linux => blk: {
             if (validXdg(xdg_data_home)) |base| {
-                break :blk try std.fs.path.join(allocator, &.{ base, "haystack", "content" });
+                break :blk try std.fs.path.join(allocator, &.{ base, name, "content" });
             }
-            break :blk try std.fs.path.join(allocator, &.{ home, ".local", "share", "haystack", "content" });
+            break :blk try std.fs.path.join(allocator, &.{ home, ".local", "share", name, "content" });
         },
-        .macos => try std.fs.path.join(allocator, &.{ home, "Library", "Application Support", "haystack", "content" }),
+        .macos => try std.fs.path.join(allocator, &.{ home, "Library", "Application Support", name, "content" }),
     };
     errdefer allocator.free(content_dir);
 
     const wallet_dir = switch (platform) {
         .linux => blk: {
             if (validXdg(xdg_data_home)) |base| {
-                break :blk try std.fs.path.join(allocator, &.{ base, "haystack", "wallet" });
+                break :blk try std.fs.path.join(allocator, &.{ base, name, "wallet" });
             }
-            break :blk try std.fs.path.join(allocator, &.{ home, ".local", "share", "haystack", "wallet" });
+            break :blk try std.fs.path.join(allocator, &.{ home, ".local", "share", name, "wallet" });
         },
-        .macos => try std.fs.path.join(allocator, &.{ home, "Library", "Application Support", "haystack", "wallet" }),
+        .macos => try std.fs.path.join(allocator, &.{ home, "Library", "Application Support", name, "wallet" }),
     };
     errdefer allocator.free(wallet_dir);
 
@@ -147,12 +171,16 @@ pub fn currentPlatform() error{UnsupportedPlatform}!Platform {
 
 /// Read the current user's storage locations from the environment.
 pub fn resolveCurrent(allocator: std.mem.Allocator) (ResolveError || error{EnvironmentUnavailable})!Locations {
-    const platform = try currentPlatform();
+    return resolveCurrentIdentity(allocator, .client);
+}
+
+pub fn resolveCurrentIdentity(allocator: std.mem.Allocator, identity: Identity) (ResolveError || error{EnvironmentUnavailable})!Locations {
+    const platform = try comptime currentPlatform();
     const home = env("HOME") orelse return error.EnvironmentUnavailable;
     if (platform == .linux) {
-        return resolve(allocator, platform, env("XDG_CONFIG_HOME"), env("XDG_DATA_HOME"), home);
+        return resolveIdentity(allocator, identity, platform, env("XDG_CONFIG_HOME"), env("XDG_DATA_HOME"), home);
     }
-    return resolve(allocator, platform, null, null, home);
+    return resolveIdentity(allocator, identity, platform, null, null, home);
 }
 
 fn env(name: [:0]const u8) ?[]const u8 {
@@ -232,4 +260,20 @@ test "macos ignores XDG and uses Application Support" {
 test "invalid HOME is rejected" {
     try testing.expectError(error.InvalidHome, resolve(testing.allocator, .linux, null, null, ""));
     try testing.expectError(error.InvalidHome, resolve(testing.allocator, .linux, null, null, "relative/home"));
+}
+
+test "server identity is separate with default XDG and macOS policy" {
+    const linux = try resolveIdentity(testing.allocator, .server, .linux, null, null, "/home/player");
+    defer linux.deinit(testing.allocator);
+    try testing.expectEqualStrings("/home/player/.config/haystack-server", linux.config_dir);
+    try testing.expectEqualStrings("/home/player/.local/share/haystack-server/wallet", linux.wallet_dir);
+    const xdg = try resolveIdentity(testing.allocator, .server, .linux, "/srv/config", "/srv/data", "/home/player");
+    defer xdg.deinit(testing.allocator);
+    try testing.expectEqualStrings("/srv/config/haystack-server", xdg.config_dir);
+    try testing.expectEqualStrings("/srv/data/haystack-server/wallet", xdg.wallet_dir);
+    try testing.expectEqual(@as(usize, 0), xdg.standard_parents.len);
+    const macos = try resolveIdentity(testing.allocator, .server, .macos, "/ignored", "/ignored", "/Users/player");
+    defer macos.deinit(testing.allocator);
+    try testing.expectEqualStrings("/Users/player/Library/Application Support/haystack-server", macos.config_dir);
+    try testing.expectEqualStrings("/Users/player/Library/Application Support/haystack-server/wallet", macos.wallet_dir);
 }

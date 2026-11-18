@@ -9,6 +9,8 @@ zig build -Dplatform=wasm        # complete browser application
 
 The independent [local server](docs/server.md) builds with
 `zig build server -Dgame=false` and has socket-free tests via `test-server`.
+It requires the native Rust/CDK toolchain and initializes a separate headless
+`haystack-server` wallet before listening; operators must back up its seed and DB.
 Native desktop configurations expose these explicit steps without adding the
 server to the default install; the game client does not connect to it yet.
 

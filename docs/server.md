@@ -4,6 +4,11 @@ Zig 0.17.0; vendored WebSocket and zig-sqlite integration. SQLite 3.54.0 is buil
 from pinned official sources, **not** linked from the system. See
 `vendor/zig-sqlite/PROVENANCE.md` and `vendor/websocket/` for revisions/patches.
 
+Native server builds also require the pinned Rust/CDK toolchain (`zig build
+setup -Dgame=false`; use `-Doffline` with warmed tools/Cargo caches). The native
+CDK target policy applies: native Linux x86_64/aarch64 or Apple Silicon macOS.
+Server-only builds do not initialize Raylib; installation remains opt-in.
+
 ```sh
 zig build server -Dgame=false
 zig build run-server -Dgame=false -- /absolute/local/path/world.sqlite3
@@ -17,6 +22,41 @@ and database-path CLI argument are unchanged. Game/Raylib targets and terrain ch
 authentication, rewards, private gameplay, regrowth or inventory are included.
 Loopback is not authentication: local processes and browsers may modify this
 world. Do not expose it as a production security boundary.
+
+## Headless wallet startup
+
+Before listening, the server locks its separate `haystack-server` storage root
+for its entire lifetime and opens a native CDK wallet. On Linux the defaults are
+`~/.config/haystack-server/haystack.lock` and
+`~/.local/share/haystack-server/wallet/{seed-words.txt,wallet.sqlite}`.
+Absolute nonempty `XDG_CONFIG_HOME`/`XDG_DATA_HOME` overrides are honored; explicit
+bases must already exist. macOS uses
+`~/Library/Application Support/haystack-server` for both roots. Client storage
+(`haystack`), executable name `haystack_server`, world DB path and CLI do not change.
+
+Only a truly absent wallet is automatically created, using a 12-word BIP39 seed.
+The seed is plaintext in an owner-only `0600` file, alongside the `0600` wallet
+database in private `0700` directories. It is never printed. **The operator is
+responsible for securely backing up both the seed and wallet database.** Later
+startups validate and reopen that same identity, not a new wallet.
+
+Existing empty, partial, invalid, insecure or locked wallet storage fails startup
+without replacement or permission repair. A failed post-commit durability flush
+retains the pair and fails that run; restart validates and flushes it again,
+including standard-parent/config directory chains. Never delete retained storage
+to bypass a failure unless intentionally abandoning that identity and its funds.
+No config.json, content directory, onboarding state, UI, wallet worker, wallet
+actions or endpoints are added. Mint selection matches the native client:
+`https://testnut.cashu.space/`, or the existing isolated `-Dapp-fixture-mint`
+override. Opening does not eagerly add a mint, poll or scan for restoration.
+
+Main owns the wallet; App borrows it. WebSocket callback draining and App cleanup
+precede wallet close; the root lock is released last. CDK/Rust's runtime, SQLite
+and allocations are **outside the three reserved server budgets below**. World
+SQLite retains its fixed heap and lifecycle, with all public C symbols renamed
+at compilation and translation to isolate it from CDK's bundled SQLite. The
+server/test/benchmark graphs audit the complete public manifest, translated
+extern linkage and actual world archive definitions/unresolved references.
 
 ## Ephemeral connection sessions
 

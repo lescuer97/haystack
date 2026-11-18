@@ -34,3 +34,16 @@ Root build selects `memsys5=true`, `zero_malloc=true`, `omit_autoinit=true`,
 `threadsafe=1`. The resulting server does not dynamically link system sqlite3.
 No SQLite scheduling/durability options were relaxed. In particular, builds
 retain WAL, FULL synchronous commits and SQLite's default checkpoint policy.
+
+The root server opts into `server_namespace=true` (default false for other
+consumers). `c/server_namespace.h` renames all public API functions/data and the
+workaround helper before C compilation; `c/server_sqlite3_c.h` applies the same
+manifest to translation. This isolates the fixed world heap/lifecycle from the
+Rust CDK archive's independently bundled SQLite. sqliteext is not renamed.
+The wrapper completes the pinned version array before translation and suppresses
+its unsupported Zig const-copy alias; access that data through
+`haystack_world_sqlite3_version`. Function aliases keep their sqlite3_* spelling.
+`build-support/check_server_namespace.py` checks manifest completeness against
+the pinned header, translated extern linkage, and all definitions/unresolved
+references in the actual world archive. No duplicate-symbol or link-order
+workarounds are used.

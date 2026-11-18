@@ -251,8 +251,9 @@ pub fn inspect(
 /// Failed pre-commit work removes only the exact staging directory owned by
 /// this call.
 ///
-/// Startup provisioning must first durably record pending onboarding and must
-/// treat unknown durability as blocked without retrying creation in that run.
+/// Client policy requires durably recording pending onboarding first; this
+/// reusable primitive does not impose onboarding on headless callers. All
+/// callers must block on unknown durability without retrying creation that run.
 pub fn create(
     io: Io,
     allocator: std.mem.Allocator,

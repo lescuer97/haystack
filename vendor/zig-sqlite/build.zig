@@ -155,6 +155,7 @@ fn makeSQLiteLib(b: *std.Build, dep: *std.Build.Dependency, c_flags: []const []c
 }
 
 pub fn build(b: *std.Build) !void {
+    const server_namespace = b.option(bool, "server_namespace", "Isolate world SQLite from native CDK SQLite") orelse false;
     const in_memory = b.option(bool, "in_memory", "Should the tests run with sqlite in memory (default true)") orelse true;
     const dbfile = b.option([]const u8, "dbfile", "Always use this database file instead of a temporary one");
     const ci = b.option(bool, "ci", "Build and test in the CI on GitHub");
@@ -227,6 +228,10 @@ pub fn build(b: *std.Build) !void {
     }
 
     const c_flags = flags.items;
+    var server_flags: std.ArrayList([]const u8) = .empty;
+    defer server_flags.deinit(b.allocator);
+    try server_flags.appendSlice(b.allocator, c_flags);
+    if (server_namespace) try server_flags.appendSlice(b.allocator, &.{ "-include", try b.root.joinString(b.allocator, "c/server_namespace.h") });
 
     //
     // Main library and module
@@ -234,7 +239,7 @@ pub fn build(b: *std.Build) !void {
 
     // const sqlite_lib, const sqlite_mod = blk: {
     const sqlite_lib, _ = blk: {
-        const lib = makeSQLiteLib(b, sqlite_dep, c_flags, target, optimize, .with);
+        const lib = makeSQLiteLib(b, sqlite_dep, server_flags.items, target, optimize, .with);
 
         const mod = b.addModule("sqlite", .{
             .root_source_file = b.path("sqlite.zig"),
@@ -242,12 +247,17 @@ pub fn build(b: *std.Build) !void {
         });
         mod.addIncludePath(b.path("c"));
         mod.addIncludePath(sqlite_dep.path("sqlite-amalgamation-3540000"));
-        mod.addImport("sqlite3_c", translateSQLite(b, sqlite_dep, "c/sqlite3_c.h", target, optimize));
+        const bindings = translateSQLite(b, sqlite_dep, if (server_namespace) "c/server_sqlite3_c.h" else "c/sqlite3_c.h", target, optimize);
+        mod.addImport("sqlite3_c", bindings);
+        b.addNamedLazyPath("sqlite_bindings", bindings.root_source_file.?);
         mod.linkLibrary(lib);
 
         break :blk .{ lib, mod };
     };
     b.installArtifact(sqlite_lib);
+    // Expose the exact world archive for the root graph's symbol audit.
+    b.addNamedLazyPath("sqlite_archive", sqlite_lib.getEmittedBin());
+    b.addNamedLazyPath("sqlite_header", sqlite_dep.path("sqlite3.h"));
 
     _ = blk: {
         const lib = makeSQLiteLib(b, sqlite_dep, c_flags, target, optimize, .without);

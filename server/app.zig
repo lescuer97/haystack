@@ -17,6 +17,8 @@ pub const Context = struct {
 };
 pub const Layout = struct { contexts: [4]Context, registry: sessions.Registry };
 pub const App = struct {
+    /// Borrowed from main, never closed here; fixtures need not provision one.
+    wallet: ?*const @import("wallet.zig").Wallet = null,
     database_path: [:0]const u8,
     contexts: *[4]Context,
     registry: *sessions.Registry,

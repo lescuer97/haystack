@@ -33,26 +33,31 @@ class GraphIsolationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         step_help = result.stdout.split("Steps:\n", 1)[1].split("\nProject-Specific Options:", 1)[0]
         steps = {line.split()[0] for line in step_help.splitlines() if line.split()}
-        for step in ("server", "run-server", "test-server", "build-bench-server", "bench-server"):
+        for step in ("server", "run-server", "test-server", "build-bench-server", "bench-server", "setup"):
             self.assertIn(step, steps)
-        for step in ("desktop", "run", "test", "wallet", "setup", "header-check", "test-wallet",
+        for step in ("desktop", "run", "test", "wallet", "header-check", "test-wallet",
                      "test-spilman", "browser", "renderer", "test-mint", "test-build", "test-package",
                      "wasm", "test-storage", "browser-fixture", "wallet-fixture", "test-onboarding",
                      "test-wallet-ui", "test-withdrawal-ui", "test-qr-portability", "test-platform"):
             self.assertNotIn(step, steps)
 
-    def test_server_only_build_does_not_check_the_selected_rust_toolchain(self):
+    def test_server_only_build_requires_selected_rust_toolchain_without_provisioning(self):
         result = subprocess.run(
             ["zig", "build", "server", "-Dgame=false", "-Doffline",
              "-Drust-toolchain=9.99.0-missing-server-only"],
             cwd=ROOT, capture_output=True, text=True, timeout=180,
         )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn("check installed Rust", result.stdout + result.stderr)
+        output = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0, output)
+        self.assertIn("zig build setup", output)
+        self.assertIn("9.99.0-missing-server-only", output)
+        self.assertNotIn("toolchain install", output)
 
-    def test_server_only_target_is_not_restricted_by_desktop_policy(self):
-        result = configure("-Dgame=false", "-Dtarget=aarch64-linux-gnu")
-        self.assertEqual(result.returncode, 0, result.stderr)
+    def test_server_only_uses_native_cdk_target_policy(self):
+        target = "x86_64-linux-gnu" if HOST_MACHINE in ("aarch64", "arm64") else "aarch64-linux-gnu"
+        result = configure("-Dgame=false", f"-Dtarget={target}")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("UnsupportedDesktopTarget", result.stderr)
 
     def test_explicit_desktop_server_only_rejects_wasm_targets(self):
         for target in ("wasm32-emscripten", "wasm64-emscripten", "wasm32-wasi"):
@@ -114,7 +119,7 @@ class GraphIsolationTests(unittest.TestCase):
     def test_wasm_does_not_configure_macos_desktop_preflight(self):
         # The wasm help text itself mentions macOS in Zig's generic host
         # integration options, so assert the graph split at the source level.
-        desktop_source = (ROOT / "build" / "desktop.zig").read_text(encoding="utf-8")
+        desktop_source = (ROOT / "build" / "native_wallet.zig").read_text(encoding="utf-8")
         wasm_source = (ROOT / "build" / "wasm.zig").read_text(encoding="utf-8")
         self.assertIn("macos-preflight.py", desktop_source)
         self.assertNotIn("macos-preflight.py", wasm_source)

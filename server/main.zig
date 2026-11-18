@@ -11,11 +11,19 @@ pub fn main(init: std.process.Init) !void {
     const sql_budget = if (args.len >= 3) try std.fmt.parseInt(usize, args[2], 10) else sqlite.default_budget;
     const ws_budget = if (args.len >= 4) try std.fmt.parseInt(usize, args[3], 10) else memory.default_ws_budget;
     const app_budget = if (args.len >= 5) try std.fmt.parseInt(usize, args[4], 10) else app.default_budget;
+    if (ws_budget < 4096 or !std.math.isPowerOfTwo(ws_budget)) return error.InvalidWebsocketBudget;
+    const native = @import("native_storage");
+    const locations = try native.paths.resolveCurrentIdentity(init.gpa, .server);
+    defer locations.deinit(init.gpa);
+    try native.storage_fs.ensureStandardParents(init.io, locations.standard_parents);
+    var lock = try native.instance_lock.acquire(init.io, locations.config_dir);
+    defer lock.release(init.io);
+    var wallet = try @import("wallet.zig").open(init.io, init.gpa, locations);
+    defer wallet.close() catch {};
     const sql_buffer = try init.gpa.alignedAlloc(u8, .fromByteUnits(8), sql_budget);
     defer init.gpa.free(sql_buffer);
     var runtime = try sqlite.Runtime.start(sql_buffer);
     defer runtime.stop();
-    if (ws_budget < 4096 or !std.math.isPowerOfTwo(ws_budget)) return error.InvalidWebsocketBudget;
     const ws_alignment: std.mem.Alignment = .fromByteUnits(ws_budget);
     const ws_ptr = init.gpa.rawAlloc(ws_budget, ws_alignment, @returnAddress()) orelse return error.OutOfMemory;
     defer init.gpa.rawFree(ws_ptr[0..ws_budget], ws_alignment, @returnAddress());
@@ -23,6 +31,7 @@ pub fn main(init: std.process.Init) !void {
     const app_buffer = try init.gpa.alignedAlloc(u8, .fromByteUnits(@alignOf(app.Layout)), app_budget);
     defer init.gpa.free(app_buffer);
     var application = try app.App.init(init.io, path, app_buffer);
+    application.wallet = &wallet;
     defer application.deinit();
     var server = ws.Server(transport.Handler).init(init.io, recycler.allocator(), @import("ws_config.zig").config) catch |err| {
         if (err == error.OutOfMemory) return error.InsufficientWebsocketBudget;

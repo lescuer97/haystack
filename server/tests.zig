@@ -5,4 +5,5 @@ test {
     _ = @import("storage.zig");
     _ = @import("sessions_tests.zig");
     _ = @import("transport_tests.zig");
+    _ = @import("wallet_tests.zig");
 }
