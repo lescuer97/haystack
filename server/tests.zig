@@ -1,4 +1,5 @@
 test {
+    _ = @import("main.zig");
     _ = @import("ws_auth.zig");
     _ = @import("actions.zig");
     _ = @import("memory.zig");

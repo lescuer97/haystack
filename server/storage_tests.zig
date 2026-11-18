@@ -19,7 +19,7 @@ fn find(terrain: world.Tile) p.Cut {
 test "BLOB id persistence replays original successes terminal errors conflicts and zero ID" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const db = &fixture.application.contexts[0].db;
+    const db = &fixture.application.context.db;
     var original: [4]p.CutResult = undefined;
     var requests: [4]p.Request = undefined;
     for ([_]world.Tile{ .grass, .tree, .rock, .dirt }, 0..) |terrain, i| {
@@ -36,7 +36,7 @@ test "BLOB id persistence replays original successes terminal errors conflicts a
     try std.testing.expectEqual(p.ErrorCode.already_cut, already.failure.code);
     fixture.application.deinit();
     fixture.application = try App.init(fixture.io, fixture.path, fixture.buffers);
-    const reopened = &fixture.application.contexts[0].db;
+    const reopened = &fixture.application.context.db;
     for (original, requests) |result, req| try std.testing.expectEqualDeep(result, try reopened.cut(req));
     try std.testing.expectEqualDeep(already, try reopened.cut(request(100, tile.x, tile.y)));
     try std.testing.expectEqual(p.ErrorCode.request_id_conflict, (try reopened.cut(request(0, tile.x + 1, tile.y))).failure.code);
@@ -47,7 +47,7 @@ test "BLOB id persistence replays original successes terminal errors conflicts a
 test "bitmap negative coordinates order empty full boundaries complete rectangle and extremes" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const db = &fixture.application.contexts[0].db;
+    const db = &fixture.application.context.db;
     try db.exec("BEGIN; INSERT INTO chunk_state VALUES(-1,-1,x'0100000000000000000000000000000000000000000000000000000000000080'),(0,-1,x'0100000000000000000000000000000000000000000000000000000000000000'),(-1,0,x'0100000000000000000000000000000000000000000000000000000000000000'),(0,0,x'0000000000000000000000000000000000000000000000000000000000000080'); COMMIT;");
     var snapshot: p.Snapshot = undefined;
     try db.readArea(.{ .cx0 = -1, .cy0 = -1, .cx1 = 0, .cy1 = 0 }, &snapshot);
@@ -84,7 +84,7 @@ fn areaStatement(db: *storage.Storage) !*c.sqlite3_stmt {
 test "area bindings refresh all widths heights signs and permitted extremes" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const db = &fixture.application.contexts[0].db;
+    const db = &fixture.application.context.db;
     var snapshot: p.Snapshot = undefined;
     const areas = [_]world.ChunkRange{
         .{ .cx0 = -4, .cy0 = -64, .cx1 = -4, .cy1 = -1 },
@@ -132,7 +132,7 @@ test "area bindings refresh all widths heights signs and permitted extremes" {
 test "production area query bounds VM work despite growing out of range history" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const db = &fixture.application.contexts[0].db;
+    const db = &fixture.application.context.db;
     const stmt = try areaStatement(db);
     try db.exec("INSERT INTO chunk_state VALUES(0,0,x'0100000000000000000000000000000000000000000000000000000000000000'),(7,7,x'0100000000000000000000000000000000000000000000000000000000000000')");
     var snapshot: p.Snapshot = undefined;
@@ -165,41 +165,34 @@ test "production area query bounds VM work despite growing out of range history"
     std.debug.print("AREA_QUERY,plan={s}\n", .{plan});
     try std.testing.expect(std.mem.indexOf(u8, plan, "USING PRIMARY KEY (cx=? AND cy>? AND cy<?)") != null);
 }
-test "four cached area SELECTs simultaneously active fit unchanged SQLite heap" {
+test "one active cached area SELECT fits unchanged SQLite heap" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    try fixture.application.contexts[0].db.exec("WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<63) INSERT INTO chunk_state SELECT i,0,zeroblob(32) FROM n");
-    var statements: [4]*c.sqlite3_stmt = undefined;
-    var active: usize = 0;
-    defer for (statements[0..active]) |stmt| {
+    try fixture.application.context.db.exec("WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<63) INSERT INTO chunk_state SELECT i,0,zeroblob(32) FROM n");
+    const stmt = try areaStatement(&fixture.application.context.db);
+    defer {
         _ = c.sqlite3_reset(stmt);
         _ = c.sqlite3_clear_bindings(stmt);
-    };
-    _ = c.sqlite3_memory_highwater(1);
-    for (fixture.application.contexts, &statements) |*context, *s| {
-        s.* = try areaStatement(&context.db);
-        active += 1;
-        try std.testing.expectEqual(@as(c_int, 66), c.sqlite3_bind_parameter_count(s.*));
-        for (0..64) |i| try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_bind_int64(s.*, @intCast(i + 1), @intCast(i)));
-        try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_bind_int64(s.*, 65, 0));
-        try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_bind_int64(s.*, 66, 0));
-        // SQLITE_ROW keeps each statement's temporary IN B-tree alive.
-        try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(s.*));
     }
+    _ = c.sqlite3_memory_highwater(1);
+    try std.testing.expectEqual(@as(c_int, 66), c.sqlite3_bind_parameter_count(stmt));
+    for (0..64) |i| try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_bind_int64(stmt, @intCast(i + 1), @intCast(i)));
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_bind_int64(stmt, 65, 0));
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_bind_int64(stmt, 66, 0));
+    // SQLITE_ROW keeps the statement's temporary IN B-tree alive.
+    try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
     std.debug.print("AREA_ACTIVE,current={d},highwater={d},ceiling={d}\n", .{ c.sqlite3_memory_used(), fixture.runtime.highWater(), fixture.heap.len });
     try std.testing.expect(fixture.runtime.highWater() < fixture.heap.len / 2);
-    for (statements) |stmt| {
-        var rows: usize = 1;
-        var rc = c.sqlite3_step(stmt);
-        while (rc == c.SQLITE_ROW) : (rc = c.sqlite3_step(stmt)) rows += 1;
-        try std.testing.expectEqual(c.SQLITE_DONE, rc);
-        try std.testing.expectEqual(@as(usize, 64), rows);
-    }
+    var rows: usize = 1;
+    var rc = c.sqlite3_step(stmt);
+    while (rc == c.SQLITE_ROW) : (rc = c.sqlite3_step(stmt)) rows += 1;
+    try std.testing.expectEqual(c.SQLITE_DONE, rc);
+    try std.testing.expectEqual(@as(usize, 64), rows);
 }
 test "trigger rollback transient busy and no mutation before a healthy lease" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const db = &fixture.application.contexts[0].db;
+    const db = &fixture.application.context.db;
     const tile = find(.grass);
     const req = request(44, tile.x, tile.y);
     try db.exec("CREATE TRIGGER fail_result BEFORE INSERT ON action_results BEGIN SELECT RAISE(ABORT,'injected'); END");
@@ -207,25 +200,26 @@ test "trigger rollback transient busy and no mutation before a healthy lease" {
     try std.testing.expect(c.sqlite3_get_autocommit(db.db) != 0);
     try std.testing.expect(!db.poisoned);
     try db.exec("DROP TRIGGER fail_result");
-    const other = &fixture.application.contexts[1].db;
+    var other = try storage.Storage.open(fixture.path);
+    defer other.close();
+    try other.ready();
     try other.exec("BEGIN IMMEDIATE");
     try std.testing.expectError(error.DatabaseBusy, db.cut(req));
     try other.exec("ROLLBACK");
     try std.testing.expect((try db.cut(req)) == .success);
-    var leases: [4]*Context = undefined;
-    for (&leases) |*lease| lease.* = fixture.application.lease().?;
+    const held = fixture.application.lease().?;
     try std.testing.expect(fixture.application.lease() == null);
     var error_storage: [33]u8 = undefined;
     const bytes = shared.wire.encode(&error_storage, shared.wire.failure(req.request_id, .database_busy));
     try std.testing.expectEqualSlices(u8, &.{ 12, 0, 0 }, bytes[20..]);
-    for (leases) |lease| fixture.application.release(lease);
-    // Explicit quarantine rebuild: no action replay and the connection is replaced in-pool.
+    fixture.application.release(held);
+    // Explicit quarantine rebuild: no action replay and the sole connection is replaced.
     const lease = fixture.application.lease().?;
     lease.db.poisoned = true;
     fixture.application.release(lease);
     try std.testing.expect(!lease.db.poisoned);
 }
-test "two independently leased writer threads one tile exactly one winner" {
+test "single context rejects cross-thread admission without mutation then reuses and replays" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     const tile = find(.grass);
@@ -234,29 +228,42 @@ test "two independently leased writer threads one tile exactly one winner" {
         req: p.Request,
         result: ?p.CutResult = null,
         fn run(self: *@This()) void {
-            const context = self.app.lease() orelse @panic("no lease");
+            const context = self.app.lease() orelse return;
             defer self.app.release(context);
             self.result = context.db.cut(self.req) catch @panic("DB failed");
         }
     };
-    var a = Worker{ .app = &fixture.application, .req = request(1, tile.x, tile.y) };
     var b = Worker{ .app = &fixture.application, .req = request(2, tile.x, tile.y) };
-    const t1 = try std.Thread.spawn(.{}, Worker.run, .{&a});
-    const t2 = try std.Thread.spawn(.{}, Worker.run, .{&b});
-    t1.join();
-    t2.join();
-    try std.testing.expectEqual(@as(u8, 1), @as(u8, @intFromBool(a.result.? == .success)) + @as(u8, @intFromBool(b.result.? == .success)));
-    const loser = if (a.result.? == .failure) a.result.? else b.result.?;
-    try std.testing.expectEqual(p.ErrorCode.already_cut, loser.failure.code);
+    const first = request(1, tile.x, tile.y);
+    var original: p.CutResult = undefined;
+    {
+        const held = fixture.application.lease().?;
+        defer fixture.application.release(held);
+        {
+            const thread = try std.Thread.spawn(.{}, Worker.run, .{&b});
+            defer thread.join();
+        }
+        try std.testing.expect(b.result == null);
+        var stmt: ?*c.sqlite3_stmt = null;
+        try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(held.db.db, "SELECT (SELECT count(*) FROM action_results)+(SELECT count(*) FROM chunk_state)", -1, &stmt, null));
+        defer _ = c.sqlite3_finalize(stmt);
+        try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+        try std.testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+        try std.testing.expectEqual(c.SQLITE_DONE, c.sqlite3_step(stmt));
+        original = try held.db.cut(first);
+        try std.testing.expect(original == .success);
+    }
+    Worker.run(&b);
+    try std.testing.expectEqual(p.ErrorCode.already_cut, b.result.?.failure.code);
+    const reused = fixture.application.lease().?;
+    defer fixture.application.release(reused);
+    try std.testing.expectEqualDeep(original, try reused.db.cut(first));
+    try std.testing.expectEqualDeep(b.result.?, try reused.db.cut(b.req));
 }
 test "SQLite heap OOM rolls back and startup budgets fail closed" {
     try std.testing.expectError(error.InvalidSqliteBudget, Fixture.initBudget(1024));
-    // The minimum heap initializes SQLite but cannot admit four prepared contexts.
-    if (Fixture.initBudget(65536)) |value| {
-        var f = value;
-        f.deinit();
-        return error.ExpectedStartupFailure;
-    } else |_| {}
+    // Even one context cannot finish startup inside the minimum 64 KiB heap.
+    try std.testing.expectError(error.SqliteOutOfMemory, Fixture.initBudget(65536));
     var fixture = try Fixture.init();
     defer fixture.deinit();
     try std.testing.expectEqual(@as(c_int, 3054000), c.sqlite3_libversion_number());
@@ -305,20 +312,22 @@ test "failed rollback quarantines context and rebuild never repeats the action" 
     try context.db.exec("DROP TRIGGER fail_result");
     try std.testing.expect((try context.db.cut(request(300, tile.x, tile.y))) == .success);
 }
-test "no healthy contexts returns fixed binary busy and in-pool rebuild can recover later" {
+test "poisoned context returns fixed binary busy and rebuild can recover later" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    for (fixture.application.contexts) |*context| context.db.poisoned = true;
+    fixture.application.context.db.poisoned = true;
     _ = c.sqlite3_hard_heap_limit64(1);
     defer _ = c.sqlite3_hard_heap_limit64(0);
     try std.testing.expect(fixture.application.lease() == null);
-    for (fixture.application.contexts) |*context| try std.testing.expect(context.db.poisoned);
+    try std.testing.expect(fixture.application.context.db.poisoned);
+    try std.testing.expect(!fixture.application.context.leased);
     var bytes: [33]u8 = undefined;
     const busy = shared.wire.encode(&bytes, shared.wire.failure(@as(p.Id, @splat(0)), .database_busy));
     try std.testing.expectEqualSlices(u8, &.{ 12, 0, 0 }, busy[20..]);
     _ = c.sqlite3_hard_heap_limit64(0);
-    // This call rebuilds unavailable contexts, but never executes the rejected action.
+    // This call repairs the context, but still rejects this admission.
     try std.testing.expect(fixture.application.lease() == null);
+    try std.testing.expect(!fixture.application.context.db.poisoned);
     const recovered = fixture.application.lease().?;
     fixture.application.release(recovered);
 }
@@ -334,12 +343,15 @@ test "one SELECT snapshot remains consistent during atomic concurrent rectangle 
             }
         }
     };
-    var writer = Writer{ .db = &fixture.application.contexts[1].db };
+    var other = try storage.Storage.open(fixture.path);
+    defer other.close();
+    try other.ready();
+    var writer = Writer{ .db = &other };
     const thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
     defer thread.join();
     var snapshot: p.Snapshot = undefined;
     for (0..256) |_| {
-        try fixture.application.contexts[0].db.readArea(.{ .cx0 = 0, .cy0 = 0, .cx1 = 7, .cy1 = 7 }, &snapshot);
+        try fixture.application.context.db.readArea(.{ .cx0 = 0, .cy0 = 0, .cx1 = 7, .cy1 = 7 }, &snapshot);
         var count: usize = 0;
         for (snapshot.chunks) |chunk| for (chunk) |byte| {
             count += @popCount(byte);
@@ -384,13 +396,13 @@ test "post-ready codec rules storage have no upstream allocator capability" {
     defer fixture.application.release(context);
     const area = p.Request{ .request_id = @splat(0), .operation = .{ .read_area = .{ .cx0 = -4, .cy0 = -4, .cx1 = 3, .cy1 = 3 } } };
     for (0..64) |_| try std.testing.expectEqual(@as(usize, 2122), context.handle(area).len);
-    std.debug.print("BUDGET,sqlite_highwater={d},app_context_bytes={d}\n", .{ fixture.runtime.highWater(), @sizeOf([4]Context) });
+    std.debug.print("BUDGET,sqlite_highwater={d},app_context_bytes={d},app_layout_bytes={d},registry_bytes={d}\n", .{ fixture.runtime.highWater(), @sizeOf(Context), @sizeOf(@import("app.zig").Layout), @sizeOf(@import("sessions.zig").Registry) });
 }
 
 test "schema 2 is rejected without rewriting existing data" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const db = &fixture.application.contexts[0].db;
+    const db = &fixture.application.context.db;
     // Controlled old-version fixture; initialization must not migrate or delete it.
     try db.exec("DROP TABLE chunk_state; CREATE TABLE cuts(x INTEGER,y INTEGER); INSERT INTO cuts VALUES(7,-9); UPDATE metadata SET schema_version=2");
     var reopened = try storage.Storage.open(fixture.path);
@@ -409,7 +421,7 @@ test "schema 2 is rejected without rewriting existing data" {
 test "corrupt bitmap lengths types and coordinate types fail closed" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const db = &fixture.application.contexts[0].db;
+    const db = &fixture.application.context.db;
     var snapshot: p.Snapshot = undefined;
     const area = world.ChunkRange{ .cx0 = 0, .cy0 = 0, .cx1 = 0, .cy1 = 0 };
     try db.exec("PRAGMA ignore_check_constraints=ON; INSERT INTO chunk_state VALUES(0,0,zeroblob(31))");
@@ -466,12 +478,17 @@ test "independent writers preserve different grass and tree bits in the same chu
             self.result = self.db.cut(self.req) catch @panic("writer failed");
         }
     };
-    var a = Worker{ .db = &fixture.application.contexts[0].db, .req = request(0, tiles[0].x, tiles[0].y) };
-    var b = Worker{ .db = &fixture.application.contexts[1].db, .req = request(1, tiles[1].x, tiles[1].y) };
-    const ta = try std.Thread.spawn(.{}, Worker.run, .{&a});
-    const tb = try std.Thread.spawn(.{}, Worker.run, .{&b});
-    ta.join();
-    tb.join();
+    var other = try storage.Storage.open(fixture.path);
+    defer other.close();
+    try other.ready();
+    var a = Worker{ .db = &fixture.application.context.db, .req = request(0, tiles[0].x, tiles[0].y) };
+    var b = Worker{ .db = &other, .req = request(1, tiles[1].x, tiles[1].y) };
+    {
+        const ta = try std.Thread.spawn(.{}, Worker.run, .{&a});
+        defer ta.join();
+        const tb = try std.Thread.spawn(.{}, Worker.run, .{&b});
+        defer tb.join();
+    }
     try std.testing.expect(a.result.? == .success and b.result.? == .success);
     try std.testing.expectEqualDeep(a.result.?, try b.db.cut(a.req));
     try std.testing.expectEqualDeep(b.result.?, try a.db.cut(b.req));
@@ -488,7 +505,7 @@ test "independent writers preserve different grass and tree bits in the same chu
 test "failed result insert rolls back existing chunk upsert and does not cache failed ID" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const db = &fixture.application.contexts[0].db;
+    const db = &fixture.application.context.db;
     const tiles = sameChunkTiles();
     _ = try db.cut(request(0, tiles[0].x, tiles[0].y));
     var before: p.Snapshot = undefined;
@@ -509,7 +526,7 @@ test "failed result insert rolls back existing chunk upsert and does not cache f
 test "negative chunk writes cover bit and byte boundaries without changing terrain rules" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const db = &fixture.application.contexts[0].db;
+    const db = &fixture.application.context.db;
     var expected: [32]u8 = @splat(0);
     for (0..256) |bit| {
         const x = @as(i32, @intCast(bit % 16)) - 16;
@@ -557,7 +574,7 @@ const FakeObserver = struct {
 test "write observer stages finalize exactly once for success replay conflict busy rule and injected errors" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const db = &fixture.application.contexts[0].db;
+    const db = &fixture.application.context.db;
     const tiles = sameChunkTiles();
     const req = request(0, tiles[0].x, tiles[0].y);
     var observer = FakeObserver{};
@@ -573,7 +590,9 @@ test "write observer stages finalize exactly once for success replay conflict bu
     observer = .{};
     try std.testing.expectEqual(p.ErrorCode.already_cut, (try db.cutObserved(request(1, tiles[0].x, tiles[0].y), &observer)).failure.code);
     try observer.expect(&.{ .begin, .replay, .rules, .result_insert, .commit, .cleanup }, null);
-    const other = &fixture.application.contexts[1].db;
+    var other = try storage.Storage.open(fixture.path);
+    defer other.close();
+    try other.ready();
     try other.exec("BEGIN IMMEDIATE");
     observer = .{};
     try std.testing.expectError(error.DatabaseBusy, db.cutObserved(req, &observer));

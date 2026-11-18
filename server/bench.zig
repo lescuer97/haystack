@@ -67,20 +67,27 @@ const Worker = struct {
             const start = now();
             const decoded = shared.wire.decode(data).request;
             const dbstart = now();
-            const context = self.app.lease() orelse return error.NoContext;
+            const context = self.app.lease();
             var profile: if (profile_enabled) WriteProfile else void = if (profile_enabled) .{} else {};
-            const response = if (profile_enabled) blk: {
-                const result = context.db.cutObserved(decoded, &profile) catch |err| break :blk shared.wire.failure(decoded.request_id, if (err == error.DatabaseBusy) .database_busy else .internal_error);
+            var busy_buffer: [33]u8 = undefined;
+            const response = if (context) |admitted| if (profile_enabled) blk: {
+                const result = admitted.db.cutObserved(decoded, &profile) catch |err| break :blk shared.wire.failure(decoded.request_id, if (err == error.DatabaseBusy) .database_busy else .internal_error);
                 break :blk shared.protocol.Response{ .request_id = decoded.request_id, .result = switch (result) {
                     .success => |state| .{ .cut = state },
                     .failure => |failure| .{ .failure = failure },
                 } };
-            } else actions.handle(&context.db, &context.snapshot, decoded);
+            } else actions.handle(&admitted.db, &admitted.snapshot, decoded) else blk: {
+                if (profile_enabled) {
+                    profile.outcome = "ContextBusy";
+                    profile.code = @backingInt(shared.protocol.ErrorCode.database_busy);
+                }
+                break :blk shared.wire.failure(decoded.request_id, .database_busy);
+            };
             const dbend = now();
-            const bytes = shared.wire.encode(&context.response, response).len;
-            self.app.release(context);
+            const bytes = shared.wire.encode(if (context) |admitted| &admitted.response else &busy_buffer, response).len;
+            if (context) |admitted| self.app.release(admitted);
             const end = now();
-            if (!profile_enabled and response.result == .failure and response.result.failure.code == .internal_error) return error.BenchmarkDatabaseFailure;
+            if (response.result == .failure and response.result.failure.code == .internal_error) return error.BenchmarkDatabaseFailure;
             const code: u16 = if (response.result == .failure) @backingInt(response.result.failure.code) else 0;
             if (i >= 8) {
                 if (profile_enabled) {
@@ -108,7 +115,7 @@ pub fn main(init: std.process.Init) !void {
 fn areaQueryStress(init: std.process.Init) !void {
     var fixture = try Fixture.initWith(init.gpa, init.io, @import("sqlite_runtime.zig").default_budget);
     defer fixture.deinit();
-    const db = &fixture.application.contexts[0].db;
+    const db = &fixture.application.context.db;
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try std.Io.Dir.cwd().realPathFile(init.io, fixture.path, &path_buffer);
     std.debug.print("AREA_STRESS,sqlite={s},fixture={s}\n", .{ c.sqlite3_libversion(), path_buffer[0..path_len] });
@@ -153,7 +160,7 @@ fn areaQueryStress(init: std.process.Init) !void {
 }
 fn run(init: std.process.Init, iterations: usize, profile: bool) !void {
     if (profile) {
-        std.debug.print("WRITE_PROFILE_SEMANTICS,ns;begin=acquisition_execution_plus_wait;rules=terrain_chunk_read_rule;commit=includes_default_autocheckpoint;cleanup=reset_clear_rollback;total=storage_entry_through_cleanup;skipped=0\n", .{});
+        std.debug.print("WRITE_PROFILE_SEMANTICS,ns;begin=acquisition_execution_plus_wait;rules=terrain_chunk_read_rule;commit=includes_default_autocheckpoint;cleanup=reset_clear_rollback;total=storage_entry_through_cleanup;ContextBusy=code12_zero_stages_zero_total_no_storage_entry;skipped=0\n", .{});
         std.debug.print("WRITE_PROFILE_HEADER,workload,run,thread,index,outcome,result_code,begin_ns,replay_ns,rules_ns,chunk_upsert_ns,result_insert_ns,commit_ns,cleanup_ns,total_ns\n", .{});
     }
     var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -174,7 +181,7 @@ fn run(init: std.process.Init, iterations: usize, profile: bool) !void {
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path_len = try std.Io.Dir.cwd().realPathFile(init.io, fixture.path, &path_buffer);
         std.debug.print("FIXTURE,{s},{s}\n", .{ mode, path_buffer[0..path_len] });
-        const db = &fixture.application.contexts[0].db;
+        const db = &fixture.application.context.db;
         if (std.mem.eql(u8, mode, "sparse") or std.mem.eql(u8, mode, "dense")) {
             try db.exec("BEGIN IMMEDIATE");
             var stmt: ?*c.sqlite3_stmt = null;
@@ -207,17 +214,19 @@ fn run(init: std.process.Init, iterations: usize, profile: bool) !void {
             if (std.mem.eql(u8, mode, "contention")) {
                 var workers: [4]Worker = undefined;
                 var threads: [4]std.Thread = undefined;
+                var spawned: usize = 0;
+                defer for (threads[0..spawned]) |thread| thread.join();
                 for (&workers, 0..) |*w, t| {
                     w.* = .{ .app = &fixture.application, .mode = mode, .run = run_index, .thread = t, .iterations = iterations, .profile = profile };
                     threads[t] = try std.Thread.spawn(.{}, Worker.entry, .{w});
+                    spawned += 1;
                 }
-                for (threads) |thread| thread.join();
             } else {
                 var worker = Worker{ .app = &fixture.application, .mode = mode, .run = run_index, .iterations = iterations, .profile = profile };
                 if (profile) try worker.go(true) else try worker.go(false);
             }
         }
-        std.debug.print("BUDGET,{s},sqlite_highwater={d},app_context_bytes={d}\n", .{ mode, fixture.runtime.highWater(), @sizeOf([4]@import("app.zig").Context) });
+        std.debug.print("BUDGET,{s},sqlite_highwater={d},app_context_bytes={d}\n", .{ mode, fixture.runtime.highWater(), @sizeOf(@import("app.zig").Context) });
     }
 }
 fn check(rc: c_int) !void {

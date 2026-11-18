@@ -88,7 +88,7 @@ test "headless fresh restart borrowed owner and independent SQLite lifetimes coe
         try t.expect(application.wallet == null);
         application.wallet = &wallet;
         try t.expectEqual(try wallet.borrowHandle(), try application.wallet.?.borrowHandle());
-        try application.contexts[0].db.exec("BEGIN IMMEDIATE; INSERT INTO chunk_state VALUES(0,0,zeroblob(32)); COMMIT;");
+        try application.context.db.exec("BEGIN IMMEDIATE; INSERT INTO chunk_state VALUES(0,0,zeroblob(32)); COMMIT;");
         try t.expect(runtime.highWater() > 0 and runtime.highWater() <= heap.len);
         try t.expectEqualStrings("3.54.0", std.mem.span(sql.c.sqlite3_libversion()));
         try t.expectEqualStrings("3.54.0", std.mem.sliceTo(&sql.c.haystack_world_sqlite3_version, 0));
@@ -104,7 +104,7 @@ test "headless fresh restart borrowed owner and independent SQLite lifetimes coe
     {
         var application = try app.App.init(t.io, world_path, buffers);
         defer application.deinit();
-        try application.contexts[0].db.exec("BEGIN IMMEDIATE; DELETE FROM chunk_state; COMMIT;");
+        try application.context.db.exec("BEGIN IMMEDIATE; DELETE FROM chunk_state; COMMIT;");
     }
     sync_seen = 0;
     wallet = try server_wallet.open(t.io, t.allocator, home.locations);

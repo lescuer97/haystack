@@ -26,6 +26,11 @@ any key owner may modify the world. Do not expose it as a production security bo
 
 ## Headless wallet startup
 
+Scoped `server_startup` info messages mark completed configuration (including budgets),
+storage/lock, wallet, SQLite, WebSocket memory, application and transport initialization.
+The final `starting listener` message precedes the blocking listener call; it does
+not confirm a successful bind or readiness to accept connections.
+
 Before listening, the server locks its separate `haystack-server` storage root
 for its entire lifetime and opens a native CDK wallet. On Linux the defaults are
 `~/.config/haystack-server/haystack.lock` and
@@ -258,13 +263,13 @@ Separate startup-configurable defaults:
 
 | Budget | Bytes | Basis |
 |---|---:|---|
-| SQLite | 4,194,304 | v3 query-stress peak 1,279,296; budget >3x peak |
+| SQLite | 4,194,304 | historical four-context v3 query-stress peak 1,279,296; budget unchanged |
 | WebSocket recycler | 4,194,304 | Linux x86_64: 64-slot array 571,392; rounded buddy high-water 1,048,576 + metadata 65,536; runtime/task stacks excluded |
-| Application buffers | 65,536 | stable Layout 21,472 bytes: four contexts 17,344 + session registry 4,128; remaining bytes are headroom |
+| Application buffers | 65,536 | Linux x86_64 stable Layout 8,464 bytes: one context 4,336 + session registry 4,128; remaining bytes are headroom |
 
 SQLite uses non-null 8-aligned `SQLITE_CONFIG_HEAP` before explicit initialize,
 MEMSYS5 + ZERO_MALLOC + OMIT_AUTOINIT, and global multithread-mode mutexes.
-Each NOMUTEX handle is exclusively owned while leased. Per-handle page cache
+The single production NOMUTEX handle is exclusively owned while leased. Its page cache
 target is 256 KiB; actual allocations still share the hard fixed SQLite heap.
 Close/finalize all handles before SQLite shutdown/free. Tests serialize complete
 global lifecycles and perform concurrency within one runtime.
@@ -276,13 +281,15 @@ retains a backing allocator, and returns OOM rather than growing. Resize stays
 within the current block; larger reallocations allocate/copy/free inside the
 pool. High-water counters count rounded allocated blocks separately from fixed
 metadata. WS measurements are component tests, **not a server/RSS high-water
-measurement**. Insufficient budgets fail initialization (named invalid-budget,
+measurement**. Even the single-context startup fails with SqliteOutOfMemory at
+a 65,536-byte SQLite heap in current Debug/ReleaseSafe tests; healthy initialization
+after that failure verifies cleanup. Insufficient budgets fail initialization (named invalid-budget,
 SqliteOutOfMemory, InsufficientApplicationBudget or WebSocket OOM errors).
 
 64 total connections **including pending HTTP and authentication**, and **no
-additional application request queue**. Four leased
-contexts own their DB handle, prepared statements, 64x32 bitmap and 2122-byte
-reply buffer through synchronous socket write; leases do not assume thread
+additional application request queue**. One exclusively leased
+context owns the DB handle, prepared statements, 64x32 bitmap and 2122-byte
+reply buffer through synchronous socket write; the lease does not assume thread
 affinity. Location updates bypass DB leasing entirely. A fully decoded cut/read
 request without a healthy available context returns
 retryable binary `database_busy` **before mutation**, from fixed 33-byte error
@@ -303,7 +310,11 @@ ends the connection; complete close-payload validation is not claimed.
 Connection tasks use `std.Io.Group.concurrent` (no inline fallback). The standard
 I/O runtime, tasks, thread stacks, sockets and OS resources are **outside the WS
 reservation**: this is not the old four-callback-thread model or an RSS bound.
-Slow authenticated readers can still hold a context; budgets do not solve latency.
+Slow authenticated readers can hold the sole context through their synchronous
+write, causing other cut/read admissions to return database_busy; location updates
+remain independent. Admission is one atomic attempt, with no queue, spin or wait
+over I/O. Repairing a poisoned context still rejects that admission; a following
+admission can use the repaired context. Budgets do not solve latency.
 
 ## Socket-free benchmark
 
@@ -322,26 +333,33 @@ VM steps, empty/two-cut snapshot outcomes and wire hashes, and SQLite current/
 peak bytes. History is now **one million distinct outside chunks**, in matching
 cx columns but outside the requested cy range; this is not historically equivalent
 to the earlier one-million-tile fixture (roughly 62,500 occupied chunks).
-Unit tests separately cover 10k/100k outside chunks and four concurrent
-active area statements (including their temporary IN structures). VM-step
+Unit tests separately cover 10k/100k outside chunks and one active cached
+area statement (including its temporary IN structure). VM-step
 ceilings, not elapsed time or FULLSCAN_STEP alone, detect the old range-scan bug.
 Historical schema-v2 bounded-query stress used 292 VM steps empty and 304 with
 two cuts (also 304 in its 10k/100k tile-row tests); its four active SELECTs used
 1,097,600 current/peak bytes, leaving 3,096,704 bytes free, and its million-tile
 stress peak was 1,302,720 bytes. Those retained measurements concern the older
 per-tile schema and history unit, not the chunk schema below.
-Latest v3 ReleaseSafe million-chunk stress: 291 VM steps empty, 303 with two cuts;
+Historical pre-single-context v3 ReleaseSafe million-chunk stress: 291 VM steps empty, 303 with two cuts;
 the 10k/100k two-cut unit cases also used 303 steps. The query plan is
 `SEARCH chunk_state USING PRIMARY KEY (cx=? AND cy>? AND cy<?)`.
 Both stress replies are complete 64-chunk, 2122-byte snapshots (zero/two bits);
 wire Wyhash values remain `24a8e39e3e6cd469` / `8d0ad7a4cd90f111`.
 Four simultaneously active 64-column SELECTs used 1,108,608 current/peak bytes,
 leaving 3,085,696 bytes of the unchanged SQLite heap free. The million-chunk stress
-peak was 1,279,296 bytes; application contexts remain 17,344 bytes within 64 KiB.
+peak was 1,279,296 bytes; those historical application contexts used 17,344 bytes within 64 KiB.
 Full dense 64-chunk unit cases also assert at most 64 unique returned rows and
 fewer than 2000 VM steps. These are memory/work bounds, not latency guarantees.
-Historical paired benchmark captures below predate this query fix; their frozen
-version-specific results are not measurements of the current query.
+Historical paired benchmark captures below predate this query fix and the
+single-context migration; their frozen version-specific results are not current
+measurements or representative of current admission/contention behavior.
+
+Single-context Linux x86_64 ReleaseSafe verification: the one-active-SELECT test
+used 280,704 current/peak SQLite bytes (below half the unchanged 4 MiB heap).
+The million-chunk stress used 291/303 VM steps for empty/two-cut snapshots,
+494,080 current bytes and 548,544 peak bytes, with the same complete replies and
+hashes above. These are socket-free fixture measurements, not server/RSS bounds.
 
 Opt-in only, never part of default tests; 16..512 measured iterations per run,
 default 128, eight warmups, three runs. Isolated real-file SQLite, no server,
@@ -359,7 +377,9 @@ numeric ASCII IDs map to u128 little-endian IDs, with
 replays primed at `(0,0)`, rule errors at `(-128,-128)`. Sparse/dense snapshots
 cover chunks [0,7]x[0,7], seeded with generated grass/tree cuts in [0,127]^2;
 sparse keeps linear tile indices divisible by 97, dense keeps all cuttable tiles.
-Four-thread contention uses independent IDs/connections against one database.
+Four-thread contention uses independent IDs competing for the one shared context.
+Rejected admissions encode an actual database_busy reply with the original ID
+in worker-local storage; there are no retries, skipped samples or extra contexts.
 Current seeding builds fixed `[64][32]` bitmaps and inserts occupied chunk rows
 in one transaction, preserving exactly 147/14,045 logical sparse/dense cut tiles
 and the original generated-terrain filters and request streams.
@@ -384,7 +404,11 @@ benchmark. `WRITE_PROFILE_HEADER` describes sample records:
 WRITE_PROFILE,workload,run,thread,index,outcome,result_code,begin_ns,replay_ns,rules_ns,chunk_upsert_ns,result_insert_ns,commit_ns,cleanup_ns,total_ns
 ```
 
-`outcome` is success, rule_failure (including replay/conflict), or the actual
+`ContextBusy` means admission failed before storage entry: result_code is 12,
+all seven stage durations and total are zero, and no observer callbacks ran.
+This differs from SQLite `DatabaseBusy`, which occurs after admission and has
+actual observed storage-stage timing. Every attempted measured request is recorded.
+Otherwise `outcome` is success, rule_failure (including replay/conflict), or the actual
 storage error name such as DatabaseBusy; result_code is the wire game-error code
 for rule failures, otherwise zero. Storage errors are not relabeled as internal
 errors in these records. Skipped stages are zero. BEGIN includes acquisition
@@ -397,10 +421,11 @@ Cleanup includes remaining reset/clear and rollback on errors; total runs from
 storage observer entry through checked cleanup, with one finalization on every
 exit. A cleanup-poisoned success is reported as PoisonedConnection instead.
 Clock/callback overhead perturbs profiling: use normal mode, not these samples,
-for fair comparisons. The current schema-v3 measurements are reported below;
-the separately labeled historical comparison measures an older frozen version.
+for fair comparisons. The schema-v3 measurements below are historical,
+pre-single-context captures; the separately labeled historical comparison
+measures an even older frozen version.
 
-### Schema-v3 chunk bitmap comparison (2026-11-17)
+### Historical pre-single-context schema-v3 chunk bitmap comparison (2026-11-17)
 
 Artifacts: `/tmp/opencode/chunk-bitmap-paired-20261117/summary.json`, with
 metadata and raw logs in the same directory. Frozen before/after inputs are

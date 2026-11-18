@@ -1,4 +1,4 @@
-//! std I/O transport; leased application contexts live through synchronous writes.
+//! std I/O transport; the leased application context lives through synchronous writes.
 const ws = std.http.Server.WebSocket;
 const wire = @import("shared").wire;
 const p = @import("shared").protocol;

@@ -209,7 +209,7 @@ test "fixed buffer authentication challenge proof ACK claims and failure cleanup
 }
 fn rows(f: *Fixture) !i64 {
     var stmt: ?*c.sqlite3_stmt = null;
-    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(f.application.contexts[0].db.db, "SELECT (SELECT count(*) FROM action_results)+(SELECT count(*) FROM chunk_state)", -1, &stmt, null));
+    try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_prepare_v2(f.application.context.db.db, "SELECT (SELECT count(*) FROM action_results)+(SELECT count(*) FROM chunk_state)", -1, &stmt, null));
     defer _ = c.sqlite3_finalize(stmt);
     try std.testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
     return c.sqlite3_column_int64(stmt, 0);
@@ -229,13 +229,12 @@ test "production nonce initialization reserves no identity and cleanup is idempo
     fresh.close();
     for (fixture.application.registry.slots) |slot| try std.testing.expect(!slot.occupied);
 }
-test "production location helper bypasses all leased databases no replay cache or durable state" {
+test "production location helper bypasses sole leased database no replay cache or durable state" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     const app = &fixture.application;
     const before = try rows(&fixture);
-    var leases: [4]*@import("app.zig").Context = undefined;
-    for (&leases) |*lease| lease.* = app.lease().?;
+    const held = app.lease().?;
     const handle = try app.registry.claim(@splat(0));
     var buf: [33]u8 = undefined;
     var snapshot: p.Snapshot = undefined;
@@ -248,7 +247,9 @@ test "production location helper bypasses all leased databases no replay cache o
         try std.testing.expectEqualDeep(@as(?p.Location, location), app.registry.get(handle).?.location);
         try std.testing.expect(app.lease() == null);
     }
-    for (leases) |lease| app.release(lease);
+    app.release(held);
+    const reused = app.lease().?;
+    app.release(reused);
     try std.testing.expectEqual(before, try rows(&fixture));
     const wrong = p.Request{ .request_id = @splat(0), .operation = .{ .cut = .{ .x = 0, .y = 0 } } };
     try std.testing.expectEqual(p.ErrorCode.invalid_request, app.handleLocation(handle, wrong).result.failure.code);
@@ -326,7 +327,7 @@ test "frozen startup allocator admits updates reads and releases all 64 sessions
         try std.testing.expect(fixture.application.handleLocation(handle.*, req).result == .location_updated);
         try std.testing.expectEqual(@as(i32, @intCast(i)), fixture.application.registry.get(handle.*).?.location.?.x);
         var snapshot: p.Snapshot = undefined;
-        try fixture.application.contexts[0].db.readArea(.{ .cx0 = 0, .cy0 = 0, .cx1 = 7, .cy1 = 7 }, &snapshot);
+        try fixture.application.context.db.readArea(.{ .cx0 = 0, .cy0 = 0, .cx1 = 7, .cy1 = 7 }, &snapshot);
     }
     for (handles) |handle| fixture.application.registry.release(handle);
     try std.testing.expect(@sizeOf(@import("app.zig").Layout) <= @import("app.zig").default_budget);

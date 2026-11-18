@@ -1,4 +1,4 @@
-//! Four exclusively leased contexts, independent of callback thread affinity.
+//! One exclusively leased context, independent of callback thread affinity.
 const std = @import("std");
 const shared = @import("shared");
 const p = shared.protocol;
@@ -15,30 +15,26 @@ pub const Context = struct {
         return shared.wire.encode(&self.response, actions.handle(&self.db, &self.snapshot, req));
     }
 };
-pub const Layout = struct { contexts: [4]Context, registry: sessions.Registry };
+pub const Layout = struct { context: Context, registry: sessions.Registry };
 pub const App = struct {
     /// Borrowed from main, never closed here; fixtures need not provision one.
     wallet: ?*const @import("wallet.zig").Wallet = null,
     database_path: [:0]const u8,
-    contexts: *[4]Context,
+    context: *Context,
     registry: *sessions.Registry,
     pub fn init(io: std.Io, path: [:0]const u8, buffers: []align(@alignOf(Layout)) u8) !App {
         if (buffers.len < @sizeOf(Layout)) return error.InsufficientApplicationBudget;
         const layout: *Layout = @ptrCast(buffers.ptr);
         layout.registry = .{ .io = io };
-        const contexts = &layout.contexts;
-        var initialized: usize = 0;
-        errdefer for (contexts[0..initialized]) |*context| context.db.close();
-        for (contexts, 0..) |*context, i| {
-            context.* = .{ .db = try Storage.open(path) };
-            initialized += 1;
-            if (i == 0) try context.db.initialize();
-            try context.db.ready();
-        }
-        return .{ .database_path = path, .contexts = contexts, .registry = &layout.registry };
+        const context = &layout.context;
+        context.* = .{ .db = try Storage.open(path) };
+        errdefer context.db.close();
+        try context.db.initialize();
+        try context.db.ready();
+        return .{ .database_path = path, .context = context, .registry = &layout.registry };
     }
     pub fn deinit(self: *App) void {
-        for (self.contexts) |*context| context.db.close();
+        self.context.db.close();
         // The server drains callbacks before destroying the application.
         self.registry.slots = @splat(.{});
     }
@@ -48,15 +44,13 @@ pub const App = struct {
         return .{ .request_id = req.request_id, .result = .location_updated };
     }
     pub fn lease(self: *App) ?*Context {
-        for (self.contexts) |*context| {
-            if (@cmpxchgStrong(bool, &context.leased, false, true, .acquire, .monotonic) != null) continue;
-            if (context.db.poisoned) {
-                self.release(context);
-                continue;
-            }
-            return context;
+        const context = self.context;
+        if (@cmpxchgStrong(bool, &context.leased, false, true, .acquire, .monotonic) != null) return null;
+        if (context.db.poisoned) {
+            self.release(context);
+            return null;
         }
-        return null;
+        return context;
     }
     pub fn release(self: *App, context: *Context) void {
         if (context.db.poisoned) {
