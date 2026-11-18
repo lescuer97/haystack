@@ -119,7 +119,7 @@ fn translateSQLite(b: *std.Build, dep: *std.Build.Dependency, header: []const u8
         // vtab.zig's sqlite3_module compile against every SQLite version.
         .default_init = true,
     });
-    t.addIncludePath(dep.path("sqlite-amalgamation-3540000"));
+    t.addIncludePath(dep.path(""));
     t.addIncludePath(b.path("c"));
 
     return t.mod;
@@ -138,11 +138,11 @@ fn makeSQLiteLib(b: *std.Build, dep: *std.Build.Dependency, c_flags: []const []c
         .root_module = mod,
     });
 
-    lib.root_module.addIncludePath(dep.path("sqlite-amalgamation-3540000"));
+    lib.root_module.addIncludePath(dep.path(""));
     lib.root_module.addIncludePath(b.path("c"));
     if (sqlite_c == .with) {
         lib.root_module.addCSourceFile(.{
-            .file = dep.path("sqlite-amalgamation-3540000/sqlite3.c"),
+            .file = dep.path("sqlite3.c"),
             .flags = c_flags,
         });
     }

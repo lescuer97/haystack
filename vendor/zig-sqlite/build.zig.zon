@@ -6,7 +6,7 @@
     .dependencies = .{
         .sqlite = .{
             .url = "https://www.sqlite.org/2026/sqlite-amalgamation-3540000.zip",
-            .hash = "N-V-__8AAIbIsABmhNL-E7oK5rlD3SerdmNKnogPURc3BRc3",
+            .hash = "N-V-__8AAIbIsACiE8KD1p1yFmEmwfDyxM6oeFpCwhUhBARB",
         },
         // C bindings (replaces @cImport and the deprecated std.Build.addTranslateC),
         // branch zig-0.17.x.
