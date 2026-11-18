@@ -47,6 +47,23 @@ test "original success and terminal errors replay with opaque full IDs and bindi
     try t.expectEqual(@as(usize, 18), s.replay_count);
 }
 
+test "water cuts replay not_cuttable without changing snapshots" {
+    var s = WorldState{};
+    const x = 26;
+    const y = 0;
+    try t.expectEqual(.water, world.sampleTile(world.public_seed, x, y));
+    const area: world.ChunkRange = .{ .cx0 = 1, .cy0 = 0, .cx1 = 1, .cy1 = 0 };
+    var before: p.Snapshot = undefined;
+    var after: p.Snapshot = undefined;
+    try s.readArea(area, &before);
+    const req = request(0, x, y);
+    const result = try s.cut(req);
+    try t.expect(result.failed == .not_cuttable);
+    try t.expectEqualDeep(result, try s.cut(req));
+    try s.readArea(area, &after);
+    try t.expectEqualDeep(before, after);
+}
+
 test "negative chunk edges and full signed coordinate domain use floor and modulo" {
     var s = WorldState{};
     const values = [_]i32{ std.math.minInt(i32), -17, -16, -1, 0, 15, 16, std.math.maxInt(i32) };

@@ -32,8 +32,8 @@ pub fn handleReadArea(state: *const WorldState, snapshot: *p.Snapshot, req: p.Re
     return .{ .ok = snapshot };
 }
 
-test "pure cut rules preserve terrain and reject rock dirt and already cut" {
-    for ([_]world.Tile{ .grass, .tree, .rock, .dirt }) |terrain| {
+test "pure cut rules preserve terrain and reject rock dirt water and already cut" {
+    for ([_]world.Tile{ .grass, .tree, .rock, .dirt, .water }) |terrain| {
         const state = p.State{ .x = -1, .y = 5, .terrain = terrain, .cut = false };
         const result = cutRule(state);
         if (terrain == .grass or terrain == .tree) {

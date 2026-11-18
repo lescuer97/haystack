@@ -20,8 +20,8 @@ world files are left untouched. There is no world SQL dependency, schema,
 table usage, persistence, or benchmark build step. Wallet SQLite remains intact.
 Gameplay requests target a global 20 Hz tick; wallet startup and authentication
 remain independent of ticks. No gameplay network client, rewards, private gameplay,
-regrowth or inventory are included. Terrain checksum remains
-`0xec04d88c8e6885e5`.
+regrowth or inventory are included. Terrain generator v2 adds water; its region checksum is
+`0x2beaf359deeea5bb` (see [world.md](world.md)).
 
 Connections must prove signing-key ownership. This is not an access allowlist:
 any key owner may modify the world. Do not expose it as a production security boundary.
@@ -196,7 +196,7 @@ exactly one of `ok` (`0x03`) or `failed` (`0x04`).
 | `update_location` | `0x03` | x:i32, y:i32 | 34 | `0x83` | Empty (26) |
 
 Tile state is `x:i32, y:i32, terrain:u8, cut:u8` (10 bytes). Terrain values are
-grass=0, dirt=1, rock=2, tree=3; booleans are strictly 0/1. A `failed` value is a
+grass=0, dirt=1, rock=2, tree=3, water=4; booleans are strictly 0/1. A `failed` value is a
 u16 code (28-byte reply), except `already_cut` appends the current tile state
 (38-byte reply). Failure codes are scoped to the operation:
 
@@ -212,7 +212,8 @@ cx. The rectangle is inclusive and covers 1–64 chunks. Offsets within the `ok`
 value are rectangle=0 (four i32s as in the request), generator version=16 (u32),
 public seed=20 (32 bytes), chunk count=52 (u16), bitmaps=54. The maximum reply is
 `4 + (3 + 16) + (3 + 54 + 64 * 32) = 2128` bytes.
-Generator v1 uses the public all-zero 32-byte seed. Each chunk has exactly 32 bytes:
+Generator v2 uses the public all-zero 32-byte seed; v1 snapshots are rejected.
+Each chunk has exactly 32 bytes:
 bit `local_y*16+local_x`, least-significant bit first. One means cut; zero is
 authoritative uncut, not an omitted update. Replace the rectangle's previous delta
 view. Reads reset the entire fixed snapshot and fill it under the exclusive lease;
@@ -268,7 +269,7 @@ state, not just the startup wallet. Malformed messages receive `PROTOCOL_ERROR`.
 ## Rules and bounded volatile state
 
 Only generated grass/tree can be cut, preserving terrain with `cut:true` for this
-process lifetime. Dirt/rock reject; another ID for a cut tile gets `already_cut`.
+process lifetime. Dirt/rock/water reject; another ID for a cut tile gets `already_cut`.
 All sixteen opaque ID bytes bind the cut coordinates `(x,y)`, including zero IDs.
 Matching IDs replay the original typed terminal success or game error; an original
 success does not become `already_cut`. Changed valid bindings conflict before mutation.

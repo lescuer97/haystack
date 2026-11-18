@@ -19,7 +19,7 @@ const location_frame = "\x03\x1e\x00" ++ id_tlv ++ "\x02\x08\x00" ++ point ++ "\
 const cut_ok = "\x81\x20\x00" ++ id_tlv ++ "\x03\x0a\x00" ++ point ++ "\x03\x01\x7e";
 const cut_already = "\x81\x22\x00" ++ id_tlv ++ "\x04\x0c\x00\x0a\x00" ++ point ++ "\x03\x01\x7e";
 const area_ok = "\x82\x6c\x00" ++ id_tlv ++ "\x03\x56\x00" ++ area ++
-    "\x01\x00\x00\x00" ++ repeat("\x00", 32) ++ "\x01\x00" ++ repeat("\x7e\xa5", 16) ++ "\x7e";
+    "\x02\x00\x00\x00" ++ repeat("\x00", 32) ++ "\x01\x00" ++ repeat("\x7e\xa5", 16) ++ "\x7e";
 const proof_frame = "\xf1\x67\x00\x11\x21\x00\x02" ++ repeat("\x7e", 32) ++ "\x12\x40\x00" ++ repeat("\x7e\x5a", 32) ++ "\x7e";
 const protocol_error_frame = "\xff\x00\x00\x7e";
 
@@ -103,6 +103,13 @@ test "wire golden replies and every strict prefix" {
     for (0..protocol_error_frame.len) |len| {
         try t.expectError(prefixError(len, protocol_error_frame.len), wire.decodeProtocolError(protocol_error_frame[0..len]));
     }
+}
+
+test "wire water state preserves appended terrain ordinal" {
+    var water = state;
+    water.terrain = .water;
+    water.cut = false;
+    try checkReply(.cut, cut_req, .{ .ok = water }, "\x81\x20\x00" ++ id_tlv ++ "\x03\x0a\x00" ++ point ++ "\x04\x00\x7e");
 }
 
 test "wire golden auth messages and every strict prefix" {
@@ -210,7 +217,7 @@ test "wire maximum snapshot fits exactly and rejects every strict prefix" {
     }
     const header = "\x82\x4c\x08" ++ id_tlv ++ "\x03\x36\x08" ++
         "\x00\x00\x00\xf8\xf8\xff\xff\x07\x07\x00\x00\xf8\xff\xff\xff\x07" ++
-        "\x01\x00\x00\x00" ++ repeat("\x00", 32) ++ "\x40\x00";
+        "\x02\x00\x00\x00" ++ repeat("\x00", 32) ++ "\x40\x00";
     var golden: [p.max_response_bytes]u8 = undefined;
     @memcpy(golden[0..header.len], header);
     @memcpy(golden[header.len .. golden.len - 1], std.mem.asBytes(&max.chunks));
@@ -235,7 +242,7 @@ test "wire snapshot output stays unchanged on metadata schema and correlation fa
         .{ .want = error.InvalidFieldValue, .offset = value + 15, .byte = 0x08 }, // Out-of-bounds y.
         .{ .want = error.InvalidFieldValue, .offset = value + 12, .byte = 68 }, // 66 chunks.
         .{ .want = error.InvalidFieldLength, .offset = value + 12, .byte = 4 }, // Geometry needs two chunks.
-        .{ .want = error.InvalidFieldValue, .offset = value + 16, .byte = 2 }, // Generator version.
+        .{ .want = error.InvalidFieldValue, .offset = value + 16, .byte = 1 }, // Previous generator version.
         .{ .want = error.InvalidFieldValue, .offset = value + 20, .byte = 0x7e }, // Public seed.
         .{ .want = error.InvalidFieldValue, .offset = value + 52, .byte = 0 }, // Declared count.
         .{ .want = error.InvalidFieldValue, .offset = value + 53, .byte = 0xff },
