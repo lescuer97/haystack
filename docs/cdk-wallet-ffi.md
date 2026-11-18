@@ -392,3 +392,13 @@ the checked-in file cannot go stale unnoticed.
   deny-only or inherited ACLs. An inspection failure also fails closed. The
   wrapper never clears or rewrites an ACL; the user must remove it and keep the
   file owner-only. Permission/ACL rejection runs before marker inspection.
+
+## Server authentication boundary
+
+WebSocket protocol/admission is implemented in server Zig, with BIP340 verification
+calling native Bitcoin Core libsecp256k1 directly through its C headers. This
+wallet library has no WebSocket nonce, domain, frame, session or authentication
+API and no new server-crypto exports. Existing headless wallet startup/linkage
+is unchanged. Authentication proves possession of a supplied key, not that the
+key originated in a wallet; client key selection/signing integration is separate.
+See [server protocol](server.md#authentication-and-ephemeral-connection-sessions).

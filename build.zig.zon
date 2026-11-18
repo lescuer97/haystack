@@ -32,8 +32,10 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .websocket = .{
-            .path = "vendor/websocket",
+        .secp256k1 = .{
+            .url = "https://github.com/bitcoin-core/secp256k1/releases/download/v0.8.0/libsecp256k1-0.8.0.tar.gz",
+            .hash = "N-V-__8AAFwQbQAc-L8ZUw4rqyk_OWdYX4-V8crqiWlJ1dhl",
+            .lazy = true,
         },
         .sqlite = .{ .path = "vendor/zig-sqlite" },
         .emsdk = .{
@@ -78,7 +80,6 @@
         "shared",
         "server",
         "docs",
-        "vendor/websocket",
         "vendor/zig-sqlite",
         "browser/index.html",
         "browser/app.js",

@@ -1,29 +1,6 @@
 const std = @import("std");
 const s = @import("sessions.zig");
 const Location = @import("shared").protocol.Location;
-fn repeat(comptime pair: []const u8, comptime n: usize) [pair.len * n]u8 {
-    var out: [pair.len * n]u8 = undefined;
-    for (0..n) |i| @memcpy(out[i * pair.len ..][0..pair.len], pair);
-    return out;
-}
-const zero_url = "/?pubkey=" ++ repeat("00", 33);
-
-test "strict owned pubkey parser rejects URL ambiguities and accepts opaque bytes" {
-    try std.testing.expectEqualDeep(@as(s.Pubkey, @splat(0)), try s.parsePubkey(zero_url));
-    const lower = try s.parsePubkey("/?pubkey=" ++ repeat("ab", 33));
-    try std.testing.expectEqualDeep(lower, try s.parsePubkey("/?pubkey=" ++ repeat("aB", 33)));
-    try std.testing.expectEqualDeep(@as(s.Pubkey, @splat(0xff)), try s.parsePubkey("/?pubkey=" ++ repeat("FF", 33)));
-    for ([_][]const u8{
-        "",                                   "/",                                        "/?",                            "/?pubkey=",                             "/?pubkey=" ++ repeat("00", 32),
-        zero_url ++ "0",                      zero_url ++ "&pubkey=" ++ repeat("00", 33), zero_url ++ "&other=1",          zero_url ++ "#",                         zero_url ++ "\x00",
-        "/other?pubkey=" ++ repeat("00", 33), "/?Pubkey=" ++ repeat("00", 33),            "/?PUBKEY=" ++ repeat("00", 33), "/?other=1&pubkey=" ++ repeat("00", 33), "/?pubkey=%0" ++ repeat("00", 32),
-        "/?pubkey=gg" ++ repeat("00", 32),    "/?pubkey=\x00a" ++ repeat("00", 32),
-    }) |url| try std.testing.expectError(error.InvalidPubkey, s.parsePubkey(url));
-    var borrowed = ("/?pubkey=" ++ repeat("01", 33)).*;
-    const owned = try s.parsePubkey(&borrowed);
-    @memset(&borrowed, 0);
-    try std.testing.expectEqualDeep(@as(s.Pubkey, @splat(1)), owned);
-}
 test "registry bounded capacity unknown origin extremes stale and repeated cleanup" {
     var registry = s.Registry{ .io = std.testing.io };
     var handles: [64]s.Handle = undefined;

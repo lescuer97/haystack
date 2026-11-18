@@ -1,8 +1,9 @@
 # Local binary server
 
-Zig 0.17.0; vendored WebSocket and zig-sqlite integration. SQLite 3.54.0 is built
+Zig 0.17.0; built-in `std.http.Server.WebSocket` and zig-sqlite integration. SQLite 3.54.0 is built
 from pinned official sources, **not** linked from the system. See
-`vendor/zig-sqlite/PROVENANCE.md` and `vendor/websocket/` for revisions/patches.
+`vendor/zig-sqlite/PROVENANCE.md` for revisions/patches. The historical WebSocket
+vendor tree is retained but is not a build dependency or package input.
 
 Native server builds also require the pinned Rust/CDK toolchain (`zig build
 setup -Dgame=false`; use `-Doffline` with warmed tools/Cargo caches). The native
@@ -16,12 +17,12 @@ zig build run-server -Dgame=false -- /absolute/local/path/world.sqlite3
 ```
 
 Default database: `haystack.sqlite3`, local filesystem only. Standalone endpoint:
-**ws://127.0.0.1:9224/?pubkey=<66 hex characters>**. The process bind address
+**ws://127.0.0.1:9224/**. The process bind address
 and database-path CLI argument are unchanged. Game/Raylib targets and terrain checksum
 `0xec04d88c8e6885e5` are unchanged. No client networking/rendering changes,
-authentication, rewards, private gameplay, regrowth or inventory are included.
-Loopback is not authentication: local processes and browsers may modify this
-world. Do not expose it as a production security boundary.
+rewards, private gameplay, regrowth or inventory are included. Connections must
+prove signing-key ownership as described below. This is not an access allowlist:
+any key owner may modify the world. Do not expose it as a production security boundary.
 
 ## Headless wallet startup
 
@@ -50,7 +51,7 @@ actions or endpoints are added. Mint selection matches the native client:
 `https://testnut.cashu.space/`, or the existing isolated `-Dapp-fixture-mint`
 override. Opening does not eagerly add a mint, poll or scan for restoration.
 
-Main owns the wallet; App borrows it. WebSocket callback draining and App cleanup
+Main owns the wallet; App borrows it. WebSocket task cancellation/join and App cleanup
 precede wallet close; the root lock is released last. CDK/Rust's runtime, SQLite
 and allocations are **outside the three reserved server budgets below**. World
 SQLite retains its fixed heap and lifecycle, with all public C symbols renamed
@@ -58,19 +59,67 @@ at compilation and translation to isolate it from CDK's bundled SQLite. The
 server/test/benchmark graphs audit the complete public manifest, translated
 extern linkage and actual world archive definitions/unresolved references.
 
-## Ephemeral connection sessions
+## Authentication and ephemeral connection sessions
 
-Every upgrade requires exactly the root URL `/?pubkey=` followed by 66 ASCII
-hex characters, decoded to 33 opaque bytes. Hex case is ignored; the `pubkey`
-parameter name is case-sensitive. This intentionally strict URL policy rejects
-other paths, extra/unknown/duplicate parameters, percent escapes, fragments,
-trailing bytes and NULs. All 33-byte values, including zero, are accepted: there
-is no curve validation, signature or authentication. **FIXME: validate key
-ownership before using identity for authorization.** Public unverified keys allow
-key-squatting. One active connection per decoded key is claimed atomically;
-duplicates reject the new connection without disturbing the old one. Missing,
-malformed or duplicate keys use the existing generic HTTP 400 and close before
-HTTP 101, not a custom status or binary registration message.
+The upgrade URL must be exactly `/`: no query (including the old `?pubkey=`),
+fragment, escape, other path, trailing byte or NUL. Invalid upgrades close without
+an HTTP response guarantee. HTTP 101 alone grants no identity or gameplay.
+Upgrade validation requires GET/HTTP1.1, version 13, an upgrade Connection token,
+exactly one valid 16-byte base64 key, and no ambiguous singleton duplicates,
+Expect or request-body framing. No extensions are negotiated.
+
+Immediately before writing HTTP 101, the server starts an absolute **5-second**
+monotonic deadline. It includes upgrade/challenge writes, proof arrival/assembly,
+verification, session claim and ACK transmission. The binary application exchange is:
+
+| Direction | Exact bytes |
+|---|---|
+| Server challenge | `F0 || nonce[32]` (33 bytes), fresh OS-secure random nonce per connection |
+| Client proof | `F1 || compressed_secp256k1_public_key[33] || signature[64]` (98 bytes) |
+| Server authenticated ACK | `F2` (one byte) |
+
+The signature is **BIP340 Schnorr** over the 32-byte digest
+`SHA256("haystack/ws-auth/v1" || nonce)`. The domain is exactly 19 ASCII bytes,
+without NUL; the outer SHA256 is applied **once**, not twice. BIP340's tagged
+challenge hashing is part of BIP340, not an additional application prehash.
+The compressed prefix must be `02` or `03` and x must lift to a valid curve point.
+Both valid parities of the same x are **one identity**, stored as `02 || x`.
+
+Only after successful verification is a bounded session claimed atomically.
+The existing verified incumbent always wins a duplicate; an unverified connection
+never reserves a key or evicts an incumbent. A claim is provisional until F2
+successfully writes and the deadline is checked again. No gameplay/database action
+is dispatched before this completes. Ordinary cleanup releases a provisional claim
+on failure/expiry. Missing, malformed, invalid, late, text/wrong-tag/wrong-length
+proofs, premature gameplay, or repeated authentication disconnect with no retries
+or replacement challenge. Only single-frame messages are supported: fragmentation
+and continuation frames are rejected. Pings, pongs, trickles and buffered traffic
+never extend either deadline. The 128-byte payload cap remains unchanged.
+After authentication, text still receives binary `unsupported_message`; repeated
+F1 disconnects, while F0/F2 pass through the ordinary gameplay decoder's errors.
+
+Authentication payload types live in `shared/protocol.zig`; the allocation-free
+`encodeAuth`/`decodeAuth` codecs in `shared/wire.zig` check binary tags and exact
+lengths independently of gameplay's 20-byte header and request IDs. Hashing,
+signature verification, nonce generation, deadlines and admission remain server-only.
+Authentication protocol, hashing, frame handling and admission are Zig. BIP340
+verification calls Bitcoin Core **libsecp256k1 v0.8.0** directly through translated
+upstream C headers, using its immutable shared static context (no context allocation).
+There are no new Rust crypto/wallet exports, key registration or persistence.
+This proves possession of
+the supplied key, **not wallet provenance**. Selecting/deriving a client wallet
+signing key and client networking/signing integration are outside this server change.
+
+The new native-server-only lazy Zig dependency is the official release archive:
+`https://github.com/bitcoin-core/secp256k1/releases/download/v0.8.0/libsecp256k1-0.8.0.tar.gz`.
+Its verified SHA256 is `dd685546f9e717b9adde329acd5a4cd8083d40f710fdb0a603ee5a83f908132b`;
+the package pin is `N-V-__8AAFwQbQAc-L8ZUw4rqyk_OWdYX4-V8crqiWlJ1dhl`.
+Upstream's MIT-licensed source remains in the Zig package cache, not vendored here.
+`build/secp256k1.zig` compiles its three C sources with only extrakeys/schnorrsig
+modules enabled and explicit upstream desktop table settings (window 15, comb
+blocks 43, teeth 6). No system installation, CMake, Cargo source path, Rust ABI or
+handwritten crypto is used. The browser/Wasm graph never requests this dependency.
+Warm Zig dependencies before using offline builds.
 
 Sessions are internal RAM only, with immutable connection identity and an
 optional packed 8-byte `Location{x:i32,y:i32}` in **tile** coordinates. Location
@@ -79,14 +128,29 @@ Every valid update is acknowledged; latest received wins, including reused or
 all-zero request IDs. An acknowledgement means RAM acceptance, not durability.
 All signed i32 coordinates are accepted for tracking only: no terrain, speed,
 proximity or game-rule enforcement. Cut/read rules and durable cut-ID replay
-remain unchanged; their connections must first pass the same URL admission.
+remain unchanged; their connections must first complete authentication.
 There is no listing, client query, subscription, broadcast or location history.
 
 Normal/error/shutdown cleanup and failed-upgrade cleanup after admission release
 the session. Generation-checked handles protect reused connection records from
 stale cleanup/update. Reconnect after close starts UNKNOWN, without a cache.
-An undetected old socket may temporarily block reconnect: no heartbeat or
-deadline was added. Registry locking never spans database or socket operations.
+An undetected authenticated old socket may temporarily block reconnect: no
+post-authentication heartbeat/idle deadline is added. Registry locking never spans
+database or socket operations.
+
+HTTP has its own absolute five-second window captured immediately after accept,
+including scheduling and parsing. Authentication gets a fresh five-second window
+immediately before launching the phase that writes HTTP101. Each phase races work
+against `std.Io.Clock.Timestamp.wait` using a two-result `std.Io.Select`.
+Every exit cancels and joins both tasks before accessing their state or closing
+the stream. Explicit clock checks cover buffered reads, verification, registry
+publication under its mutex, and before/after ACK flush; equality is expired.
+The auth worker never dispatches gameplay. A losing race can have delivered F2,
+but cannot dispatch gameplay and always releases its provisional identity.
+Native I/O cancellation interrupts pending network reads/writes; this is not a
+hard real-time scheduling guarantee. There is no custom event loop or watchdog.
+Authenticated writes have no new deadline and can hold a DB lease; group
+cancellation joins all connection tasks before freeing application/slot storage.
 
 ## Binary v1 (no JSON compatibility)
 
@@ -195,7 +259,7 @@ Separate startup-configurable defaults:
 | Budget | Bytes | Basis |
 |---|---:|---|
 | SQLite | 4,194,304 | v3 query-stress peak 1,279,296; budget >3x peak |
-| WebSocket recycler | 4,194,304 | measured socket-free component peak 812,672 + metadata 65,536 with actual session Handler; room for remaining worker/queue objects and churn |
+| WebSocket recycler | 4,194,304 | Linux x86_64: 64-slot array 571,392; rounded buddy high-water 1,048,576 + metadata 65,536; runtime/task stacks excluded |
 | Application buffers | 65,536 | stable Layout 21,472 bytes: four contexts 17,344 + session registry 4,128; remaining bytes are headroom |
 
 SQLite uses non-null 8-aligned `SQLITE_CONFIG_HEAP` before explicit initialize,
@@ -215,24 +279,31 @@ metadata. WS measurements are component tests, **not a server/RSS high-water
 measurement**. Insufficient budgets fail initialization (named invalid-budget,
 SqliteOutOfMemory, InsufficientApplicationBudget or WebSocket OOM errors).
 
-64 total connections **including pending handshakes**, four callback workers,
-64 connection-readiness jobs, and **no additional request queue**. Four leased
+64 total connections **including pending HTTP and authentication**, and **no
+additional application request queue**. Four leased
 contexts own their DB handle, prepared statements, 64x32 bitmap and 2122-byte
 reply buffer through synchronous socket write; leases do not assume thread
 affinity. Location updates bypass DB leasing entirely. A fully decoded cut/read
 request without a healthy available context returns
-retryable binary `database_busy` **before mutation**, from fixed 33-byte callback
-error storage. SQLite heap OOM after admission is internal_error, not a falsely
-premutation busy result. At the connection cap, bounded rejection batches try
-one nonblocking constant HTTP 503 write, then raw-close; delivery is not promised.
-Handshake limits: 5 seconds, 8192 bytes, 32 headers. Fragment buffers are bounded.
-`server/ws_config.zig` is shared by production and component tests. All 64
-128-byte fragment buffers are prewarmed; 64-way repeated fragment churn requires
-zero additional buddy allocation calls. The three-argument callback does not
-request an allocator, so callback allocator scratch size is zero. Connection
-read buffers remain 64x2048; four callback workers and the 64-job queue are unchanged.
-Synchronous writes remain unchanged: a slow reader can block a callback worker
-and hold a context. Budgeting does not solve that latency source.
+retryable binary `database_busy` **before mutation**, from fixed 33-byte error
+storage. SQLite heap OOM after admission is internal_error, not a falsely
+premutation busy result. At capacity an accepted socket is immediately closed,
+without launching a task or promising HTTP503. HTTP limits: 5 seconds, 8192 bytes,
+32 headers. `server/ws_config.zig` holds the fixed production/test limits.
+Before listening, the buddy allocator reserves one array of 64 slots. Each owns
+8192-byte HTTP, 128-byte WebSocket and 512-byte output buffers plus stable key and
+bookkeeping. On Linux x86_64 a slot is **8928 bytes**, the array **571392 bytes**;
+buddy rounded managed high-water is **1048576 bytes**, plus **65536 bytes** of
+metadata inside the default 4 MiB region. Socket-free capacity/reuse tests perform
+no further managed allocation. Insufficient startup reservation fails closed.
+The retained HTTP reader preserves pipelined frame bytes. A thin forwarding guard
+checks RSV, FIN, mask, opcode, canonical lengths, control limits and payload cap
+before passing unchanged bytes to std, including internally skipped pongs. Close
+ends the connection; complete close-payload validation is not claimed.
+Connection tasks use `std.Io.Group.concurrent` (no inline fallback). The standard
+I/O runtime, tasks, thread stacks, sockets and OS resources are **outside the WS
+reservation**: this is not the old four-callback-thread model or an RSS bound.
+Slow authenticated readers can still hold a context; budgets do not solve latency.
 
 ## Socket-free benchmark
 
@@ -498,7 +569,7 @@ established explanation for the invalid comparison. Protocol, response shape,
 pooling, prepared SQL, page caches, SQLite builds and handle lifetimes all change:
 **no isolated allocation-related causal speedup is claimed**.
 
-## Verification (no sockets)
+## Verification
 
 ```sh
 zig build test-server server -Dgame=false --summary all
@@ -511,13 +582,19 @@ zig fmt --check build.zig build.zig.zon build shared server src/world.zig
 git diff --check
 ```
 
-Only pure/unit tests, isolated real-file SQLite and explicit in-process benchmarks
-were run. Root tests select the vendor's `bounded-memory` filter, never upstream's
-full socket-containing test suite. Tests cover wire goldens/malformed input,
+`test-server` uses only pure/unit tests, fixed-buffer transport checks and isolated
+real-file SQLite, never sockets or upstream vendor tests. Tests cover wire goldens/malformed input,
 bitmaps/metadata/extremes, durable replay/conflicts, atomic trigger rollback,
 independent concurrent writers, consistent snapshots, real SQLite heap OOM,
 quarantine/rebuild, failed budgets, context exhaustion, buddy reclamation and
 concurrent churn. Actual startup allocator guards trap unexpected subsequent
-upstream calls during application/WS component tests. They cannot instrument C:
+upstream calls during application tests; the WS buddy retains no upstream allocator.
+They cannot instrument C:
 SQLite's ZERO_MALLOC/MEMSYS5 build and no malloc/free/realloc undefined symbols
 in its static archive are separate evidence, not a universal OS-memory proof.
+
+Authentication tests cover shared message goldens and structurally invalid input,
+inline positive/negative signature fixtures, parity/domain/nonce/single-hash
+binding, malformed keys/signatures, and existing
+deterministic socket-free admission/deadline/ownership checks. Socket integration
+tests are deferred until the client exists.

@@ -1,18 +1,9 @@
-//! Ephemeral, bounded connection identity and latest tile location. No authorization.
+//! Ephemeral, bounded verified connection identity and latest tile location.
 const std = @import("std");
 const Location = @import("shared").protocol.Location;
 pub const Pubkey = [33]u8;
 pub const Handle = struct { index: usize, generation: u64 };
 pub const SessionSnapshot = struct { pubkey: Pubkey, location: ?Location };
-
-/// Strict root URL only: no other parameters, escapes, fragments or normalization.
-pub fn parsePubkey(url: []const u8) !Pubkey {
-    const prefix = "/?pubkey=";
-    if (url.len != prefix.len + 66 or !std.mem.startsWith(u8, url, prefix)) return error.InvalidPubkey;
-    var key: Pubkey = undefined;
-    _ = std.fmt.hexToBytes(&key, url[prefix.len..]) catch return error.InvalidPubkey;
-    return key;
-}
 
 pub const Registry = struct {
     const Slot = struct {
@@ -29,6 +20,14 @@ pub const Registry = struct {
     pub fn claim(self: *Registry, key: Pubkey) !Handle {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        return self.claimLocked(key, null);
+    }
+    pub fn claimBefore(self: *Registry, key: Pubkey, deadline: std.Io.Clock.Timestamp) !Handle {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.claimLocked(key, deadline);
+    }
+    fn claimLocked(self: *Registry, key: Pubkey, deadline: ?std.Io.Clock.Timestamp) !Handle {
         var free: ?usize = null;
         for (&self.slots, 0..) |*slot, i| {
             if (slot.occupied) {
@@ -37,6 +36,9 @@ pub const Registry = struct {
         }
         const index = free orelse return error.SessionCapacity;
         if (self.generation == std.math.maxInt(u64)) return error.GenerationExhausted;
+        if (deadline) |end| {
+            if (std.Io.Clock.Timestamp.now(self.io, end.clock).compare(.gte, end)) return error.DeadlineExpired;
+        }
         self.generation += 1;
         self.slots[index] = .{ .occupied = true, .generation = self.generation, .pubkey = key };
         return .{ .index = index, .generation = self.generation };

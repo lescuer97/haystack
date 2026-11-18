@@ -2,6 +2,41 @@
 const std = @import("std");
 const p = @import("protocol.zig");
 const world = @import("world.zig");
+/// Separate from the gameplay header. The caller supplies storage for the fixed message length.
+pub fn encodeAuth(out: []u8, message: p.AuthMessage) []const u8 {
+    out[0] = @backingInt(message);
+    switch (message) {
+        .challenge => |nonce| {
+            @memcpy(out[1..33], &nonce);
+            return out[0..33];
+        },
+        .proof => |proof| {
+            @memcpy(out[1..34], &proof.pubkey);
+            @memcpy(out[34..98], &proof.signature);
+            return out[0..98];
+        },
+        .authenticated => return out[0..1],
+    }
+}
+/// Structural validation only; direction and cryptographic verification belong to the caller.
+pub fn decodeAuth(data: []const u8, binary: bool) error{InvalidAuthentication}!p.AuthMessage {
+    if (!binary or data.len == 0) return error.InvalidAuthentication;
+    const kind = std.enums.fromInt(p.AuthKind, data[0]) orelse return error.InvalidAuthentication;
+    switch (kind) {
+        .challenge => {
+            if (data.len != 33) return error.InvalidAuthentication;
+            return .{ .challenge = data[1..33].* };
+        },
+        .proof => {
+            if (data.len != 98) return error.InvalidAuthentication;
+            return .{ .proof = .{ .pubkey = data[1..34].*, .signature = data[34..98].* } };
+        },
+        .authenticated => {
+            if (data.len != 1) return error.InvalidAuthentication;
+            return .authenticated;
+        },
+    }
+}
 pub const Decoded = union(enum) { request: p.Request, failure: p.Response };
 pub fn failure(id: ?p.Id, code: p.ErrorCode) p.Response {
     return .{ .request_id = id, .result = .{ .failure = .{ .code = code } } };
@@ -278,7 +313,40 @@ test "location wire goldens exact lengths IDs flags and packed representation" {
         try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..20], &snapshot));
     }
 }
-test "random request and reply decode guards" {
+test "authentication independent byte goldens and roundtrips" {
+    const cases = [_]struct { message: p.AuthMessage, golden: []const u8 }{
+        .{ .message = .{ .challenge = @splat(0) }, .golden = &(.{0xf0} ++ @as([32]u8, @splat(0))) },
+        .{ .message = .{ .challenge = @splat(255) }, .golden = &(.{0xf0} ++ @as([32]u8, @splat(255))) },
+        .{ .message = .{ .proof = .{ .pubkey = @splat(0), .signature = @splat(255) } }, .golden = &(.{0xf1} ++ @as([33]u8, @splat(0)) ++ @as([64]u8, @splat(255))) },
+        .{ .message = .{ .proof = .{ .pubkey = @splat(255), .signature = @splat(0) } }, .golden = &(.{0xf1} ++ @as([33]u8, @splat(255)) ++ @as([64]u8, @splat(0))) },
+        .{ .message = .authenticated, .golden = &.{0xf2} },
+    };
+    var out: [98]u8 = undefined;
+    for (cases) |case| {
+        const encoded = encodeAuth(&out, case.message);
+        try std.testing.expectEqualSlices(u8, case.golden, encoded);
+        try std.testing.expectEqualDeep(case.message, try decodeAuth(case.golden, true));
+        try std.testing.expectEqualDeep(case.message, try decodeAuth(encoded, true));
+        try std.testing.expectError(error.InvalidAuthentication, decodeAuth(case.golden, false));
+    }
+}
+test "authentication rejects every wrong tag length and text" {
+    var buf: [129]u8 = @splat(0);
+    for (0..256) |tag| {
+        buf[0] = @intCast(tag);
+        const expected: ?usize = switch (tag) {
+            0xf0 => 33,
+            0xf1 => 98,
+            0xf2 => 1,
+            else => null,
+        };
+        for (0..buf.len + 1) |n| {
+            if (expected == null or n != expected.?) try std.testing.expectError(error.InvalidAuthentication, decodeAuth(buf[0..n], true));
+            try std.testing.expectError(error.InvalidAuthentication, decodeAuth(buf[0..n], false));
+        }
+    }
+}
+test "random request reply and authentication decode guards" {
     var random = std.Random.DefaultPrng.init(0x73657373696f6e);
     var buf: [p.max_response_bytes + 1]u8 = undefined;
     var snapshot: p.Snapshot = undefined;
@@ -287,5 +355,6 @@ test "random request and reply decode guards" {
         const n = random.random().uintLessThan(usize, buf.len + 1);
         _ = decode(buf[0..n]);
         _ = decodeResponse(buf[0..n], &snapshot) catch {};
+        _ = decodeAuth(buf[0..n], true) catch {};
     }
 }

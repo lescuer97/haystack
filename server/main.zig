@@ -1,5 +1,4 @@
 const std = @import("std");
-const ws = @import("websocket");
 const transport = @import("transport.zig");
 const memory = @import("memory.zig");
 const sqlite = @import("sqlite_runtime.zig");
@@ -33,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     var application = try app.App.init(init.io, path, app_buffer);
     application.wallet = &wallet;
     defer application.deinit();
-    var server = ws.Server(transport.Handler).init(init.io, recycler.allocator(), @import("ws_config.zig").config) catch |err| {
+    var server = transport.Server.init(init.io, recycler.allocator()) catch |err| {
         if (err == error.OutOfMemory) return error.InsufficientWebsocketBudget;
         return err;
     };

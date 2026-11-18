@@ -4,10 +4,10 @@ const std = @import("std");
 pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
     const target = native.options.target;
     const optimize = native.options.optimize;
+    const secp = @import("secp256k1.zig").create(b, target, optimize) orelse return;
     const storage = b.createModule(.{ .root_source_file = b.path("src/native_storage.zig"), .target = target, .optimize = optimize, .link_libc = true });
     storage.addImport("cdk", native.cdk);
     const shared = @import("shared.zig").create(b, target, optimize);
-    const websocket = b.dependency("websocket", .{ .target = target, .optimize = optimize });
     const sqlite_dep = b.dependency("sqlite", .{ .target = target, .optimize = optimize, .server_namespace = true, .memsys5 = true, .zero_malloc = true, .omit_autoinit = true, .threadsafe = @as(u2, 1) });
     const sqlite = sqlite_dep.module("sqlite");
     if (native.preflight) |step| sqlite_dep.artifact("sqlite").step.dependOn(&step.step);
@@ -20,11 +20,12 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
         .root_source_file = b.path("server/main.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{ .{ .name = "shared", .module = shared }, .{ .name = "websocket", .module = websocket.module("websocket") } },
+        .imports = &.{.{ .name = "shared", .module = shared }},
     });
     server_mod.addImport("sqlite", sqlite);
     server_mod.addImport("native_storage", storage);
     native.link(server_mod);
+    secp.link(server_mod);
     server_mod.link_libc = true;
     const server = b.addExecutable(.{ .name = "haystack_server", .root_module = server_mod });
     server.step.dependOn(&native.rust.step);
@@ -38,7 +39,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
     unit_mod.addImport("sqlite", sqlite);
     unit_mod.addImport("native_storage", storage);
     native.link(unit_mod);
-    unit_mod.addImport("websocket", websocket.module("websocket"));
+    secp.link(unit_mod);
     unit_mod.link_libc = true;
     const unit_binary = b.addTest(.{ .root_module = unit_mod });
     unit_binary.step.dependOn(&native.rust.step);
@@ -49,12 +50,11 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
     server_test_step.dependOn(&namespace.step);
     server_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = storage })).step);
     server_test_step.dependOn(&shared_tests.step);
-    const bounded_ws_tests = b.addRunArtifact(b.addTest(.{ .root_module = websocket.module("bounded_tests"), .filters = &.{"bounded-memory"} }));
-    server_test_step.dependOn(&bounded_ws_tests.step);
-    const ws_memory_mod = b.createModule(.{ .root_source_file = b.path("server/ws_memory_tests.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "websocket", .module = websocket.module("websocket") }} });
+    const ws_memory_mod = b.createModule(.{ .root_source_file = b.path("server/ws_memory_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ws_memory_mod.addImport("shared", shared);
     ws_memory_mod.addImport("sqlite", sqlite);
     ws_memory_mod.addImport("native_storage", storage);
+    secp.link(ws_memory_mod);
     server_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = ws_memory_mod, .filters = &.{"bounded-memory application"} })).step);
     const bench_mod = b.createModule(.{ .root_source_file = b.path("server/bench.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "shared", .module = shared }, .{ .name = "sqlite", .module = sqlite } } });
     bench_mod.addImport("native_storage", storage);

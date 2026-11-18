@@ -9,6 +9,9 @@ pub const min_chunk: i32 = -134217728;
 pub const max_chunk: i32 = 134217727;
 pub const Cut = struct { x: i32, y: i32 };
 pub const Location = packed struct(u64) { x: i32, y: i32 };
+pub const AuthKind = enum(u8) { challenge = 0xf0, proof = 0xf1, authenticated = 0xf2 };
+pub const AuthProof = struct { pubkey: [33]u8, signature: [64]u8 };
+pub const AuthMessage = union(AuthKind) { challenge: [32]u8, proof: AuthProof, authenticated: void };
 pub const Request = struct {
     version: u16 = version,
     request_id: Id,
