@@ -60,8 +60,7 @@ same storage works headlessly.
    state.
 6. `endMode2D` flushes world geometry; `endDrawing` flushes the UI and presents.
     The optional native screenshot is taken after draw, with an explicit batch
-    flush BEFORE presentation. A privacy latch from before real-time completions
-    excludes any outer frame that had blocking onboarding, even between ticks.
+    flush BEFORE presentation, including any visible onboarding or recovery words.
     Native draws at 120 FPS and browser rAF draws every callback without interpolation.
 
 Allocation failures from streaming are handled in `GameState.streamChunks`: it

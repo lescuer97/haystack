@@ -116,32 +116,29 @@ pub const Driver = struct {
 
     /// No time-based animations currently exist. If added, advance them ONCE
     /// here using tick.dt_seconds, not once per drained input record.
-    pub fn advance(self: *Driver, seconds: f64, game: *game_mod.GameState, model: ?*onboarding.Onboarding, sink: ?EffectSink, privacy_blocked: *bool) !bool {
+    pub fn advance(self: *Driver, seconds: f64, game: *game_mod.GameState, model: ?*onboarding.Onboarding, sink: ?EffectSink) !bool {
         const now = clockNanoseconds(seconds) orelse return false;
         if (!self.schedule.poll(now)) return false;
         self.repeat.beginTick();
         while (self.queue.pop()) |value| {
             var sample = value;
             defer sample.scrub();
-            try self.consume(sample, game, model, sink, privacy_blocked);
+            try self.consume(sample, game, model, sink);
         }
         // Includes a dropped release, but NEVER a dropped edge/text/delta.
-        try self.consume(self.queue.latest, game, model, sink, privacy_blocked);
+        try self.consume(self.queue.latest, game, model, sink);
         try self.prepare(game, self.queue.latest.frame.viewport_w, self.queue.latest.frame.viewport_h);
         self.routing = Routing.get(game, model);
         return true;
     }
 
-    fn consume(self: *Driver, sample: input.RawSample, game: *game_mod.GameState, model: ?*onboarding.Onboarding, sink: ?EffectSink, privacy_blocked: *bool) !void {
-        if (model) |m| privacy_blocked.* = privacy_blocked.* or m.isBlocking();
+    fn consume(self: *Driver, sample: input.RawSample, game: *game_mod.GameState, model: ?*onboarding.Onboarding, sink: ?EffectSink) !void {
         const modal = game.menu.opened or (if (model) |m| m.isBlocking() else false);
         var frame = self.repeat.route(sample, modal);
         defer std.crypto.secureZero(u21, &frame.characters);
         const effect = try routeFrame(game, model, frame);
         if (model) |m| {
-            privacy_blocked.* = privacy_blocked.* or m.isBlocking();
             if (effect) |e| if (sink) |s| s.dispatch(s.context, m, e);
-            privacy_blocked.* = privacy_blocked.* or m.isBlocking();
         }
         if (sink) |s| if (s.after_input) |after| after(s.context, game);
     }
@@ -233,11 +230,10 @@ test "120 and 144 presentation frames produce the same twenty updates and ten st
         var game = try game_mod.GameState.init(std.testing.allocator, 1000, 640);
         defer game.deinit();
         var updates: usize = 0;
-        var privacy = false;
         for (0..fps) |i| {
             var s = input.RawSample{ .navigation = .{ .right = true } };
             driver.queue.push(&s);
-            updates += @intFromBool(try driver.advance(@as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(fps)), &game, null, null, &privacy));
+            updates += @intFromBool(try driver.advance(@as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(fps)), &game, null, null));
         }
         try std.testing.expectEqual(@as(usize, 20), updates);
         try std.testing.expectEqual(@as(i32, 10), game.camera.tile_x);
@@ -254,21 +250,20 @@ test "no between-tick updates; initial preparation and viewport remain coherent"
     defer d.deinit();
     var g = try game_mod.GameState.init(std.testing.allocator, 1000, 640);
     defer g.deinit();
-    var privacy = false;
     try d.prepare(&g, 1000, 640);
     pushFrame(&d, .{ .toggle_grid = true, .viewport_w = 1200, .viewport_h = 700 });
     const settings = g.settings;
-    try std.testing.expect(!try d.advance(std.math.nan(f64), &g, null, null, &privacy));
+    try std.testing.expect(!try d.advance(std.math.nan(f64), &g, null, null));
     try std.testing.expect(std.meta.eql(settings, g.settings));
     try std.testing.expect(d.view != null and d.viewport_w == 1000);
-    try std.testing.expect(try d.advance(0, &g, null, null, &privacy));
+    try std.testing.expect(try d.advance(0, &g, null, null));
     try std.testing.expect(d.viewport_w == 1200 and d.viewport_h == 700);
     const view = d.view.?;
     pushFrame(&d, .{ .toggle_grid = true, .viewport_w = 800 });
-    try std.testing.expect(!try d.advance(0.049, &g, null, null, &privacy));
+    try std.testing.expect(!try d.advance(0.049, &g, null, null));
     try std.testing.expect(std.meta.eql(view, d.view.?));
     try std.testing.expect(d.viewport_w == 1200);
-    try std.testing.expect(try d.advance(0.05, &g, null, null, &privacy));
+    try std.testing.expect(try d.advance(0.05, &g, null, null));
     try std.testing.expect(std.meta.eql(settings, g.settings));
     try std.testing.expect(d.viewport_w == 800);
 }
@@ -278,23 +273,22 @@ test "short tap survives release and many taps permit at most one step per tick"
     defer d.deinit();
     var g = try game_mod.GameState.init(std.testing.allocator, 1000, 640);
     defer g.deinit();
-    var privacy = false;
     for (0..8) |_| {
         var s = input.RawSample{ .navigation = .{ .right = true, .down = true } };
         d.queue.push(&s);
         s.navigation = .{};
         d.queue.push(&s);
     }
-    _ = try d.advance(0, &g, null, null, &privacy);
+    _ = try d.advance(0, &g, null, null);
     try std.testing.expect(g.camera.tile_x == 1 and g.camera.tile_y == 1);
-    _ = try d.advance(10, &g, null, null, &privacy);
+    _ = try d.advance(10, &g, null, null);
     try std.testing.expect(g.camera.tile_x == 1 and g.camera.tile_y == 1);
     var held = input.RawSample{ .navigation = .{ .right = true } };
     d.queue.push(&held);
-    _ = try d.advance(10.05, &g, null, null, &privacy);
+    _ = try d.advance(10.05, &g, null, null);
     try std.testing.expectEqual(@as(i32, 2), g.camera.tile_x);
     d.skipPast(30);
-    try std.testing.expect(!try d.advance(30, &g, null, null, &privacy));
+    try std.testing.expect(!try d.advance(30, &g, null, null));
     try std.testing.expectEqual(@as(i32, 2), g.camera.tile_x);
 }
 
@@ -303,20 +297,19 @@ test "ordered Escape then WASD typing confirm cannot navigate the menu" {
     defer d.deinit();
     var g = try game_mod.GameState.init(std.testing.allocator, 1000, 640);
     defer g.deinit();
-    var privacy = false;
     pushFrame(&d, .{ .escape_clicked = true });
     var letter = input.RawSample{ .wasd = .{ .down = true }, .frame = .{ .character_count = 1 } };
     letter.frame.characters[0] = 's';
     d.queue.push(&letter);
     pushFrame(&d, .{ .confirm = true });
-    _ = try d.advance(0, &g, null, null, &privacy);
+    _ = try d.advance(0, &g, null, null);
     try std.testing.expect(g.menu.opened and g.menu.currentPage == .Wallet);
     try std.testing.expectEqual(@as(i32, 0), g.camera.tile_y);
     // Input-driven transitions do not flush the remaining ordered edges.
     pushFrame(&d, .{ .escape_clicked = true });
     pushFrame(&d, .{ .escape_clicked = true });
     const was_open = g.menu.opened;
-    _ = try d.advance(0.05, &g, null, null, &privacy);
+    _ = try d.advance(0.05, &g, null, null);
     try std.testing.expectEqual(was_open, g.menu.opened);
 }
 
@@ -328,7 +321,6 @@ test "typing backspace toggle multiplicity and drag release remain ordered" {
     var m = onboarding.Onboarding.init(std.testing.allocator);
     defer m.deinit();
     m.receive(.resume_phrase_entry);
-    var privacy = false;
     var text = input.FrameInput{ .character_count = 2 };
     text.characters[0..2].* = .{ 'a', 'b' };
     pushFrame(&d, text);
@@ -336,16 +328,15 @@ test "typing backspace toggle multiplicity and drag release remain ordered" {
     text.characters[0] = 'c';
     text.character_count = 1;
     pushFrame(&d, text);
-    _ = try d.advance(0, &g, &m, null, &privacy);
+    _ = try d.advance(0, &g, &m, null);
     try std.testing.expectEqualStrings("ac", m.recoveryPhrase());
-    try std.testing.expect(privacy);
     m.phase = .inactive;
     d.observeRouting(&g, &m);
     const settings = g.settings;
     pushFrame(&d, .{ .toggle_grid = true, .toggle_borders = true, .dragging = true, .drag_x = -20 });
     pushFrame(&d, .{ .toggle_grid = true, .toggle_borders = true });
     pushFrame(&d, .{ .dragging = true, .drag_x = -20 });
-    _ = try d.advance(0.05, &g, &m, null, &privacy);
+    _ = try d.advance(0.05, &g, &m, null);
     try std.testing.expect(std.meta.eql(settings, g.settings));
     try std.testing.expectEqual(@as(i32, 0), g.camera.tile_x);
     try std.testing.expectEqual(@as(f64, 20), g.camera.drag_remainder_x);
@@ -356,17 +347,16 @@ test "overflow drops newest edges but reconciles held and mouse release" {
     defer d.deinit();
     var g = try game_mod.GameState.init(std.testing.allocator, 1000, 640);
     defer g.deinit();
-    var privacy = false;
     const grid = g.settings.debug.tile_grid;
     for (0..capacity) |_| {
         var s = input.RawSample{ .navigation = .{ .right = true }, .frame = .{ .dragging = true, .drag_x = -0.25 } };
         d.queue.push(&s);
     }
     pushFrame(&d, .{ .toggle_grid = true }); // dropped, release still reconciles
-    _ = try d.advance(0, &g, null, null, &privacy);
+    _ = try d.advance(0, &g, null, null);
     try std.testing.expectEqual(grid, g.settings.debug.tile_grid);
     try std.testing.expectEqual(@as(f64, 0), g.camera.drag_remainder_x);
-    _ = try d.advance(0.1, &g, null, null, &privacy);
+    _ = try d.advance(0.1, &g, null, null);
     try std.testing.expectEqual(@as(i32, 0), g.camera.tile_x);
 }
 
@@ -377,17 +367,16 @@ test "async completion invalidates old modal input even on skipped ticks" {
     defer g.deinit();
     var m = onboarding.Onboarding.init(std.testing.allocator);
     defer m.deinit();
-    var privacy = m.isBlocking(); // captured BEFORE external completion
     d.observeRouting(&g, &m);
-    _ = try d.advance(0, &g, &m, null, &privacy);
+    _ = try d.advance(0, &g, &m, null);
     pushFrame(&d, .{ .escape_clicked = true, .toggle_grid = true });
     m.receive(.ready);
     d.observeRouting(&g, &m); // before capture, not behind tick permission
     try std.testing.expectEqual(@as(usize, 0), d.queue.len);
-    try std.testing.expect(!try d.advance(0.01, &g, &m, null, &privacy));
-    try std.testing.expect(privacy and !g.menu.opened);
+    try std.testing.expect(!try d.advance(0.01, &g, &m, null));
+    try std.testing.expect(!g.menu.opened);
     const settings = g.settings;
-    _ = try d.advance(0.05, &g, &m, null, &privacy);
+    _ = try d.advance(0.05, &g, &m, null);
     try std.testing.expect(std.meta.eql(settings, g.settings));
     try std.testing.expect(!g.menu.opened);
     // Content replacement without phase changes uses explicit invalidation.
@@ -449,7 +438,6 @@ test "each effect is immediate including paste before typing and restore payload
     var m = onboarding.Onboarding.init(std.testing.allocator);
     defer m.deinit();
     m.receive(.resume_phrase_entry);
-    var privacy = false;
     var recorder = Recorder{};
     defer std.crypto.secureZero(u8, &recorder.payload);
     const sink = EffectSink{ .context = &recorder, .dispatch = Recorder.dispatch };
@@ -461,14 +449,14 @@ test "each effect is immediate including paste before typing and restore payload
     pushFrame(&d, .{ .clicked = true, .pointer_x = restore.centerX(), .pointer_y = restore.centerY() });
     pushFrame(&d, .{ .backspace = true });
     pushFrame(&d, .{ .paste_shortcut = true });
-    _ = try d.advance(0, &g, &m, sink, &privacy);
+    _ = try d.advance(0, &g, &m, sink);
     try std.testing.expectEqual(@as(usize, 3), recorder.len);
     try std.testing.expect(recorder.order[0] == .paste_requested and recorder.order[1] == .restore_requested and recorder.order[2] == .paste_requested);
     try std.testing.expectEqualStrings("onex", recorder.payload[0..recorder.payload_len]);
     try std.testing.expectEqualStrings("one", m.recoveryPhrase());
 }
 
-test "screenshot privacy latches intermediate blocking transitions before effects" {
+test "completion effect immediately clears the mnemonic" {
     const Complete = struct {
         fn dispatch(_: ?*anyopaque, model: *onboarding.Onboarding, _: onboarding.Effect) void {
             model.receive(.complete_success); // destroys mnemonic before draw
@@ -483,9 +471,7 @@ test "screenshot privacy latches intermediate blocking transitions before effect
     m.receive(.{ .backup = try std.testing.allocator.dupe(u8, "secret") });
     m.saved = true;
     m.selected = .complete_backup;
-    var privacy = false;
     pushFrame(&d, .{ .confirm = true });
-    _ = try d.advance(0, &g, &m, .{ .dispatch = Complete.dispatch }, &privacy);
+    _ = try d.advance(0, &g, &m, .{ .dispatch = Complete.dispatch });
     try std.testing.expect(m.phase == .inactive and m.mnemonic() == null);
-    try std.testing.expect(privacy);
 }

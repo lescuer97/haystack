@@ -45,14 +45,13 @@ prepared without consuming input.
 
 ```zig
 while (!rl.windowShouldClose()) {
-    // Latch screenshot blocking BEFORE asynchronous completions can erase words.
     // Service wallet/auth/clipboard completions and real-time deadlines.
     // Invalidate stale queued input for accepted external target replacements.
     // Observe routing identity, then poll hardware ONCE and enqueue raw input.
     // If due: drain records in order, dispatch each effect immediately,
     // calculate/cache view+viewport, stream once, then skipPast a fresh clock.
     // Persist changed settings; draw cached state on EVERY display frame.
-    // Screenshot only if onboarding never blocked anywhere in this outer frame.
+    // Capture a requested screenshot of the current frame before presentation.
 }
 ```
 
@@ -87,13 +86,8 @@ Why this order:
 
 Screenshot mode (`HAYSTACK_SHOT=/path.png`) runs a few frames, then captures
 **inside the drawing pass before `endDrawing` presents**, so the rendered world
-and HUD are included rather than a cleared black back buffer.
-If native onboarding is blocking at the start of the capture frame, the capture
-is skipped and the screenshot budget is consumed; no PNG is written. A model
-that is blocking at capture time also prevents capture. This also
-protects completion-transition frames that started with recovery words visible.
-The guard is captured before the real-time prelude and latched at every routed
-record, before and after immediate effects, even when a tick is skipped.
+and HUD are included rather than a cleared black back buffer. It captures the
+current frame even during onboarding, including any visible recovery words.
 
 ### Input queue and cadence
 

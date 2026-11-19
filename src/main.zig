@@ -267,7 +267,6 @@ fn startBrowser(settings: game_mod.Settings) !void {
 /// before any resource is released; later callbacks return immediately.
 fn browserFrame() callconv(.c) void {
     const ctx = browser_context orelse return;
-    var privacy_blocked = ctx.model.isBlocking();
 
     // Never call raylib's `windowShouldClose` here. The pinned web backend
     // implements it with a blocking `emscripten_sleep` that is forbidden
@@ -307,7 +306,6 @@ fn browserFrame() callconv(.c) void {
         haystack_wallet_request(browser_onboarding.currentGeneration(), request.serial, @intCast(@backingInt(request.operation)), request.argument.slice().ptr, @intCast(request.argument.len), walletCallback);
         wallet_model.request = null;
     }
-    privacy_blocked = privacy_blocked or ctx.model.isBlocking();
     stepFrame(
         &ctx.game_state,
         &ctx.input_reader,
@@ -316,7 +314,6 @@ fn browserFrame() callconv(.c) void {
         browser_settings_persister,
         &ctx.model,
         .{ .dispatch = browserDispatch },
-        &privacy_blocked,
     ) catch |err| {
         std.log.err("browser frame failed: {s}", .{@errorName(err)});
         stopBrowser();
@@ -439,7 +436,6 @@ fn stepFrame(
     persister: ?SettingsPersister,
     model: ?*onboarding.Onboarding,
     sink: ?frame_loop.EffectSink,
-    privacy_blocked: *bool,
 ) !void {
     const vw: f32 = @floatFromInt(rl.getScreenWidth());
     const vh: f32 = @floatFromInt(rl.getScreenHeight());
@@ -450,7 +446,7 @@ fn stepFrame(
     // Initial preparation is safe even with an invalid startup clock: no
     // simulation input is consumed, but drawing never uses an undefined view.
     const settings_before = game_state.settings;
-    const advanced = try driver.advance(rl.getTime(), game_state, model, sink, privacy_blocked);
+    const advanced = try driver.advance(rl.getTime(), game_state, model, sink);
     if (driver.view == null) try driver.prepare(game_state, vw, vh);
 
     // A save follows an actual toggle only; modal frames and idle frames leave
@@ -471,32 +467,11 @@ fn stepFrame(
     // The 2D overlay (HUD/minimap) is still batched at this point;
     // flush it explicitly so it is present in the captured image. Only the
     // requested screenshot frame pays this cost.
-    if (shouldCaptureScreenshot(shot_path != null, privacy_blocked.*, model)) {
-        const path = shot_path.?;
+    if (shot_path) |path| {
         rl.gl.rlDrawRenderBatchActive();
         rl.takeScreenshot(path);
     }
     rl.endDrawing();
-}
-
-/// A frame that starts or ends behind onboarding must never be captured.
-fn shouldCaptureScreenshot(requested: bool, blocking_at_start: bool, model: ?*const onboarding.Onboarding) bool {
-    return requested and !blocking_at_start and !(if (model) |m| m.isBlocking() else false);
-}
-
-test "screenshots exclude onboarding and transition frames" {
-    var model = onboarding.Onboarding.init(std.testing.allocator);
-    defer model.deinit();
-    for ([_]onboarding.Phase{ .loading, .backup, .completing, .blocked }) |phase| {
-        model.phase = phase;
-        try std.testing.expect(!shouldCaptureScreenshot(true, true, &model));
-        try std.testing.expect(!shouldCaptureScreenshot(true, false, &model));
-    }
-    model.phase = .inactive;
-    try std.testing.expect(!shouldCaptureScreenshot(true, true, &model));
-    try std.testing.expect(shouldCaptureScreenshot(true, false, &model));
-    try std.testing.expect(shouldCaptureScreenshot(true, false, null));
-    try std.testing.expect(!shouldCaptureScreenshot(false, false, null));
 }
 
 test "onboarding consumes game input including the completion transition" {
@@ -870,7 +845,6 @@ pub fn main() anyerror!void {
     var onboarding_hand_cursor = false;
 
     while (!rl.windowShouldClose()) {
-        var privacy_blocked = model.isBlocking();
         const unix = std.Io.Clock.real.now(io).toSeconds();
         if (unix >= 0) game_state.menu.wallet.unix_now = @intCast(unix);
         if (!model.isBlocking() and game_state.menu.paste_requested) {
@@ -901,7 +875,6 @@ pub fn main() anyerror!void {
             scan_job = null;
         };
         // Capture on the last requested frame, inside stepFrame's drawing pass.
-        privacy_blocked = privacy_blocked or model.isBlocking();
         try stepFrame(
             &game_state,
             &input_reader,
@@ -910,7 +883,6 @@ pub fn main() anyerror!void {
             persister,
             &model,
             .{ .context = &effects, .dispatch = NativeEffects.dispatch, .after_input = NativeEffects.afterInput },
-            &privacy_blocked,
         );
 
         if (!started) {
