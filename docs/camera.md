@@ -11,7 +11,7 @@ code yet.
 | Piece | Owns | Lives in |
 |---|---|---|
 | `Camera` (ours) | tile position, keyboard/pad/drag movement | `src/camera.zig` |
-| `rl.Camera2D` | the world→screen matrix | built fresh each frame |
+| `rl.Camera2D` | the world→screen matrix | cached by the loop with its viewport until the next 20 Hz tick |
 
 Raylib's camera is only a **transform**. It does not follow anything, does not
 cull, and is not the source of truth. We keep our own camera state so it can be
@@ -82,11 +82,11 @@ Facts about the current behaviour:
 
 - `tile_x`/`tile_y` are the only persistent position. The camera never stores a
   fractional or pixel camera position.
-- Keyboard, D-pad, and left-stick directions are all held flags. `input.Reader`
-  turns them into one-tile requests on a single shared 10 steps/s cadence: a new
-  direction steps immediately, and holding it steps again every 0.1 s during
-  normal frame rates. At most one step is emitted per frame, so below 10 FPS or
-  after a stall missed whole steps are discarded, not replayed. The OS keyboard
+- Keyboard, D-pad, and left-stick directions are raw held flags. The loop-owned
+  `input.Repeater` turns them into one-tile requests on a shared 10 steps/s
+  cadence: a new vector steps on its first eligible tick, then every two
+  executed 50 ms ticks. At most one direction step is emitted per tick across
+  all queued records; after a stall missed steps are discarded. The OS keyboard
   auto-repeat rate is not used, so holding two directions keeps both axes on the
   same cadence.
 - Controller support is controller index 0 only, using its D-pad or left analog
@@ -100,10 +100,11 @@ Facts about the current behaviour:
   frame. Negative raw deltas accumulate in `f64`; whole `TILE_PX` steps become
   tile moves and the sub-tile remainder carries to later frames. A large drag
   can move several tiles at once, symmetrically in both directions.
-- Any non-drag frame resets both remainders, so one gesture cannot leak into the
-  next. A drag or a neutral frame also resets the held-direction cadence.
+- Any non-drag record resets both remainders, so one gesture cannot leak into the
+  next. Ordered queued drag/release records preserve that boundary. A world drag
+  or neutral record resets repeat; world dragging suppresses directions that tick.
 - There is no movement speed or fractional camera position: movement is
-  discrete. `input.Reader` uses frame `dt` only to pace held steps. Both axes are
+  discrete. Presentation `dt` is never used to pace held steps. Both axes are
   validated and committed together. Non-finite drags and moves whose tile-center
   pixel cannot fit the `i32` world-pixel contract return
   `error.CoordinateOutOfBounds` without changing state.
@@ -167,7 +168,9 @@ Notes:
   working if zoom is added later.
 - Validation happens before any world mutation, including the full prefetch
   ring and its count.
-- The view is derived per frame and is not stored in `GameState`.
+- The view is derived once per tick and cached with the viewport in the loop,
+  not in `GameState`. Rendering stays native 120 FPS/browser rAF, with no
+  interpolation. The minimap and menu use the same cached viewport.
 
 ---
 
@@ -192,19 +195,14 @@ mouse only pans the camera, so there is no world-space cursor yet.
 Actual order in `src/main.zig`:
 
 ```zig
-const frame = input_reader.read(rl.getFrameTime(), game_state.menu.opened); // devices -> data
-try game_state.update(frame);                       // persistent state
-const view = try camera.calculate(game_state.camera, vw, vh);
-try game_state.streamChunks(view.chunks);           // residency only
-
-rl.beginDrawing();
-rendering.draw(&game_state, view);                  // read-only
-rl.endDrawing();
+// Every display frame: real-time completions, invalidate stale input, raw poll.
+// Due at 20 Hz: route ordered records, immediate effects, prepare view/stream.
+// Every display frame: draw latest state with cached view AND viewport.
 ```
 
-`input_reader` is a long-lived `input.Reader` owned by `main`, outside the loop.
-It keeps the held-direction cadence across frames; `FrameInput` itself is still
-per-frame data passed to `GameState.update`.
+`input_reader` only polls hardware. `frame_loop.Driver` owns the bounded queue,
+repeater, schedule and cached view; native `main` or `BrowserContext` owns it.
+`FrameInput` remains the routed contract passed to `GameState.update`.
 
 `rendering.draw` uses `view.transform` for `beginMode2D` and `view.chunks` for
 iteration. The renderer neither reads input nor mutates the camera or world.

@@ -21,19 +21,28 @@ async function expect(name, expression) {
   throw new Error('Functional check failed');
 }
 const frames = () => evaluate('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>r(true))))');
+// Two 20 Hz game ticks, independent of how quickly display frames are drawn.
+const settleTicksExpression = `new Promise(resolve=>{
+  const start=performance.now();
+  function tick(now){if(now-start>=100)resolve(true);else requestAnimationFrame(tick);}
+  requestAnimationFrame(tick);
+})`;
+const settleTicks = () => evaluate(settleTicksExpression);
 async function key(key, code, number) {
   await send('Input.dispatchKeyEvent', {type:'rawKeyDown', key, code, windowsVirtualKeyCode:number});
+  // Use only a short display-frame hold, not 100ms logical settling,
+  // to avoid deliberately triggering directional repeat.
   await frames();
   await send('Input.dispatchKeyEvent', {type:'keyUp', key, code, windowsVirtualKeyCode:number});
-  await frames();
+  await settleTicks();
 }
 async function click(x, y) {
   await send('Input.dispatchMouseEvent', {type:'mouseMoved',x,y});
-  await frames();
+  await settleTicks();
   await send('Input.dispatchMouseEvent', {type:'mousePressed',button:'left',clickCount:1,x,y});
   await frames();
   await send('Input.dispatchMouseEvent', {type:'mouseReleased',button:'left',clickCount:1,x,y});
-  await frames();
+  await settleTicks();
 }
 // Shared layout's documented dimensions, used only to target real input events.
 async function row(page, index) {
@@ -46,7 +55,7 @@ async function row(page, index) {
   const top = (640-height)/2+20+44+content*scale;
   await click(500,top+index*66*scale+(index>0?extra*scale:0)+(56+(index===0?extra:0))*scale/2);
 }
-const idle = () => expect('renderer consumes reply before next action', '(async()=>{if(checks.active)return false;const count=checks.requests.length;await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));return !checks.active&&checks.requests.length===count})()');
+const idle = () => expect('renderer consumes reply before next action', `(async()=>{if(checks.active)return false;const count=checks.requests.length;await ${settleTicksExpression};return !checks.active&&checks.requests.length===count})()`);
 async function counts() {
   const reply = await fetch(new URL('/test-withdrawal-counts',origin));
   if (!reply.ok) throw new Error('Fixture counts unavailable');
@@ -88,20 +97,20 @@ const instrumentation = `(() => {
     };
   }});
 })();`;
-async function openWallet() { await key('Escape','Escape',27); await row('Main',0); }
+async function openWallet() { await settleTicks(); await key('Escape','Escape',27); await row('Main',0); }
 async function openWithdraw() { await row('Wallet',2); }
 async function paste(text) {
   const delivered = await evaluate('checks.pasteDelivered');
   await evaluate(`checks.paste=${JSON.stringify(text)}`);
   await row('Withdraw',1); // Trusted Paste gesture reads the stubbed clipboard.
   await expect('trusted clipboard callback receives complete atomic invoice',`checks.pasteDelivered===${delivered+1} && checks.pasteBytes===${Buffer.byteLength(text,'utf8')}`);
-  await frames(); // Consume the clipboard mailbox before Review is activated.
+  await settleTicks(); // Consume the clipboard mailbox before Review is activated.
 }
 async function reviewWithdrawal() {
   await expect('CDK recovery is clear before explicit Review',`(async()=>{
     if(checks.recoveryPending||checks.creationRecovery!=='none'||checks.active)return false;
     const serial=checks.recoverySerial;
-    await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+    await ${settleTicksExpression};
     return !checks.recoveryPending&&checks.creationRecovery==='none'&&!checks.active&&checks.recoverySerial===serial;
   })()`);
   const prepares = await evaluate('checks.requests.filter(n=>n===9).length');

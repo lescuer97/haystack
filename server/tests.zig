@@ -6,5 +6,7 @@ test {
     _ = @import("world_state_tests.zig");
     _ = @import("sessions_tests.zig");
     _ = @import("transport_tests.zig");
+    _ = @import("tick_mailbox.zig");
+    _ = @import("tick_mailbox_tests.zig");
     _ = @import("wallet_tests.zig");
 }

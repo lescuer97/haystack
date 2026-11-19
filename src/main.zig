@@ -1,12 +1,10 @@
 //! Application entry point: owns the allocator, the window, and the visibly
 //! explicit frame loop.
 //!
-//! Frame order:
-//!   1. collect input into a plain value,
-//!   2. apply it to persistent `GameState`,
-//!   3. calculate the temporary camera view,
-//!   4. prepare (stream) the chunks that view needs,
-//!   5. render read-only state.
+//! Display frames service real-time completions, poll raw input, and draw.
+//! A loop-owned driver consumes ordered input at 20 Hz, dispatches effects
+//! immediately, and caches the calculated view + viewport after streaming.
+//! Native 120 FPS/browser rAF presentation draws latest state, no interpolation.
 //!
 //! The same stages run on native and in the browser. The native build drives
 //! them from a blocking loop; the browser build exports a C `main` and lets
@@ -20,9 +18,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rl = @import("raylib");
 
-const camera = @import("camera.zig");
 const game_mod = @import("game.zig");
 const input = @import("input.zig");
+const frame_loop = @import("frame_loop.zig");
+const routeFrame = frame_loop.routeFrame;
 const rendering = @import("rendering.zig");
 const world = @import("world.zig");
 const browser_storage = @import("browser_storage.zig");
@@ -41,6 +40,7 @@ const wallet_service = if (builtin.os.tag != .emscripten) @import("wallet_servic
 // Import every source file explicitly so no test file is silently skipped.
 comptime {
     _ = @import("input.zig");
+    _ = @import("frame_loop.zig");
     _ = @import("camera.zig");
     _ = @import("game.zig");
     _ = @import("menu.zig");
@@ -78,6 +78,7 @@ comptime {
 const BrowserContext = struct {
     game_state: game_mod.GameState,
     input_reader: input.Reader,
+    driver: frame_loop.Driver = .{},
     model: onboarding.Onboarding,
     onboarding_start_failed: bool = false,
 };
@@ -106,20 +107,21 @@ fn clipboardProbe(kind: c_int, x: c_int, y: c_int, ptr: [*]u8, cap: u32) callcon
     if (!ctx.model.isBlocking() and ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Withdraw) {
         const state = &ctx.game_state.menu;
         if (kind == 2) return if (state.focus == .withdrawal_invoice) 16 else 0;
-        const layout = state.layoutFor(@floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()));
+        const layout = state.layoutFor(ctx.driver.viewport_w, ctx.driver.viewport_h);
         const selected = if (kind == 1) state.selected_index else if (kind == 0)
-            layout.hitTest(@as(f32, @floatFromInt(x)) * @as(f32, @floatFromInt(rl.getScreenWidth())) / 1_000_000, @as(f32, @floatFromInt(y)) * @as(f32, @floatFromInt(rl.getScreenHeight())) / 1_000_000) orelse return 0
+            layout.hitTest(@as(f32, @floatFromInt(x)) * ctx.driver.viewport_w / 1_000_000, @as(f32, @floatFromInt(y)) * ctx.driver.viewport_h / 1_000_000) orelse return 0
         else
             return 0;
         if (selected != 1) return 0;
+        if (state.focus != .withdrawal_invoice) ctx.driver.invalidateInput();
         state.focus = .withdrawal_invoice;
         return 16;
     }
     if (!ctx.model.isBlocking() and ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Invoice) {
         const state = &ctx.game_state.menu;
-        const layout = @import("menu.zig").calculateLayout(.Invoice, @floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()));
+        const layout = @import("menu.zig").calculateLayout(.Invoice, ctx.driver.viewport_w, ctx.driver.viewport_h);
         const selected = if (kind == 1) state.selected_index else if (kind == 0)
-            layout.hitTest(@as(f32, @floatFromInt(x)) * @as(f32, @floatFromInt(rl.getScreenWidth())) / 1_000_000, @as(f32, @floatFromInt(y)) * @as(f32, @floatFromInt(rl.getScreenHeight())) / 1_000_000) orelse return 0
+            layout.hitTest(@as(f32, @floatFromInt(x)) * ctx.driver.viewport_w / 1_000_000, @as(f32, @floatFromInt(y)) * ctx.driver.viewport_h / 1_000_000) orelse return 0
         else
             return 0;
         if (selected != 0 or !state.wallet.canCopyInvoice() or state.wallet.invoice.len >= cap) return 0;
@@ -127,7 +129,7 @@ fn clipboardProbe(kind: c_int, x: c_int, y: c_int, ptr: [*]u8, cap: u32) callcon
         @memcpy(ptr[0..state.wallet.invoice.len], state.wallet.invoice.slice());
         return 15;
     }
-    return browser_onboarding.probe(&ctx.model, kind, x, y, @floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()), ptr[0..cap]);
+    return browser_onboarding.probe(&ctx.model, kind, x, y, ctx.driver.viewport_w, ctx.driver.viewport_h, ptr[0..cap]);
 }
 fn clipboardPaste(ptr: [*c]const u8, len: u32) callconv(.c) void {
     const ctx = browser_context orelse return;
@@ -265,6 +267,7 @@ fn startBrowser(settings: game_mod.Settings) !void {
 /// before any resource is released; later callbacks return immediately.
 fn browserFrame() callconv(.c) void {
     const ctx = browser_context orelse return;
+    var privacy_blocked = ctx.model.isBlocking();
 
     // Never call raylib's `windowShouldClose` here. The pinned web backend
     // implements it with a blocking `emscripten_sleep` that is forbidden
@@ -273,14 +276,18 @@ fn browserFrame() callconv(.c) void {
     if (ctx.onboarding_start_failed) {
         ctx.onboarding_start_failed = false;
         ctx.model.receive(.blocked);
+        ctx.driver.invalidateInput();
     }
     if (browser_onboarding.take()) |value| {
         var result = value;
         defer std.crypto.secureZero(u8, &result.bytes);
         browser_onboarding.deliver(&result, &ctx.model);
+        ctx.driver.invalidateInput();
     }
+    if (clipboard_mailbox.has_paste and ctx.model.phase == .phrase_entry) ctx.driver.invalidateInput();
     clipboard_mailbox.consume(&ctx.model, rl.getTime());
     if (withdrawal_clipboard_pending) {
+        ctx.driver.invalidateInput();
         if (!ctx.model.isBlocking()) _ = ctx.game_state.menu.pasteWithdrawal(withdrawal_clipboard.slice());
         withdrawal_clipboard = .{};
         withdrawal_clipboard_pending = false;
@@ -291,6 +298,7 @@ fn browserFrame() callconv(.c) void {
     if (std.math.isFinite(unix) and unix >= 0 and unix < 253402300800) wallet_model.unix_now = @intFromFloat(unix);
     ctx.game_state.menu.paste_requested = false; // Browser reads only in the trusted gesture handler.
     if (wallet_result_serial) |serial| {
+        if (wallet_model.pending and wallet_model.serial == serial) ctx.driver.invalidateInput();
         if (wallet_result_ok) wallet_model.accept(serial, wallet_mailbox.slice(), rl.getTime(), std.heap.c_allocator) else wallet_model.fail(serial, rl.getTime());
         wallet_result_serial = null;
     }
@@ -299,18 +307,25 @@ fn browserFrame() callconv(.c) void {
         haystack_wallet_request(browser_onboarding.currentGeneration(), request.serial, @intCast(@backingInt(request.operation)), request.argument.slice().ptr, @intCast(request.argument.len), walletCallback);
         wallet_model.request = null;
     }
-    const effect = stepFrame(
+    privacy_blocked = privacy_blocked or ctx.model.isBlocking();
+    stepFrame(
         &ctx.game_state,
         &ctx.input_reader,
+        &ctx.driver,
         null,
         browser_settings_persister,
         &ctx.model,
+        .{ .dispatch = browserDispatch },
+        &privacy_blocked,
     ) catch |err| {
         std.log.err("browser frame failed: {s}", .{@errorName(err)});
         stopBrowser();
         return;
     };
-    if (effect) |e| browserEffect(&ctx.model, e);
+}
+
+fn browserDispatch(_: ?*anyopaque, model: *onboarding.Onboarding, effect: onboarding.Effect) void {
+    browserEffect(model, effect);
 }
 
 fn browserEffect(model: *onboarding.Onboarding, effect: onboarding.Effect) void {
@@ -360,6 +375,7 @@ fn stopBrowser() void {
     browser_onboarding.close();
     emscripten_cancel_main_loop();
     ctx.model.deinit();
+    ctx.driver.deinit();
     ctx.game_state.deinit();
     std.heap.c_allocator.destroy(ctx);
     rl.closeWindow();
@@ -411,29 +427,31 @@ const browser_settings_persister: SettingsPersister = .{
 
 // ── shared frame stages ──────────────────────────────────────────────────────
 
-/// Run one complete frame for either platform. Persistent state and the input
-/// reader are borrowed; the browser owns them in `BrowserContext`, the native
-/// loop owns them in `main`. `shot_path` is captured inside the drawing pass
+/// Run one presentation frame for either platform, with at most one due tick.
+/// State, driver and input reader are borrowed from `BrowserContext` or native
+/// `main`. `shot_path` is captured inside the drawing pass
 /// (before presentation) so the image is not a post-swap black frame.
 fn stepFrame(
     game_state: *game_mod.GameState,
     input_reader: *input.Reader,
+    driver: *frame_loop.Driver,
     shot_path: ?[:0]const u8,
     persister: ?SettingsPersister,
     model: ?*onboarding.Onboarding,
-) !?onboarding.Effect {
+    sink: ?frame_loop.EffectSink,
+    privacy_blocked: *bool,
+) !void {
     const vw: f32 = @floatFromInt(rl.getScreenWidth());
     const vh: f32 = @floatFromInt(rl.getScreenHeight());
 
-    // 1. collect input: this is the only stage that touches devices. dt only
-    //    paces held directions; the camera still takes whole-tile requests.
-    //    The menu's open state filters WASD out of directions.
-    const blocking = if (model) |m| m.isBlocking() else false;
-    const frame_input = input_reader.read(rl.getFrameTime(), game_state.menu.opened or blocking);
-
-    // 2. update persistent state from that input.
+    driver.observeRouting(game_state, model);
+    var sample = input_reader.read();
+    driver.queue.push(&sample);
+    // Initial preparation is safe even with an invalid startup clock: no
+    // simulation input is consumed, but drawing never uses an undefined view.
     const settings_before = game_state.settings;
-    const result = try routeFrame(game_state, model, frame_input);
+    const advanced = try driver.advance(rl.getTime(), game_state, model, sink, privacy_blocked);
+    if (driver.view == null) try driver.prepare(game_state, vw, vh);
 
     // A save follows an actual toggle only; modal frames and idle frames leave
     // the settings untouched and produce no write.
@@ -443,28 +461,22 @@ fn stepFrame(
         }
     }
 
-    // 3. calculate this frame's view. It is temporary; persistent state does
-    //    not store a view.
-    const view = try camera.calculate(game_state.camera, vw, vh);
-
-    // 4. prepare the resident world chunks for that view.
-    try game_state.streamChunks(view.chunks);
+    if (advanced) driver.skipPast(rl.getTime());
 
     // 5. render read-only state. The caller owns presentation timing.
     rl.beginDrawing();
-    rendering.draw(game_state, view, vw, vh, model);
+    rendering.draw(game_state, driver.view.?, driver.viewport_w, driver.viewport_h, model);
     // Capture after drawing and before `endDrawing` swaps/presents, otherwise
     // the framebuffer read is the cleared back buffer (a black screenshot).
     // The 2D overlay (HUD/minimap) is still batched at this point;
     // flush it explicitly so it is present in the captured image. Only the
     // requested screenshot frame pays this cost.
-    if (shouldCaptureScreenshot(shot_path != null, blocking, model)) {
+    if (shouldCaptureScreenshot(shot_path != null, privacy_blocked.*, model)) {
         const path = shot_path.?;
         rl.gl.rlDrawRenderBatchActive();
         rl.takeScreenshot(path);
     }
     rl.endDrawing();
-    return result;
 }
 
 /// A frame that starts or ends behind onboarding must never be captured.
@@ -485,29 +497,6 @@ test "screenshots exclude onboarding and transition frames" {
     try std.testing.expect(shouldCaptureScreenshot(true, false, &model));
     try std.testing.expect(shouldCaptureScreenshot(true, false, null));
     try std.testing.expect(!shouldCaptureScreenshot(false, false, null));
-}
-
-fn routeFrame(game_state: *game_mod.GameState, model: ?*onboarding.Onboarding, frame: input.FrameInput) !?onboarding.Effect {
-    if (model) |m| {
-        const result = m.applyInput(.{
-            .pointer_x = frame.pointer_x,
-            .pointer_y = frame.pointer_y,
-            .viewport_w = frame.viewport_w,
-            .viewport_h = frame.viewport_h,
-            .clicked = frame.clicked,
-            .up = frame.up,
-            .down = frame.down,
-            .confirm = frame.confirm,
-            .escape_clicked = frame.escape_clicked,
-            .characters = frame.characters,
-            .character_count = frame.character_count,
-            .backspace = frame.backspace,
-            .paste_shortcut = frame.paste_shortcut,
-        });
-        if (result.consumed) return result.effect;
-    }
-    try game_state.update(frame);
-    return null;
 }
 
 test "onboarding consumes game input including the completion transition" {
@@ -694,6 +683,68 @@ fn pasteWithdrawal(state: *@import("menu.zig").Menu) void {
     _ = state.pasteWithdrawal(text[0..len]);
 }
 
+const NativeEffects = struct {
+    allocator: std.mem.Allocator,
+    native: native_onboarding.Native,
+    scan_job: *?*ScanJob,
+
+    fn dispatch(context: ?*anyopaque, model: *onboarding.Onboarding, action: onboarding.Effect) void {
+        const self: *NativeEffects = @ptrCast(@alignCast(context.?));
+        const allocator = self.allocator;
+        switch (action) {
+            .copy_requested => if (model.mnemonic()) |secret| {
+                if (allocator.allocSentinel(u8, secret.len, 0)) |copy| {
+                    defer allocator.free(copy);
+                    defer std.crypto.secureZero(u8, copy.ptr[0 .. copy.len + 1]);
+                    @memcpy(copy, secret);
+                    rl.setClipboardText(copy);
+                    model.markCopyHandedOff(.copy_seed, rl.getTime());
+                } else |_| {
+                    std.log.warn("wallet: clipboard request unavailable", .{});
+                }
+            },
+            .copy_word_requested => |index| if (model.mnemonicWord(index)) |word| {
+                if (word.len <= 1024) if (allocator.allocSentinel(u8, word.len, 0)) |copy| {
+                    defer allocator.free(copy);
+                    defer std.crypto.secureZero(u8, copy.ptr[0 .. copy.len + 1]);
+                    @memcpy(copy, word);
+                    rl.setClipboardText(copy);
+                    model.markCopyHandedOff(.{ .copy_word = index }, rl.getTime());
+                } else |_| {
+                    std.log.warn("wallet: clipboard request unavailable", .{});
+                };
+            },
+            .paste_requested => pasteRecovery(model, allocator),
+            .complete_requested, .create_requested, .restore_requested, .retry_requested, .generate_requested, .finish_restore_requested => {
+                if (self.scan_job.* == null) {
+                    const operation: NativeOperation = switch (action) {
+                        .complete_requested => .complete,
+                        .create_requested => .create,
+                        .restore_requested => .restore,
+                        .retry_requested => .retry,
+                        .generate_requested => .generate,
+                        .finish_restore_requested => .finish_restore,
+                        else => unreachable,
+                    };
+                    // startScan copies the phrase NOW, before later records.
+                    self.scan_job.* = startScan(self.native, model, operation) catch blk: {
+                        model.receive(if (operation == .complete or operation == .finish_restore) .complete_fail else .blocked);
+                        break :blk null;
+                    };
+                }
+            },
+        }
+    }
+
+    fn afterInput(_: ?*anyopaque, game: *game_mod.GameState) void {
+        if (game.menu.paste_requested) pasteWithdrawal(&game.menu);
+        if (game.menu.wallet.copy_requested) {
+            game.menu.wallet.copy_requested = false;
+            if (game.menu.wallet.canCopyInvoice()) rl.setClipboardText(game.menu.wallet.invoice.z());
+        }
+    }
+};
+
 pub fn main() anyerror!void {
     // Browser builds enter through the exported `webMain` and never reach the
     // blocking loop below.
@@ -811,15 +862,21 @@ pub fn main() anyerror!void {
     var shot_frames: i32 = if (shot_path != null) 5 else -1;
 
     // ── frame loop ───────────────────────────────────────────────────────────
-    // The reader owns the held-direction cadence across frames. It is not
-    // global; this loop is its only owner.
+    // Input queue, repeat and derived view belong to this loop, not GameState.
     var input_reader = input.Reader{};
+    var driver = frame_loop.Driver{};
+    defer driver.deinit();
+    var effects = NativeEffects{ .allocator = allocator, .native = native, .scan_job = &scan_job };
     var onboarding_hand_cursor = false;
 
     while (!rl.windowShouldClose()) {
+        var privacy_blocked = model.isBlocking();
         const unix = std.Io.Clock.real.now(io).toSeconds();
         if (unix >= 0) game_state.menu.wallet.unix_now = @intCast(unix);
-        if (!model.isBlocking() and game_state.menu.paste_requested) pasteWithdrawal(&game_state.menu);
+        if (!model.isBlocking() and game_state.menu.paste_requested) {
+            driver.invalidateInput();
+            pasteWithdrawal(&game_state.menu);
+        }
         game_state.menu.wallet.tick(!model.isBlocking(), rl.getTime());
         if (game_state.menu.wallet.pending and game_state.menu.wallet.request != null and wallet_worker == null) {
             wallet_worker = wallet_service.Worker.start(wallet_paths) catch blk: {
@@ -828,7 +885,9 @@ pub fn main() anyerror!void {
                 break :blk null;
             };
         }
-        if (wallet_worker) |worker| worker.step(&game_state.menu.wallet, rl.getTime());
+        if (wallet_worker) |worker| {
+            if (worker.step(&game_state.menu.wallet, rl.getTime())) driver.invalidateInput();
+        }
         if (game_state.menu.wallet.copy_requested) {
             game_state.menu.wallet.copy_requested = false;
             if (game_state.menu.wallet.canCopyInvoice()) rl.setClipboardText(game_state.menu.wallet.invoice.z());
@@ -837,16 +896,21 @@ pub fn main() anyerror!void {
         if (scan_job) |job| if (job.done.load(.acquire)) {
             job.thread.join();
             job.deliver(&model);
+            driver.invalidateInput();
             job.destroy();
             scan_job = null;
         };
         // Capture on the last requested frame, inside stepFrame's drawing pass.
-        const effect = try stepFrame(
+        privacy_blocked = privacy_blocked or model.isBlocking();
+        try stepFrame(
             &game_state,
             &input_reader,
+            &driver,
             if (shot_frames == 0) shot_path else null,
             persister,
             &model,
+            .{ .context = &effects, .dispatch = NativeEffects.dispatch, .after_input = NativeEffects.afterInput },
+            &privacy_blocked,
         );
 
         if (!started) {
@@ -856,52 +920,8 @@ pub fn main() anyerror!void {
                 break :blk null;
             };
         }
-        if (effect) |action| switch (action) {
-            .copy_requested => if (model.mnemonic()) |secret| {
-                if (allocator.allocSentinel(u8, secret.len, 0)) |copy| {
-                    defer allocator.free(copy);
-                    defer std.crypto.secureZero(u8, copy.ptr[0 .. copy.len + 1]);
-                    @memcpy(copy, secret);
-                    rl.setClipboardText(copy);
-                    model.markCopyHandedOff(.copy_seed, rl.getTime());
-                } else |_| {
-                    std.log.warn("wallet: clipboard request unavailable", .{});
-                }
-            },
-            .copy_word_requested => |index| if (model.mnemonicWord(index)) |word| {
-                if (word.len <= 1024) if (allocator.allocSentinel(u8, word.len, 0)) |copy| {
-                    defer allocator.free(copy);
-                    defer std.crypto.secureZero(u8, copy.ptr[0 .. copy.len + 1]);
-                    @memcpy(copy, word);
-                    rl.setClipboardText(copy);
-                    model.markCopyHandedOff(.{ .copy_word = index }, rl.getTime());
-                } else |_| {
-                    std.log.warn("wallet: clipboard request unavailable", .{});
-                };
-            },
-            .paste_requested => pasteRecovery(&model, allocator),
-            .complete_requested, .create_requested, .restore_requested, .retry_requested, .generate_requested, .finish_restore_requested => {
-                if (scan_job == null) {
-                    const operation: NativeOperation = switch (action) {
-                        .complete_requested => .complete,
-                        .create_requested => .create,
-                        .restore_requested => .restore,
-                        .retry_requested => .retry,
-                        .generate_requested => .generate,
-                        .finish_restore_requested => .finish_restore,
-                        else => unreachable,
-                    };
-                    scan_job = startScan(native, &model, operation) catch blk: {
-                        model.receive(if (operation == .complete or operation == .finish_restore) .complete_fail else .blocked);
-                        break :blk null;
-                    };
-                }
-            },
-        };
-
-        const pointer = rl.getMousePosition();
-        const layout = onboarding.calculateLayout(@floatFromInt(rl.getScreenWidth()), @floatFromInt(rl.getScreenHeight()));
-        const hand = model.hoverEnabled(layout, pointer.x, pointer.y);
+        const layout = onboarding.calculateLayout(driver.viewport_w, driver.viewport_h);
+        const hand = model.hoverEnabled(layout, model.pointer_x, model.pointer_y);
         if (hand != onboarding_hand_cursor) {
             rl.setMouseCursor(if (hand) .pointing_hand else .default);
             onboarding_hand_cursor = hand;

@@ -140,10 +140,10 @@ fn drawCameraMarker(target: rl.Vector2) void {
 
 /// Top-right minimap: loaded chunks (green), visible rect (yellow),
 /// camera chunk (red dot). Makes the prefetch ring visible at a glance.
-fn drawMinimap(w: *const world.World, vis: world.ChunkRange, cam: *const camera.Camera) void {
+fn drawMinimap(w: *const world.World, vis: world.ChunkRange, cam: *const camera.Camera, viewport_w: f32) void {
     const panel_w: i32 = 180;
     const panel_h: i32 = 140;
-    const x0 = rl.getScreenWidth() - panel_w - 12;
+    const x0 = @as(i32, @intFromFloat(viewport_w)) - panel_w - 12;
     const y0 = 12;
 
     rl.drawRectangle(x0, y0, panel_w, panel_h, hud_bg);
@@ -599,7 +599,7 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
     rl.endMode2D();
 
     drawHud(&game.world, view.chunks, &game.camera, game.settings.debug);
-    drawMinimap(&game.world, view.chunks, &game.camera);
+    drawMinimap(&game.world, view.chunks, &game.camera, viewport_w);
 
     if (game.menu.opened) {
         drawMenu(game, viewport_w, viewport_h);

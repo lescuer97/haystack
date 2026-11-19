@@ -25,26 +25,28 @@ async function expect(name, expression) {
   throw new Error('Wallet check failed');
 }
 const frames = () => evaluate('new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(()=>r(true))))');
-const inputFrames = milliseconds => evaluate(`new Promise(resolve=>{
+// Wait two 20 Hz game ticks while drawing continues at the display refresh rate.
+const settleTicksExpression = `new Promise(resolve=>{
   const start=performance.now();
-  function tick(now){if(now-start>=${milliseconds})resolve(true);else requestAnimationFrame(tick);}
+  function tick(now){if(now-start>=100)resolve(true);else requestAnimationFrame(tick);}
   requestAnimationFrame(tick);
-})`);
+})`;
+const settleTicks = () => evaluate(settleTicksExpression);
 async function key(key, code, number) {
   await send('Input.dispatchKeyEvent', {type:'rawKeyDown', key, code, windowsVirtualKeyCode:number});
   // Keep presses short to avoid input.Reader's 100ms directional repeat;
   // the longer neutral interval below separates consecutive key edges.
   await frames();
   await send('Input.dispatchKeyEvent', {type:'keyUp', key, code, windowsVirtualKeyCode:number});
-  await inputFrames(100); // Ensure a rendered neutral frame resets repeat state.
+  await settleTicks(); // Two neutral game ticks reset repeat state.
 }
 const enter = async () => {
-  // A delivered reply is still pending in the renderer mailbox until its next
-  // frame. Use a recent, stable completion so the next poll slot cannot race input.
+  // Wait nominal game-tick intervals before dependent UI activation. Use a recent,
+  // stable completion so the next poll slot cannot race input.
   await expect('wallet idle before activation', `(async()=>{
     if(walletUiChecks.active!==0 || performance.now()-walletUiChecks.settledAt>500)return false;
     const count=walletUiChecks.requests.length;
-    await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+    await ${settleTicksExpression};
     return walletUiChecks.active===0 && walletUiChecks.requests.length===count;
   })()`);
   await key('Enter','Enter',13);
@@ -53,9 +55,9 @@ const down = () => key('ArrowDown','ArrowDown',40);
 const escape = () => key('Escape','Escape',27);
 async function activateRow(y) {
   // These renderer rows are measured at the fixture's fixed 1000x640 size.
-  // Pointer selection avoids depending on directional repeats at Debug's FPS.
+  // Pointer selection avoids depending on the 100ms (two-tick) directional repeat.
   await send('Input.dispatchMouseEvent',{type:'mouseMoved',x:500,y});
-  await frames();
+  await settleTicks();
   await enter();
 }
 const depositRow = index => activateRow(177+65*index);
@@ -119,6 +121,7 @@ const instrumentation = `(() => {
   }});
 })();`;
 async function openWallet() {
+  await settleTicks(); // Consume ready/reload replies before opening the menu.
   await escape(); await enter(); // Main -> Wallet
 }
 async function run() {
@@ -148,7 +151,7 @@ async function run() {
    await down(); await enter(); // Wallet -> Deposit
   await enter(); // Custom sats
   for (const text of '1.5') await send('Input.dispatchKeyEvent',{type:'char',text,unmodifiedText:text});
-  await frames();
+  await settleTicks();
    await depositRow(5);
   await expect('custom decimal rejected before Rust/network','!walletUiChecks.requests.includes(2)');
    await depositRow(2); // preset 42

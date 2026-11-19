@@ -18,7 +18,8 @@ Endpoint: **ws://127.0.0.1:9224/**. Cuts and request replay history reset on
 every restart. No world database is opened, converted, deleted or used; existing
 world files are left untouched. There is no world SQL dependency, schema,
 table usage, persistence, or benchmark build step. Wallet SQLite remains intact.
-No ticks, client networking/rendering changes, rewards, private gameplay,
+Gameplay requests target a global 20 Hz tick; wallet startup and authentication
+remain independent of ticks. No client network protocol changes, rewards, private gameplay,
 regrowth or inventory are included. Terrain checksum remains
 `0xec04d88c8e6885e5`.
 
@@ -152,7 +153,7 @@ The auth worker never dispatches gameplay. A losing race can have delivered F2,
 but cannot dispatch gameplay and always releases its provisional identity.
 Native I/O cancellation interrupts pending network reads/writes; this is not a
 hard real-time scheduling guarantee. There is no custom event loop or watchdog.
-Authenticated writes have no new deadline and can hold the world context lease;
+Authenticated writes have no new deadline and never hold the world context lease;
 group cancellation joins all connection tasks before freeing application/slot storage.
 
 ## Binary v1 (no JSON compatibility)
@@ -246,7 +247,7 @@ Initialization/shutdown may use the process allocator. Budgets do not guarantee 
 
 | Budget | Default bytes | Linux x86_64 measured layout |
 |---|---:|---|
-| WebSocket recycler | 4,194,304 | 64-slot array 571,392; rounded buddy high-water 1,048,576 + metadata 65,536; runtime/task stacks excluded |
+| WebSocket recycler | 4,194,304 | 64-slot array 713,728; rounded buddy high-water 1,048,576 + metadata 65,536; runtime/task stacks excluded |
 | Application buffers | 65,536 | Layout 55,440 = context 51,312 + session registry 4,128; WorldState 47,120 is inside context |
 
 The WS budget must be a power of two, at least 4096, with a correspondingly
@@ -259,20 +260,24 @@ are component measurements, **not server/RSS high-water measurements**.
 Application startup requires at least `@sizeOf(app.Layout)` bytes; insufficient
 budgets fail initialization. Additional application bytes are unused headroom.
 
-64 total connections **including pending HTTP and authentication**, with **no
-additional application request queue**. One exclusively leased context owns world
-state, snapshot and 2122-byte response buffer through synchronous socket write;
-the lease does not assume thread affinity. Location updates bypass this lease.
-A fully decoded cut/read request without an available context gets `server_busy`
-**before mutation**, from fixed 33-byte error storage. Context contention is
-transient; unlike store-full busy it can resolve when the current lease releases.
+64 total connections **including pending HTTP and authentication**, with **at most
+one pending gameplay request per connection**. Each stable slot owns a copied
+request, generation-checked session handle, completion event, and 2122-byte encoded
+reply. No queued pointer borrows a handler, reader, request buffer or App snapshot.
+One exclusively leased context owns world state and scratch response/snapshot;
+the tick copies its encoded reply into the slot **before releasing the lease**,
+and only then may the connection write to its socket. Location updates use the
+session registry rather than this lease, but are dispatched on the same tick.
+A cut/read without an available context gets `server_busy` **before mutation**.
+Context contention is transient; unlike store-full busy it can resolve when the
+current lease releases. The sole production tick owner normally avoids contention.
 At connection capacity an accepted socket is immediately closed without launching
 a task or promising HTTP503. HTTP limits: 5 seconds, 8192 bytes, 32 headers.
 `server/ws_config.zig` holds the fixed production/test limits.
 
 Before listening, the buddy reserves one array of 64 slots. Each owns 8192-byte
 HTTP, 128-byte WebSocket and 512-byte output buffers plus stable key/bookkeeping.
-A slot is 8928 bytes on Linux x86_64. Socket-free capacity/reuse tests perform no
+A slot is 11,152 bytes on Linux x86_64. Socket-free capacity/reuse/tick tests perform no
 further managed allocation. Insufficient startup reservation fails closed.
 The retained HTTP reader preserves pipelined frame bytes. A thin forwarding guard
 checks RSV, FIN, mask, opcode, canonical lengths, control limits and payload cap
@@ -280,10 +285,48 @@ before passing unchanged bytes to std, including internally skipped pongs. Close
 ends the connection; complete close-payload validation is not claimed.
 Connection tasks use `std.Io.Group.concurrent` (no inline fallback). The standard
 I/O runtime, tasks, thread stacks, sockets and OS resources are **outside the WS
-reservation**. Slow authenticated readers can hold the sole context through their
-synchronous write, causing other cut/read admissions to return `server_busy`;
-location updates remain independent. Admission is one atomic attempt with no
-queue, spin or wait over I/O.
+reservation**. Slow writers occupy only their own slots, not the world lease.
+The sequential connection reader does not read more messages while awaiting a
+tick reply or writing it: ping and disconnect detection can therefore be delayed.
+There is no claim of uninterrupted ping service, post-auth heartbeat, or new
+write-timeout policy.
+
+## Tick handoff and cancellation
+
+One task in the existing listener group starts before accepts; failure to start
+it fails listening. It uses the shared 20 Hz schedule and absolute monotonic
+`awake` deadlines (50 ms), with an immediate initial batch. At each due batch it
+snapshots up to 64 queued `(slot, request generation)` records under one mailbox
+mutex, in round-robin order. Later arrivals, including a new request from a slot
+already served, wait for the next tick. All decoded cut/read/location requests
+use this path; malformed messages, proof verification, admission, HTTP/auth
+deadlines and ping replies are not quantized.
+
+Each batch has a soft 50 ms work budget from its actual start, checked between
+requests. Unclaimed work stays queued, and the cursor advances past the last
+serviced/examined slot so a costly prefix cannot starve the tail. Bounded world
+actions finish once claimed, even if that overruns the target. Missed boundaries
+are discarded after work; no catch-up batches, tick IDs, synchronization protocol,
+prediction or interpolation are introduced. This is a scheduling target, not a
+hard real-time latency guarantee. The existing RAM capacities and replay rules
+remain unchanged; there is no tick work on wallet/auth or SQL state.
+
+Mailbox states are idle, queued, executing and ready. A connection owns its slot
+through completion and the end of its socket write. Queued cancellation removes
+work immediately under the mutex, without waiting for another tick. Executing
+cancellation marks it abandoned, then waits **uncancelably** for completion before
+releasing its session and slot. Claimed execution has no cancellation points:
+registry locks are uncancelable, actions touch bounded RAM, and ready publication
+always sets the completion event, including stale-session/busy replies. Neither
+the mailbox mutex nor the world lease spans socket I/O or completion waits; no
+registry/mailbox locks nest. Cancellation is checked between requests and during
+absolute tick sleep, and group cancellation joins tick and connection tasks before
+App/slot teardown. Tick exit wakes any still-queued waiters with a closing busy
+reply and rejects new publication, so no waiter depends on another tick after exit.
+Ready cancellation discards the reply after the write ends; event reset occurs
+only on the next publication after all prior waits returned. Request generations
+persist across slot reuse and reject exhaustion rather than wrapping, so cutoff
+records cannot execute a replacement request.
 
 ## Verification
 
@@ -303,4 +346,9 @@ retain seed hashes/inodes across reopen, borrowed ownership, locking and failure
 preservation checks. Authentication tests retain message goldens, positive/negative
 signature fixtures, parity/domain/nonce/single-hash binding, malformed keys and
 signatures, admission/deadline/ownership checks. Socket integration tests remain
-deferred until the client exists; no socket harness is added.
+deferred until the client exists; no socket harness is added. Tick tests exercise
+production snapshot/claim/execute/cleanup methods with explicit clock inputs,
+cutoff/generation reuse, all three operations, soft-budget fairness, full-store
+and busy behavior, owned replies after context reuse, event-reset lifecycle,
+queued/executing cancellation and group join. The real tick task's absolute wait
+and cancellation are also checked without listening or opening sockets.

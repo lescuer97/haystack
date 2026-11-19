@@ -18,12 +18,13 @@ PRUNED = {
     ".profiles", "chromium-profile", "secrets", ".secrets",
 }
 REQUIRED = (
-    "shared/root.zig", "shared/world.zig", "shared/protocol.zig", "shared/wire.zig",
+    "shared/root.zig", "shared/tick.zig", "shared/world.zig", "shared/protocol.zig", "shared/wire.zig",
     "server/main.zig", "server/tests.zig", "server/ws_memory_tests.zig",
     "server/actions.zig", "server/app.zig", "server/fixture.zig", "server/memory.zig",
     "server/sessions.zig", "server/sessions_tests.zig", "server/world_state.zig",
     "server/world_state_tests.zig", "server/transport.zig",
     "server/transport_tests.zig", "server/ws_config.zig",
+    "server/tick_mailbox.zig", "server/tick_mailbox_tests.zig",
     "server/ws_auth.zig", "build/secp256k1.zig",
     "build/server.zig", "build/shared.zig",
     "browser/game-ui.js", "browser/wallet-integration.js",

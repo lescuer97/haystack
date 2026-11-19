@@ -173,6 +173,12 @@ async function runGame(flow) {
     return result.result?.value;
   };
   const frames = () => evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))');
+  // Display frames keep physical holds short; UI/mailboxes advance at 20 Hz.
+  const settleTicks = () => evaluate(`new Promise(resolve => {
+    const start = performance.now();
+    function tick(now) { if (now - start >= 100) resolve(true); else requestAnimationFrame(tick); }
+    requestAnimationFrame(tick);
+  })`);
   async function expect(label, expression) {
     failureLabel = label;
     const deadline = Date.now() + 15000;
@@ -189,19 +195,20 @@ async function runGame(flow) {
   }
   async function click(y) {
     // src/onboarding.zig: 560x500 panel centered in a 1000x640 viewport.
-    await frames();
+    await settleTicks();
     await send('Input.dispatchMouseEvent', {type:'mouseMoved', x:500, y}, sessionId);
+    await settleTicks();
     await send('Input.dispatchMouseEvent', {type:'mousePressed', x:500, y, button:'left', clickCount:1}, sessionId);
     await frames();
     await send('Input.dispatchMouseEvent', {type:'mouseReleased', x:500, y, button:'left', clickCount:1}, sessionId);
-    await frames();
+    await settleTicks();
   }
   async function reload() {
     await flushRuntime(sessionId);
     const previousOrigin = await evaluate('performance.timeOrigin');
     await send('Page.reload', {}, sessionId);
     await expect('game reload initializes transport', `performance.timeOrigin !== ${previousOrigin} && !!window.gameOnboardingChecks && !!window.haystackOnboarding?.session?.service`);
-    await frames();
+    await settleTicks();
     await flushRuntime(sessionId);
     assertRuntimeClean(sessionId, `${flow}: no uncaught runtime errors across reload`);
   }
@@ -210,10 +217,10 @@ async function runGame(flow) {
     await send('Input.dispatchKeyEvent', {type:'rawKeyDown', key:'g', code:'KeyG', windowsVirtualKeyCode:71}, sessionId);
     await frames();
     await send('Input.dispatchKeyEvent', {type:'keyUp', key:'g', code:'KeyG', windowsVirtualKeyCode:71}, sessionId);
-    await frames();
+    await settleTicks();
   }
   async function expectGameplay(transition) {
-    await frames();
+    await settleTicks();
     const baseline = (await evaluate(gridSetting)).value;
     await pressGridKey();
     await expect(`${flow}: gameplay after ${transition} changes persisted grid`, `${gridSetting}.then(setting => setting.persisted && setting.value === ${!baseline})`);
@@ -272,13 +279,13 @@ async function runGame(flow) {
   await expect('recovery game starts at choice', 'window.gameOnboardingChecks?.events.includes("choice")');
   await click(400);
   async function type(text) {
-    // Raylib's character mailbox is bounded per frame; do not overflow it.
+    // Raylib's character mailbox is bounded per display-frame raw sample; do not overflow it.
     for (let i = 0; i < text.length; i += 8) {
       for (const character of text.slice(i, i + 8)) {
         // GLFW listens for keypress characters, not DOM text-field insertion.
         await send('Input.dispatchKeyEvent', {type:'char', text:character, unmodifiedText:character}, sessionId);
       }
-      await frames();
+      await settleTicks();
     }
   }
   await type('invalid');

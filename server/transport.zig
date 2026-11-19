@@ -1,4 +1,4 @@
-//! std I/O transport; the leased application context lives through synchronous writes.
+//! std I/O transport; gameplay crosses a stable, bounded tick mailbox.
 const ws = std.http.Server.WebSocket;
 const wire = @import("shared").wire;
 const p = @import("shared").protocol;
@@ -7,6 +7,8 @@ const sessions = @import("sessions.zig");
 const std = @import("std");
 const auth = @import("ws_auth.zig");
 const config = @import("ws_config.zig");
+const ticks = @import("tick_mailbox.zig");
+const tick = @import("shared").tick;
 pub const Deadline = std.Io.Clock.Timestamp;
 
 pub fn freshDeadline(io: std.Io) Deadline {
@@ -110,6 +112,8 @@ pub const Handler = struct {
     deadline: Deadline,
     session: ?sessions.Handle = null,
     authenticated: bool = false,
+    dispatch: ?*ticks.Dispatcher = null,
+    mailbox: ?*ticks.Mailbox = null,
     pub fn init(conn: *ws, app: *App) !Handler {
         var nonce: [32]u8 = undefined;
         try app.registry.io.randomSecure(&nonce);
@@ -121,6 +125,7 @@ pub const Handler = struct {
         try self.conn.writeMessage(wire.encodeAuth(&challenge, .{ .challenge = self.nonce }), .binary);
     }
     pub fn close(self: *Handler) void {
+        if (self.dispatch) |dispatch| dispatch.cleanup(self.mailbox.?);
         if (self.session) |session| self.app.registry.release(session);
         self.session = null;
         self.authenticated = false;
@@ -149,24 +154,24 @@ pub const Handler = struct {
         switch (wire.decodeMessage(data, tpe == .binary)) {
             .failure => |f| try self.conn.writeMessage(wire.encode(&error_storage, f), .binary),
             .request => |req| {
-                if (req.operation == .update_location) {
-                    const response = self.app.handleLocation(self.session.?, req);
-                    try self.conn.writeMessage(wire.encode(&error_storage, response), .binary);
-                    if (response.result == .failure) return error.StaleSession;
-                    return;
-                }
-                const context = self.app.lease() orelse {
-                    try self.conn.writeMessage(wire.encode(&error_storage, wire.failure(req.request_id, .server_busy)), .binary);
-                    return;
-                };
-                defer self.app.release(context);
-                try self.conn.writeMessage(context.handle(req), .binary);
+                const dispatch = self.dispatch orelse return error.MissingTickDispatcher;
+                const box = self.mailbox.?;
+                try dispatch.publish(box, self.session.?, req);
+                try self.finishReply();
             },
         }
+    }
+    pub fn finishReply(self: *Handler) !void {
+        const box = self.mailbox.?;
+        defer self.dispatch.?.cleanup(box);
+        try box.completion.wait(self.app.registry.io);
+        try self.conn.writeMessage(box.reply[0..box.len], .binary);
+        if (box.close_after_reply) return error.StaleSession;
     }
 };
 
 pub const Slot = struct {
+    mailbox: ticks.Mailbox = .{},
     occupied: std.atomic.Value(bool) = .init(false),
     stream: std.Io.net.Stream = undefined,
     deadline: Deadline = undefined,
@@ -198,11 +203,13 @@ pub const Server = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
     slots: []Slot,
+    dispatch: ticks.Dispatcher,
+    schedule: tick.Schedule = .{},
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator) !Server {
         const slots = try allocator.alloc(Slot, config.max_connections);
         for (slots) |*slot| slot.* = .{};
-        return .{ .io = io, .allocator = allocator, .slots = slots };
+        return .{ .io = io, .allocator = allocator, .slots = slots, .dispatch = .{ .io = io } };
     }
     pub fn deinit(self: *Server) void {
         self.allocator.free(self.slots);
@@ -214,6 +221,7 @@ pub const Server = struct {
         return null;
     }
     pub fn release(_: *Server, slot: *Slot) void {
+        std.debug.assert(slot.mailbox.state == .idle);
         slot.occupied.store(false, .release);
     }
     pub fn listen(self: *Server, app: *App) !void {
@@ -222,6 +230,7 @@ pub const Server = struct {
         defer listener.deinit(self.io);
         var group: std.Io.Group = .init;
         defer group.cancel(self.io); // joins before app/slots can be freed
+        try group.concurrent(self.io, tickTask, .{ self, app });
         while (true) {
             const stream = listener.accept(self.io) catch |err| switch (acceptAction(err)) {
                 .retry => continue,
@@ -247,9 +256,60 @@ pub const Server = struct {
     fn serve(self: *Server, slot: *Slot, app: *App) void {
         defer self.release(slot);
         defer slot.stream.close(self.io);
-        serveConnection(self.io, slot, app) catch {};
+        serveConnection(self, slot, app) catch {};
+    }
+
+    fn now(self: *Server) i128 {
+        return Deadline.now(self.io, .awake).raw.nanoseconds;
+    }
+    fn tickTask(self: *Server, app: *App) void {
+        defer self.dispatch.stop(self.slots);
+        self.tickLoop(app) catch |err| switch (err) {
+            error.Canceled => {},
+        };
+    }
+    fn tickLoop(self: *Server, app: *App) std.Io.Cancelable!void {
+        while (true) {
+            try self.io.checkCancel();
+            if (self.schedule.poll(self.now())) {
+                var batch = self.dispatch.beginBatch(self.slots, self.now());
+                while (true) {
+                    try self.io.checkCancel();
+                    const work = self.dispatch.claimNext(self.slots, &batch, self.now()) orelse break;
+                    self.dispatch.execute(app, &self.slots[work.record.index].mailbox, work);
+                }
+                self.schedule.skipPast(self.now());
+            }
+            const next = self.schedule.nextDeadline() orelse return;
+            // Timestamp storage is narrower than the shared scheduler. Fail
+            // closed (and wake queued connections) rather than overflow or spin.
+            const ns = std.math.cast(i96, next) orelse return;
+            try (Deadline{ .raw = .{ .nanoseconds = ns }, .clock = .awake }).wait(self.io);
+        }
     }
 };
+
+test "production tick owner executes queued work and group cancellation joins its absolute wait" {
+    var fixture = try @import("fixture.zig").Fixture.init();
+    defer fixture.deinit();
+    var server = try Server.init(std.testing.io, std.testing.allocator);
+    defer server.deinit();
+    const slot = server.reserve().?;
+    defer server.release(slot);
+    const session = try fixture.application.registry.claim(@splat(19));
+    try server.dispatch.publish(&slot.mailbox, session, .{
+        .request_id = @splat(0),
+        .operation = .{ .update_location = .{ .x = 1, .y = 2 } },
+    });
+    var group: std.Io.Group = .init;
+    defer group.cancel(std.testing.io);
+    try group.concurrent(std.testing.io, Server.tickTask, .{ &server, &fixture.application });
+    try slot.mailbox.completion.wait(std.testing.io);
+    group.cancel(std.testing.io);
+    try std.testing.expect(server.dispatch.stopping);
+    try std.testing.expectEqual(@as(i32, 1), fixture.application.registry.get(session).?.location.?.x);
+    server.dispatch.cleanup(&slot.mailbox);
+}
 
 const Connection = struct {
     io: std.Io,
@@ -315,13 +375,16 @@ test "deadline race joins cancelled work before returning without sockets" {
     try std.testing.expect(work.finished.load(.acquire));
 }
 
-fn serveConnection(io: std.Io, slot: *Slot, app: *App) !void {
+fn serveConnection(server: *Server, slot: *Slot, app: *App) !void {
+    const io = server.io;
     var reader = slot.stream.reader(io, &slot.http_buffer);
     var writer = slot.stream.writer(io, &slot.output_buffer);
     var guard = FrameInput.init(&reader.interface, &slot.ws_buffer);
     var connection = Connection{ .io = io, .slot = slot, .http = .init(&reader.interface, &writer.interface), .guard = &guard };
     try race(io, slot.deadline, Connection.receive, .{&connection});
     connection.handler = try Handler.init(&connection.websocket, app);
+    connection.handler.dispatch = &server.dispatch;
+    connection.handler.mailbox = &slot.mailbox;
     defer connection.handler.close();
     // Separate absolute auth window: preparation and HTTP time do not consume it.
     connection.handler.deadline = freshDeadline(io);

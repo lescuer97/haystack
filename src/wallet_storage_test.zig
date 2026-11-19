@@ -34,7 +34,7 @@ test "application worker owns one locked handle across reads and joins before re
         var model = ui.Model{};
         model.tick(true, 0);
         for (0..250) |_| {
-            worker.step(&model, 0);
+            _ = worker.step(&model, 0);
             if (!model.pending) break;
             try testing.io.sleep(.fromMilliseconds(20), .awake);
         }
@@ -43,7 +43,7 @@ test "application worker owns one locked handle across reads and joins before re
         try testing.expectError(error.CdkFailure, wallet.inspect(testing.io, testing.allocator, h.paths, true));
         try testing.expect(model.enqueue(.snapshot, ""));
         for (0..250) |_| {
-            worker.step(&model, 0);
+            _ = worker.step(&model, 0);
             if (!model.pending) break;
             try testing.io.sleep(.fromMilliseconds(20), .awake);
         }

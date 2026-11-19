@@ -24,8 +24,12 @@ pub const Worker = struct {
         self.thread.join();
         std.heap.page_allocator.destroy(self);
     }
-    pub fn step(self: *Worker, model: *ui.Model, now: f64) void {
+    /// Reports accepted delivery, not idle polls or stale results. The loop
+    /// invalidates input captured against the old actionable wallet content.
+    pub fn step(self: *Worker, model: *ui.Model, now: f64) bool {
+        var accepted = false;
         if (self.state.load(.acquire) == .result) {
+            accepted = model.pending and self.request.serial == model.serial;
             if (self.ok) model.accept(self.request.serial, self.result.slice(), now, std.heap.page_allocator) else model.fail(self.request.serial, now);
             self.state.store(.idle, .release);
         }
@@ -34,6 +38,7 @@ pub const Worker = struct {
             model.request = null;
             self.state.store(.request, .release);
         };
+        return accepted;
     }
     fn run(self: *Worker) void {
         var threaded: std.Io.Threaded = .init_single_threaded;
@@ -102,3 +107,17 @@ pub const Worker = struct {
         self.ok = self.result.set(std.mem.span(@as([*:0]const u8, @ptrCast(value))));
     }
 };
+
+test "delivery reports accepted results only, not idle polls or stale serials" {
+    var worker = Worker{ .paths = undefined, .thread = undefined, .request = .{ .operation = .open, .serial = 1 } };
+    var model = ui.Model{ .serial = 2, .pending = true };
+    try std.testing.expect(!worker.step(&model, 0));
+    worker.state.store(.result, .release);
+    try std.testing.expect(!worker.step(&model, 0));
+    try std.testing.expect(model.pending);
+    worker.request.serial = 2;
+    worker.state.store(.result, .release);
+    try std.testing.expect(worker.step(&model, 0));
+    try std.testing.expect(!model.pending);
+    try std.testing.expect(!worker.step(&model, 0));
+}

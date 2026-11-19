@@ -15,7 +15,8 @@ extension points.
 | File | Job | Talks to Raylib? |
 |---|---|---|
 | `src/main.zig` | allocator, window, the explicit per-frame loop or browser callback, teardown, screenshot hook | yes |
-| `src/input.zig` | polls keyboard/mouse/gamepad 0 and paces held directions into a plain `FrameInput` value; also collects pointer, clicks, viewport size, and bounded typed text | yes |
+| `src/input.zig` | raw device polling, bounded text, and a device-free tick-count direction repeater | yes |
+| `src/frame_loop.zig` | shared schedule adapter, ordered bounded queue, modal routing, immediate effects, cached view/viewport | no device polling |
 | `src/game.zig` | `GameState` owns the world, camera, menu, and debug settings; applies input | indirectly |
 | `src/menu.zig` | menu page/item data, pure layout, bounded text fields, and runtime menu state | **no** |
 | `src/onboarding.zig` | platform-neutral onboarding model, modal input, effects, and layout | **no** |
@@ -27,40 +28,31 @@ extension points.
 
 `world.zig` and `menu.zig` are intentionally Raylib-free. That keeps them
 headless-testable. The standalone [server](server.md) already uses shared terrain
-and persists cuts separately; this client does not connect to it or apply deltas.
+and owns RAM cuts/replay separately; this client does not connect to it or apply deltas.
 The client's pixel-safe drawable chunk bounds intentionally differ from the
 server's full tile-coordinate bounds.
 
 ## One frame, in order
 
-`main` makes every stage visible. Nothing hides behind a single `tick()` call.
+Both platforms update game/UI input at **20 Hz (50 ms)** and draw the latest
+state without interpolation: native targets 120 FPS; the browser uses rAF.
+`frame_loop.Driver` belongs to native `main` or the heap-owned `BrowserContext`,
+never `GameState`. The shared `tick.Schedule` grants an immediate first update,
+preserves phase, and skips missed deadlines without catch-up. Raylib seconds are
+converted to nanoseconds only after finite, nonnegative, exclusive-bound checks;
+invalid clocks do not advance simulation. A safe initial view can still be
+prepared without consuming input.
 
 ```zig
 while (!rl.windowShouldClose()) {
-    const vw = screen width;
-    const vh = screen height;
-
-    // 1. collect input
-    const blocking = if (model) |m| m.isBlocking() else false;
-    const frame = input_reader.read(rl.getFrameTime(), game_state.menu.opened or blocking);
-
-    // 2. update persistent state
-    const effect = try routeFrame(&game_state, model, frame);
-    // routeFrame gives onboarding first refusal; otherwise GameState updates.
-    // Persist settings if they changed.
-
-    // 3. calculate a temporary view
-    const view = try camera.calculate(game_state.camera, vw, vh);
-
-    // 4. prepare resident chunks for that view
-    try game_state.streamChunks(view.chunks);
-
-    // 5. render read-only state
-    rl.beginDrawing();
-    rendering.draw(&game_state, view, vw, vh, model);
-    // Capture a requested screenshot only if onboarding did not block this frame.
-    rl.endDrawing();
-    // Native loop handles onboarding effects and adapter events after the frame.
+    // Latch screenshot blocking BEFORE asynchronous completions can erase words.
+    // Service wallet/auth/clipboard completions and real-time deadlines.
+    // Invalidate stale queued input for accepted external target replacements.
+    // Observe routing identity, then poll hardware ONCE and enqueue raw input.
+    // If due: drain records in order, dispatch each effect immediately,
+    // calculate/cache view+viewport, stream once, then skipPast a fresh clock.
+    // Persist changed settings; draw cached state on EVERY display frame.
+    // Screenshot only if onboarding never blocked anywhere in this outer frame.
 }
 ```
 
@@ -69,13 +61,12 @@ Why this order:
 1. **Input first.** `input.zig` is the only place that calls `isKeyDown`,
    `isKeyPressed`, `isMouseButtonDown`, `getMouseDelta`, `getCharPressed`, or the
    gamepad functions. `main` owns one `input.Reader` outside the loop; it polls
-   the devices and turns held directions into at most one one-tile request per
-   axis on a shared 10 steps/s cadence used by both the camera and the menu. The
+   the devices without timing or modal filtering. The
    same value carries the screen-space pointer, click/escape/confirm/backspace
    edges, viewport size, and a bounded array of typed codepoints. It does not
    change the game.
 2. **Update second.** An optional onboarding model receives input first and
-   consumes it while blocking, including transition frames. Otherwise
+   consumes each queued record while blocking, including transition records. Otherwise
    `GameState.update` applies that one input value to the
    persistent camera, menu, and debug settings. The menu is modal: while it is
    open, and on the frame that opens or closes it, the update returns before the
@@ -84,8 +75,8 @@ Why this order:
    toggle is applied. This is one of only two places that mutate persistent
    state.
 3. **View third.** The camera may have moved in step 2, so the view is
-   calculated afterwards and therefore uses the new position this same frame.
-   The view is derived data, not state.
+   calculated once after the batch. The loop caches derived view and viewport
+   together until the next tick; resize layout can lag by up to 50 ms.
 4. **Stream fourth.** `streamChunks` is the other mutation site, but it only
    changes *which chunks are resident*. Generated world content is unchanged.
 5. **Render last.** Rendering receives `*const GameState`, a `View`, the
@@ -101,12 +92,48 @@ If native onboarding is blocking at the start of the capture frame, the capture
 is skipped and the screenshot budget is consumed; no PNG is written. A model
 that is blocking at capture time also prevents capture. This also
 protects completion-transition frames that started with recovery words visible.
+The guard is captured before the real-time prelude and latched at every routed
+record, before and after immediate effects, even when a tick is skipped.
+
+### Input queue and cadence
+
+The queue holds **64 raw samples**, preserving separate WASD and combined
+arrow/controller held vectors. Adjacent records coalesce only when both are
+edge/text-free, have zero drag deltas, and identical held/drag state; latest
+pointer and viewport replace the old values. Edges are never ORed together.
+Overflow drops the **newest whole sample**. This is bounded best effort, not an
+unbounded lossless promise. A separate continuous snapshot always updates, so
+dropped releases reconcile without replaying dropped clicks, text, or deltas.
+Queued recovery text is securely scrubbed on consumption, discard, overflow,
+and teardown; the continuous snapshot never contains text.
+
+At consumption, current menu/onboarding mode filters WASD, so an earlier Escape
+affects later queued letters. Non-direction records still run in order after
+the direction allowance is used. A nonneutral vector steps on its first eligible
+tick, then every two executed ticks (10 steps/s). At most one direction step
+per tick covers all records, taps and direction changes; diagonals share it.
+Neutral resets repeat, and world dragging resets/suppresses it. Short taps can
+survive release before the tick; latest held state governs subsequent ticks.
+Neither presentation frequency nor a long stall creates a movement burst.
+
+Effects execute at their originating input, before later records: restore
+copies/serializes its phrase immediately and native paste completes before later
+typing. Effects do not flush the rest of the batch. External accepted onboarding
+and wallet results, clipboard content replacement and trusted withdrawal-focus
+replacement explicitly invalidate old input/reset repeat. Phase/attempt/menu
+page/focus and actionable copy/confirm identity provide a before-capture
+backstop, also on skipped ticks. Idle/stale wallet polls do not flush input.
+Trusted browser clipboard operations remain synchronous in the original gesture
+handler, outside the game clock. Wallet expiry, Unix time and worker dispatch
+also remain real-time. No animations currently require a time hook; future
+time-based simulation belongs once per tick with `tick.dt_seconds`, not once
+per queued input or draw.
 
 ## Native wallet startup
 
 After the window and world are initialized, the first frame displays a blocking
 loading overlay. Native wallet inspection and, when needed, provisioning run
-synchronously after that frame. A validated existing wallet proceeds directly to
+on a joined background worker after that frame. A validated existing wallet proceeds directly to
 the game. A newly provisioned or pending wallet displays its recovery words and
 requires the player to acknowledge saving them before continuing. Completion
 must be persisted successfully; otherwise the player can retry. Invalid or
@@ -133,7 +160,7 @@ disabled or replaced with built-in settings, as described in
 [browser-storage.md](browser-storage.md).
 
 Once the settings gate succeeds, its continuation creates the heap-owned
-`BrowserContext` (the `GameState`, persistent `input.Reader`, and shared onboarding
+`BrowserContext` (the `GameState`, `input.Reader`, loop driver, and shared onboarding
 model), starts the asynchronous `BrowserOnboarding` inspection, and hands an
 Emscripten callback to `emscripten_set_main_loop(browserFrame, 0, 0)`. The context
 outlives the entry function; Emscripten never receives a pointer to a returned
@@ -188,9 +215,10 @@ shared onboarding model and its asynchronous bridge.
 | Kind | Example | Lifetime | Who mutates it |
 |---|---|---|---|
 | Persistent state | `GameState.world`, `.camera`, `.menu`, `.settings.debug` | until shutdown | `update`, `streamChunks` |
-| Persistent input timing | `input.Reader` (`last_dx`, `last_dy`, `elapsed` direction cadence) | until shutdown | `Reader.read` |
-| Per-frame input | `FrameInput` (`right`, `down`, `confirm`, `dragging`, `pointer_x`, `characters`, …) | one frame, then dropped | `Reader.read` |
-| Calculated view | `camera.View` (`transform`, `chunks`) | one frame, then dropped | nobody; derived from state + window size |
+| Loop state | `frame_loop.Driver` schedule, queue, repeater | until shutdown | input capture and due ticks |
+| Raw input | `RawSample` (separate held vectors, edges, text, drag, pointer, viewport) | bounded queue, then scrubbed | `Reader.read` |
+| Routed input | `FrameInput` | one ordered consumption | repeater and current modal filter |
+| Calculated view | cached `camera.View` and viewport | until next tick | derived from camera + viewport |
 
 `GameState` does **not** store the view or the input. That separation is the
 point: tests can feed a `FrameInput` directly, and a future replay or network
@@ -206,14 +234,10 @@ cache. A non-resident chunk still exists conceptually; the deterministic generat
 
 ## A concrete trace: press and hold D
 
-1. `input_reader.read(dt, game_state.menu.opened)` sees D held (or controller
-   0's D-pad/left stick on the same direction) and emits
-   `FrameInput{ .right = true }`. The first
-   frame of a new direction steps immediately; while it stays held the same
-   request repeats every 0.1 s, so movement is 10 steps per second during normal
-   frame rates. At most one step is emitted per frame, so below 10 FPS or after a
-   stall missed whole steps are dropped. The OS keyboard auto-repeat is not
-   used.
+1. `input_reader.read()` sees D held and queues a separate WASD vector. At the
+   next due tick, if no menu/onboarding blocks it, the repeater emits
+   `FrameInput{ .right = true }`. Stable holds repeat every two executed ticks;
+   missed ticks are dropped, not replayed. OS direction auto-repeat is unused.
 2. `GameState.update` calls `Camera.applyInput`. Each request moves the camera
    exactly one tile on that axis. Opposing inputs cancel, and a held diagonal
    (for example D plus S) moves one tile on both axes per step. A held left
@@ -231,9 +255,8 @@ cache. A non-resident chunk still exists conceptually; the deterministic generat
    marker, the HUD, and the minimap. If the menu is open it draws that last, in
    screen space, followed by any blocking onboarding overlay. It reads
    `GameState`, `View`, the viewport size, and the optional model only.
-6. Next frame starts over. There is no event queue and no fixed timestep; input
-   is sampled once per frame, and `input.Reader` uses the frame delta only to
-   pace held directional steps.
+6. The next display frame polls again and draws the cached latest state. Only
+   the next due tick consumes its queued input and refreshes the view.
 
 ## Memory ownership
 
@@ -242,7 +265,7 @@ cache. A non-resident chunk still exists conceptually; the deterministic generat
   uses `c_allocator` for its heap-owned `BrowserContext`.
 - `main` owns `GameState`; `GameState` owns `World`, `Camera`, `Menu`, and
   `Settings`. In the browser, `BrowserContext` owns both `GameState` and
-  `input.Reader`.
+  `input.Reader` and `frame_loop.Driver`; driver teardown scrubs its queue.
 - `Menu` and its `TextField` buffers are fixed-size values: no allocation, no
   separate teardown.
 - `World` owns its chunk pool, resident hash map, and reusable unload-key list.
@@ -255,7 +278,7 @@ cache. A non-resident chunk still exists conceptually; the deterministic generat
   capacity, so normal frames do not allocate. There is no per-frame snapshot of
   the world.
 - Allocation failure during streaming keeps whatever loaded, sets
-  `memory_pressure`, warns once per episode, and retries next frame. A
+  `memory_pressure`, warns once per episode, and retries next tick. A
   coordinate error is a program invariant and propagates out of the loop.
 - See `memory.md` for the HUD accounting details.
 

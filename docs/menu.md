@@ -26,11 +26,23 @@ it cannot move the world.
 | Backspace | delete the last codepoint in the focused field |
 
 `WASD` is **not** a menu direction: typing never moves the highlight. Amounts
-are validated separately as positive decimal integer sats. Held directions step once immediately and then
-repeat at the same shared 10 steps/s cadence as the camera. `Space` types a
+are validated separately as positive decimal integer sats. Held directions step on
+the first eligible 20 Hz tick and then every two executed ticks (10 steps/s),
+using the same repeat allowance as the camera. `Space` types a
 space; it is not a confirm key. Arrow keys, D-pad, and stick
 share the vertical list: up/left mean previous, down/right mean next, and at
-most one row moves per frame. Opposing requests on the same frame cancel.
+most one directional row step occurs per tick, across all queued records.
+Opposing held requests in one sample cancel. Edges/text/drag records still route
+in order, even after the direction allowance is spent. Modal WASD filtering is
+done at consumption, so queued Escape followed by typing cannot navigate.
+
+Devices poll every display frame into a bounded 64-sample queue. Overflow drops
+the newest whole record, but a separate text/edge/delta-free snapshot reconciles
+held releases. Adjacent unchanged quiet samples may coalesce. This is not an
+unbounded lossless queue. External accepted result/content/focus replacements
+invalidate stale queued input before capture; ordinary queued modal transitions
+do not. Browser clipboard work retains its trusted synchronous gesture handler,
+and wallet timers/results are real-time, outside the game clock.
 
 The highlight is persistent UI state (`Menu.selected_index`), not a transient
 hover: it moves only when a direction steps or the pointer actually moves onto
@@ -142,7 +154,8 @@ complete invoice, not its bounded preview.
 
 | File | Job |
 |---|---|
-| `src/input.zig` | polls devices only; produces one `FrameInput` with screen-space pointer, click/escape/confirm/backspace edges, viewport size, bounded typed text, and the shared directional requests used by both camera and menu |
+| `src/input.zig` | polls raw samples with separate WASD/navigation vectors; device-free tick repeater produces routed directions |
+| `src/frame_loop.zig` | queues 64 ordered samples, filters WASD against current mode, routes input/effects, caches view/viewport at 20 Hz |
 | `src/menu.zig` | page/item data, pure layout maths, `TextField`, and the runtime `Menu` state (page, selected row, focus, text buffers, last pointer) |
 | `src/game.zig` | `GameState.update` gives the menu first refusal; a consumed frame never reaches the camera or debug toggles |
 | `src/rendering.zig` | reads menu state and draws the modal last, over the world, HUD, and minimap |

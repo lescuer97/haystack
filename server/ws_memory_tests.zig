@@ -13,6 +13,7 @@ test "bounded-memory application slots reserve once reuse at capacity without up
         defer server.deinit();
         const used = pool.used;
         const calls = pool.allocation_calls;
+        try std.testing.expectEqual(@as(usize, 1024 * 1024), used);
         // Buddy retains no upstream allocator: managed steady state cannot fall back.
         for (0..256) |_| {
             var slots: [64]*transport.Slot = undefined;
@@ -22,6 +23,22 @@ test "bounded-memory application slots reserve once reuse at capacity without up
             try std.testing.expect(server.reserve().? == slots[17]);
             for (slots) |slot| server.release(slot);
         }
+        var fixture = try @import("fixture.zig").Fixture.init();
+        defer fixture.deinit();
+        const session = try fixture.application.registry.claim(@splat(3));
+        const slot = server.reserve().?;
+        for (0..128) |_| {
+            try server.dispatch.publish(&slot.mailbox, session, .{
+                .request_id = @splat(0),
+                .operation = .{ .read_area = .{ .cx0 = 0, .cy0 = 0, .cx1 = 7, .cy1 = 7 } },
+            });
+            var batch = server.dispatch.beginBatch(server.slots, 0);
+            const work = server.dispatch.claimNext(server.slots, &batch, 0).?;
+            server.dispatch.execute(&fixture.application, &slot.mailbox, work);
+            try slot.mailbox.completion.wait(std.testing.io);
+            server.dispatch.cleanup(&slot.mailbox);
+        }
+        server.release(slot);
         try std.testing.expectEqual(used, pool.used);
         try std.testing.expectEqual(calls, pool.allocation_calls);
         try std.testing.expectEqual(@as(usize, 0), pool.exhaustions);

@@ -15,7 +15,7 @@ application is part of client residency. Read `game-loop.md` first for the frame
   There is no outer scene arena retaining old hash-map and scratch-list buffers.
 - `GameState` owns `World`, `Camera`, `Menu`, and `Settings`. Native `main`
   defers `game_state.deinit()`; the browser `BrowserContext` owns `GameState`
-  and the persistent `input.Reader`, and `stopBrowser` deinitializes them.
+  and the `input.Reader` plus `frame_loop.Driver`, and `stopBrowser` deinitializes them.
   `World.deinit` releases the chunk pool, resident hash map, and reusable
   unload-key list. `Menu` and its text-field buffers are fixed-size values with
   no allocation or separate teardown.
@@ -35,31 +35,38 @@ same storage works headlessly.
 
 ## Frame lifetime
 
-1. `input.Reader.read(dt, menu_opened)` collects devices and paces held
-   directions into a temporary `FrameInput`. It does not touch the world. The
-   same helper is used by the native loop and the browser callback; only its
-   owner differs.
-2. `GameState.update` mutates persistent camera, menu, and debug state. It does
-   not allocate.
-3. `camera.calculate` derives a temporary `View` (Raylib transform + validated
-   chunk range). It does not allocate.
+1. `input.Reader.read()` polls once per display frame. A loop-owned driver holds
+   at most 64 ordered raw samples, a continuous text/edge/delta-free snapshot,
+   a tick repeater and the shared 20 Hz schedule. Quiet unchanged samples can
+   coalesce; overflow drops the newest whole record while still reconciling
+   releases. The queue allocates nothing. Text is securely scrubbed after
+   consumption, discard, overflow and driver teardown.
+2. On a due tick, ordered `FrameInput` values route through onboarding then
+   `GameState.update`; each effect dispatches before the next record. Camera,
+   menu and debug updates do not allocate. Real-time wallet/clipboard plumbing
+   stays outside tick permission.
+3. `camera.calculate` derives a `View` (Raylib transform + validated chunk range)
+   once per tick without allocation. The driver caches it AND its viewport,
+   not GPU assets or a rendered texture; `GameState` stores neither input nor view.
 4. `GameState.streamChunks` -> `World.stream` unloads chunks outside the
    two-chunk prefetch ring, loads visible chunks first, then loads/reserves the
    rest of the ring. It mutates residency only. The unload list always has
    enough capacity for all residents, so eviction cannot fail to allocate.
-   Normal steady-state frames reuse existing capacity; allocation can occur
+    Normal steady-state ticks reuse existing capacity; allocation can occur
    only when the world grows.
 5. `rendering.draw` borrows `*const GameState`, a `View`, and the viewport size,
    and draws into Raylib's own CPU batch buffers. Raylib does not retain chunk
    pointers or HUD text pointers. Rendering never collects input or mutates game
    state.
 6. `endMode2D` flushes world geometry; `endDrawing` flushes the UI and presents.
-   The optional screenshot is taken after that presentation. The browser has no
-   screenshot hook; it cancels the next callback after cleanup instead.
+    The optional native screenshot is taken after draw, with an explicit batch
+    flush BEFORE presentation. A privacy latch from before real-time completions
+    excludes any outer frame that had blocking onboarding, even between ticks.
+    Native draws at 120 FPS and browser rAF draws every callback without interpolation.
 
 Allocation failures from streaming are handled in `GameState.streamChunks`: it
 logs once per pressure episode, marks the HUD as incomplete, draws the chunks
-that are available, and retries next frame. A failed load returns its chunk slot
+that are available, and retries next tick. A failed load returns its chunk slot
 to the pool. A coordinate error is not memory pressure and propagates out of the
 frame loop. There is no fixed memory budget: residency follows the requested
 ring.

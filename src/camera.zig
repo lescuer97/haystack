@@ -2,9 +2,8 @@
 //! temporary view calculated from it.
 //!
 //! Persistent camera state is ours (`Camera`). `rl.Camera2D` is only a
-//! world→screen matrix built fresh each frame. The visible chunk range is also
-//! temporary: it is derived from the camera and the window size, handed to the
-//! world for streaming, then discarded.
+//! world→screen matrix derived each tick. The loop caches it and the visible
+//! chunk range with the viewport; neither belongs to persistent GameState.
 
 const std = @import("std");
 const rl = @import("raylib");
