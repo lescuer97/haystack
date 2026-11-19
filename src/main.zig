@@ -80,20 +80,12 @@ const BrowserContext = struct {
     input_reader: input.Reader,
     driver: frame_loop.Driver = .{},
     model: onboarding.Onboarding,
-    onboarding_start_failed: bool = false,
+    clipboard_identity: browser_onboarding.ClipboardIdentity = .{},
+    recovery_paste_epoch: u64 = 0,
+    withdrawal_paste_epoch: u64 = 0,
 };
 
 var browser_context: ?*BrowserContext = null;
-var wallet_mailbox: wallet_ui.Text(128 * 1024) = .{};
-var wallet_result_serial: ?u32 = null;
-var wallet_result_ok = false;
-extern "c" fn haystack_wallet_request(u32, u32, c_int, [*]const u8, u32, *const fn (c_int, u32, u32, [*c]const u8, u32) callconv(.c) void) void;
-fn walletCallback(ok: c_int, generation: u32, serial: u32, ptr: [*c]const u8, len: u32) callconv(.c) void {
-    if (browser_context == null or generation != browser_onboarding.currentGeneration()) return;
-    if (len > 128 * 1024 or (len != 0 and ptr == null)) return;
-    wallet_result_serial = serial;
-    wallet_result_ok = ok == 1 and wallet_mailbox.set(if (len == 0) "" else ptr[0..len]);
-}
 var clipboard_mailbox: browser_onboarding.ClipboardMailbox = .{};
 var withdrawal_clipboard: wallet_ui.Text(4096) = .{};
 var withdrawal_clipboard_pending = false;
@@ -101,12 +93,29 @@ extern "c" fn haystack_wallet_unix_time() f64;
 extern "c" fn haystack_onboarding_bind_input(*const fn (c_int, c_int, c_int, [*]u8, u32) callconv(.c) c_int, *const fn ([*c]const u8, u32) callconv(.c) void, *const fn (c_int) callconv(.c) void) void;
 extern "c" fn haystack_onboarding_unbind_input() void;
 
+fn syncClipboardTarget(ctx: *BrowserContext) void {
+    const target: browser_onboarding.ClipboardTarget = if (ctx.model.isBlocking())
+        if (ctx.model.phase == .phrase_entry) .{ .recovery = ctx.model.attempt_id } else .none
+    else if (ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Withdraw and ctx.game_state.menu.focus == .withdrawal_invoice)
+        .withdrawal
+    else
+        .none;
+    ctx.clipboard_identity.sync(target);
+}
+
+fn pasteProbe(ctx: *BrowserContext, ptr: [*]u8, cap: u32, code: c_int) c_int {
+    if (cap < 8) return 0;
+    syncClipboardTarget(ctx);
+    std.mem.writeInt(u64, ptr[0..8], ctx.clipboard_identity.epoch, .little);
+    return code;
+}
+
 fn clipboardProbe(kind: c_int, x: c_int, y: c_int, ptr: [*]u8, cap: u32) callconv(.c) c_int {
     const ctx = browser_context orelse return 0;
     if (cap > 4097) return 0;
     if (!ctx.model.isBlocking() and ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Withdraw) {
         const state = &ctx.game_state.menu;
-        if (kind == 2) return if (state.focus == .withdrawal_invoice) 16 else 0;
+        if (kind == 2) return if (state.focus == .withdrawal_invoice) pasteProbe(ctx, ptr, cap, 16) else 0;
         const layout = state.layoutFor(ctx.driver.viewport_w, ctx.driver.viewport_h);
         const selected = if (kind == 1) state.selected_index else if (kind == 0)
             layout.hitTest(@as(f32, @floatFromInt(x)) * ctx.driver.viewport_w / 1_000_000, @as(f32, @floatFromInt(y)) * ctx.driver.viewport_h / 1_000_000) orelse return 0
@@ -115,7 +124,7 @@ fn clipboardProbe(kind: c_int, x: c_int, y: c_int, ptr: [*]u8, cap: u32) callcon
         if (selected != 1) return 0;
         if (state.focus != .withdrawal_invoice) ctx.driver.invalidateInput();
         state.focus = .withdrawal_invoice;
-        return 16;
+        return pasteProbe(ctx, ptr, cap, 16);
     }
     if (!ctx.model.isBlocking() and ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Invoice) {
         const state = &ctx.game_state.menu;
@@ -129,24 +138,29 @@ fn clipboardProbe(kind: c_int, x: c_int, y: c_int, ptr: [*]u8, cap: u32) callcon
         @memcpy(ptr[0..state.wallet.invoice.len], state.wallet.invoice.slice());
         return 15;
     }
-    return browser_onboarding.probe(&ctx.model, kind, x, y, ctx.driver.viewport_w, ctx.driver.viewport_h, ptr[0..cap]);
+    const code = browser_onboarding.probe(&ctx.model, kind, x, y, ctx.driver.viewport_w, ctx.driver.viewport_h, ptr[0..cap]);
+    return if (code == 14) pasteProbe(ctx, ptr, cap, code) else code;
 }
 fn clipboardPaste(ptr: [*c]const u8, len: u32) callconv(.c) void {
     const ctx = browser_context orelse return;
     if (len > 4096 or (len > 0 and ptr == null)) return;
+    syncClipboardTarget(ctx);
     if (!ctx.model.isBlocking()) {
         if (ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Withdraw and ctx.game_state.menu.focus == .withdrawal_invoice) {
             withdrawal_clipboard_pending = withdrawal_clipboard.set(if (len == 0) "" else ptr[0..len]);
+            if (withdrawal_clipboard_pending) ctx.withdrawal_paste_epoch = ctx.clipboard_identity.epoch;
         }
         return;
     }
     if (len > 1024) return;
     clipboard_mailbox.paste(if (len == 0) "" else ptr[0..len]);
+    if (clipboard_mailbox.has_paste) ctx.recovery_paste_epoch = ctx.clipboard_identity.epoch;
 }
 fn clipboardCopied(code: c_int) callconv(.c) void {
     if (browser_context != null and code >= 1 and code <= 13) clipboard_mailbox.copied = code;
 }
 var storage_continuation_done = false;
+var pending_browser_settings: game_mod.Settings = undefined;
 
 fn webMain(_: c_int, _: [*c][*c]u8) callconv(.c) c_int {
     if (builtin.os.tag != .emscripten) return 0;
@@ -182,15 +196,29 @@ fn storageReady(
         .ready => {},
     }
 
-    const settings = loaded.settings;
+    pending_browser_settings = loaded.settings;
+    browser_onboarding.start(browserServiceReady) catch {
+        stopBrowser();
+        haystack_ui_result(0);
+    };
+}
 
+fn browserServiceReady(ok: bool) void {
+    if (!ok) {
+        stopBrowser();
+        haystack_ui_result(0);
+        return;
+    }
     // Do not build any game state before the storage gate succeeds. Initialization
     // failures still clean up every partially-created resource and fail closed.
-    startBrowser(settings) catch |err| {
+    startBrowser(pending_browser_settings) catch |err| {
         std.log.err("browser initialization failed: {s}", .{@errorName(err)});
         stopBrowser();
         haystack_ui_result(0);
         return;
+    };
+    _ = browser_onboarding.request("inspect", "{}") catch {
+        browser_context.?.model.receive(.blocked);
     };
     haystack_ui_result(1);
     // In an async continuation `simulate_infinite_loop` must be 0: the loop
@@ -257,9 +285,6 @@ fn startBrowser(settings: game_mod.Settings) !void {
     withdrawal_clipboard = .{};
     withdrawal_clipboard_pending = false;
     haystack_onboarding_bind_input(clipboardProbe, clipboardPaste, clipboardCopied);
-    browser_onboarding.start() catch {
-        ctx.onboarding_start_failed = true;
-    };
 }
 
 /// One browser frame. Errors cannot cross the C callback boundary, so a failure
@@ -272,23 +297,25 @@ fn browserFrame() callconv(.c) void {
     // implements it with a blocking `emscripten_sleep` that is forbidden
     // inside `emscripten_set_main_loop` (and aborts with asyncify disabled).
     // Browser lifetime is owned by the page/main loop instead.
-    if (ctx.onboarding_start_failed) {
-        ctx.onboarding_start_failed = false;
-        ctx.model.receive(.blocked);
-        ctx.driver.invalidateInput();
-    }
     if (browser_onboarding.take()) |value| {
         var result = value;
         defer std.crypto.secureZero(u8, &result.bytes);
         browser_onboarding.deliver(&result, &ctx.model);
         ctx.driver.invalidateInput();
     }
+    syncClipboardTarget(ctx);
+    if (clipboard_mailbox.has_paste and (ctx.clipboard_identity.target != .recovery or ctx.recovery_paste_epoch != ctx.clipboard_identity.epoch)) {
+        std.crypto.secureZero(u8, &clipboard_mailbox.bytes);
+        clipboard_mailbox.len = 0;
+        clipboard_mailbox.has_paste = false;
+    }
     if (clipboard_mailbox.has_paste and ctx.model.phase == .phrase_entry) ctx.driver.invalidateInput();
     clipboard_mailbox.consume(&ctx.model, rl.getTime());
     if (withdrawal_clipboard_pending) {
         ctx.driver.invalidateInput();
-        if (!ctx.model.isBlocking()) _ = ctx.game_state.menu.pasteWithdrawal(withdrawal_clipboard.slice());
-        withdrawal_clipboard = .{};
+        if (ctx.clipboard_identity.target == .withdrawal and ctx.withdrawal_paste_epoch == ctx.clipboard_identity.epoch) _ = ctx.game_state.menu.pasteWithdrawal(withdrawal_clipboard.slice());
+        std.crypto.secureZero(u8, &withdrawal_clipboard.bytes);
+        withdrawal_clipboard.len = 0;
         withdrawal_clipboard_pending = false;
     }
     ctx.model.expire(rl.getTime());
@@ -296,24 +323,14 @@ fn browserFrame() callconv(.c) void {
     const unix = haystack_wallet_unix_time();
     if (std.math.isFinite(unix) and unix >= 0 and unix < 253402300800) wallet_model.unix_now = @intFromFloat(unix);
     ctx.game_state.menu.paste_requested = false; // Browser reads only in the trusted gesture handler.
-    if (wallet_result_serial) |serial| {
-        if (wallet_model.pending and wallet_model.serial == serial) ctx.driver.invalidateInput();
-        if (wallet_result_ok) wallet_model.accept(serial, wallet_mailbox.slice(), rl.getTime(), std.heap.c_allocator) else wallet_model.fail(serial, rl.getTime());
-        wallet_result_serial = null;
-    }
-    wallet_model.tick(!ctx.model.isBlocking(), rl.getTime());
-    if (wallet_model.request) |request| {
-        haystack_wallet_request(browser_onboarding.currentGeneration(), request.serial, @intCast(@backingInt(request.operation)), request.argument.slice().ptr, @intCast(request.argument.len), walletCallback);
-        wallet_model.request = null;
-    }
+    if (browser_onboarding.stepWallet(wallet_model, !ctx.model.isBlocking(), rl.getTime())) ctx.driver.invalidateInput();
     stepFrame(
         &ctx.game_state,
         &ctx.input_reader,
         &ctx.driver,
-        null,
         browser_settings_persister,
         &ctx.model,
-        .{ .dispatch = browserDispatch },
+        .{ .context = ctx, .dispatch = browserDispatch, .after_input = browserAfterInput },
     ) catch |err| {
         std.log.err("browser frame failed: {s}", .{@errorName(err)});
         stopBrowser();
@@ -321,8 +338,16 @@ fn browserFrame() callconv(.c) void {
     };
 }
 
-fn browserDispatch(_: ?*anyopaque, model: *onboarding.Onboarding, effect: onboarding.Effect) void {
+fn browserDispatch(context: ?*anyopaque, model: *onboarding.Onboarding, effect: onboarding.Effect) void {
+    const ctx: *BrowserContext = @ptrCast(@alignCast(context.?));
+    syncClipboardTarget(ctx);
     browserEffect(model, effect);
+    syncClipboardTarget(ctx);
+}
+
+fn browserAfterInput(context: ?*anyopaque, _: *game_mod.GameState) void {
+    const ctx: *BrowserContext = @ptrCast(@alignCast(context.?));
+    syncClipboardTarget(ctx);
 }
 
 fn browserEffect(model: *onboarding.Onboarding, effect: onboarding.Effect) void {
@@ -333,6 +358,7 @@ fn browserEffect(model: *onboarding.Onboarding, effect: onboarding.Effect) void 
         .generate_requested => "generate",
         .complete_requested => "complete_backup",
         .finish_restore_requested => "finish_restore",
+        .retry_open_requested => "retry_open",
         .copy_requested, .copy_word_requested, .paste_requested => return,
     };
     if (effect == .restore_requested) {
@@ -349,7 +375,9 @@ fn browserEffect(model: *onboarding.Onboarding, effect: onboarding.Effect) void 
         };
     } else {
         _ = browser_onboarding.request(op, "{}") catch {
-            if (effect == .complete_requested or effect == .finish_restore_requested) {
+            if (effect == .retry_open_requested) {
+                model.receive(.open_failed);
+            } else if (effect == .complete_requested or effect == .finish_restore_requested) {
                 model.receive(.complete_fail);
             } else if (effect == .retry_requested and model.stage_created) {
                 model.receive(.{ .restore_failed = .{ .attempt_id = model.attempt_id, .stage_created = true, .can_generate_new = false } });
@@ -361,20 +389,21 @@ fn browserEffect(model: *onboarding.Onboarding, effect: onboarding.Effect) void 
 }
 
 fn stopBrowser() void {
-    const ctx = browser_context orelse return;
+    const ctx = browser_context;
     browser_context = null;
+    browser_onboarding.close();
+    const context = ctx orelse return;
 
     haystack_onboarding_unbind_input();
     clipboard_mailbox.clear();
     withdrawal_clipboard = .{};
     withdrawal_clipboard_pending = false;
 
-    browser_onboarding.close();
     emscripten_cancel_main_loop();
-    ctx.model.deinit();
-    ctx.driver.deinit();
-    ctx.game_state.deinit();
-    std.heap.c_allocator.destroy(ctx);
+    context.model.deinit();
+    context.driver.deinit();
+    context.game_state.deinit();
+    std.heap.c_allocator.destroy(context);
     rl.closeWindow();
 }
 
@@ -426,13 +455,11 @@ const browser_settings_persister: SettingsPersister = .{
 
 /// Run one presentation frame for either platform, with at most one due tick.
 /// State, driver and input reader are borrowed from `BrowserContext` or native
-/// `main`. `shot_path` is captured inside the drawing pass
-/// (before presentation) so the image is not a post-swap black frame.
+/// `main`.
 fn stepFrame(
     game_state: *game_mod.GameState,
     input_reader: *input.Reader,
     driver: *frame_loop.Driver,
-    shot_path: ?[:0]const u8,
     persister: ?SettingsPersister,
     model: ?*onboarding.Onboarding,
     sink: ?frame_loop.EffectSink,
@@ -462,15 +489,6 @@ fn stepFrame(
     // 5. render read-only state. The caller owns presentation timing.
     rl.beginDrawing();
     rendering.draw(game_state, driver.view.?, driver.viewport_w, driver.viewport_h, model);
-    // Capture after drawing and before `endDrawing` swaps/presents, otherwise
-    // the framebuffer read is the cleared back buffer (a black screenshot).
-    // The 2D overlay (HUD/minimap) is still batched at this point;
-    // flush it explicitly so it is present in the captured image. Only the
-    // requested screenshot frame pays this cost.
-    if (shot_path) |path| {
-        rl.gl.rlDrawRenderBatchActive();
-        rl.takeScreenshot(path);
-    }
     rl.endDrawing();
 }
 
@@ -515,125 +533,6 @@ test "paste shortcut routes only in phrase entry and consumes its character" {
 
 // ── native entry point ──────────────────────────────────────────────────────
 
-const NativeOperation = enum { start, create, restore, retry, complete, generate, finish_restore };
-const ScanJob = if (builtin.os.tag != .emscripten) struct {
-    native: native_onboarding.Native,
-    phrase: []u8,
-    attempt_id: u64,
-    operation: NativeOperation,
-    done: std.atomic.Value(bool) = .init(false),
-    result: onboarding.Event = .blocked,
-    thread: std.Thread = undefined,
-
-    fn run(job: *@This()) void {
-        var threaded: std.Io.Threaded = .init_single_threaded;
-        defer threaded.deinit();
-        var native_copy = job.native;
-        native_copy.io = threaded.io();
-        native_copy.allocator = std.heap.page_allocator;
-        job.result = job.perform(&native_copy) catch |err| if (err == error.InvalidMnemonic)
-            .{ .invalid_phrase = job.attempt_id }
-        else if (job.operation == .complete or job.operation == .finish_restore)
-            .complete_fail
-        else
-            .blocked;
-        std.crypto.secureZero(u8, job.phrase);
-        job.done.store(true, .release);
-    }
-
-    fn perform(job: *@This(), native_copy: *native_onboarding.Native) anyerror!onboarding.Event {
-        return switch (job.operation) {
-            .start => native_copy.start(),
-            .create => native_copy.createNew(),
-            .restore => native_copy.restore(job.phrase, job.attempt_id),
-            .retry => native_copy.retry(job.attempt_id),
-            .complete => blk: {
-                try native_copy.complete();
-                break :blk onboarding.Event.complete_success;
-            },
-            .generate => native_copy.generateNew(),
-            .finish_restore => blk: {
-                try native_copy.finishRestore();
-                break :blk onboarding.Event.complete_success;
-            },
-        };
-    }
-
-    fn destroy(job: *@This()) void {
-        if (job.result == .backup) {
-            std.crypto.secureZero(u8, job.result.backup);
-            std.heap.page_allocator.free(job.result.backup);
-        }
-        std.crypto.secureZero(u8, job.phrase);
-        std.heap.page_allocator.free(job.phrase);
-        std.heap.page_allocator.destroy(job);
-    }
-
-    fn deliver(job: *@This(), model: *onboarding.Onboarding) void {
-        if (job.result == .backup) {
-            // Worker and model allocators differ. Transfer a scrubbed copy,
-            // never a page-allocator buffer into the UI's allocator ownership.
-            if (model.allocator.dupe(u8, job.result.backup)) |phrase| model.receive(.{ .backup = phrase }) else |_| model.receive(.blocked);
-        } else model.receive(job.result);
-    }
-} else struct {};
-
-fn startScan(native: native_onboarding.Native, model: *onboarding.Onboarding, operation: NativeOperation) !*ScanJob {
-    const allocator = std.heap.page_allocator;
-    const job = try allocator.create(ScanJob);
-    errdefer allocator.destroy(job);
-    const phrase = try allocator.dupe(u8, if (operation == .restore) model.recoveryPhrase() else "");
-    errdefer {
-        std.crypto.secureZero(u8, phrase);
-        allocator.free(phrase);
-    }
-    job.* = .{ .native = native, .phrase = phrase, .attempt_id = model.attempt_id, .operation = operation };
-    job.thread = try std.Thread.spawn(.{}, ScanJob.run, .{job});
-    return job;
-}
-
-test "native onboarding jobs transfer backup ownership and finish before Ready" {
-    if (builtin.os.tag == .emscripten) return error.SkipZigTest;
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
-    defer a.free(root);
-    const config_dir = try std.fs.path.join(a, &.{ root, "config" });
-    defer a.free(config_dir);
-    try storage_fs.ensureOwnedDir(io, config_dir);
-    const wallet_dir = try std.fs.path.join(a, &.{ root, "data", "wallet" });
-    defer a.free(wallet_dir);
-    const wallet_paths = try native_wallet.Paths.init(a, wallet_dir);
-    defer wallet_paths.deinit(a);
-    const native = native_onboarding.Native{ .io = io, .allocator = a, .config_dir = config_dir, .paths = wallet_paths };
-    var model = onboarding.Onboarding.init(a);
-    defer model.deinit();
-    const created = try startScan(native, &model, .create);
-    created.thread.join();
-    defer created.destroy();
-    created.deliver(&model);
-    try std.testing.expectEqual(onboarding.Phase.backup, model.phase);
-    try std.testing.expect(model.mnemonic().?.ptr != created.result.backup.ptr);
-    try std.testing.expect(std.mem.eql(u8, created.result.backup, model.mnemonic().?));
-    model.saved = true;
-    _ = model.activateAction(.complete_backup);
-    const complete = try startScan(native, &model, .complete);
-    complete.thread.join();
-    defer complete.destroy();
-    complete.deliver(&model);
-    try std.testing.expectEqual(onboarding.Phase.inactive, model.phase);
-    try std.testing.expect(model.mnemonic() == null);
-    var resumed = onboarding.Onboarding.init(a);
-    defer resumed.deinit();
-    const inspected = try startScan(native, &resumed, .start);
-    inspected.thread.join();
-    defer inspected.destroy();
-    inspected.deliver(&resumed);
-    try std.testing.expectEqual(onboarding.Phase.inactive, resumed.phase);
-}
-
 extern "c" fn GetClipboardText() ?[*:0]const u8;
 
 fn pasteRecovery(model: *onboarding.Onboarding, allocator: std.mem.Allocator) void {
@@ -660,8 +559,7 @@ fn pasteWithdrawal(state: *@import("menu.zig").Menu) void {
 
 const NativeEffects = struct {
     allocator: std.mem.Allocator,
-    native: native_onboarding.Native,
-    scan_job: *?*ScanJob,
+    worker: *wallet_service.Worker,
 
     fn dispatch(context: ?*anyopaque, model: *onboarding.Onboarding, action: onboarding.Effect) void {
         const self: *NativeEffects = @ptrCast(@alignCast(context.?));
@@ -690,23 +588,20 @@ const NativeEffects = struct {
                 };
             },
             .paste_requested => pasteRecovery(model, allocator),
-            .complete_requested, .create_requested, .restore_requested, .retry_requested, .generate_requested, .finish_restore_requested => {
-                if (self.scan_job.* == null) {
-                    const operation: NativeOperation = switch (action) {
-                        .complete_requested => .complete,
-                        .create_requested => .create,
-                        .restore_requested => .restore,
-                        .retry_requested => .retry,
-                        .generate_requested => .generate,
-                        .finish_restore_requested => .finish_restore,
-                        else => unreachable,
-                    };
-                    // startScan copies the phrase NOW, before later records.
-                    self.scan_job.* = startScan(self.native, model, operation) catch blk: {
-                        model.receive(if (operation == .complete or operation == .finish_restore) .complete_fail else .blocked);
-                        break :blk null;
-                    };
-                }
+            .complete_requested, .create_requested, .restore_requested, .retry_requested, .retry_open_requested, .generate_requested, .finish_restore_requested => {
+                const operation: wallet_service.NativeOperation = switch (action) {
+                    .complete_requested => .complete,
+                    .create_requested => .create,
+                    .restore_requested => .restore,
+                    .retry_requested => .retry,
+                    .retry_open_requested => .retry_open,
+                    .generate_requested => .generate,
+                    .finish_restore_requested => .finish_restore,
+                    else => unreachable,
+                };
+                self.worker.submit(operation, model) catch {
+                    model.receive(if (operation == .complete or operation == .finish_restore) .complete_fail else if (operation == .retry_open) .open_failed else .blocked);
+                };
             },
         }
     }
@@ -783,6 +678,19 @@ pub fn main() anyerror!void {
     };
     const persister = SettingsPersister{ .context = &persistence, .save = nativeSaveSettings };
 
+    const wallet_paths = try native_wallet.Paths.init(allocator, locations.wallet_dir);
+    defer wallet_paths.deinit(allocator);
+    const native = native_onboarding.Native{
+        .io = io,
+        .allocator = allocator,
+        .config_dir = locations.config_dir,
+        .paths = wallet_paths,
+        .standard_parents = locations.standard_parents,
+    };
+    // One worker exists before the window; startup inspection runs asynchronously.
+    const wallet_worker = try wallet_service.Worker.startNative(native);
+    defer wallet_worker.stop();
+
     // ── window ───────────────────────────────────────────────────────────────
     const screen_w = 1000;
     const screen_h = 640;
@@ -813,35 +721,12 @@ pub fn main() anyerror!void {
 
     var model = onboarding.Onboarding.init(allocator);
     defer model.deinit();
-    const wallet_paths = try native_wallet.Paths.init(allocator, locations.wallet_dir);
-    defer wallet_paths.deinit(allocator);
-    const native = native_onboarding.Native{
-        .io = io,
-        .allocator = allocator,
-        .config_dir = locations.config_dir,
-        .paths = wallet_paths,
-        .standard_parents = locations.standard_parents,
-    };
-    var started = false;
-    var scan_job: ?*ScanJob = null;
-    var wallet_worker: ?*wallet_service.Worker = null;
-    defer if (wallet_worker) |worker| worker.stop();
-    // Never detach: shutdown may wait for the Rust scan timeout (up to 30 minutes).
-    defer if (scan_job) |job| {
-        job.thread.join();
-        job.destroy();
-    };
-
-    // Optional: HAYSTACK_SHOT=/path.png grabs a frame and exits (handy for CI).
-    const shot_path: ?[:0]const u8 = if (std.c.getenv("HAYSTACK_SHOT")) |p| std.mem.span(p) else null;
-    var shot_frames: i32 = if (shot_path != null) 5 else -1;
-
     // ── frame loop ───────────────────────────────────────────────────────────
     // Input queue, repeat and derived view belong to this loop, not GameState.
     var input_reader = input.Reader{};
     var driver = frame_loop.Driver{};
     defer driver.deinit();
-    var effects = NativeEffects{ .allocator = allocator, .native = native, .scan_job = &scan_job };
+    var effects = NativeEffects{ .allocator = allocator, .worker = wallet_worker };
     var onboarding_hand_cursor = false;
 
     while (!rl.windowShouldClose()) {
@@ -852,56 +737,27 @@ pub fn main() anyerror!void {
             pasteWithdrawal(&game_state.menu);
         }
         game_state.menu.wallet.tick(!model.isBlocking(), rl.getTime());
-        if (game_state.menu.wallet.pending and game_state.menu.wallet.request != null and wallet_worker == null) {
-            wallet_worker = wallet_service.Worker.start(wallet_paths) catch blk: {
-                game_state.menu.wallet.fail(game_state.menu.wallet.serial, rl.getTime());
-                game_state.menu.wallet.request = null;
-                break :blk null;
-            };
-        }
-        if (wallet_worker) |worker| {
-            if (worker.step(&game_state.menu.wallet, rl.getTime())) driver.invalidateInput();
-        }
+        if (wallet_worker.stepOnboarding(&model)) driver.invalidateInput();
+        if (wallet_worker.step(&game_state.menu.wallet, rl.getTime())) driver.invalidateInput();
         if (game_state.menu.wallet.copy_requested) {
             game_state.menu.wallet.copy_requested = false;
             if (game_state.menu.wallet.canCopyInvoice()) rl.setClipboardText(game_state.menu.wallet.invoice.z());
         }
         model.expire(rl.getTime());
-        if (scan_job) |job| if (job.done.load(.acquire)) {
-            job.thread.join();
-            job.deliver(&model);
-            driver.invalidateInput();
-            job.destroy();
-            scan_job = null;
-        };
-        // Capture on the last requested frame, inside stepFrame's drawing pass.
         try stepFrame(
             &game_state,
             &input_reader,
             &driver,
-            if (shot_frames == 0) shot_path else null,
             persister,
             &model,
             .{ .context = &effects, .dispatch = NativeEffects.dispatch, .after_input = NativeEffects.afterInput },
         );
 
-        if (!started) {
-            started = true;
-            scan_job = startScan(native, &model, .start) catch blk: {
-                model.receive(.blocked);
-                break :blk null;
-            };
-        }
         const layout = onboarding.calculateLayout(driver.viewport_w, driver.viewport_h);
         const hand = model.hoverEnabled(layout, model.pointer_x, model.pointer_y);
         if (hand != onboarding_hand_cursor) {
             rl.setMouseCursor(if (hand) .pointing_hand else .default);
             onboarding_hand_cursor = hand;
-        }
-
-        if (shot_frames >= 0) {
-            if (shot_frames == 0) break;
-            shot_frames -= 1;
         }
     }
 }

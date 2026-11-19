@@ -3,12 +3,22 @@
 const std = @import("std");
 const wallet = @import("wallet.zig");
 const ui = @import("wallet_ui.zig");
+const onboarding = @import("onboarding.zig");
+const native_onboarding = @import("onboarding_native.zig");
+pub const NativeOperation = enum { start, create, restore, retry, complete, generate, finish_restore, retry_open };
 pub const Worker = struct {
     paths: wallet.Paths,
+    native: ?native_onboarding.Native = null,
     state: std.atomic.Value(enum(u8) { idle, request, result }) = .init(.idle),
     stopping: std.atomic.Value(bool) = .init(false),
+    kind: enum { wallet, onboarding } = .wallet,
     request: ui.Request = undefined,
     result: ui.Text(128 * 1024) = .{},
+    operation: NativeOperation = .start,
+    attempt_id: u64 = 0,
+    phrase: ?[]u8 = null,
+    event: onboarding.Event = .blocked,
+    fail_open: std.atomic.Value(bool) = .init(false),
     ok: bool = false,
     thread: std.Thread = undefined,
 
@@ -19,21 +29,63 @@ pub const Worker = struct {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
     }
+    pub fn startNative(native: native_onboarding.Native) !*Worker {
+        const self = try std.heap.page_allocator.create(Worker);
+        errdefer std.heap.page_allocator.destroy(self);
+        self.* = .{ .paths = native.paths, .native = native, .kind = .onboarding, .operation = .start };
+        self.state.store(.request, .release);
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
     pub fn stop(self: *Worker) void {
         self.stopping.store(true, .release);
         self.thread.join();
+        self.clearPayload();
         std.heap.page_allocator.destroy(self);
+    }
+    fn clearPayload(self: *Worker) void {
+        if (self.phrase) |phrase| {
+            std.crypto.secureZero(u8, phrase);
+            std.heap.page_allocator.free(phrase);
+            self.phrase = null;
+        }
+        if (self.kind == .onboarding and self.state.load(.acquire) == .result and self.event == .backup) {
+            std.crypto.secureZero(u8, self.event.backup);
+            std.heap.page_allocator.free(self.event.backup);
+            self.event = .blocked;
+        }
+    }
+    /// Capture the phrase on the input thread, before the next queued input.
+    pub fn submit(self: *Worker, operation: NativeOperation, model: *const onboarding.Onboarding) !void {
+        if (self.state.load(.acquire) != .idle) return error.Busy;
+        const phrase = if (operation == .restore) try std.heap.page_allocator.dupe(u8, model.recoveryPhrase()) else null;
+        self.kind = .onboarding;
+        self.operation = operation;
+        self.attempt_id = model.attempt_id;
+        self.phrase = phrase;
+        self.state.store(.request, .release);
+    }
+    pub fn stepOnboarding(self: *Worker, model: *onboarding.Onboarding) bool {
+        if (self.state.load(.acquire) != .result or self.kind != .onboarding) return false;
+        const before = model.phase;
+        if (self.event == .backup) {
+            if (model.allocator.dupe(u8, self.event.backup)) |copy| model.receive(.{ .backup = copy }) else |_| model.receive(.blocked);
+        } else model.receive(self.event);
+        self.clearPayload();
+        self.state.store(.idle, .release);
+        return before != model.phase;
     }
     /// Reports accepted delivery, not idle polls or stale results. The loop
     /// invalidates input captured against the old actionable wallet content.
     pub fn step(self: *Worker, model: *ui.Model, now: f64) bool {
         var accepted = false;
-        if (self.state.load(.acquire) == .result) {
+        if (self.state.load(.acquire) == .result and self.kind == .wallet) {
             accepted = model.pending and self.request.serial == model.serial;
             if (self.ok) model.accept(self.request.serial, self.result.slice(), now, std.heap.page_allocator) else model.fail(self.request.serial, now);
             self.state.store(.idle, .release);
         }
         if (self.state.load(.acquire) == .idle) if (model.request) |request| {
+            self.kind = .wallet;
             self.request = request;
             model.request = null;
             self.state.store(.request, .release);
@@ -46,23 +98,66 @@ pub const Worker = struct {
         const io = threaded.io();
         var owner: ?wallet.Wallet = null;
         defer if (owner) |*h| h.close() catch {};
-        while (!self.stopping.load(.acquire)) {
+        while (true) {
             if (self.state.load(.acquire) != .request) {
+                if (self.stopping.load(.acquire)) break;
                 // ponytail: one sleeping worker, not a new thread per poll.
                 io.sleep(.fromMilliseconds(20), .awake) catch {};
                 continue;
             }
-            self.ok = false;
-            self.execute(io, &owner) catch {};
+            if (self.kind == .onboarding) {
+                var native = self.native.?;
+                native.io = io;
+                native.allocator = std.heap.page_allocator;
+                self.event = self.executeOnboarding(&native, &owner) catch |err| if (err == error.InvalidMnemonic)
+                    .{ .invalid_phrase = self.attempt_id }
+                else if (self.operation == .complete or self.operation == .finish_restore)
+                    .complete_fail
+                else
+                    .blocked;
+                if (self.phrase) |phrase| {
+                    std.crypto.secureZero(u8, phrase);
+                    std.heap.page_allocator.free(phrase);
+                    self.phrase = null;
+                }
+            } else {
+                self.ok = false;
+                self.execute(io, &owner) catch {};
+            }
             self.state.store(.result, .release);
         }
+    }
+    fn openOwner(self: *Worker, io: std.Io, owner: *?wallet.Wallet) !void {
+        if (self.fail_open.load(.acquire)) return error.Unavailable;
+        const inspection = try wallet.inspect(io, std.heap.page_allocator, self.paths, true);
+        owner.* = inspection.wallet orelse return error.Unavailable;
+    }
+    fn executeOnboarding(self: *Worker, native: *native_onboarding.Native, owner: *?wallet.Wallet) !onboarding.Event {
+        const event: onboarding.Event = switch (self.operation) {
+            .start => try native.start(),
+            .create => try native.createNew(),
+            .restore => try native.restore(self.phrase.?, self.attempt_id),
+            .retry => try native.retry(self.attempt_id),
+            .generate => try native.generateNew(),
+            .complete => blk: {
+                try native.complete();
+                break :blk .complete_success;
+            },
+            .finish_restore => blk: {
+                try native.finishRestore();
+                break :blk .complete_success;
+            },
+            .retry_open => .open_success,
+        };
+        if (event == .ready or event == .complete_success or event == .open_success) {
+            self.openOwner(native.io, owner) catch return .open_failed;
+        }
+        return event;
     }
     fn execute(self: *Worker, io: std.Io, owner: *?wallet.Wallet) !void {
         const allocator = std.heap.page_allocator;
         if (self.request.operation == .open) {
-            if (owner.* != null) return error.AlreadyOpen;
-            const inspection = try wallet.inspect(io, allocator, self.paths, true);
-            owner.* = inspection.wallet orelse return error.Unavailable;
+            if (owner.* == null) try self.openOwner(io, owner);
         }
         const handle = if (owner.*) |*w| try w.borrowHandle() else return error.Unavailable;
         if (self.request.operation == .create) {
@@ -120,4 +215,20 @@ test "delivery reports accepted results only, not idle polls or stale serials" {
     try std.testing.expect(worker.step(&model, 0));
     try std.testing.expect(!model.pending);
     try std.testing.expect(!worker.step(&model, 0));
+}
+
+test "restore command captures phrase immediately and rejects busy mailbox" {
+    var worker = Worker{ .paths = undefined };
+    var model = onboarding.Onboarding.init(std.testing.allocator);
+    defer model.deinit();
+    model.receive(.{ .choice = .{ .recover_enabled = true } });
+    _ = model.activateAction(.enter_recovery);
+    model.receive(.{ .paste = try std.testing.allocator.dupe(u8, "first phrase") });
+    _ = model.activateAction(.restore_phrase);
+    try worker.submit(.restore, &model);
+    try std.testing.expectEqualStrings("first phrase", worker.phrase.?);
+    try std.testing.expectError(error.Busy, worker.submit(.retry, &model));
+    model.phrase[0] = 'X';
+    try std.testing.expectEqualStrings("first phrase", worker.phrase.?);
+    worker.clearPayload();
 }

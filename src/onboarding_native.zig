@@ -179,7 +179,10 @@ pub const Native = struct {
             break :blk true;
         };
         if (final_exists) {
-            try self.validate();
+            if (state == null or state.?.step == .complete) {
+                const inspection = try wallet.inspect(self.io, self.allocator, self.paths, false);
+                if (inspection.state != .ready) return error.WalletUnavailable;
+            } else try self.validate();
             try wallet.syncDurability(self.io, self.paths);
             if (state == null) return .ready;
             if (state.?.step == .complete) {

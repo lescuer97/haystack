@@ -14,7 +14,7 @@ extension points.
 
 | File | Job | Talks to Raylib? |
 |---|---|---|
-| `src/main.zig` | allocator, window, the explicit per-frame loop or browser callback, teardown, screenshot hook | yes |
+| `src/main.zig` | allocator, window, the explicit per-frame loop or browser callback, teardown | yes |
 | `src/input.zig` | raw device polling, bounded text, and a device-free tick-count direction repeater | yes |
 | `src/frame_loop.zig` | shared schedule adapter, ordered bounded queue, modal routing, immediate effects, cached view/viewport | no device polling |
 | `src/game.zig` | `GameState` owns the world, camera, menu, and debug settings; applies input | indirectly |
@@ -51,7 +51,6 @@ while (!rl.windowShouldClose()) {
     // If due: drain records in order, dispatch each effect immediately,
     // calculate/cache view+viewport, stream once, then skipPast a fresh clock.
     // Persist changed settings; draw cached state on EVERY display frame.
-    // Capture a requested screenshot of the current frame before presentation.
 }
 ```
 
@@ -83,11 +82,6 @@ Why this order:
    take read-only pointers, so the compiler helps prevent accidental mutation.
    When the menu is open it is drawn after the world, HUD, and minimap, so its
    dim backdrop covers them. A blocking onboarding overlay is drawn last.
-
-Screenshot mode (`HAYSTACK_SHOT=/path.png`) runs a few frames, then captures
-**inside the drawing pass before `endDrawing` presents**, so the rendered world
-and HUD are included rather than a cleared black back buffer. It captures the
-current frame even during onboarding, including any visible recovery words.
 
 ### Input queue and cadence
 
@@ -125,13 +119,16 @@ per queued input or draw.
 
 ## Native wallet startup
 
-After the window and world are initialized, the first frame displays a blocking
-loading overlay. Native wallet inspection and, when needed, provisioning run
-on a joined background worker after that frame. A validated existing wallet proceeds directly to
-the game. A newly provisioned or pending wallet displays its recovery words and
-requires the player to acknowledge saving them before continuing. Completion
-must be persisted successfully; otherwise the player can retry. Invalid or
-unavailable wallet storage blocks startup without repairing existing data.
+A persistent native wallet worker is started before the window. It inspects
+storage asynchronously while the blocking loading overlay is active. A missing
+wallet offers Create or Recover; provisioning starts only after Create. A
+pending or newly created wallet displays its recovery words and requires the
+player to acknowledge saving them. Gameplay begins only after completion is
+persisted and the worker has opened and retained the wallet handle. If that
+open fails, Retry only opens the handle again; it does not repeat completion.
+Other invalid or unavailable wallet storage blocks startup without repair.
+Wallet operations reuse the same worker and handle, and shutdown joins it,
+including any active recovery scan.
 Copying is optional and exposes the words to other applications and clipboard
 history; the clipboard is not automatically cleared. The desktop wallet is
 persistent: `seed-words.txt` and `wallet.sqlite` live in a Haystack-owned wallet
@@ -153,7 +150,9 @@ or unavailable settings do not fail startup; they are preserved with autosave
 disabled or replaced with built-in settings, as described in
 [browser-storage.md](browser-storage.md).
 
-Once the settings gate succeeds, its continuation creates the heap-owned
+Once the settings gate succeeds, its continuation initializes the wallet service
+before creating a window. Module or service startup failure is fatal. After the
+service acknowledges startup, its continuation creates the heap-owned
 `BrowserContext` (the `GameState`, `input.Reader`, loop driver, and shared onboarding
 model), starts the asynchronous `BrowserOnboarding` inspection, and hands an
 Emscripten callback to `emscripten_set_main_loop(browserFrame, 0, 0)`. The context
@@ -163,12 +162,11 @@ stack frame. The page is never blocked.
 Wallet inspection and onboarding continue asynchronously and are delivered to
 the shared onboarding model. Until that model reports ready, it is blocking, so
 the frame loop keeps running but gameplay input is gated and the onboarding
-modal (initially a loading state) is drawn on the canvas. A wallet inspection,
-creation, recovery or storage failure appears as that blocked modal, not as the
-generic startup message. Ready means the persistent `haystack-user` records were
-provisioned and validated; the JS wallet is not retained as an open
-`BrowserWallet`, and there is no gameplay wallet-operation or spending bridge, so
-completing onboarding is not end-to-end in-game spending verification. See
+modal (initially a loading state) is drawn on the canvas. Inspection errors
+appear in the blocked modal; completion persistence errors retain their own
+failure state. After confirmed readiness or completion, the bridge opens and
+retains a `BrowserWallet` before delivering success. An open failure shows a
+retry that only retries opening, not provisioning or recovery. See
 [browser-wallet.md](browser-wallet.md) for the IndexedDB records and their
 limitations.
 
@@ -192,11 +190,13 @@ disabled. The browser page/main loop owns lifetime instead, and `EndDrawing`
 still polls input and timing normally. The browser also sets raylib's target FPS
 to zero so `requestAnimationFrame`, not a raylib sleep, controls pacing.
 
-Browser teardown is explicit and idempotent: `stopBrowser` clears the global
+Browser teardown is best effort: `stopBrowser` clears the global
 context first, unbinds the onboarding callbacks, closes the onboarding bridge,
 cancels the main loop, deinitializes the onboarding model and `GameState`,
 destroys the context, and closes the window. A callback that finds no context
-returns immediately, so no stage touches freed state after cleanup. Settings-gate
+returns immediately, so no stage touches freed state after cleanup. Accepted
+bridge work drains before the wallet and then the service are closed; tab
+destruction cannot guarantee that asynchronous cleanup finishes. Settings-gate
 or renderer-initialization failures log, run the same cleanup, call the generic
 error UI and never register a loop. Wallet/onboarding failures after startup keep
 the loop running behind the blocked modal instead. Both entry points disable

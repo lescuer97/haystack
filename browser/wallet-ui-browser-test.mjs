@@ -115,7 +115,7 @@ const instrumentation = `(() => {
             walletUiChecks.invoice=invoice;
           }
         }
-      }else if(typeof text==='string')walletUiChecks.events.push(JSON.parse(text).event);
+      }else if(!startup&&typeof text==='string')walletUiChecks.events.push(JSON.parse(text).event);
       return deliver.apply(this,arguments);
     };
   }});

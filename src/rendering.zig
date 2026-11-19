@@ -656,6 +656,8 @@ fn drawOnboarding(model: *const onboarding.Onboarding, vw: f32, vh: f32) void {
     rl.drawRectangleLinesEx(toRaylibRect(onboardingRect(layout.panel)), 2, menu_panel_border);
     switch (model.phase) {
         .loading => drawCenteredText("Loading wallet...", onboardingRect(layout.title), size, menu_title_color),
+        .opening => drawCenteredText("Opening wallet...", onboardingRect(layout.title), size, menu_title_color),
+        .open_failed => drawCenteredText("Unable to open wallet", onboardingRect(layout.title), size, menu_title_color),
         .completing => drawCenteredText("Completing setup...", onboardingRect(layout.title), size, menu_title_color),
         .restoring => drawCenteredText("Restoring wallet...", onboardingRect(layout.title), size, menu_title_color),
         .choice => {

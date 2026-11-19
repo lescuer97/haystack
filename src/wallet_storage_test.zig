@@ -572,3 +572,122 @@ test "symlinked managed entries are rejected" {
     );
     _ = try Io.Dir.cwd().statFile(testing.io, real_dir, .{ .follow_symlinks = false });
 }
+
+fn waitOnboarding(worker: *@import("wallet_service.zig").Worker, model: *@import("onboarding.zig").Onboarding) !void {
+    for (0..500) |_| {
+        if (worker.stepOnboarding(model)) return;
+        try testing.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    return error.WorkerTimeout;
+}
+
+test "native worker choice, backup transfer, open retry and retained wallet" {
+    const service = @import("wallet_service.zig");
+    const onboarding = @import("onboarding.zig");
+    const ui = @import("wallet_ui.zig");
+    var h = try Harness.init();
+    defer h.deinit();
+    const config_dir = try std.fs.path.join(testing.allocator, &.{ h.base, "config" });
+    defer testing.allocator.free(config_dir);
+    try sf.ensureOwnedDir(testing.io, config_dir);
+    const native = @import("onboarding_native.zig").Native{ .io = testing.io, .allocator = testing.allocator, .config_dir = config_dir, .paths = h.paths };
+    var model = onboarding.Onboarding.init(testing.allocator);
+    defer model.deinit();
+    {
+        const worker = try service.Worker.startNative(native);
+        defer worker.stop();
+        try waitOnboarding(worker, &model);
+        try testing.expectEqual(onboarding.Phase.choice, model.phase);
+        const inspection = try wallet.inspect(testing.io, testing.allocator, h.paths, false);
+        try testing.expectEqual(wallet.State.not_initialized, inspection.state);
+        try testing.expect(model.activateAction(.create_wallet).? == .create_requested);
+        try worker.submit(.create, &model);
+        try waitOnboarding(worker, &model);
+        try testing.expectEqual(onboarding.Phase.backup, model.phase);
+        try testing.expect(model.mnemonic() != null);
+        try testing.expect(worker.event != .backup);
+        model.saved = true;
+        try testing.expect(model.activateAction(.complete_backup).? == .complete_requested);
+        worker.fail_open.store(true, .release);
+        try worker.submit(.complete, &model);
+        try waitOnboarding(worker, &model);
+        try testing.expectEqual(onboarding.Phase.open_failed, model.phase);
+        try testing.expect(model.mnemonic() == null);
+        try testing.expect(model.activateAction(.retry_open).? == .retry_open_requested);
+        try worker.submit(.retry_open, &model);
+        try waitOnboarding(worker, &model);
+        try testing.expectEqual(onboarding.Phase.open_failed, model.phase);
+        worker.fail_open.store(false, .release);
+        try testing.expect(model.activateAction(.retry_open).? == .retry_open_requested);
+        try worker.submit(.retry_open, &model);
+        try waitOnboarding(worker, &model);
+        try testing.expectEqual(onboarding.Phase.inactive, model.phase);
+        try testing.expectError(error.CdkFailure, wallet.inspect(testing.io, testing.allocator, h.paths, true));
+        var wallet_model = ui.Model{};
+        wallet_model.tick(true, 0);
+        for (0..250) |_| {
+            _ = worker.step(&wallet_model, 0);
+            if (!wallet_model.pending) break;
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        try testing.expect(wallet_model.available and !wallet_model.pending);
+    }
+    var resumed = onboarding.Onboarding.init(testing.allocator);
+    defer resumed.deinit();
+    const worker = try service.Worker.startNative(native);
+    defer worker.stop();
+    try waitOnboarding(worker, &resumed);
+    try testing.expectEqual(onboarding.Phase.inactive, resumed.phase);
+    try testing.expectError(error.CdkFailure, wallet.inspect(testing.io, testing.allocator, h.paths, true));
+}
+
+test "native worker shutdown cleans unread backup result" {
+    const service = @import("wallet_service.zig");
+    const onboarding = @import("onboarding.zig");
+    var h = try Harness.init();
+    defer h.deinit();
+    const config_dir = try std.fs.path.join(testing.allocator, &.{ h.base, "config" });
+    defer testing.allocator.free(config_dir);
+    try sf.ensureOwnedDir(testing.io, config_dir);
+    const native = @import("onboarding_native.zig").Native{ .io = testing.io, .allocator = testing.allocator, .config_dir = config_dir, .paths = h.paths };
+    var model = onboarding.Onboarding.init(testing.allocator);
+    defer model.deinit();
+    const worker = try service.Worker.startNative(native);
+    try waitOnboarding(worker, &model);
+    _ = model.activateAction(.create_wallet);
+    try worker.submit(.create, &model);
+    for (0..500) |_| {
+        if (worker.state.load(.acquire) == .result) break;
+        try testing.io.sleep(.fromMilliseconds(20), .awake);
+    }
+    try testing.expect(worker.state.load(.acquire) == .result);
+    try testing.expect(worker.event == .backup);
+    worker.stop();
+}
+
+test "existing complete wallet open failure retries only open" {
+    const service = @import("wallet_service.zig");
+    const onboarding = @import("onboarding.zig");
+    var h = try Harness.init();
+    defer h.deinit();
+    const config_dir = try std.fs.path.join(testing.allocator, &.{ h.base, "config" });
+    defer testing.allocator.free(config_dir);
+    try sf.ensureOwnedDir(testing.io, config_dir);
+    const created = try wallet.create(testing.io, testing.allocator, h.paths);
+    defer created.deinit(testing.allocator);
+    var locked = try wallet.inspect(testing.io, testing.allocator, h.paths, true);
+    const native = @import("onboarding_native.zig").Native{ .io = testing.io, .allocator = testing.allocator, .config_dir = config_dir, .paths = h.paths };
+    var model = onboarding.Onboarding.init(testing.allocator);
+    defer model.deinit();
+    const worker = try service.Worker.startNative(native);
+    defer worker.stop();
+    try waitOnboarding(worker, &model);
+    try testing.expectEqual(onboarding.Phase.open_failed, model.phase);
+    try testing.expect(model.mnemonic() == null);
+    try locked.close();
+    _ = model.activateAction(.retry_open);
+    try worker.submit(.retry_open, &model);
+    try waitOnboarding(worker, &model);
+    try testing.expectEqual(onboarding.Phase.inactive, model.phase);
+    try testing.expectError(error.CdkFailure, wallet.inspect(testing.io, testing.allocator, h.paths, true));
+}

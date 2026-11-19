@@ -3,9 +3,9 @@
 //! Never copy an Onboarding value: it uniquely owns its mnemonic allocation.
 const std = @import("std");
 
-pub const Phase = enum { loading, choice, phrase_entry, restoring, restore_failed, restore_result, backup, completing, blocked, inactive };
+pub const Phase = enum { loading, choice, phrase_entry, restoring, restore_failed, restore_result, backup, completing, open_failed, opening, blocked, inactive };
 pub const Step = enum { backup_seed };
-pub const Action = union(enum) { create_wallet, enter_recovery, paste_phrase, restore_phrase, back_to_choice, retry_recovery, generate_wallet, finish_restore, copy_seed, copy_word: u8, toggle_backup_saved, complete_backup };
+pub const Action = union(enum) { create_wallet, enter_recovery, paste_phrase, restore_phrase, back_to_choice, retry_recovery, retry_open, generate_wallet, finish_restore, copy_seed, copy_word: u8, toggle_backup_saved, complete_backup };
 pub const Control = struct { action: Action, label: [:0]const u8, rect: Rect, enabled: bool, kind: enum { button, checkbox, word } = .button };
 pub const Controls = struct {
     items: [15]Control = undefined,
@@ -23,7 +23,7 @@ pub const Controls = struct {
         return null;
     }
 };
-pub const Effect = union(enum) { copy_requested, copy_word_requested: u8, complete_requested, create_requested, paste_requested, restore_requested, retry_requested, generate_requested, finish_restore_requested };
+pub const Effect = union(enum) { copy_requested, copy_word_requested: u8, complete_requested, create_requested, paste_requested, restore_requested, retry_requested, retry_open_requested, generate_requested, finish_restore_requested };
 
 pub const RestoreReport = struct {
     spendable_sats: u64,
@@ -38,6 +38,8 @@ pub const Event = union(enum) {
     ready,
     backup: []u8,
     blocked,
+    open_failed,
+    open_success,
     complete_success,
     complete_fail,
     choice: struct { recover_enabled: bool },
@@ -284,6 +286,16 @@ pub const Onboarding = struct {
                 self.phase = .blocked;
                 self.selected = null;
             },
+            .open_failed => if (self.phase == .loading or self.phase == .completing or self.phase == .opening) {
+                self.clearSecret();
+                self.clearPhrase();
+                self.phase = .open_failed;
+                self.selected = .retry_open;
+            },
+            .open_success => if (self.phase == .opening) {
+                self.phase = .inactive;
+                self.selected = null;
+            },
             .complete_success => if (self.phase == .completing) {
                 self.clearSecret();
                 self.clearPhrase();
@@ -372,6 +384,7 @@ pub const Onboarding = struct {
                 result.add(.back_to_choice, "Back", layout.continue_button, !self.recovery_preparation_pending, .button);
             },
             .restore_failed => result.add(.retry_recovery, "Retry", layout.copy, true, .button),
+            .open_failed => result.add(.retry_open, "Retry", layout.copy, true, .button),
             .restore_result => {
                 if (self.hasFundsOrHistory()) {
                     result.add(.finish_restore, "Continue", layout.copy, true, .button);
@@ -446,6 +459,11 @@ pub const Onboarding = struct {
                 }
                 return self.startAttempt(.retry_requested);
             },
+            .retry_open => {
+                self.phase = .opening;
+                self.selected = null;
+                return .retry_open_requested;
+            },
             .generate_wallet => {
                 self.clearPhrase();
                 self.phase = .loading;
@@ -498,7 +516,7 @@ pub const Onboarding = struct {
                 self.phrase_len += len;
             }
         }
-        if (self.phase != .backup and self.phase != .choice and self.phase != .phrase_entry and self.phase != .restore_failed and self.phase != .restore_result) return .{ .consumed = true };
+        if (self.phase != .backup and self.phase != .choice and self.phase != .phrase_entry and self.phase != .restore_failed and self.phase != .restore_result and self.phase != .open_failed) return .{ .consumed = true };
 
         const layout = calculateLayout(frame.viewport_w, frame.viewport_h);
         const list = self.controls(layout);
@@ -946,4 +964,24 @@ test "hover uses enabled controls in current phase" {
     try std.testing.expect(!backup.hoverEnabled(layout, layout.continue_button.centerX(), layout.continue_button.centerY()));
     backup.receive(.complete_success);
     try std.testing.expect(!backup.hoverEnabled(layout, word.centerX(), word.centerY()));
+}
+
+test "native open failure clears secrets and retry accepts keyboard and click" {
+    var m = Onboarding.init(std.testing.allocator);
+    defer m.deinit();
+    m.receive(.{ .backup = try std.testing.allocator.dupe(u8, "secret words") });
+    m.saved = true;
+    _ = m.activateAction(.complete_backup);
+    m.receive(.open_failed);
+    try std.testing.expect(m.mnemonic() == null);
+    try std.testing.expectEqual(Phase.open_failed, m.phase);
+    try std.testing.expect(m.applyInput(.{ .confirm = true }).effect.? == .retry_open_requested);
+    try std.testing.expectEqual(Phase.opening, m.phase);
+    m.receive(.open_failed);
+    const rect = calculateLayout(1000, 640).copy;
+    try std.testing.expect(m.applyInput(.{ .clicked = true, .pointer_x = rect.centerX(), .pointer_y = rect.centerY() }).effect.? == .retry_open_requested);
+    m.receive(.open_success);
+    try std.testing.expectEqual(Phase.inactive, m.phase);
+    m.receive(.open_failed);
+    try std.testing.expectEqual(Phase.inactive, m.phase);
 }

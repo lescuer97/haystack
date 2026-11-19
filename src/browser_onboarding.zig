@@ -1,6 +1,36 @@
 //! Bounded callback mailbox. Callbacks never touch the onboarding model.
 const std = @import("std");
 const onboarding = @import("onboarding.zig");
+const wallet_ui = @import("wallet_ui.zig");
+
+pub const ClipboardTarget = union(enum) { none, recovery: u64, withdrawal };
+pub const ClipboardIdentity = struct {
+    target: ClipboardTarget = .none,
+    epoch: u64 = 0,
+
+    pub fn sync(self: *ClipboardIdentity, target: ClipboardTarget) void {
+        if (!std.meta.eql(self.target, target)) {
+            self.target = target;
+            self.epoch +%= 1;
+        }
+    }
+};
+
+test "clipboard identity changes on leave and reentry" {
+    var identity: ClipboardIdentity = .{};
+    identity.sync(.{ .recovery = 1 });
+    const first = identity.epoch;
+    identity.sync(.{ .recovery = 1 });
+    try std.testing.expectEqual(first, identity.epoch);
+    identity.sync(.none);
+    identity.sync(.{ .recovery = 1 });
+    try std.testing.expect(identity.epoch != first);
+    identity.sync(.withdrawal);
+    const withdrawal = identity.epoch;
+    identity.sync(.none);
+    identity.sync(.withdrawal);
+    try std.testing.expect(identity.epoch != withdrawal);
+}
 
 pub const ClipboardMailbox = struct {
     bytes: [1024]u8 = @splat(0),
@@ -93,7 +123,7 @@ test "clipboard probe and mailbox lifecycle" {
     try std.testing.expect(std.mem.allEqual(u8, &mailbox.bytes, 0));
 }
 
-pub const Op = enum { inspect, create, restore, retry, generate, finish_restore, complete_backup };
+pub const Op = enum { inspect, create, restore, retry, generate, finish_restore, complete_backup, retry_open };
 pub const Result = struct { status: c_int, op: Op, bytes: [4096]u8 = undefined, len: u32 };
 const StartCallback = *const fn (c_int, u32, [*c]const u8, u32) callconv(.c) void;
 const RequestCallback = *const fn (c_int, u32, u32, [*c]const u8, u32) callconv(.c) void;
@@ -112,13 +142,15 @@ var active: bool = false;
 var known_stage: bool = false;
 var operation: Op = .inspect;
 var result: ?Result = null;
+var startup_continuation: ?*const fn (bool) void = null;
 
-pub fn start() !void {
+pub fn start(continuation: *const fn (bool) void) !void {
     if (active or pending or result != null) return error.Busy;
     generation +%= 1;
     known_stage = false;
     starting = true;
     pending = true;
+    startup_continuation = continuation;
     haystack_onboarding_start(generation, startupCallback);
 }
 
@@ -149,6 +181,11 @@ pub fn close() void {
     pending = false;
     starting = false;
     active = false;
+    startup_continuation = null;
+    wallet_result_serial = null;
+    wallet_pending_serial = null;
+    std.crypto.secureZero(u8, &wallet_mailbox.bytes);
+    wallet_mailbox.len = 0;
     known_stage = false;
     if (result) |*r| std.crypto.secureZero(u8, &r.bytes);
     result = null;
@@ -161,7 +198,9 @@ fn record(status: c_int, ptr: [*c]const u8, len: u32, op: Op) void {
         if (len != 0) @memcpy(value.bytes[0..len], ptr[0..len]);
         // Only validated JSON events can establish knowledge of a durable stage.
     } else {
-        const fallback = if (op == .complete_backup or op == .finish_restore)
+        const fallback = if (op == .retry_open)
+            "{\"event\":\"open_failed\"}"
+        else if (op == .complete_backup or op == .finish_restore)
             "{\"event\":\"complete_fail\"}"
         else if (op == .retry and known_stage)
             "{\"event\":\"restore_failed\",\"stage_created\":true,\"can_generate_new\":false}"
@@ -178,8 +217,10 @@ fn startupCallback(status: c_int, gen: u32, ptr: [*c]const u8, len: u32) callcon
     if (gen != generation or !pending or !starting) return;
     pending = false;
     starting = false;
-    active = status == 1 and len <= 4096 and (len == 0 or ptr != null);
-    record(status, ptr, len, .inspect);
+    active = status == 1 and len == 0 and ptr == null;
+    const continuation = startup_continuation;
+    startup_continuation = null;
+    if (continuation) |callback| callback(active);
 }
 fn requestCallback(status: c_int, gen: u32, tok: u32, ptr: [*c]const u8, len: u32) callconv(.c) void {
     if (gen != generation or !pending or starting or tok != token) return;
@@ -230,12 +271,22 @@ pub fn decode(r: *const Result, allocator: std.mem.Allocator, attempt_id: u64) !
     const eq = std.mem.eql;
     if (eq(u8, name, "blocked")) {
         try exact(root, 1);
-        if (r.op == .complete_backup or r.op == .finish_restore) return error.InvalidEvent;
+        if (r.op == .complete_backup or r.op == .finish_restore or r.op == .retry_open) return error.InvalidEvent;
         return .blocked;
+    }
+    if (eq(u8, name, "open_failed")) {
+        try exact(root, 1);
+        if (r.op != .inspect and r.op != .complete_backup and r.op != .finish_restore and r.op != .retry_open) return error.InvalidEvent;
+        return .open_failed;
+    }
+    if (eq(u8, name, "open_success")) {
+        try exact(root, 1);
+        if (r.op != .retry_open) return error.InvalidEvent;
+        return .open_success;
     }
     if (eq(u8, name, "ready")) {
         try exact(root, 1);
-        if (r.op != .inspect) return error.InvalidEvent;
+        if (r.op != .inspect or !eq(u8, r.bytes[0..r.len], "{\"event\":\"ready\"}")) return error.InvalidEvent;
         return .ready;
     }
     if (eq(u8, name, "choice")) {
@@ -266,6 +317,7 @@ pub fn decode(r: *const Result, allocator: std.mem.Allocator, attempt_id: u64) !
     if (eq(u8, name, "complete_success") or eq(u8, name, "complete_fail")) {
         try exact(root, 1);
         if (r.op != .complete_backup and r.op != .finish_restore) return error.InvalidEvent;
+        if (eq(u8, name, "complete_success") and !eq(u8, r.bytes[0..r.len], "{\"event\":\"complete_success\"}")) return error.InvalidEvent;
         return if (eq(u8, name, "complete_success")) .complete_success else .complete_fail;
     }
     if (eq(u8, name, "resume_failed")) {
@@ -303,7 +355,7 @@ pub fn deliver(r: *const Result, model: *onboarding.Onboarding) void {
     };
     switch (event) {
         .resume_failed, .resume_result, .restore_failed, .restore_finished => known_stage = true,
-        .choice, .ready, .backup, .complete_success => known_stage = false,
+        .choice, .ready, .backup, .complete_success, .open_failed, .open_success => known_stage = false,
         else => {},
     }
     model.receive(event);
@@ -312,13 +364,43 @@ pub fn deliver(r: *const Result, model: *onboarding.Onboarding) void {
 // Retain all bridge symbols in the renderer without starting the service.
 pub fn link(which: u32) callconv(.c) void {
     switch (which) {
-        1 => start() catch {},
+        1 => start(linkStarted) catch {},
         2 => {
             _ = request("inspect", "{}") catch 0;
         },
         3 => close(),
         else => {},
     }
+}
+fn linkStarted(_: bool) void {}
+
+var wallet_mailbox: wallet_ui.Text(128 * 1024) = .{};
+var wallet_result_serial: ?u32 = null;
+var wallet_pending_serial: ?u32 = null;
+var wallet_result_ok = false;
+extern "c" fn haystack_wallet_request(u32, u32, c_int, [*]const u8, u32, *const fn (c_int, u32, u32, [*c]const u8, u32) callconv(.c) void) void;
+fn walletCallback(ok: c_int, gen: u32, serial: u32, ptr: [*c]const u8, len: u32) callconv(.c) void {
+    if (!active or gen != generation or wallet_pending_serial == null or wallet_pending_serial.? != serial or wallet_result_serial != null) return;
+    wallet_result_serial = serial;
+    wallet_result_ok = len <= 128 * 1024 and (len == 0 or ptr != null) and ok == 1 and wallet_mailbox.set(if (len == 0) "" else ptr[0..len]);
+}
+pub fn stepWallet(model: *wallet_ui.Model, enabled: bool, now: f64) bool {
+    var accepted = false;
+    if (wallet_result_serial) |serial| {
+        accepted = model.pending and model.serial == serial;
+        if (wallet_result_ok) model.accept(serial, wallet_mailbox.slice(), now, std.heap.c_allocator) else model.fail(serial, now);
+        wallet_result_serial = null;
+        wallet_pending_serial = null;
+        std.crypto.secureZero(u8, &wallet_mailbox.bytes);
+        wallet_mailbox.len = 0;
+    }
+    model.tick(enabled, now);
+    if (model.request) |req| {
+        wallet_pending_serial = req.serial;
+        haystack_wallet_request(generation, req.serial, @intCast(@backingInt(req.operation)), req.argument.slice().ptr, @intCast(req.argument.len), walletCallback);
+        model.request = null;
+    }
+    return accepted;
 }
 
 test "stale tokens, generations, duplicate callbacks and bounded results" {
@@ -358,6 +440,9 @@ test "retry failure only reports a known stage" {
     record(0, null, 0, .restore);
     r = take().?;
     try std.testing.expectEqualStrings("{\"event\":\"blocked\"}", r.bytes[0..r.len]);
+    record(0, null, 0, .retry_open);
+    r = take().?;
+    try std.testing.expectEqualStrings("{\"event\":\"open_failed\"}", r.bytes[0..r.len]);
 }
 
 fn testResult(op: Op, text: []const u8) Result {
@@ -378,13 +463,21 @@ test "strict event decoding and operation gating" {
         .{ .restore, "{\"event\":\"restore_finished\",\"report\":{\"spendable_sats\":\"0\",\"pending_sats\":\"0\",\"spent_sats\":\"0\",\"can_generate_new\":true}}" },
         .{ .complete_backup, "{\"event\":\"complete_success\"}" },
         .{ .finish_restore, "{\"event\":\"complete_fail\"}" },
+        .{ .inspect, "{\"event\":\"open_failed\"}" },
+        .{ .retry_open, "{\"event\":\"open_success\"}" },
     };
     for (cases) |c| _ = try decode(&testResult(c[0], c[1]), std.testing.allocator, 42);
     const bad = [_]struct { Op, []const u8 }{
         .{ .create, "{\"event\":\"ready\"}" },
+        .{ .create, "{\"event\":\"open_failed\"}" },
+        .{ .inspect, "{\"event\":\"open_success\"}" },
         .{ .retry, "{\"event\":\"invalid_phrase\"}" },
         .{ .finish_restore, "{\"event\":\"blocked\"}" },
         .{ .inspect, "{\"event\":\"ready\",\"extra\":1}" },
+        .{ .inspect, "{ \"event\":\"ready\"}" },
+        .{ .inspect, "{\"event\":\"\\u0072eady\"}" },
+        .{ .complete_backup, "{\"event\": \"complete_success\"}" },
+        .{ .finish_restore, "{\"event\":\"complete_succes\\u0073\"}" },
         .{ .inspect, "{\"event\":\"ready\",\"event\":\"ready\"}" },
         .{ .inspect, "{\"event\":\"choice\",\"recover_enabled\":false}" },
         .{ .inspect, "{\"event\":\"resume_failed\",\"can_generate_new\":true}" },
@@ -397,6 +490,26 @@ test "strict event decoding and operation gating" {
         if (decode(&testResult(c[0], c[1]), std.testing.allocator, 42)) |_| {
             return error.TestExpectedError;
         } else |_| {}
+    }
+}
+
+test "ready and open operation gates" {
+    const ops = std.meta.tags(Op);
+    for (ops) |op| {
+        const cases = [_]struct { []const u8, bool }{
+            .{ "{\"event\":\"ready\"}", op == .inspect },
+            .{ "{\"event\":\"complete_success\"}", op == .complete_backup or op == .finish_restore },
+            .{ "{\"event\":\"complete_fail\"}", op == .complete_backup or op == .finish_restore },
+            .{ "{\"event\":\"open_failed\"}", op == .inspect or op == .complete_backup or op == .finish_restore or op == .retry_open },
+            .{ "{\"event\":\"open_success\"}", op == .retry_open },
+        };
+        for (cases) |case| {
+            if (case[1]) {
+                _ = try decode(&testResult(op, case[0]), std.testing.allocator, 0);
+            } else {
+                try std.testing.expectError(error.InvalidEvent, decode(&testResult(op, case[0]), std.testing.allocator, 0));
+            }
+        }
     }
 }
 
@@ -418,17 +531,20 @@ test "backup ownership validation and scan attempt" {
     try std.testing.expect(event == .invalid_phrase and event.invalid_phrase == 42);
 }
 
-test "startup callback defers model delivery and fails closed" {
-    var model = onboarding.Onboarding.init(std.testing.allocator);
-    defer model.deinit();
+test "startup callback ignores stale and malformed acknowledgements" {
     generation = 88;
     pending = true;
     starting = true;
     result = null;
+    startup_continuation = null;
+    startupCallback(1, 87, null, 0);
+    try std.testing.expect(pending);
     startupCallback(0, 88, null, 0);
-    try std.testing.expect(model.phase == .loading);
-    var r = take().?;
-    defer std.crypto.secureZero(u8, &r.bytes);
-    deliver(&r, &model);
-    try std.testing.expect(model.phase == .blocked);
+    try std.testing.expect(!active and take() == null);
+    pending = true;
+    starting = true;
+    startupCallback(1, 88, null, 1);
+    try std.testing.expect(!active and !pending);
+    startupCallback(1, 88, null, 0);
+    try std.testing.expect(!active);
 }

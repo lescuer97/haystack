@@ -37,7 +37,7 @@ const tick = () => new Promise(r => setImmediate(r));
 bridge.start(1, callback);
 await tick();
 assert.equal(events.length, 1);
-assert.deepEqual(calls[0], ['inspect', '{}']);
+assert.equal(calls.length, 0, 'startup acknowledgement precedes inspect');
 heap.set(new TextEncoder().encode('create'), 0);
 heap.set(new TextEncoder().encode('{"x":1}'), 100);
 bridge.request(1, 5, 0, 6, 100, 7, callback);
@@ -46,14 +46,13 @@ bridge.request(1, 6, 0, 0, 0, 0, callback);
 bridge.close(1);
 bridge.start(2, callback);
 await tick();
-assert.equal(events.length, 2); // rejected second startup, while first request is in flight
-assert.equal(events[1][0], 0);
-assert.deepEqual(calls[1], ['create', '{"x":1}']);
+assert.equal(events.length, 1); // closing session suppresses all callbacks
+assert.deepEqual(calls[0], ['create', '{"x":1}']);
 assert.equal(calls.some(c => c[0] === 'close'), false);
 release();
 await tick();
-assert.deepEqual(calls.slice(2).map(c => c[0]), ['', 'close', 'free']);
-assert.deepEqual(events.slice(2).map(e => e[2]), [5, 6]);
+assert.deepEqual(calls.slice(1).map(c => c[0]), ['', 'close', 'free']);
+assert.equal(events.length, 1, 'queued work completes without callbacks after close');
 bridge.start(3, callback);
 await tick();
 assert.equal(events.at(-1)[1], 3);
@@ -78,7 +77,7 @@ const canvas = {
   getBoundingClientRect: () => ({ left: 10, top: 20, width: 200, height: 100 }),
 };
 context.document = { getElementById: () => canvas, activeElement: canvas };
-let resolveWrite, writes = [], pasted = [], copied = [], code = 1;
+let resolveWrite, writes = [], pasted = [], copied = [], code = 1, epoch = 1;
 context.navigator = { clipboard: {
   writeText: text => { writes.push(text); return new Promise(r => { resolveWrite = r; }); },
   readText: () => Promise.resolve('read phrase'),
@@ -87,7 +86,8 @@ alloc = 8192;
 const probe = (kind, x, y, ptr, cap) => {
   assert.equal(cap, 4097);
   if (kind === 0) assert.deepEqual([x, y], [500000, 500000]);
-  heap.set(new TextEncoder().encode('secret'), ptr);
+  if (code === 14 || code === 16) new DataView(heap.buffer).setBigUint64(ptr, BigInt(epoch), true);
+  else heap.set(new TextEncoder().encode('secret'), ptr);
   return code;
 };
 const paste = (ptr, len) => pasted.push(new TextDecoder().decode(heap.slice(ptr, ptr + len)));
@@ -118,6 +118,152 @@ assert.deepEqual(pasted, ['phrase', 'read phrase']);
 code = 1;
 listeners.get('pointerdown')(pointer(true));
 bridge.unbindInput();
+
+// Service startup and operational opening are separate from durable requests.
+{
+  alloc = 8192;
+  let resolveInit, resolveOpen, opens = 0, failOpen = true, locked = false;
+  const log = [], received = [];
+  const lifecycleWallet = {
+    async call(op) { log.push(op); return '{"status":0,"value":"{}"}'; },
+    async close() { log.push('wallet-close'); },
+    free() { log.push('wallet-free'); },
+  };
+  const lifecycleService = {
+    async request(op) {
+      locked = true;
+      log.push(op);
+      locked = false;
+      return JSON.stringify({ event: op === 'inspect' ? 'ready' : 'complete_success' });
+    },
+    async open_ready_wallet() {
+      assert.equal(locked, false, 'request lock is released before open');
+      opens++;
+      if (failOpen) throw Error('open');
+      if (resolveOpen) await new Promise(r => { resolveOpen = r; });
+      return lifecycleWallet;
+    },
+    async close() { log.push('service-close'); },
+    free() { log.push('service-free'); },
+  };
+  const cb = (status, gen, ...rest) => {
+    const len = rest.pop(), ptr = rest.pop();
+    received.push([status, gen, ...rest, new TextDecoder().decode(heap.subarray(ptr, ptr + len))]);
+  };
+  const send = (gen, token, op) => {
+    const bytes = new TextEncoder().encode(op);
+    heap.set(bytes, 0);
+    bridge.request(gen, token, 0, bytes.length, 100, 2, cb);
+  };
+  heap.set(new TextEncoder().encode('{}'), 100);
+  bridge.resolveModule = async () => ({ default: async () => {}, onboarding_mint: () => 'fixture',
+    start_onboarding: () => new Promise(r => { resolveInit = r; }) });
+  bridge.start(10, cb);
+  await tick();
+  assert.equal(received.length, 0);
+  resolveInit(lifecycleService);
+  await tick();
+  assert.deepEqual(received.map(x => x[0]), [1]);
+  assert.deepEqual(log, [], 'startup never inspects');
+  for (const [token, op] of [[1, 'inspect'], [2, 'complete_backup'], [3, 'finish_restore']]) {
+    send(10, token, op);
+    await tick();
+    assert.equal(JSON.parse(received.at(-1).at(-1)).event, 'open_failed');
+  }
+  assert.equal(opens, 3);
+  const requestsBeforeRetry = log.length;
+  failOpen = false;
+  resolveOpen = true;
+  send(10, 4, 'retry_open');
+  await tick();
+  assert.equal(received.length, 4, 'success waits for open');
+  assert.equal(log.length, requestsBeforeRetry, 'retry does not repeat persistence');
+  resolveOpen();
+  await tick();
+  assert.equal(JSON.parse(received.at(-1).at(-1)).event, 'open_success');
+  bridge.walletRequest(10, 5, 0, 0, 0, cb);
+  await tick();
+  assert.equal(opens, 4, 'wallet screen reuses retained handle');
+  assert.equal(log.at(-1), 'wallet_screen');
+  bridge.close(10);
+  await tick();
+  assert.deepEqual(log.slice(-4), ['wallet-close', 'wallet-free', 'service-close', 'service-free']);
+
+  received.length = 0;
+  bridge.resolveModule = async () => { throw Error('init'); };
+  bridge.start(11, cb);
+  await tick();
+  assert.equal(received[0][0], 0);
+  bridge.close(11);
+  await tick();
+
+  received.length = 0;
+  bridge.resolveModule = async () => ({ default: async () => {}, onboarding_mint: () => 'fixture',
+    start_onboarding: () => new Promise(r => { resolveInit = r; }) });
+  bridge.start(12, cb);
+  await tick();
+  bridge.close(12);
+  resolveInit(lifecycleService);
+  await tick();
+  assert.equal(received.length, 0, 'close during init suppresses startup');
+  assert.deepEqual(log.slice(-2), ['service-close', 'service-free']);
+
+  received.length = 0;
+  bridge.resolveModule = async () => ({ default: async () => {}, onboarding_mint: () => 'fixture',
+    start_onboarding: async () => lifecycleService });
+  bridge.start(17, () => { throw Error('callback'); });
+  await tick();
+  assert.deepEqual(log.slice(-2), ['service-close', 'service-free'], 'throwing startup callback closes service');
+
+  received.length = 0;
+  resolveOpen = true;
+  bridge.resolveModule = async () => ({ default: async () => {}, onboarding_mint: () => 'fixture',
+    start_onboarding: async () => lifecycleService });
+  bridge.start(13, cb);
+  await tick();
+  send(13, 1, 'inspect');
+  await tick();
+  assert.equal(received.length, 1, 'ready is not delivered before open');
+  bridge.close(13);
+  resolveOpen();
+  await tick();
+  assert.equal(received.length, 1, 'close during open suppresses ready');
+  assert.deepEqual(log.slice(-4), ['wallet-close', 'wallet-free', 'service-close', 'service-free']);
+
+  for (const [gen, op, expected] of [[14, 'inspect', 'ready'], [15, 'complete_backup', 'complete_success'], [16, 'finish_restore', 'complete_success']]) {
+    resolveOpen = false;
+    bridge.start(gen, cb);
+    await tick();
+    send(gen, 1, op);
+    await tick();
+    assert.equal(JSON.parse(received.at(-1).at(-1)).event, expected);
+    bridge.close(gen);
+    await tick();
+  }
+  let response = '';
+  lifecycleService.request = async () => response;
+  resolveOpen = false;
+  bridge.start(18, cb);
+  await tick();
+  const before = opens;
+  for (const [op, text] of [
+    ['inspect', '{ "event":"ready"}'],
+    ['inspect', '{"event":"\\u0072eady"}'],
+    ['complete_backup', '{"event": "complete_success"}'],
+    ['finish_restore', '{"event":"complete_success","extra":1}'],
+    ['inspect', '{"event":"backup","mnemonic":"one two three"}'],
+  ]) {
+    response = text;
+    send(18, 1, op);
+    await tick();
+    assert.equal(received.at(-1).at(-1), text, 'noncanonical and backup responses pass through unchanged');
+  }
+  assert.equal(opens, before, 'only canonical success opens the wallet');
+  bridge.close(18);
+  await tick();
+  bridge.resolveModule = async () => ({ default: async () => {}, onboarding_mint: () => 'fixture',
+    start_onboarding: async () => service });
+}
 alloc = 8192;
 code = 16;
 bridge.bindInput(probe, paste, success);
@@ -137,6 +283,14 @@ listeners.get('pointerdown')(pointer(true));
 code = 14; // Focus changed to onboarding while the asynchronous read was pending.
 resolveRead(longInvoice); await tick();
 assert.equal(pasted.length, priorPastes, 'late clipboard data cannot cross the target focus boundary');
+code = 16;
+listeners.get('pointerdown')(pointer(true));
+epoch++;
+resolveRead('stale'); await tick();
+assert.equal(pasted.length, priorPastes, 'same action with a new focus epoch rejects delayed data');
+listeners.get('pointerdown')(pointer(true));
+resolveRead('current'); await tick();
+assert.equal(pasted.at(-1), 'current', 'unchanged focus epoch accepts delayed data');
 bridge.unbindInput();
 const walletCalls = [];
 const walletArgs = [];
@@ -159,6 +313,14 @@ service.open_ready_wallet = async () => {
 };
 bridge.start(4, callback);
 await tick();
+service.request = async (...args) => {
+  requestHeld = true;
+  try { calls.push(args); return '{"event":"ready"}'; }
+  finally { requestHeld = false; }
+};
+heap.set(new TextEncoder().encode('inspect'), 200);
+bridge.request(4, 50, 200, 7, 0, 0, callback);
+await tick();
 bridge.walletRequest(4, 1, 0, 0, 0, callback);
 await tick();
 assert.deepEqual(walletCalls, ['open', 'wallet_screen']);
@@ -177,9 +339,11 @@ heap.fill(0,1000,5096); // Publication must have copied the argument.
 for (const operation of [10,11,12,13]) bridge.walletRequest(4,10+operation,operation,200,5,callback);
 bridge.walletRequest(4,30,9,1000,4097,callback); // Refused before any wallet call.
 bridge.walletRequest(4,6,99,0,0,callback);
+const beforeWalletClose = events.length;
 bridge.close(4);
 assert.equal(walletCalls.includes('close'), false);
 finishWallet(); await tick();
+assert.equal(events.length, beforeWalletClose, 'close suppresses wallet callbacks');
 assert.deepEqual(walletCalls, ['open', 'wallet_screen', 'wallet_screen', 'quote_history_page', 'resume_deposit', 'deposit_update', 'deposit_update', 'saved_invoice', 'deposit_update', 'prepare_withdrawal', 'confirm_withdrawal', 'cancel_withdrawal', 'saved_withdrawal', 'poll_withdrawals', 'close', 'free']);
 assert.deepEqual(walletArgs.slice(2),[['quote_history_page',['0']],['resume_deposit',['fixture']],['deposit_update',['fixture','recover','']],['deposit_update',['fixture','poll','after']],['saved_invoice',['fixture','after']],['deposit_update',['fixture','check','after']],['prepare_withdrawal',['fixture',longInvoice]],['confirm_withdrawal',['fixture','after']],['cancel_withdrawal',['fixture','after']],['saved_withdrawal',['fixture','after']],['poll_withdrawals',['fixture','after']]]);
 assert.equal(walletCalls.includes('check_deposit'),false,'unknown operation must not fall through to check');
@@ -190,6 +354,8 @@ assert.equal(listeners.size, 0);
 bridge.bindInput(probe, paste, success);
 bridge.unbindInput();
 bridge.start(5, callback);await tick();
+heap.set(new TextEncoder().encode('inspect'),200);
+bridge.request(5,50,200,7,0,0,callback);await tick();
 bridge.walletRequest(5,1,0,0,0,callback);await tick();
 for(const [operation,status] of [[9,2],[10,14],[11,19],[12,13],[13,23]]) {
   walletStatus=status;

@@ -92,7 +92,7 @@ const instrumentation = `(() => {
         if(typeof value?.creation_recovery==='string')checks.creationRecovery=value.creation_recovery;
         if(value?.sats!==undefined)checks.snapshot=value;
         if(Array.isArray(value?.rows))checks.history=value;
-      }else if(typeof text==='string')checks.events.push(JSON.parse(text).event);
+      }else if(!startup&&typeof text==='string')checks.events.push(JSON.parse(text).event);
       return deliver.apply(this,arguments);
     };
   }});

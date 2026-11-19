@@ -6,7 +6,7 @@ import {access, mkdir, writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {strict as assert} from 'node:assert';
 import {
-  bounded, CdpConnection, discoverEndpoint, disposableRoot, makeProfile,
+  bounded, CdpConnection, discoverEndpoint, disposableRoot, launchBrowser, makeProfile,
   removeProfile, stopBrowser, watchdog,
 } from './cdp-runner.mjs';
 
@@ -51,6 +51,20 @@ class FakeBrowser extends EventEmitter {
 const tests = [];
 const test = (name, fn) => tests.push({name, fn});
 const tick = () => new Promise(resolve => setTimeout(resolve, 0));
+
+test('browser launch isolates macOS test profiles from the real keychain', async () => {
+  const previous = process.env.CHROMIUM;
+  process.env.CHROMIUM = '/usr/bin/true';
+  try {
+    const browser = launchBrowser('/test-profile', ['--test-flag']);
+    assert.equal(browser.spawnargs.includes('--use-mock-keychain'), process.platform === 'darwin');
+    assert.ok(browser.spawnargs.includes('--test-flag'));
+    await new Promise(resolve => browser.once('close', resolve));
+  } finally {
+    if (previous === undefined) delete process.env.CHROMIUM;
+    else process.env.CHROMIUM = previous;
+  }
+});
 
 test('correlates out-of-order CDP responses with their requests', async () => {
   const socket = new FakeSocket();

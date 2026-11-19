@@ -30,22 +30,24 @@ mergeInto(LibraryManager.library, {
             if (end === ptr) return null;
             text = new TextDecoder('utf-8', { fatal: true }).decode(HEAPU8.subarray(ptr, end));
           }
-          return { code: code, text: text };
+          var epoch = (code === 14 || code === 16) ? Array.from(HEAPU8.subarray(ptr, ptr + 8)) : null;
+          return { code: code, text: text, epoch: epoch };
         } catch (_) { return null; }
         finally {
           if (ptr && ptr >= 0 && ptr + 4097 <= HEAPU8.length) HEAPU8.fill(0, ptr, ptr + 4097);
           if (ptr) _free(ptr);
         }
       }
-      function deliver(text, code) {
+      function deliver(text, result) {
         var bytes, ptr = 0;
         try {
           if (typeof text !== 'string' || text.indexOf('\0') !== -1) return false;
           bytes = new TextEncoder().encode(text);
-          if (bytes.length > (code === 16 ? 4096 : 1024)) return false;
+          if (bytes.length > (result.code === 16 ? 4096 : 1024)) return false;
           // Read-side focus is checked again after asynchronous clipboard reads.
           var current = check(2, 0, 0);
-          if (!current || current.code !== code) return false;
+          if (!current || current.code !== result.code || !current.epoch ||
+              !result.epoch || !current.epoch.every(function (v, i) { return v === result.epoch[i]; })) return false;
           if (bytes.length) {
             ptr = _malloc(bytes.length);
             if (!ptr || ptr < 0 || ptr + bytes.length > HEAPU8.length) return false;
@@ -70,7 +72,7 @@ mergeInto(LibraryManager.library, {
             }, function () {});
           } else if ((result.code === 14 || result.code === 16) && navigator.clipboard && navigator.clipboard.readText) {
             Promise.resolve(navigator.clipboard.readText()).then(function (text) {
-              if (self.input === b) deliver(text, result.code);
+              if (self.input === b) deliver(text, result);
             }, function () {});
           }
         } catch (_) {}
@@ -91,7 +93,7 @@ mergeInto(LibraryManager.library, {
       b.paste = function (event) {
         if (!event.isTrusted || document.activeElement !== canvas || !event.clipboardData) return;
         var result = check(2, 0, 0);
-        if (result && (result.code === 14 || result.code === 16) && deliver(event.clipboardData.getData('text/plain'), result.code)) event.preventDefault();
+        if (result && (result.code === 14 || result.code === 16) && deliver(event.clipboardData.getData('text/plain'), result)) event.preventDefault();
       };
       canvas.addEventListener('pointerdown', b.pointer);
       canvas.addEventListener('keydown', b.key);
@@ -113,16 +115,23 @@ mergeInto(LibraryManager.library, {
           HEAPU8.set(bytes, ptr);
         }
         status = 1;
-      } catch (_) { bytes = null; }
+      } catch (_) {}
       try {
-        if (startup) {{{ makeDynCall('viiii', 'callback') }}}(status, generation, ptr, bytes ? bytes.length : 0);
-        else {{{ makeDynCall('viiiii', 'callback') }}}(status, generation, token, ptr, bytes ? bytes.length : 0);
-      } finally { if (ptr) _free(ptr); }
+        if (startup) {{{ makeDynCall('viiii', 'callback') }}}(status, generation, ptr, status ? bytes.length : 0);
+        else {{{ makeDynCall('viiiii', 'callback') }}}(status, generation, token, ptr, status ? bytes.length : 0);
+      } finally {
+        if (ptr && bytes && ptr + bytes.length <= HEAPU8.length) HEAPU8.fill(0, ptr, ptr + bytes.length);
+        if (bytes) bytes.fill(0);
+        if (ptr) _free(ptr);
+      }
     },
     start: function (generation, callback) {
       var self = this;
       if (self.session) {
-        Promise.resolve().then(function () { self.deliver(callback, generation, 0, null, true); });
+        var existing = self.session;
+        Promise.resolve().then(function () {
+          if (self.session === existing && !existing.closing) self.deliver(callback, generation, 0, null, true);
+        });
         return;
       }
       var s = { generation: generation, closing: false, service: null, wallet: null, mint: null, chain: null };
@@ -134,10 +143,16 @@ mergeInto(LibraryManager.library, {
           await mod.default();
           s.mint = mod.onboarding_mint();
           s.service = await mod.start_onboarding(s.mint);
-          result = await s.service.request('inspect', '{}');
+          result = '';
         } catch (_) {}
-        self.deliver(callback, generation, 0, result, true);
+        if (self.session === s && !s.closing) {
+          try { self.deliver(callback, generation, 0, result, true); }
+          catch (_) { self.close(generation); }
+        }
       }).catch(function () {});
+    },
+    open: async function (s) {
+      if (!s.wallet) s.wallet = await s.service.open_ready_wallet();
     },
     request: function (generation, token, opPtr, opLen, argsPtr, argsLen, callback) {
       var self = this, s = self.session, op, args;
@@ -145,16 +160,27 @@ mergeInto(LibraryManager.library, {
         if (!s || s.closing || s.generation !== generation || opLen > 32 || argsLen > 4096 ||
             opPtr < 0 || argsPtr < 0 || opPtr + opLen > HEAPU8.length || argsPtr + argsLen > HEAPU8.length) throw 0;
         var decoder = new TextDecoder('utf-8', { fatal: true });
-        op = decoder.decode(HEAPU8.slice(opPtr, opPtr + opLen));
-        args = decoder.decode(HEAPU8.slice(argsPtr, argsPtr + argsLen));
+        op = decoder.decode(HEAPU8.subarray(opPtr, opPtr + opLen));
+        args = decoder.decode(HEAPU8.subarray(argsPtr, argsPtr + argsLen));
       } catch (_) {
-        Promise.resolve().then(function () { self.deliver(callback, generation, token, null, false); });
+        Promise.resolve().then(function () { if (self.session === s && s && !s.closing) self.deliver(callback, generation, token, null, false); });
         return;
       }
       s.chain = s.chain.then(async function () {
         var result = null;
-        try { if (s.service) result = await s.service.request(op, args); } catch (_) {}
-        self.deliver(callback, generation, token, result, false);
+        try {
+          if (op === 'retry_open') {
+            try { await self.open(s); result = '{"event":"open_success"}'; }
+            catch (_) { result = '{"event":"open_failed"}'; }
+          } else if (s.service) {
+            result = await s.service.request(op, args);
+            if ((op === 'inspect' && result === '{"event":"ready"}') ||
+                ((op === 'complete_backup' || op === 'finish_restore') && result === '{"event":"complete_success"}')) {
+              try { await self.open(s); } catch (_) { result = '{"event":"open_failed"}'; }
+            }
+          }
+        } catch (_) {}
+        if (self.session === s && !s.closing) self.deliver(callback, generation, token, result, false);
       }).catch(function () {});
     },
     close: function (generation) {
@@ -179,20 +205,14 @@ mergeInto(LibraryManager.library, {
       var self = this, s = self.session, argument;
       try {
         if (!s || s.closing || s.generation !== generation || len > 4096 || ptr < 0 || ptr + len > HEAPU8.length) throw 0;
-        argument = new TextDecoder('utf-8', { fatal: true }).decode(HEAPU8.slice(ptr, ptr + len));
+        argument = new TextDecoder('utf-8', { fatal: true }).decode(HEAPU8.subarray(ptr, ptr + len));
       } catch (_) {
-        Promise.resolve().then(function () { self.deliver(callback, generation, serial, null, false, 131072); });
+        Promise.resolve().then(function () { if (self.session === s && s && !s.closing) self.deliver(callback, generation, serial, null, false, 131072); });
         return;
       }
       s.chain = s.chain.then(async function () {
         var result = null;
         try {
-          if (operation === 0) {
-            if (s.wallet || !s.service) throw 0;
-            // Separate call: request('inspect'/complete) has returned, dropping
-            // its temporary user lock. Rust audits Ready and derives the seed.
-            s.wallet = await s.service.open_ready_wallet();
-          }
           if (!s.wallet) throw 0;
           if (operation === 2) {
             var added = JSON.parse(await s.wallet.call('add_mint', JSON.stringify([s.mint])));
@@ -226,7 +246,13 @@ mergeInto(LibraryManager.library, {
   },
   haystack_onboarding_start__deps: ['$haystackOnboarding', 'malloc', 'free'],
   haystack_onboarding_start__sig: 'vii',
-  haystack_onboarding_start: function (generation, callback) { haystackOnboarding.start(generation, callback); },
+  haystack_onboarding_start: function (generation, callback) {
+    try { haystackOnboarding.start(generation, callback); }
+    catch (_) {
+      try { haystackOnboarding.deliver(callback, generation, 0, null, true); } catch (_) {}
+      haystackOnboarding.close(generation);
+    }
+  },
   haystack_onboarding_request__deps: ['$haystackOnboarding', 'malloc', 'free'],
   haystack_onboarding_request__sig: 'viiiiiii',
   haystack_onboarding_request: function (generation, token, opPtr, opLen, argsPtr, argsLen, callback) {

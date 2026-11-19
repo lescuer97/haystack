@@ -26,7 +26,7 @@ export async function makeProfile(prefix) {
 // `flags` carries per-runner switches such as wallet GL options.
 export function launchBrowser(profile, flags = []) {
   const browser = spawn(process.env.CHROMIUM || 'chromium', [
-    '--headless', '--no-sandbox', ...flags, `--user-data-dir=${profile}`,
+    '--headless', '--no-sandbox', ...(process.platform === 'darwin' ? ['--use-mock-keychain'] : []), ...flags, `--user-data-dir=${profile}`,
     '--remote-debugging-port=0', 'about:blank',
   ], {stdio:['ignore', 'ignore', 'pipe']});
   // Discovery attaches its own bounded listeners; a later spawn error must not

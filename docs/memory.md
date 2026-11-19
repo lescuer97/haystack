@@ -59,8 +59,6 @@ same storage works headlessly.
    pointers or HUD text pointers. Rendering never collects input or mutates game
    state.
 6. `endMode2D` flushes world geometry; `endDrawing` flushes the UI and presents.
-    The optional native screenshot is taken after draw, with an explicit batch
-    flush BEFORE presentation, including any visible onboarding or recovery words.
     Native draws at 120 FPS and browser rAF draws every callback without interpolation.
 
 Allocation failures from streaming are handled in `GameState.streamChunks`: it

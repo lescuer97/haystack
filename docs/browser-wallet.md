@@ -27,6 +27,10 @@ checks across menu close/reload. Fee reserve plus Cashu fees form an estimate,
 not a guaranteed cap. History detail is local and cannot resubmit a payment.
 Browser clipboard reads require a focused field and a trusted Paste/Ctrl+V
 gesture; onboarding retains its independent 1024-byte phrase limit.
+The browser initializes its onboarding service before opening the game window.
+After a Ready inspection or successful completion, it opens and retains the
+operational wallet before allowing gameplay. If opening fails, Retry only opens
+the already-provisioned wallet; it does not repeat creation or recovery.
 
 `zig build test-withdrawal-ui -Dplatform=wasm -Doffline` runs the functional
 renderer/CDK withdrawal fixture in isolated Chromium, without screenshots or a

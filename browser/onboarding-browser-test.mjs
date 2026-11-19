@@ -16,9 +16,12 @@ const contexts = [];
 const runtimeBinding = 'haystackTestRuntime';
 // Node owns these counters: destroying a document must never erase its errors.
 const runtimeReports = new Map();
+const diagnosticEvents = ['choice', 'backup', 'ready', 'complete_success', 'open_failed', 'open_success', 'blocked', 'invalid_phrase', 'transport_error', 'restore_failed', 'resume_failed', 'restore_finished'];
+const diagnosticOperations = ['inspect', 'create', 'restore', 'complete_backup', 'retry', 'retry_open', 'generate'];
 let failureLabel = 'browser startup';
+let stage = 'browser startup';
 function send(method, params = {}, sessionId) {
-  return connection.send(method, params, sessionId);
+  return bounded(connection.send(method, params, sessionId), 5000, `CDP ${method}`);
 }
 async function run() {
   const endpoint = await discoverEndpoint(browser);
@@ -36,7 +39,11 @@ async function run() {
         if (!report.faultInjected) console.log(`Fault injected: ${fault} (${report.flow})`);
         report.faultInjected = true;
         break;
-      default: report.monitorErrors++;
+      default:
+        if (diagnosticEvents.some(name => message.params.payload === `event:${name}`) ||
+            diagnosticOperations.some(name => message.params.payload === `operation:${name}`)) {
+          report.observed.push(message.params.payload);
+        } else report.monitorErrors++;
     }
   });
   // Fault runs isolate one actual-game flow; normal runs keep the Rust fixture.
@@ -53,16 +60,31 @@ async function run() {
       try {
         const result = await send('Runtime.evaluate', {expression:'window.onboardingTestReport || null', returnByValue:true}, sessionId);
         report = result.result?.value;
-      } catch (_) {
+      } catch (error) {
+        if (error.message === 'CDP Runtime.evaluate timed out') throw error;
         if (!connection.isOpen) throw new Error('CDP closed');
       }
       if (!report) await new Promise(resolve => setTimeout(resolve, 200));
     }
     console.log(JSON.stringify({flow, ...report}));
     if (!report.ok) throw new Error('onboarding checks failed');
+    await send('Target.disposeBrowserContext', {browserContextId});
+    contexts.splice(contexts.indexOf(browserContextId), 1);
   }
   for (const flow of selectedFlow === 'all' ? ['create', 'recovery'] : [selectedFlow]) {
+    const contextStart = contexts.length;
+    const existingSessions = new Set(runtimeReports.keys());
     await runGame(flow);
+    const sessions = [...runtimeReports.keys()].filter(sessionId => !existingSessions.has(sessionId));
+    for (const sessionId of sessions) {
+      await flushRuntime(sessionId);
+      assertRuntimeClean(sessionId, `${runtimeReports.get(sessionId).flow}: no uncaught runtime errors across reload`);
+    }
+    for (const browserContextId of contexts.slice(contextStart)) {
+      await send('Target.disposeBrowserContext', {browserContextId});
+      contexts.splice(contexts.indexOf(browserContextId), 1);
+    }
+    for (const sessionId of sessions) runtimeReports.delete(sessionId);
   }
   for (const [sessionId, report] of runtimeReports) {
     await flushRuntime(sessionId);
@@ -89,7 +111,7 @@ async function flushRuntime(sessionId) {
 }
 
 async function prepareGame(sessionId, flow) {
-  runtimeReports.set(sessionId, {flow, errors:0, rejections:0, barriers:0, monitorErrors:0, faultInjected:false});
+  runtimeReports.set(sessionId, {flow, errors:0, rejections:0, barriers:0, monitorErrors:0, faultInjected:false, observed:[]});
   await send('Runtime.enable', {}, sessionId);
   // No executionContextId: the binding also exists in future/reloaded contexts.
   await send('Runtime.addBinding', {name:runtimeBinding}, sessionId);
@@ -116,11 +138,20 @@ const gameInstrumentation = `(() => {
     get() { return this.__gameOnboardingBridge; },
     set(bridge) {
       this.__gameOnboardingBridge = bridge;
-      const deliver = bridge.deliver, request = bridge.request;
+      const deliver = bridge.deliver, request = bridge.request, open = bridge.open;
+      bridge.open = async function() {
+        if (sessionStorage.getItem('test-fail-open') === '1') {
+          sessionStorage.removeItem('test-fail-open');
+          throw new Error('synthetic open failure');
+        }
+        return open.apply(this, arguments);
+      };
       bridge.deliver = function(callback, generation, token, text, startup) {
+        if (startup) return deliver.apply(this, arguments);
         const event = typeof text === 'string' ? JSON.parse(text).event : 'transport_error';
-        const allowed = ['choice', 'backup', 'ready', 'complete_success', 'blocked', 'invalid_phrase', 'transport_error', 'restore_failed', 'resume_failed', 'restore_finished'];
+        const allowed = ['choice', 'backup', 'ready', 'complete_success', 'open_failed', 'open_success', 'blocked', 'invalid_phrase', 'transport_error', 'restore_failed', 'resume_failed', 'restore_finished'];
         window.gameOnboardingChecks.events.push(allowed.includes(event) ? event : 'other');
+        if (allowed.includes(event)) window.${runtimeBinding}('event:' + event);
         const drop = (fault === 'drop-ready' && event === 'ready') || (fault === 'drop-complete' && event === 'complete_success');
         if (!injected && (drop || (event === 'backup' && (fault === 'backup-error' || fault === 'backup-rejection')))) {
           injected = true;
@@ -133,7 +164,8 @@ const gameInstrumentation = `(() => {
       };
       bridge.request = function(generation, token, opPtr, opLen) {
         const op = new TextDecoder().decode(HEAPU8.subarray(opPtr, opPtr + opLen));
-        window.gameOnboardingChecks.operations.push(['create', 'restore', 'complete_backup', 'retry', 'generate'].includes(op) ? op : 'other');
+        if (['inspect', 'create', 'restore', 'complete_backup', 'retry', 'retry_open', 'generate'].includes(op)) window.${runtimeBinding}('operation:' + op);
+        if (op !== 'inspect') window.gameOnboardingChecks.operations.push(['create', 'restore', 'complete_backup', 'retry', 'retry_open', 'generate'].includes(op) ? op : 'other');
         return request.apply(this, arguments);
       };
     }
@@ -181,27 +213,44 @@ async function runGame(flow) {
   })`);
   async function expect(label, expression) {
     failureLabel = label;
+    stage = `expect: ${label}`;
     const deadline = Date.now() + 15000;
     while (Date.now() < deadline) {
       try {
         if (await evaluate(expression)) { checks.push(label); return; }
-      } catch (_) {
+      } catch (error) {
+        if (error.message === 'CDP Runtime.evaluate timed out') throw error;
         // Reload temporarily destroys the old execution context.
         if (!connection.isOpen) throw new Error('CDP closed');
       }
       await new Promise(resolve => setTimeout(resolve, 50));
     }
+    console.error(`Game check failed: ${failureLabel}`);
+    console.error('Node runtime counters:', runtimeReports.get(sessionId));
+    try {
+      const state = await bounded(evaluate('window.gameOnboardingChecks ? {copies:window.gameOnboardingChecks.copies} : null'), 3000, 'game diagnostic');
+      console.error('Game diagnostic:', state);
+    } catch (_) {
+      console.error('Game diagnostic response unavailable or timed out');
+    }
     throw new Error('game check timed out');
   }
   async function click(y) {
     // src/onboarding.zig: 560x500 panel centered in a 1000x640 viewport.
+    stage = `click ${y}: settle before move`;
     await settleTicks();
     await send('Input.dispatchMouseEvent', {type:'mouseMoved', x:500, y}, sessionId);
+    stage = `click ${y}: settle before press`;
     await settleTicks();
+    stage = `click ${y}: press`;
     await send('Input.dispatchMouseEvent', {type:'mousePressed', x:500, y, button:'left', clickCount:1}, sessionId);
+    stage = `click ${y}: frames after press`;
     await frames();
+    stage = `click ${y}: release`;
     await send('Input.dispatchMouseEvent', {type:'mouseReleased', x:500, y, button:'left', clickCount:1}, sessionId);
+    stage = `click ${y}: settle after release`;
     await settleTicks();
+    stage = `click ${y}: complete`;
   }
   async function reload() {
     await flushRuntime(sessionId);
@@ -242,16 +291,32 @@ async function runGame(flow) {
     await click(344);
     await expect('game consumes reloaded backup', 'window.gameOnboardingChecks.copies === 1');
     await click(400); // Confirm saved
+    if (!fault) await evaluate(`sessionStorage.setItem('test-fail-open', '1')`);
     await click(514); // Continue
-    await expect('game completes confirmed backup', 'window.gameOnboardingChecks.operations.includes("complete_backup") && window.gameOnboardingChecks.events.includes("complete_success")');
+    if (fault) {
+      await expect('game completes confirmed backup', 'window.gameOnboardingChecks.operations.includes("complete_backup") && window.gameOnboardingChecks.events.includes("complete_success")');
+    } else {
+      await expect('game completion open failure', 'window.gameOnboardingChecks.operations.includes("complete_backup") && window.gameOnboardingChecks.events.includes("open_failed")');
+      await click(344);
+      await expect('game completion open retry', 'window.gameOnboardingChecks.operations.includes("retry_open") && window.gameOnboardingChecks.events.includes("open_success") && window.gameOnboardingChecks.operations.filter(x => x === "complete_backup").length === 1');
+    }
     await expectGameplay('completion');
     await click(344);
     await expect('game dismisses backup controls', 'window.gameOnboardingChecks.copies === 1');
+    if (!fault) await evaluate(`sessionStorage.setItem('test-fail-open', '1')`);
     await reload();
-    await expect('game reload recognizes ready wallet', 'window.gameOnboardingChecks.events.includes("ready")');
+    if (fault) {
+      await expect('game reload recognizes ready wallet', 'window.gameOnboardingChecks.events.includes("ready")');
+    } else {
+      await expect('ready reload open failure', 'window.gameOnboardingChecks.events.includes("open_failed")');
+      await click(344);
+      await expect('ready reload open retry', 'window.gameOnboardingChecks.events.includes("open_success")');
+    }
     await expectGameplay('ready reload');
     await click(344);
-    await expect('ready game does not reprovision wallet', 'window.gameOnboardingChecks.operations.length === 0 && window.gameOnboardingChecks.copies === 0');
+    await expect('ready game does not reprovision wallet', fault
+      ? 'window.gameOnboardingChecks.operations.length === 0 && window.gameOnboardingChecks.copies === 0'
+      : 'window.gameOnboardingChecks.operations.length === 1 && window.gameOnboardingChecks.operations[0] === "retry_open" && window.gameOnboardingChecks.copies === 0');
     await flushRuntime(sessionId);
     assertRuntimeClean(sessionId, 'create: no uncaught runtime errors across reload');
     checks.push('game has no uncaught runtime errors across reloads');
@@ -314,8 +379,15 @@ async function runGame(flow) {
   await click(344);
   await expect('game consumes recovered backup', 'window.gameOnboardingChecks.copies === 1');
   await click(400);
+  if (!fault) await evaluate(`sessionStorage.setItem('test-fail-open', '1')`);
   await click(514);
-  await expect('game completes recovered wallet setup', 'window.gameOnboardingChecks.events.includes("complete_success")');
+  if (fault) {
+    await expect('game completes recovered wallet setup', 'window.gameOnboardingChecks.events.includes("complete_success")');
+  } else {
+    await expect('recovered wallet open failure', 'window.gameOnboardingChecks.events.includes("open_failed")');
+    await click(344);
+    await expect('recovered wallet open retry', 'window.gameOnboardingChecks.events.includes("open_success") && window.gameOnboardingChecks.operations.filter(x => x === "complete_backup").length === 1');
+  }
   await expectGameplay('completion');
   await reload();
   await expect('recovered game wallet survives reload', 'window.gameOnboardingChecks.events.includes("ready")');
@@ -332,8 +404,11 @@ const work = run();
 work.catch(() => {});
 try {
   await Promise.race([work, watch.promise]);
-} catch (_) {
+} catch (error) {
   console.error(`Onboarding browser test failed or timed out: ${failureLabel}`);
+  console.error(`Last stage: ${stage}`);
+  if (/^CDP [A-Za-z.]+ timed out$/.test(error?.message)) console.error(error.message);
+  for (const report of runtimeReports.values()) console.error('Node runtime counters:', report);
   process.exitCode = 1;
 } finally {
   watch.stop();
