@@ -35,10 +35,11 @@ const oak_asset = "assets/Outdoor decoration/Oak_Tree.png";
 const oak_sheet_width = 64;
 const oak_sheet_height = 80;
 const oak_source = rl.Rectangle{ .x = 0, .y = 0, .width = 64, .height = 80 };
-const rock_asset = "assets/Outdoor decoration/Outdoor_Decor_Free.png";
-const rock_sheet_width = 112;
-const rock_sheet_height = 192;
+const decor_asset = "assets/Outdoor decoration/Outdoor_Decor_Free.png";
+const decor_sheet_width = 112;
+const decor_sheet_height = 192;
 const rock_source = rl.Rectangle{ .x = 32, .y = 32, .width = 16, .height = 16 };
+const grass_clump_source = rl.Rectangle{ .x = 96, .y = 16, .width = 16, .height = 16 };
 
 fn rockDest(x: f32, y: f32) rl.Rectangle {
     // Source baseline (8,12) meets the ground tile bottom; shadow extends below.
@@ -140,7 +141,7 @@ pub const Resources = struct {
     grass: rl.Texture2D,
     dirt: rl.Texture2D,
     oak: rl.Texture2D,
-    rock: rl.Texture2D,
+    decor: rl.Texture2D,
     water: rl.Texture2D,
 
     pub fn init(allocator: std.mem.Allocator) !Resources {
@@ -150,13 +151,13 @@ pub const Resources = struct {
         errdefer rl.unloadTexture(dirt);
         const oak = try loadAtlas(allocator, oak_asset, oak_sheet_width, oak_sheet_height);
         errdefer rl.unloadTexture(oak);
-        const rock = try loadAtlas(allocator, rock_asset, rock_sheet_width, rock_sheet_height);
-        errdefer rl.unloadTexture(rock);
+        const decor = try loadAtlas(allocator, decor_asset, decor_sheet_width, decor_sheet_height);
+        errdefer rl.unloadTexture(decor);
         return .{
             .grass = grass,
             .dirt = dirt,
             .oak = oak,
-            .rock = rock,
+            .decor = decor,
             .water = try loadAtlas(allocator, water_asset, water_sheet_width, water_sheet_height),
         };
     }
@@ -165,7 +166,7 @@ pub const Resources = struct {
         rl.unloadTexture(self.grass);
         rl.unloadTexture(self.dirt);
         rl.unloadTexture(self.oak);
-        rl.unloadTexture(self.rock);
+        rl.unloadTexture(self.decor);
         rl.unloadTexture(self.water);
     }
 };
@@ -271,6 +272,29 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
             }
         }
     }
+
+    // Contained tall grass clumps share the decor atlas; finish before rock shadows.
+    var clump_cy = vis.cy0;
+    while (clump_cy <= vis.cy1) : (clump_cy += 1) {
+        var clump_cx = vis.cx0;
+        while (clump_cx <= vis.cx1) : (clump_cx += 1) {
+            const chunk = w.get(clump_cx, clump_cy) orelse continue;
+            for (chunk.tiles, 0..) |tile, i| {
+                if (tile != .grass) continue;
+                const tx = chunk.cx * world.CHUNK_TILES + @as(i32, @intCast(i % world.CT));
+                const ty = chunk.cy * world.CHUNK_TILES + @as(i32, @intCast(i / world.CT));
+                const x: f32 = @floatFromInt(tx * world.TILE_PX);
+                const y: f32 = @floatFromInt(ty * world.TILE_PX);
+                rl.drawTexturePro(resources.decor, grass_clump_source, .{
+                    .x = x,
+                    .y = y,
+                    .width = world.TILE_PX,
+                    .height = world.TILE_PX,
+                }, .{ .x = 0, .y = 0 }, 0, .white);
+            }
+        }
+    }
+
     // Shadows and canopies reach beyond their anchor chunk. Resident reads only.
     const sprite_range = vis.expanded(1);
     var rock_cy = sprite_range.cy0;
@@ -282,7 +306,7 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
                 if (tile != .rock) continue;
                 const x: f32 = @floatFromInt((rock_cx * world.CHUNK_TILES + @as(i32, @intCast(i % world.CT))) * world.TILE_PX);
                 const y: f32 = @floatFromInt((rock_cy * world.CHUNK_TILES + @as(i32, @intCast(i / world.CT))) * world.TILE_PX);
-                rl.drawTexturePro(resources.rock, rock_source, rockDest(x, y), .{ .x = 0, .y = 0 }, 0, .white);
+                rl.drawTexturePro(resources.decor, rock_source, rockDest(x, y), .{ .x = 0, .y = 0 }, 0, .white);
             }
         }
     }
@@ -935,6 +959,14 @@ test "grass is a whole tile at 2x beneath grass trees and rocks" {
     try std.testing.expect(!isGrassGround(.water));
 }
 
+test "tall grass source is bounded by the decor atlas and fills a tile at 2x" {
+    try std.testing.expectEqualDeep(rl.Rectangle{ .x = 96, .y = 16, .width = 16, .height = 16 }, grass_clump_source);
+    try std.testing.expect(grass_clump_source.x >= 0 and grass_clump_source.x + grass_clump_source.width <= decor_sheet_width);
+    try std.testing.expect(grass_clump_source.y >= 0 and grass_clump_source.y + grass_clump_source.height <= decor_sheet_height);
+    try std.testing.expectEqual(@as(f32, world.TILE_PX), grass_clump_source.width * 2);
+    try std.testing.expectEqual(@as(f32, world.TILE_PX), grass_clump_source.height * 2);
+}
+
 test "all 256 dirt and water neighbor patterns share bounded shore quadrants at 2x" {
     try std.testing.expectEqualDeep(rl.Rectangle{ .x = 16, .y = 16, .width = 16, .height = 16 }, dirt_source);
     try std.testing.expect(dirt_source.x + dirt_source.width <= dirt_sheet_width);
@@ -1072,11 +1104,11 @@ test "dirt and water neighbors cross negative chunk boundaries and match fallbac
 }
 
 test "rock crop doubles with its baseline at the ground tile bottom center" {
-    try std.testing.expectEqual(112, rock_sheet_width);
-    try std.testing.expectEqual(192, rock_sheet_height);
+    try std.testing.expectEqual(112, decor_sheet_width);
+    try std.testing.expectEqual(192, decor_sheet_height);
     try std.testing.expectEqualDeep(rl.Rectangle{ .x = 32, .y = 32, .width = 16, .height = 16 }, rock_source);
-    try std.testing.expect(rock_source.x >= 0 and rock_source.x + rock_source.width <= rock_sheet_width);
-    try std.testing.expect(rock_source.y >= 0 and rock_source.y + rock_source.height <= rock_sheet_height);
+    try std.testing.expect(rock_source.x >= 0 and rock_source.x + rock_source.width <= decor_sheet_width);
+    try std.testing.expect(rock_source.y >= 0 and rock_source.y + rock_source.height <= decor_sheet_height);
     for ([_]f32{ 0, -32 }) |pixel| {
         const dest = rockDest(pixel, pixel);
         try std.testing.expectEqual(pixel, dest.x);
