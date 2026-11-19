@@ -143,9 +143,7 @@ pub const Handler = struct {
             self.session = try self.app.registry.claimBefore(key, self.deadline);
             errdefer self.close();
             var ack: [1]u8 = undefined;
-            try checkDeadline(io, self.deadline);
             try self.conn.writeMessage(wire.encodeAuth(&ack, .authenticated), .binary);
-            try checkDeadline(io, self.deadline);
             self.authenticated = true;
             return;
         }
