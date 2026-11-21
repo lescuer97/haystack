@@ -6,13 +6,34 @@ const WorldState = @import("world_state.zig").WorldState;
 const actions = @import("actions.zig");
 const sessions = @import("sessions.zig");
 pub const default_budget = 64 * 1024;
+
+pub const CommonFailure = enum { invalid_request, server_busy };
+
+/// The caller supplies reply storage of at least p.max_response_bytes.
+pub fn encodeCommonFailure(out: []u8, req: p.Request, failure: CommonFailure) []const u8 {
+    return switch (req.operation) {
+        inline else => |payload, kind| shared.wire.encodeReply(out, kind, .{
+            .request_id = req.request_id,
+            .payload = payload,
+        }, .{ .failed = switch (failure) {
+            .invalid_request => .invalid_request,
+            .server_busy => .server_busy,
+        } }) catch unreachable,
+    };
+}
 pub const Context = struct {
     leased: bool = false,
     state: WorldState = .{},
     response: [p.max_response_bytes]u8 = undefined,
     snapshot: p.Snapshot = undefined,
-    pub fn handle(self: *Context, req: p.Request) []const u8 {
-        return shared.wire.encode(&self.response, actions.handle(&self.state, &self.snapshot, req));
+    pub fn handle(self: *Context, comptime kind: p.Kind, req: p.RequestFor(kind)) []const u8 {
+        const outcome = switch (kind) {
+            .cut => actions.handleCut(&self.state, req),
+            .read_area => actions.handleReadArea(&self.state, &self.snapshot, req),
+            else => @compileError("only cut and read_area use the world context"),
+            .channel_requirements, .channel_open, .channel_payment, .channel_close => @compileError("channel requests do not use the world context"),
+        };
+        return shared.wire.encodeReply(&self.response, kind, req, outcome) catch unreachable;
     }
 };
 pub const Layout = struct { context: Context, registry: sessions.Registry };
@@ -33,10 +54,9 @@ pub const App = struct {
         // The server drains callbacks before destroying the application.
         self.registry.slots = @splat(.{});
     }
-    pub fn handleLocation(self: *App, handle: sessions.Handle, req: p.Request) p.Response {
-        if (req.operation != .update_location) return shared.wire.failure(req.request_id, .invalid_request);
-        self.registry.update(handle, req.operation.update_location) catch return shared.wire.failure(req.request_id, .invalid_request);
-        return .{ .request_id = req.request_id, .result = .location_updated };
+    pub fn handleLocation(self: *App, handle: sessions.Handle, req: p.RequestFor(.update_location)) p.Outcome(.update_location) {
+        self.registry.update(handle, req.payload) catch return .{ .failed = .invalid_request };
+        return .{ .ok = {} };
     }
     pub fn lease(self: *App) ?*Context {
         const context = self.context;

@@ -1,360 +1,568 @@
-//! Allocation-free, explicit little-endian v1 wire format. No native struct layout.
+//! Allocation-free TLV codec. All integers on the wire are little-endian.
 const std = @import("std");
 const p = @import("protocol.zig");
 const world = @import("world.zig");
-/// Separate from the gameplay header. The caller supplies storage for the fixed message length.
-pub fn encodeAuth(out: []u8, message: p.AuthMessage) []const u8 {
-    out[0] = @backingInt(message);
-    switch (message) {
-        .challenge => |nonce| {
-            @memcpy(out[1..33], &nonce);
-            return out[0..33];
-        },
-        .proof => |proof| {
-            @memcpy(out[1..34], &proof.pubkey);
-            @memcpy(out[34..98], &proof.signature);
-            return out[0..98];
-        },
-        .authenticated => return out[0..1],
-    }
+
+const bye = 0x7e;
+const header_bytes = 3;
+const envelope_bytes = header_bytes + 1;
+const Tag = enum(u8) {
+    cut = 0x01,
+    read_area = 0x02,
+    update_location = 0x03,
+    cut_reply = 0x81,
+    read_area_reply = 0x82,
+    update_location_reply = 0x83,
+    challenge = 0xf0,
+    proof = 0xf1,
+    reply = 0xf2,
+    channel_payment = 0x20,
+    channel_requirements = 0x21,
+    channel_open = 0x22,
+    channel_close = 0x23,
+    channel_payment_reply = 0xa0,
+    channel_requirements_reply = 0xa1,
+    channel_open_reply = 0xa2,
+    channel_close_reply = 0xa3,
+    protocol_error = 0xff,
+};
+const Field = enum(u8) {
+    id = 1,
+    payload = 2,
+    ok = 3,
+    failed = 4,
+    nonce = 0x10,
+    pubkey = 0x11,
+    signature = 0x12,
+    channel_id = 0x20,
+    amount = 0x21,
+    payment_signature = 0x22,
+    tool = 0x23,
+    funding_proof = 0x24,
+};
+
+pub const protocol_error = [4]u8{ @backingInt(Tag.protocol_error), 0, 0, bye };
+pub const DecodeError = error{
+    NonBinaryMessage,
+    MessageTooLarge,
+    TruncatedHeader,
+    TruncatedBody,
+    MissingBye,
+    InvalidBye,
+    TrailingBytes,
+    UnknownMessageType,
+    UnexpectedMessageType,
+    TruncatedFieldHeader,
+    TruncatedFieldValue,
+    UnknownField,
+    DuplicateField,
+    OutOfOrderField,
+    InvalidFieldLength,
+    MissingRequiredField,
+    InvalidFieldValue,
+    ConflictingOutcome,
+    UnexpectedRequestId,
+    OverlappingBuffers,
+};
+const EncodeBufferError = error{ BufferTooSmall, OverlappingBuffers };
+pub const EncodeError = EncodeBufferError || error{InvalidSnapshot};
+
+fn overlaps(a: []const u8, b: []const u8) bool {
+    if (a.len == 0 or b.len == 0) return false;
+    const a_start = @intFromPtr(a.ptr);
+    const b_start = @intFromPtr(b.ptr);
+    return if (a_start <= b_start) b_start - a_start < a.len else a_start - b_start < b.len;
 }
-/// Structural validation only; direction and cryptographic verification belong to the caller.
-pub fn decodeAuth(data: []const u8, binary: bool) error{InvalidAuthentication}!p.AuthMessage {
-    if (!binary or data.len == 0) return error.InvalidAuthentication;
-    const kind = std.enums.fromInt(p.AuthKind, data[0]) orelse return error.InvalidAuthentication;
-    switch (kind) {
-        .challenge => {
-            if (data.len != 33) return error.InvalidAuthentication;
-            return .{ .challenge = data[1..33].* };
-        },
-        .proof => {
-            if (data.len != 98) return error.InvalidAuthentication;
-            return .{ .proof = .{ .pubkey = data[1..34].*, .signature = data[34..98].* } };
-        },
-        .authenticated => {
-            if (data.len != 1) return error.InvalidAuthentication;
-            return .authenticated;
-        },
-    }
-}
-pub const Decoded = union(enum) { request: p.Request, failure: p.Response };
-pub fn failure(id: ?p.Id, code: p.ErrorCode) p.Response {
-    return .{ .request_id = id, .result = .{ .failure = .{ .code = code } } };
-}
-pub fn decodeMessage(data: []const u8, binary: bool) Decoded {
-    return if (binary) decode(data) else .{ .failure = failure(null, .unsupported_message) };
-}
+
 fn get(comptime T: type, data: []const u8, offset: usize) T {
     return std.mem.readInt(T, data[offset..][0..@sizeOf(T)], .little);
 }
 fn put(comptime T: type, data: []u8, offset: usize, value: T) void {
     std.mem.writeInt(T, data[offset..][0..@sizeOf(T)], value, .little);
 }
-pub fn decode(data: []const u8) Decoded {
-    if (data.len > p.max_request_bytes) return .{ .failure = failure(null, .too_large) };
-    if (data.len < 20 or data[3] != 1) return .{ .failure = failure(null, .invalid_request) };
-    const id: p.Id = data[4..20].*;
-    if (get(u16, data, 0) != p.version) return .{ .failure = failure(id, .unsupported_version) };
-    const expected: usize = switch (data[2]) {
-        1, 3 => 28,
-        2 => 36,
-        else => return .{ .failure = failure(id, .unknown_operation) },
+
+const Reader = struct {
+    remaining: []const u8,
+    seen: u64 = 0,
+    last: u8 = 0,
+
+    fn next(self: *Reader, allowed: []const Field) DecodeError!?struct { tag: Field, bytes: []const u8 } {
+        const data = self.remaining;
+        if (data.len == 0) return null;
+        if (data.len < header_bytes) return error.TruncatedFieldHeader;
+        const n = get(u16, data, 1);
+        if (n > data.len - header_bytes) return error.TruncatedFieldValue;
+        const tag = std.enums.fromInt(Field, data[0]) orelse return error.UnknownField;
+        if (std.mem.indexOfScalar(Field, allowed, tag) == null) return error.UnknownField;
+        const bit = @as(u64, 1) << @as(u6, @intCast(data[0]));
+        if (self.seen & bit != 0) return error.DuplicateField;
+        if (data[0] < self.last) return error.OutOfOrderField;
+        self.seen |= bit;
+        self.last = data[0];
+        const end = header_bytes + @as(usize, n);
+        self.remaining = data[end..];
+        return .{ .tag = tag, .bytes = data[header_bytes..end] };
+    }
+
+    fn exact(self: *Reader, allowed: []const Field, expected: Field, comptime n: usize) DecodeError!*const [n]u8 {
+        const item = try self.next(allowed) orelse return error.MissingRequiredField;
+        if (item.tag != expected) return error.OutOfOrderField;
+        if (item.bytes.len != n) return error.InvalidFieldLength;
+        return item.bytes[0..n];
+    }
+
+    fn finish(self: *Reader, allowed: []const Field) DecodeError!void {
+        if (try self.next(allowed)) |_| return error.ConflictingOutcome;
+    }
+};
+
+fn open(data: []const u8, binary: bool, cap: usize) DecodeError!struct { tag: Tag, body: Reader } {
+    if (!binary) return error.NonBinaryMessage;
+    if (data.len > cap) return error.MessageTooLarge;
+    if (data.len < header_bytes) return error.TruncatedHeader;
+    const n: usize = get(u16, data, 1);
+    if (n > cap - envelope_bytes) return error.MessageTooLarge;
+    const available = data.len - header_bytes;
+    if (n > available) return error.TruncatedBody;
+    if (n == available) return error.MissingBye;
+    const end = header_bytes + n;
+    if (data[end] != bye) return error.InvalidBye;
+    if (available - n != 1) return error.TrailingBytes;
+    const tag = std.enums.fromInt(Tag, data[0]) orelse return error.UnknownMessageType;
+    return .{ .tag = tag, .body = .{ .remaining = data[header_bytes..end] } };
+}
+
+const Writer = struct {
+    frame: []u8,
+    offset: usize = header_bytes,
+
+    fn initFrom(out: []u8, tag: Tag, body_len: u16, source: []const u8) EncodeBufferError!Writer {
+        const n = envelope_bytes + @as(usize, body_len);
+        if (out.len >= n and overlaps(out[0..n], source)) return error.OverlappingBuffers;
+        return init(out, tag, body_len);
+    }
+    fn init(out: []u8, tag: Tag, body_len: u16) error{BufferTooSmall}!Writer {
+        const n = envelope_bytes + @as(usize, body_len);
+        if (out.len < n) return error.BufferTooSmall;
+        out[0] = @backingInt(tag);
+        put(u16, out, 1, body_len);
+        out[n - 1] = bye;
+        return .{ .frame = out[0..n] };
+    }
+    fn field(self: *Writer, tag: Field, n: u16) []u8 {
+        const start = self.offset;
+        const end = start + header_bytes + @as(usize, n);
+        std.debug.assert(end < self.frame.len);
+        self.frame[start] = @backingInt(tag);
+        put(u16, self.frame, start + 1, n);
+        self.offset = end;
+        return self.frame[start + header_bytes .. end];
+    }
+    fn bytes(self: *Writer, tag: Field, data: []const u8) void {
+        @memcpy(self.field(tag, @intCast(data.len)), data);
+    }
+    fn finish(self: Writer) []const u8 {
+        std.debug.assert(self.offset + 1 == self.frame.len);
+        return self.frame;
+    }
+};
+
+fn requestTag(kind: p.Kind) Tag {
+    return switch (kind) {
+        .cut => .cut,
+        .read_area => .read_area,
+        .update_location => .update_location,
+        .channel_requirements => .channel_requirements,
+        .channel_open => .channel_open,
+        .channel_payment => .channel_payment,
+        .channel_close => .channel_close,
     };
-    if (data.len != expected) return .{ .failure = failure(id, .invalid_request) };
-    return .{ .request = .{ .request_id = id, .operation = switch (data[2]) {
-        1 => .{ .cut = .{ .x = get(i32, data, 20), .y = get(i32, data, 24) } },
-        2 => .{ .read_area = .{ .cx0 = get(i32, data, 20), .cy0 = get(i32, data, 24), .cx1 = get(i32, data, 28), .cy1 = get(i32, data, 32) } },
-        3 => .{ .update_location = .{ .x = get(i32, data, 20), .y = get(i32, data, 24) } },
+}
+fn replyTag(kind: p.Kind) Tag {
+    return switch (kind) {
+        .cut => .cut_reply,
+        .read_area => .read_area_reply,
+        .update_location => .update_location_reply,
+        .channel_requirements => .channel_requirements_reply,
+        .channel_open => .channel_open_reply,
+        .channel_payment => .channel_payment_reply,
+        .channel_close => .channel_close_reply,
+    };
+}
+
+fn writePoint(out: []u8, x: i32, y: i32) void {
+    put(i32, out, 0, x);
+    put(i32, out, 4, y);
+}
+fn writeArea(out: []u8, area: world.ChunkRange) void {
+    writePoint(out, area.cx0, area.cy0);
+    writePoint(out[8..], area.cx1, area.cy1);
+}
+fn readArea(data: []const u8) world.ChunkRange {
+    return .{ .cx0 = get(i32, data, 0), .cy0 = get(i32, data, 4), .cx1 = get(i32, data, 8), .cy1 = get(i32, data, 12) };
+}
+fn writeState(out: []u8, s: p.State) void {
+    writePoint(out, s.x, s.y);
+    out[8] = @backingInt(s.terrain);
+    out[9] = @intFromBool(s.cut);
+}
+fn readState(data: []const u8) DecodeError!p.State {
+    if (data.len != 10) return error.InvalidFieldLength;
+    if (data[9] > 1) return error.InvalidFieldValue;
+    return .{ .x = get(i32, data, 0), .y = get(i32, data, 4), .terrain = std.enums.fromInt(world.Tile, data[8]) orelse return error.InvalidFieldValue, .cut = data[9] == 1 };
+}
+
+/// A channel-open proof must not overlap the bytes written to `out`.
+pub fn encodeRequest(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind)) (EncodeBufferError || error{InvalidProofLength})![]const u8 {
+    const payload_bytes: u16 = switch (kind) {
+        .cut, .update_location => header_bytes + 8,
+        .read_area => header_bytes + 16,
+        .channel_requirements => header_bytes + 1,
+        .channel_close => header_bytes + 32,
+        .channel_payment => 3 * header_bytes + 32 + 8 + 64,
+        .channel_open => blk: {
+            const len = req.payload.proof.len;
+            if (len == 0 or len > p.max_channel_proof_bytes) return error.InvalidProofLength;
+            break :blk @intCast(2 * header_bytes + 32 + len);
+        },
+    };
+    const source = if (kind == .channel_open) req.payload.proof else &.{};
+    var writer = try Writer.initFrom(out, requestTag(kind), header_bytes + @sizeOf(p.Id) + payload_bytes, source);
+    writer.bytes(.id, &req.request_id);
+    switch (kind) {
+        .cut, .update_location => writePoint(writer.field(.payload, 8), req.payload.x, req.payload.y),
+        .read_area => writeArea(writer.field(.payload, 16), req.payload),
+        .channel_requirements => writer.field(.tool, 1)[0] = @backingInt(req.payload.tool),
+        .channel_close => writer.bytes(.channel_id, &req.payload.id),
+        .channel_payment => {
+            writer.bytes(.channel_id, &req.payload.id);
+            put(u64, writer.field(.amount, 8), 0, req.payload.amount);
+            writer.bytes(.payment_signature, &req.payload.signature);
+        },
+        .channel_open => {
+            writer.bytes(.channel_id, &req.payload.id);
+            writer.bytes(.funding_proof, req.payload.proof);
+        },
+    }
+    return writer.finish();
+}
+
+/// A decoded channel-open proof borrows `data` until that buffer is reused.
+pub fn decodeMessage(data: []const u8, binary: bool) DecodeError!p.Request {
+    const cap: usize = if (data.len > 0 and data[0] == @backingInt(Tag.channel_open)) p.max_request_bytes else p.max_gameplay_request_bytes;
+    var frame = try open(data, binary, cap);
+    const fields: []const Field = switch (frame.tag) {
+        .cut, .read_area, .update_location => &.{ .id, .payload },
+        .channel_requirements => &.{ .id, .tool },
+        .channel_open => &.{ .id, .channel_id, .funding_proof },
+        .channel_payment => &.{ .id, .channel_id, .amount, .payment_signature },
+        .channel_close => &.{ .id, .channel_id },
+        else => return error.UnexpectedMessageType,
+    };
+    const id = (try frame.body.exact(fields, .id, @sizeOf(p.Id))).*;
+    const operation: @FieldType(p.Request, "operation") = switch (frame.tag) {
+        .cut => blk: {
+            const point = try frame.body.exact(fields, .payload, 8);
+            break :blk .{ .cut = .{ .x = get(i32, point, 0), .y = get(i32, point, 4) } };
+        },
+        .update_location => blk: {
+            const point = try frame.body.exact(fields, .payload, 8);
+            break :blk .{ .update_location = .{ .x = get(i32, point, 0), .y = get(i32, point, 4) } };
+        },
+        .read_area => .{ .read_area = readArea(try frame.body.exact(fields, .payload, 16)) },
+        .channel_requirements => .{ .channel_requirements = .{
+            .tool = std.enums.fromInt(p.tool, (try frame.body.exact(fields, .tool, 1))[0]) orelse return error.InvalidFieldValue,
+        } },
+        .channel_open => blk: {
+            const channel_id = (try frame.body.exact(fields, .channel_id, 32)).*;
+            const proof = try frame.body.next(fields) orelse return error.MissingRequiredField;
+            if (proof.tag != .funding_proof) return error.OutOfOrderField;
+            if (proof.bytes.len == 0 or proof.bytes.len > p.max_channel_proof_bytes) return error.InvalidFieldLength;
+            break :blk .{ .channel_open = .{ .id = channel_id, .proof = proof.bytes } };
+        },
+        .channel_payment => .{ .channel_payment = .{
+            .id = (try frame.body.exact(fields, .channel_id, 32)).*,
+            .amount = get(u64, try frame.body.exact(fields, .amount, 8), 0),
+            .signature = (try frame.body.exact(fields, .payment_signature, 64)).*,
+        } },
+        .channel_close => .{ .channel_close = .{ .id = (try frame.body.exact(fields, .channel_id, 32)).* } },
         else => unreachable,
-    } } };
-}
-fn header(out: []u8, kind: u8, id: ?p.Id) void {
-    put(u16, out, 0, p.version);
-    out[2] = kind;
-    out[3] = @intFromBool(id != null);
-    @memcpy(out[4..20], &(id orelse @as(p.Id, @splat(0))));
-}
-fn state(out: []u8, offset: usize, s: p.State) void {
-    put(i32, out, offset, s.x);
-    put(i32, out, offset + 4, s.y);
-    out[offset + 8] = @intCast(@backingInt(s.terrain));
-    out[offset + 9] = @intFromBool(s.cut);
-}
-fn rectangle(out: []u8, area: world.ChunkRange) void {
-    put(i32, out, 20, area.cx0);
-    put(i32, out, 24, area.cy0);
-    put(i32, out, 28, area.cx1);
-    put(i32, out, 32, area.cy1);
-}
-pub fn encodeRequest(out: *[36]u8, req: p.Request) []const u8 {
-    header(out, switch (req.operation) {
-        .cut => 1,
-        .read_area => 2,
-        .update_location => 3,
-    }, req.request_id);
-    put(u16, out, 0, req.version);
-    switch (req.operation) {
-        .update_location => |tile| {
-            put(i32, out, 20, tile.x);
-            put(i32, out, 24, tile.y);
-            return out[0..28];
-        },
-        .cut => |tile| {
-            put(i32, out, 20, tile.x);
-            put(i32, out, 24, tile.y);
-            return out[0..28];
-        },
-        .read_area => |area| {
-            rectangle(out, area);
-            return out;
-        },
-    }
-}
-pub fn encode(out: []u8, response: p.Response) []const u8 {
-    switch (response.result) {
-        .location_updated => {
-            std.debug.assert(response.request_id != null);
-            header(out, 131, response.request_id);
-            return out[0..20];
-        },
-        .cut => |s| {
-            header(out, 129, response.request_id);
-            state(out, 20, s);
-            return out[0..30];
-        },
-        .failure => |f| {
-            header(out, 255, response.request_id);
-            put(u16, out, 20, @backingInt(f.code));
-            std.debug.assert(f.current == null or f.code == .already_cut);
-            out[22] = @intFromBool(f.current != null);
-            if (f.current) |s| {
-                state(out, 23, s);
-                return out[0..33];
-            }
-            return out[0..23];
-        },
-        .snapshot => |s| {
-            std.debug.assert(s.count >= 1 and s.count <= 64);
-            header(out, 130, response.request_id);
-            rectangle(out, s.area);
-            put(u32, out, 36, world.generator_version);
-            @memcpy(out[40..72], &world.public_seed);
-            put(u16, out, 72, s.count);
-            for (s.chunks[0..s.count], 0..) |chunk, i| @memcpy(out[74 + i * 32 ..][0..32], &chunk);
-            return out[0 .. 74 + @as(usize, s.count) * 32];
-        },
-    }
-}
-pub const ReplyError = error{InvalidReply};
-fn readState(data: []const u8, offset: usize) ReplyError!p.State {
-    if (data[offset + 9] > 1) return error.InvalidReply;
-    return .{ .x = get(i32, data, offset), .y = get(i32, data, offset + 4), .terrain = std.enums.fromInt(world.Tile, data[offset + 8]) orelse return error.InvalidReply, .cut = data[offset + 9] == 1 };
-}
-/// Optional public reply decoder; uses caller-owned bitmap storage, never allocates.
-pub fn decodeResponse(data: []const u8, snapshot: *p.Snapshot) ReplyError!p.Response {
-    if (data.len < 20 or data[3] > 1 or get(u16, data, 0) != p.version) return error.InvalidReply;
-    const id: p.Id = data[4..20].*;
-    if (data[3] == 0 and !std.mem.allEqual(u8, &id, 0)) return error.InvalidReply;
-    const reply_id: ?p.Id = if (data[3] == 1) id else null;
-    switch (data[2]) {
-        131 => {
-            if (data.len != 20 or reply_id == null) return error.InvalidReply;
-            return .{ .request_id = reply_id, .result = .location_updated };
-        },
-        129 => {
-            if (data.len != 30) return error.InvalidReply;
-            return .{ .request_id = reply_id, .result = .{ .cut = try readState(data, 20) } };
-        },
-        255 => {
-            if (data.len != 23 and data.len != 33) return error.InvalidReply;
-            const code = std.enums.fromInt(p.ErrorCode, get(u16, data, 20)) orelse return error.InvalidReply;
-            if (data[22] > 1 or (data[22] == 1 and (code != .already_cut or data.len != 33)) or (data[22] == 0 and (code == .already_cut or data.len != 23))) return error.InvalidReply;
-            return .{ .request_id = reply_id, .result = .{ .failure = .{ .code = code, .current = if (data[22] == 1) try readState(data, 23) else null } } };
-        },
-        130 => {
-            if (data.len < 106 or data.len > p.max_response_bytes) return error.InvalidReply;
-            const area = world.ChunkRange{ .cx0 = get(i32, data, 20), .cy0 = get(i32, data, 24), .cx1 = get(i32, data, 28), .cy1 = get(i32, data, 32) };
-            if (area.cx0 > area.cx1 or area.cy0 > area.cy1 or area.cx0 < p.min_chunk or area.cy0 < p.min_chunk or area.cx1 > p.max_chunk or area.cy1 > p.max_chunk) return error.InvalidReply;
-            const count = (@as(i64, area.cx1) - area.cx0 + 1) * (@as(i64, area.cy1) - area.cy0 + 1);
-            if (count < 1 or count > 64 or get(u16, data, 72) != count or data.len != 74 + count * 32 or get(u32, data, 36) != world.generator_version or !std.mem.eql(u8, data[40..72], &world.public_seed)) return error.InvalidReply;
-            snapshot.* = .{ .area = area, .count = @intCast(count) };
-            for (snapshot.chunks[0..snapshot.count], 0..) |*chunk, i| @memcpy(chunk, data[74 + i * 32 ..][0..32]);
-            return .{ .request_id = reply_id, .result = .{ .snapshot = snapshot } };
-        },
-        else => return error.InvalidReply,
-    }
-}
-test "reply decoding rejects invalid boolean enum flags lengths and metadata" {
-    var out: [p.max_response_bytes]u8 = undefined;
-    var snapshot: p.Snapshot = undefined;
-    const response = p.Response{ .request_id = @splat(0), .result = .{ .cut = .{ .x = -1, .y = 2, .terrain = .rock, .cut = true } } };
-    _ = encode(&out, response);
-    try std.testing.expectEqualDeep(response, try decodeResponse(out[0..30], &snapshot));
-    out[29] = 2;
-    try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..30], &snapshot));
-    out[29] = 1;
-    out[28] = 4;
-    try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..30], &snapshot));
-    out[28] = 2;
-    out[3] = 3;
-    try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..30], &snapshot));
-    out[3] = 1;
-    try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..31], &snapshot));
-    out[3] = 0;
-    out[4] = 1;
-    try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..30], &snapshot));
-    _ = encode(&out, failure(null, .server_busy));
-    out[20] = 14;
-    try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..23], &snapshot));
-    out[20] = 12;
-    out[22] = 2;
-    try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..23], &snapshot));
-    var source = p.Snapshot{ .area = .{ .cx0 = -1, .cy0 = -1, .cx1 = -1, .cy1 = -1 }, .count = 1 };
-    _ = encode(&out, .{ .request_id = null, .result = .{ .snapshot = &source } });
-    try std.testing.expectEqual(@as(u16, 1), (try decodeResponse(out[0..106], &snapshot)).result.snapshot.count);
-    out[40] ^= 1;
-    try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..106], &snapshot));
-    out[40] ^= 1;
-    out[72] = 0;
-    try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..106], &snapshot));
-}
-test "binary golden zero ID extreme coordinates request and success" {
-    var buf: [36]u8 = undefined;
-    const req = p.Request{ .request_id = @splat(0), .operation = .{ .cut = .{ .x = std.math.minInt(i32), .y = std.math.maxInt(i32) } } };
-    const bytes = encodeRequest(&buf, req);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 127 }, bytes);
-    try std.testing.expectEqualDeep(req, decode(bytes).request);
-    const area = p.Request{ .request_id = @splat(0), .operation = .{ .read_area = .{ .cx0 = -1, .cy0 = -2, .cx1 = 0, .cy1 = 1 } } };
-    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 254, 255, 255, 255, 0, 0, 0, 0, 1, 0, 0, 0 }, encodeRequest(&buf, area));
-    try std.testing.expectEqualDeep(area, decode(&buf).request);
-    var out: [p.max_response_bytes]u8 = undefined;
-    const success = encode(&out, .{ .request_id = req.request_id, .result = .{ .cut = .{ .x = -1, .y = 0, .terrain = .tree, .cut = true } } });
-    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 129, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 3, 1 }, success);
-    const err = encode(&out, failure(null, .server_busy));
-    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0 }, err);
-}
-test "binary malformed flags lengths unknown operations versions and cap" {
-    var buf: [129]u8 = @splat(0);
-    buf[0] = 1;
-    buf[2] = 1;
-    buf[3] = 1;
-    for ([_]usize{ 0, 19, 20, 27, 29, 36, 128 }) |n| try std.testing.expectEqual(p.ErrorCode.invalid_request, decode(buf[0..n]).failure.result.failure.code);
-    try std.testing.expectEqual(p.ErrorCode.too_large, decode(&buf).failure.result.failure.code);
-    buf[3] = 3;
-    try std.testing.expect(decode(buf[0..28]).failure.request_id == null);
-    buf[3] = 0;
-    try std.testing.expect(decode(buf[0..28]).failure.request_id == null);
-    buf[3] = 1;
-    buf[0] = 2;
-    try std.testing.expectEqual(p.ErrorCode.unsupported_version, decode(buf[0..28]).failure.result.failure.code);
-    buf[0] = 1;
-    buf[2] = 129;
-    try std.testing.expectEqual(p.ErrorCode.unknown_operation, decode(buf[0..28]).failure.result.failure.code);
-    try std.testing.expectEqual(p.ErrorCode.unsupported_message, decodeMessage(buf[0..28], false).failure.result.failure.code);
-    try std.testing.expect(decodeMessage("not binary", false).failure.request_id == null);
-}
-test "snapshot golden metadata empty full and error state" {
-    var snapshot = p.Snapshot{ .area = .{ .cx0 = -1, .cy0 = -2, .cx1 = 6, .cy1 = 5 }, .count = 64 };
-    snapshot.chunks[0][0] = 1;
-    snapshot.chunks[63] = @splat(255);
-    var out: [p.max_response_bytes]u8 = undefined;
-    const bytes = encode(&out, .{ .request_id = @splat(0), .result = .{ .snapshot = &snapshot } });
-    try std.testing.expectEqual(@as(usize, 2122), bytes.len);
-    try std.testing.expectEqual(@as(u8, 130), bytes[2]);
-    try std.testing.expectEqual(@as(i32, -2), get(i32, bytes, 24));
-    try std.testing.expectEqual(world.generator_version, get(u32, bytes, 36));
-    try std.testing.expectEqualSlices(u8, &world.public_seed, bytes[40..72]);
-    try std.testing.expectEqual(@as(u16, 64), get(u16, bytes, 72));
-    try std.testing.expectEqual(@as(u8, 1), bytes[74]);
-    try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(255)), bytes[2090..2122]);
-    snapshot.count = 1;
-    try std.testing.expectEqual(@as(usize, 106), encode(&out, .{ .request_id = null, .result = .{ .snapshot = &snapshot } }).len);
-    const err = encode(&out, .{ .request_id = @splat(0), .result = .{ .failure = .{ .code = .already_cut, .current = .{ .x = -1, .y = 1, .terrain = .grass, .cut = true } } } });
-    try std.testing.expectEqual(@as(usize, 33), err.len);
-    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 1, 255, 255, 255, 255, 1, 0, 0, 0, 0, 1 }, err[20..]);
-}
-test "location wire goldens exact lengths IDs flags and packed representation" {
-    try std.testing.expectEqual(@as(usize, 8), @sizeOf(p.Location));
-    try std.testing.expectEqual(@as(usize, 64), @bitSizeOf(p.Location));
-    var buf: [36]u8 = undefined;
-    const req = p.Request{ .request_id = @splat(0), .operation = .{ .update_location = .{ .x = std.math.minInt(i32), .y = std.math.maxInt(i32) } } };
-    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255, 255, 127 }, encodeRequest(&buf, req));
-    try std.testing.expectEqualDeep(req, decode(buf[0..28]).request);
-    const locations = [_]p.Location{ .{ .x = 0, .y = 0 }, .{ .x = -1, .y = -2 }, .{ .x = 12, .y = 34 } };
-    const payloads = [_][8]u8{ .{ 0, 0, 0, 0, 0, 0, 0, 0 }, .{ 255, 255, 255, 255, 254, 255, 255, 255 }, .{ 12, 0, 0, 0, 34, 0, 0, 0 } };
-    for (locations, payloads) |location, payload| {
-        const reused = p.Request{ .request_id = req.request_id, .operation = .{ .update_location = location } };
-        try std.testing.expectEqualDeep(reused, decode(encodeRequest(&buf, reused)).request);
-        try std.testing.expectEqualSlices(u8, &payload, buf[20..28]);
-    }
-    for (0..37) |n| {
-        if (n != 28 and n <= buf.len) try std.testing.expect(decode(buf[0..n]) == .failure);
-    }
-    buf[3] = 0;
-    try std.testing.expect(decode(buf[0..28]) == .failure);
-    buf[3] = 2;
-    try std.testing.expect(decode(buf[0..28]) == .failure);
-    buf[3] = 1;
-    buf[2] = 4;
-    try std.testing.expectEqual(p.ErrorCode.unknown_operation, decode(buf[0..28]).failure.result.failure.code);
-    var out: [p.max_response_bytes + 1]u8 = @splat(0);
-    var snapshot: p.Snapshot = undefined;
-    const ack = p.Response{ .request_id = @splat(0), .result = .location_updated };
-    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 131, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, encode(&out, ack));
-    try std.testing.expectEqualDeep(ack, try decodeResponse(out[0..20], &snapshot));
-    const nonzero = p.Response{ .request_id = @splat(0x45), .result = .location_updated };
-    try std.testing.expectEqualDeep(nonzero, try decodeResponse(encode(&out, nonzero), &snapshot));
-    _ = encode(&out, ack);
-    for (0..out.len + 1) |n| {
-        if (n != 20) try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..n], &snapshot));
-    }
-    for ([_]u8{ 0, 2, 3, 255 }) |flag| {
-        out[3] = flag;
-        try std.testing.expectError(error.InvalidReply, decodeResponse(out[0..20], &snapshot));
-    }
-}
-test "authentication independent byte goldens and roundtrips" {
-    const cases = [_]struct { message: p.AuthMessage, golden: []const u8 }{
-        .{ .message = .{ .challenge = @splat(0) }, .golden = &(.{0xf0} ++ @as([32]u8, @splat(0))) },
-        .{ .message = .{ .challenge = @splat(255) }, .golden = &(.{0xf0} ++ @as([32]u8, @splat(255))) },
-        .{ .message = .{ .proof = .{ .pubkey = @splat(0), .signature = @splat(255) } }, .golden = &(.{0xf1} ++ @as([33]u8, @splat(0)) ++ @as([64]u8, @splat(255))) },
-        .{ .message = .{ .proof = .{ .pubkey = @splat(255), .signature = @splat(0) } }, .golden = &(.{0xf1} ++ @as([33]u8, @splat(255)) ++ @as([64]u8, @splat(0))) },
-        .{ .message = .authenticated, .golden = &.{0xf2} },
     };
-    var out: [98]u8 = undefined;
-    for (cases) |case| {
-        const encoded = encodeAuth(&out, case.message);
-        try std.testing.expectEqualSlices(u8, case.golden, encoded);
-        try std.testing.expectEqualDeep(case.message, try decodeAuth(case.golden, true));
-        try std.testing.expectEqualDeep(case.message, try decodeAuth(encoded, true));
-        try std.testing.expectError(error.InvalidAuthentication, decodeAuth(case.golden, false));
-    }
+    try frame.body.finish(fields);
+    return .{ .request_id = id, .operation = operation };
 }
-test "authentication rejects every wrong tag length and text" {
-    var buf: [129]u8 = @splat(0);
-    for (0..256) |tag| {
-        buf[0] = @intCast(tag);
-        const expected: ?usize = switch (tag) {
-            0xf0 => 33,
-            0xf1 => 98,
-            0xf2 => 1,
-            else => null,
+
+fn snapshotSize(count: u16) u16 {
+    return p.snapshot_metadata_bytes + count * p.chunk_bytes;
+}
+fn writeSnapshot(out: []u8, s: *const p.Snapshot) void {
+    writeArea(out, s.area);
+    put(u32, out, 16, world.generator_version);
+    @memcpy(out[20..52], &world.public_seed);
+    put(u16, out, 52, s.count);
+    @memcpy(out[p.snapshot_metadata_bytes..], std.mem.sliceAsBytes(s.chunks[0..s.count]));
+}
+fn validateSnapshot(data: []const u8) DecodeError!struct { area: world.ChunkRange, count: u16 } {
+    if (data.len < p.snapshot_metadata_bytes) return error.InvalidFieldLength;
+    const area = readArea(data);
+    const count = (p.areaGeometry(area) catch return error.InvalidFieldValue).count;
+    if (data.len != snapshotSize(count)) return error.InvalidFieldLength;
+    if (get(u16, data, 52) != count or get(u32, data, 16) != world.generator_version or !std.mem.eql(u8, data[20..52], &world.public_seed)) return error.InvalidFieldValue;
+    return .{ .area = area, .count = count };
+}
+
+/// A snapshot source must not overlap the bytes written to `out`.
+pub fn encodeReply(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind), outcome: p.Outcome(kind)) EncodeError![]const u8 {
+    const n: u16 = switch (outcome) {
+        .ok => |value| switch (kind) {
+            .cut => 10,
+            .channel_requirements => 49,
+            .update_location, .channel_open, .channel_payment, .channel_close => 0,
+            .read_area => blk: {
+                const geometry = p.areaGeometry(value.area) catch return error.InvalidSnapshot;
+                if (value.count != geometry.count) return error.InvalidSnapshot;
+                break :blk snapshotSize(value.count);
+            },
+        },
+        .failed => |failure| if (kind == .cut and failure == .already_cut) 12 else 2,
+    };
+    const source = if (kind == .read_area and outcome == .ok) std.mem.asBytes(outcome.ok) else &.{};
+    var writer = try Writer.initFrom(out, replyTag(kind), 2 * header_bytes + @sizeOf(p.Id) + n, source);
+    writer.bytes(.id, &req.request_id);
+    switch (outcome) {
+        .ok => |value| {
+            const dest = writer.field(.ok, n);
+            switch (kind) {
+                .cut => writeState(dest, value),
+                .read_area => writeSnapshot(dest, value),
+                .channel_requirements => {
+                    @memcpy(dest[0..33], &value.pubkey);
+                    put(u64, dest, 33, value.amount);
+                    put(u64, dest, 41, value.refundTime);
+                },
+                .update_location, .channel_open, .channel_payment, .channel_close => {},
+            }
+        },
+        .failed => |failure| {
+            const dest = writer.field(.failed, n);
+            if (kind == .cut) {
+                put(u16, dest, 0, @backingInt(std.meta.activeTag(failure)));
+                if (failure == .already_cut) writeState(dest[2..], failure.already_cut);
+            } else put(u16, dest, 0, @backingInt(failure));
+        },
+    }
+    return writer.finish();
+}
+
+fn readFailure(comptime kind: p.Kind, value: []const u8) DecodeError!p.FailureFor(kind) {
+    if (value.len < 2) return error.InvalidFieldLength;
+    const code = get(u16, value, 0);
+    if (kind != .cut) {
+        if (value.len != 2) return error.InvalidFieldLength;
+        return std.enums.fromInt(p.FailureFor(kind), code) orelse error.InvalidFieldValue;
+    }
+    const tag = std.enums.fromInt(std.meta.Tag(p.CutFailure), code) orelse return error.InvalidFieldValue;
+    if (tag == .already_cut) return .{ .already_cut = try readState(value[2..]) };
+    if (value.len != 2) return error.InvalidFieldLength;
+    return switch (tag) {
+        .already_cut => unreachable,
+        inline else => |t| @unionInit(p.CutFailure, @tagName(t), {}),
+    };
+}
+
+/// On snapshot success, `snapshot` must not overlap the input frame `data`.
+pub fn decodeReply(data: []const u8, comptime kind: p.Kind, expected_id: p.Id, snapshot: *p.Snapshot) DecodeError!p.Outcome(kind) {
+    var frame = try open(data, true, p.max_response_bytes);
+    if (frame.tag != replyTag(kind)) return error.UnexpectedMessageType;
+    const id = try frame.body.exact(reply_fields, .id, @sizeOf(p.Id));
+    if (!std.mem.eql(u8, id, &expected_id)) return error.UnexpectedRequestId;
+    return (try decodeOutcome(&frame.body, kind, snapshot, data)).?;
+}
+
+const reply_fields: []const Field = &.{ .id, .ok, .failed };
+
+// A null destination validates a late reply without touching application storage.
+fn decodeOutcome(body: *Reader, comptime kind: p.Kind, snapshot: ?*p.Snapshot, data: []const u8) DecodeError!?p.Outcome(kind) {
+    const outcome = try body.next(reply_fields) orelse return error.MissingRequiredField;
+    try body.finish(reply_fields);
+    if (outcome.tag == .failed) return .{ .failed = try readFailure(kind, outcome.bytes) };
+    return .{ .ok = switch (kind) {
+        .cut => try readState(outcome.bytes),
+        .read_area => blk: {
+            const meta = try validateSnapshot(outcome.bytes);
+            const dest = snapshot orelse return null;
+            if (overlaps(std.mem.asBytes(dest), data)) return error.OverlappingBuffers;
+            dest.* = .{ .area = meta.area, .count = meta.count };
+            @memcpy(std.mem.sliceAsBytes(dest.chunks[0..meta.count]), outcome.bytes[p.snapshot_metadata_bytes..]);
+            break :blk dest;
+        },
+        .channel_requirements => blk: {
+            if (outcome.bytes.len != 49) return error.InvalidFieldLength;
+            break :blk .{
+                .pubkey = outcome.bytes[0..33].*,
+                .amount = get(u64, outcome.bytes, 33),
+                .refundTime = get(u64, outcome.bytes, 41),
+            };
+        },
+        .update_location, .channel_open, .channel_payment, .channel_close => if (outcome.bytes.len != 0) return error.InvalidFieldLength,
+    } };
+}
+
+/// Client-side correlation only. A socket/UI integration owns logging, deadlines,
+/// and the popover; protocol errors deliberately never consume an entry.
+pub const Pending = struct {
+    pub const capacity = 8;
+    const Entry = struct { id: p.Id, kind: p.Kind };
+    pub const Received = union(enum) {
+        protocol_error,
+        unmatched_reply: p.Id,
+        reply: struct {
+            id: p.Id,
+            outcome: union(p.Kind) {
+                cut: p.Outcome(.cut),
+                read_area: p.Outcome(.read_area),
+                update_location: p.Outcome(.update_location),
+                channel_requirements: p.Outcome(.channel_requirements),
+                channel_open: p.Outcome(.channel_open),
+                channel_payment: p.Outcome(.channel_payment),
+                channel_close: p.Outcome(.channel_close),
+            },
+        },
+    };
+    entries: [capacity]?Entry = @splat(null),
+
+    pub fn track(self: *Pending, comptime kind: p.Kind, req: p.RequestFor(kind)) error{ DuplicateRequestId, TooManyPendingRequests }!void {
+        if (self.find(req.request_id) != null) return error.DuplicateRequestId;
+        for (&self.entries) |*entry| {
+            if (entry.* == null) {
+                entry.* = .{ .id = req.request_id, .kind = kind };
+                return;
+            }
+        }
+        return error.TooManyPendingRequests;
+    }
+
+    /// Call when the connection's owner times out or fails to send a request.
+    pub fn forget(self: *Pending, id: p.Id) void {
+        if (self.find(id)) |index| self.entries[index] = null;
+    }
+
+    fn find(self: *const Pending, id: p.Id) ?usize {
+        for (self.entries, 0..) |maybe, i| {
+            const entry = maybe orelse continue;
+            if (std.mem.eql(u8, &id, &entry.id)) return i;
+        }
+        return null;
+    }
+
+    /// A matched snapshot reply requires `snapshot` to be disjoint from `data`.
+    pub fn receive(self: *Pending, data: []const u8, binary: bool, snapshot: *p.Snapshot) DecodeError!Received {
+        var frame = try open(data, binary, p.max_response_bytes);
+        if (frame.tag == .protocol_error) {
+            try frame.body.finish(&.{});
+            return .protocol_error;
+        }
+        const kind: p.Kind = switch (frame.tag) {
+            .cut_reply => .cut,
+            .read_area_reply => .read_area,
+            .update_location_reply => .update_location,
+            .channel_requirements_reply => .channel_requirements,
+            .channel_open_reply => .channel_open,
+            .channel_payment_reply => .channel_payment,
+            .channel_close_reply => .channel_close,
+            else => return error.UnexpectedMessageType,
         };
-        for (0..buf.len + 1) |n| {
-            if (expected == null or n != expected.?) try std.testing.expectError(error.InvalidAuthentication, decodeAuth(buf[0..n], true));
-            try std.testing.expectError(error.InvalidAuthentication, decodeAuth(buf[0..n], false));
+        const id = (try frame.body.exact(reply_fields, .id, @sizeOf(p.Id))).*;
+        const index = self.find(id);
+        if (index) |i| {
+            if (self.entries[i].?.kind != kind) return error.UnexpectedMessageType;
+        }
+        switch (kind) {
+            inline else => |k| {
+                const outcome = try decodeOutcome(&frame.body, k, if (index != null) snapshot else null, data);
+                const i = index orelse return .{ .unmatched_reply = id };
+                self.entries[i] = null;
+                return .{ .reply = .{ .id = id, .outcome = @unionInit(@FieldType(@FieldType(Received, "reply"), "outcome"), @tagName(k), outcome.?) } };
+            },
         }
     }
-}
-test "random request reply and authentication decode guards" {
-    var random = std.Random.DefaultPrng.init(0x73657373696f6e);
-    var buf: [p.max_response_bytes + 1]u8 = undefined;
-    var snapshot: p.Snapshot = undefined;
-    for (0..2000) |_| {
-        random.random().bytes(&buf);
-        const n = random.random().uintLessThan(usize, buf.len + 1);
-        _ = decode(buf[0..n]);
-        _ = decodeResponse(buf[0..n], &snapshot) catch {};
-        _ = decodeAuth(buf[0..n], true) catch {};
+};
+
+pub fn encodeAuth(out: []u8, message: p.AuthMessage) error{BufferTooSmall}![]const u8 {
+    const n: u16 = switch (message) {
+        .challenge => header_bytes + 32,
+        .proof => 2 * header_bytes + 33 + 64,
+        .reply => |outcome| header_bytes + @as(u16, if (outcome == .ok) 0 else 2),
+    };
+    var writer = try Writer.init(out, @fromBackingInt(@intCast(@backingInt(std.meta.activeTag(message)))), n);
+    switch (message) {
+        .challenge => |nonce| writer.bytes(.nonce, &nonce),
+        .proof => |proof| {
+            writer.bytes(.pubkey, &proof.pubkey);
+            writer.bytes(.signature, &proof.signature);
+        },
+        .reply => |outcome| switch (outcome) {
+            .ok => writer.bytes(.ok, &.{}),
+            .failed => |code| put(u16, writer.field(.failed, 2), 0, @backingInt(code)),
+        },
     }
+    return writer.finish();
+}
+
+pub fn decodeAuth(data: []const u8, binary: bool, expected: p.AuthKind) DecodeError!p.AuthMessage {
+    var frame = try open(data, binary, p.max_gameplay_request_bytes);
+    if (@backingInt(frame.tag) != @backingInt(expected)) return error.UnexpectedMessageType;
+    switch (expected) {
+        .challenge => {
+            const fields = &.{.nonce};
+            const nonce = try frame.body.exact(fields, .nonce, 32);
+            try frame.body.finish(fields);
+            return .{ .challenge = nonce.* };
+        },
+        .proof => {
+            const fields = &.{ .pubkey, .signature };
+            const key = try frame.body.exact(fields, .pubkey, 33);
+            const signature = try frame.body.exact(fields, .signature, 64);
+            try frame.body.finish(fields);
+            return .{ .proof = .{ .pubkey = key.*, .signature = signature.* } };
+        },
+        .reply => {
+            const fields = &.{ .ok, .failed };
+            const outcome = try frame.body.next(fields) orelse return error.MissingRequiredField;
+            try frame.body.finish(fields);
+            if (outcome.tag == .ok) {
+                if (outcome.bytes.len != 0) return error.InvalidFieldLength;
+                return .{ .reply = .ok };
+            }
+            if (outcome.bytes.len != 2) return error.InvalidFieldLength;
+            const code = std.enums.fromInt(p.AuthFailure, get(u16, outcome.bytes, 0)) orelse return error.InvalidFieldValue;
+            return .{ .reply = .{ .failed = code } };
+        },
+    }
+}
+
+pub fn decodeProtocolError(data: []const u8) DecodeError!void {
+    var frame = try open(data, true, p.max_response_bytes);
+    if (frame.tag != .protocol_error) return error.UnexpectedMessageType;
+    try frame.body.finish(&.{});
+}
+
+test "payment request matches golden bytes and rejects truncated prefixes" {
+    const payment: p.SpillmanChannelPayment = .{ .id = @splat(0x42), .amount = 0x0102030405060708, .signature = @splat(bye) };
+    const id: p.Id = @splat(0x24);
+    var storage: [136]u8 = undefined;
+    const data = try encodeRequest(&storage, .channel_payment, .{ .request_id = id, .payload = payment });
+    const golden = [_]u8{ 0x20, 132, 0, 1, 16, 0 } ++ id ++
+        [_]u8{ 0x20, 32, 0 } ++ payment.id ++ [_]u8{ 0x21, 8, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0x22, 64, 0 } ++
+        payment.signature ++ [_]u8{0x7e};
+    try std.testing.expectEqualSlices(u8, &golden, data);
+    try std.testing.expectEqualDeep(p.Request{ .request_id = id, .operation = .{ .channel_payment = payment } }, try decodeMessage(data, true));
+    for (0..data.len) |n| {
+        const err: DecodeError = if (n < header_bytes) error.TruncatedHeader else if (n == data.len - 1) error.MissingBye else error.TruncatedBody;
+        try std.testing.expectError(err, decodeMessage(data[0..n], true));
+    }
+}
+
+test {
+    _ = @import("wire_tests.zig");
 }

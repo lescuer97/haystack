@@ -1,12 +1,15 @@
-//! Production admission/cleanup and location helper, deliberately no socket use.
+//! Production framing, authentication, and request routing without sockets.
 const std = @import("std");
 const ws = std.http.Server.WebSocket;
 const transport = @import("transport.zig");
 const shared = @import("shared");
 const p = shared.protocol;
+const wire = shared.wire;
+const config = @import("ws_config.zig");
 const Handler = @import("transport.zig").Handler;
 const Fixture = @import("fixture.zig").Fixture;
 const sessions = @import("sessions.zig");
+const ticks = @import("tick_mailbox.zig");
 const upgrade_headers = "Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
 const many_headers = blk: {
     var bytes: [29 * 6]u8 = undefined;
@@ -67,7 +70,7 @@ test "std upgrade preserves already buffered frame bytes and stable key" {
     var key: [24]u8 = undefined;
     try transport.validateUpgrade(&request, &key);
     var websocket = try request.respondWebSocket(.{ .key = &key });
-    var buffer: [128]u8 = undefined;
+    var buffer: [config.max_payload]u8 = undefined;
     var guard = transport.FrameInput.init(&input, &buffer);
     websocket.input = &guard.interface;
     const message = try websocket.readSmallMessage();
@@ -77,26 +80,30 @@ test "std upgrade preserves already buffered frame bytes and stable key" {
 }
 
 test "thin frame guard rejects RSV mask FIN opcode noncanonical control and oversize including skipped pongs" {
+    var oversize_header = [_]u8{ 0x82, 0xfe, 0, 0 };
+    std.mem.writeInt(u16, oversize_header[2..4], config.max_payload + 1, .big);
     for ([_][]const u8{
-        "\xc2\x80",         "\xa2\x80",                                 "\x92\x80",                                 "\x82\x00",                                 "\x02\x80",         "\x80\x80",         "\x83\x80",
-        "\x82\xfe\x00\x7d", "\x82\xff\x00\x00\x00\x00\x00\x00\x00\x80", "\x82\xff\x80\x00\x00\x00\x00\x00\x00\x00", "\x82\xff\x00\x00\x00\x00\x00\x01\x00\x00", "\x82\xfe\x00\x81", "\x89\xfe\x00\x7e", "\x8a\xfe\x00\x7e",
+        "\xc2\x80",         "\xa2\x80",                                 "\x92\x80",                                 "\x82\x00",                                 "\x02\x80",       "\x80\x80",         "\x83\x80",
+        "\x82\xfe\x00\x7d", "\x82\xff\x00\x00\x00\x00\x00\x00\x00\x80", "\x82\xff\x80\x00\x00\x00\x00\x00\x00\x00", "\x82\xff\x00\x00\x00\x00\x00\x01\x00\x00", &oversize_header, "\x89\xfe\x00\x7e", "\x8a\xfe\x00\x7e",
         "\x88\x81",         "\x8a\x80\x00\x00\x00\x00\xc2\x80",         "\xca\x80",                                 "\x0a\x80",                                 "\x82\xff",
     }) |bytes| {
         var input = std.Io.Reader.fixed(bytes);
-        var buffer: [128]u8 = undefined;
+        var buffer: [config.max_payload]u8 = undefined;
         var guard = transport.FrameInput.init(&input, &buffer);
         var output = std.Io.Writer.failing;
         var websocket = ws{ .input = &guard.interface, .output = &output, .key = "" };
         try std.testing.expectError(error.ReadFailed, websocket.readSmallMessage());
     }
-    for ([_]usize{ 0, 125, 126, 128 }) |length| {
-        var bytes: [136]u8 = @splat(0);
+    try std.testing.expectEqual(@as(usize, 1024), config.max_payload);
+    try std.testing.expectEqual(@as(usize, 256), p.max_gameplay_request_bytes);
+    for ([_]usize{ 0, 125, 126, p.max_gameplay_request_bytes, p.max_gameplay_request_bytes + 1, config.max_payload }) |length| {
+        var bytes: [config.max_payload + 8]u8 = @splat(0);
         bytes[0] = 0x82;
         const header: usize = if (length < 126) 2 else 4;
         bytes[1] = if (length < 126) 0x80 | @as(u8, @intCast(length)) else 0xfe;
         if (header == 4) std.mem.writeInt(u16, bytes[2..4], @intCast(length), .big);
         var input = std.Io.Reader.fixed(bytes[0 .. header + 4 + length]);
-        var buffer: [128]u8 = undefined;
+        var buffer: [config.max_payload]u8 = undefined;
         var guard = transport.FrameInput.init(&input, &buffer);
         var output = std.Io.Writer.failing;
         var websocket = ws{ .input = &guard.interface, .output = &output, .key = "" };
@@ -107,7 +114,7 @@ test "thin frame guard rejects RSV mask FIN opcode noncanonical control and over
 test "frame guard zero limits and partial forwarding preserve exact bytes and boundaries" {
     const bytes = "\x82\x81\x01\x02\x03\x04\xf0\x89\x80\x00\x00\x00\x00";
     var input = std.Io.Reader.fixed(bytes);
-    var buffer: [128]u8 = undefined;
+    var buffer: [config.max_payload]u8 = undefined;
     var guard = transport.FrameInput.init(&input, &buffer);
     var storage: [bytes.len]u8 = undefined;
     var output = std.Io.Writer.fixed(&storage);
@@ -116,6 +123,36 @@ test "frame guard zero limits and partial forwarding preserve exact bytes and bo
     for (0..bytes.len) |_| try std.testing.expectEqual(@as(usize, 1), try guard.interface.stream(&output, .limited(1)));
     try std.testing.expectEqual(@as(usize, 0), guard.remaining);
     try std.testing.expectEqualSlices(u8, bytes, output.buffered());
+}
+
+const protocol_error_frame = "\x82\x04\xff\x00\x00\x7e";
+const auth_ack_frame = "\x82\x07\xf2\x03\x00\x03\x00\x00\x7e";
+const test_pubkey_hex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+const test_signature_hex = "49eacfb328fa4897cd34d70e114b33f3f1964f0a0d36ecf0ef5719488358b61eabd2b684bff67111333304d960ff5a1dc83d9aa3a632c4b27e329fc4e47acf20";
+
+fn writeClientFrame(out: *std.Io.Writer, payload: []const u8) !void {
+    try out.writeByte(0x82);
+    if (payload.len < 126) {
+        try out.writeByte(0x80 | @as(u8, @intCast(payload.len)));
+    } else {
+        try out.writeByte(0xfe);
+        var length: [2]u8 = undefined;
+        std.mem.writeInt(u16, &length, @intCast(payload.len), .big);
+        try out.writeAll(&length);
+    }
+    const mask = [4]u8{ 1, 2, 3, 4 };
+    try out.writeAll(&mask);
+    for (payload, 0..) |byte, i| try out.writeByte(byte ^ mask[i % mask.len]);
+}
+
+fn handleNextFrame(handler: *Handler) !void {
+    const message = try handler.conn.readSmallMessage();
+    try handler.clientMessage(message.data, message.opcode);
+}
+
+fn expectAuthFailure(frame: []const u8, failure: p.AuthFailure) !void {
+    try std.testing.expectEqualSlices(u8, "\x82\x09", frame[0..2]);
+    try std.testing.expectEqualDeep(p.AuthOutcome{ .failed = failure }, (try wire.decodeAuth(frame[2..], true, .reply)).reply);
 }
 
 test "fixed buffer authentication challenge proof ACK claims and failure cleanup" {
@@ -130,48 +167,60 @@ test "fixed buffer authentication challenge proof ACK claims and failure cleanup
     handler.nonce = @splat(7);
     handler.deadline = transport.freshDeadline(std.testing.io);
     try handler.sendChallenge();
-    try std.testing.expectEqualSlices(u8, "\x82\x21\xf0" ++ @as([32]u8, @splat(7)), output.buffered());
+    const challenge_frame = "\x82\x27\xf0\x23\x00\x10\x20\x00" ++ @as([32]u8, @splat(7)) ++ "\x7e";
+    try std.testing.expectEqualSlices(u8, challenge_frame, output.buffered());
     var key: [33]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&key, "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+    _ = try std.fmt.hexToBytes(&key, test_pubkey_hex);
     var signature: [64]u8 = undefined;
-    _ = try std.fmt.hexToBytes(&signature, "49eacfb328fa4897cd34d70e114b33f3f1964f0a0d36ecf0ef5719488358b61eabd2b684bff67111333304d960ff5a1dc83d9aa3a632c4b27e329fc4e47acf20");
-    var proof: [98]u8 = undefined;
-    _ = shared.wire.encodeAuth(&proof, .{ .proof = .{ .pubkey = key, .signature = signature } });
-    proof[50] ^= 1;
-    try std.testing.expectError(error.InvalidAuthentication, handler.clientMessage(&proof, .binary));
-    try std.testing.expect(handler.session == null);
-    proof[50] ^= 1;
-    const frame = "\x82\xe2\x00\x00\x00\x00" ++ @as([98]u8, @splat(0));
-    var frame_bytes = frame.*;
-    @memcpy(frame_bytes[6..], &proof);
+    _ = try std.fmt.hexToBytes(&signature, test_signature_hex);
+    var proof: [107]u8 = undefined;
+    try std.testing.expectEqual(proof.len, (try wire.encodeAuth(&proof, .{ .proof = .{ .pubkey = key, .signature = signature } })).len);
+
+    // A well-framed proof with a bad signature gets a typed failure and terminates.
+    var rejected = try Handler.init(&websocket, &fixture.application);
+    defer rejected.close();
+    rejected.nonce = handler.nonce;
+    rejected.deadline = handler.deadline;
+    proof[proof.len - 2] ^= 1;
+    try std.testing.expectError(error.AuthenticationRejected, rejected.clientMessage(&proof, .binary));
+    try expectAuthFailure(output.buffered()[challenge_frame.len..], .invalid_credentials);
+    try std.testing.expect(!rejected.authenticated and rejected.session == null);
+    proof[proof.len - 2] ^= 1;
+    output.end = challenge_frame.len;
+
+    const before_proof = handler.deadline;
+    try handler.clientMessage(&proof, .text);
+    try std.testing.expectEqualSlices(u8, protocol_error_frame, output.buffered()[challenge_frame.len..]);
+    try std.testing.expectEqualDeep(before_proof, handler.deadline);
+    try std.testing.expect(!handler.authenticated and handler.session == null);
+    const ack_start = output.buffered().len;
+    var frame_bytes: [6 + proof.len]u8 = undefined;
+    var frame_writer = std.Io.Writer.fixed(&frame_bytes);
+    try writeClientFrame(&frame_writer, &proof);
     var frame_reader = std.Io.Reader.fixed(&frame_bytes);
-    var frame_buffer: [128]u8 = undefined;
+    var frame_buffer: [config.max_payload]u8 = undefined;
     var guard = transport.FrameInput.init(&frame_reader, &frame_buffer);
     websocket.input = &guard.interface;
-    const message = try websocket.readSmallMessage();
-    try handler.clientMessage(message.data, message.opcode);
+    try handleNextFrame(&handler);
     try std.testing.expect(handler.authenticated);
     try std.testing.expectEqualDeep(key, fixture.application.registry.get(handler.session.?).?.pubkey);
-    try std.testing.expectEqualSlices(u8, "\x82\x01\xf2", output.buffered()[35..]);
-    try std.testing.expectError(error.RepeatedAuthentication, handler.clientMessage(&proof, .binary));
-    var ordinary = [_]u8{0xf0};
-    for ([_]ws.Opcode{ .text, .binary }) |opcode| {
+    try std.testing.expectEqualSlices(u8, auth_ack_frame, output.buffered()[ack_start..]);
+    const session = handler.session.?;
+    for ([_][]const u8{ &proof, challenge_frame[2..], auth_ack_frame[2..], "\x00" }, [_]ws.Opcode{ .binary, .binary, .binary, .text }) |data, opcode| {
         const start = output.buffered().len;
-        try handler.clientMessage(&ordinary, opcode);
-        var snapshot: p.Snapshot = undefined;
-        const response = try shared.wire.decodeResponse(output.buffered()[start + 2 ..], &snapshot);
-        try std.testing.expectEqual(if (opcode == .text) p.ErrorCode.unsupported_message else p.ErrorCode.invalid_request, response.result.failure.code);
+        try handler.clientMessage(data, opcode);
+        try std.testing.expectEqualSlices(u8, protocol_error_frame, output.buffered()[start..]);
+        try std.testing.expect(handler.authenticated);
+        try std.testing.expectEqualDeep(session, handler.session.?);
     }
-    ordinary[0] = 0xf2;
-    const start = output.buffered().len;
-    try handler.clientMessage(&ordinary, .binary);
-    var snapshot: p.Snapshot = undefined;
-    try std.testing.expectEqual(p.ErrorCode.invalid_request, (try shared.wire.decodeResponse(output.buffered()[start + 2 ..], &snapshot)).result.failure.code);
     var duplicate = try Handler.init(&websocket, &fixture.application);
+    defer duplicate.close();
     duplicate.nonce = handler.nonce;
     duplicate.deadline = handler.deadline;
-    try std.testing.expectError(error.DuplicatePubkey, duplicate.clientMessage(&proof, .binary));
-    try std.testing.expect(duplicate.session == null);
+    const failure_start = output.buffered().len;
+    try std.testing.expectError(error.AuthenticationRejected, duplicate.clientMessage(&proof, .binary));
+    try expectAuthFailure(output.buffered()[failure_start..], .unavailable);
+    try std.testing.expect(!duplicate.authenticated and duplicate.session == null);
     handler.close();
     handler.close();
     handler.deadline = .{ .raw = .{ .nanoseconds = 0 }, .clock = .awake };
@@ -198,7 +247,7 @@ test "fixed buffer authentication challenge proof ACK claims and failure cleanup
     websocket.output = &expiring.writer;
     handler.deadline = transport.freshDeadline(std.testing.io);
     try std.testing.expectError(error.DeadlineExpired, handler.clientMessage(&proof, .binary));
-    try std.testing.expectEqualSlices(u8, "\x82\x01\xf2", expiring.writer.buffered());
+    try std.testing.expectEqualSlices(u8, auth_ack_frame, expiring.writer.buffered());
     try std.testing.expect(!handler.authenticated and handler.session == null);
     for (fixture.application.registry.slots) |slot| try std.testing.expect(!slot.occupied);
     // The new auth window is independent of an expired accept/HTTP timestamp.
@@ -232,14 +281,14 @@ test "production location helper bypasses sole leased world with no replay state
     const before = stateCount(&fixture);
     const held = app.lease().?;
     const handle = try app.registry.claim(@splat(0));
-    var buf: [33]u8 = undefined;
+    var buf: [p.max_response_bytes]u8 = undefined;
     var snapshot: p.Snapshot = undefined;
     for ([_]p.Location{ .{ .x = 0, .y = 0 }, .{ .x = -1, .y = -2 }, .{ .x = std.math.minInt(i32), .y = std.math.maxInt(i32) } }) |location| {
-        const req = p.Request{ .request_id = @splat(0), .operation = .{ .update_location = location } };
+        const req = p.RequestFor(.update_location){ .request_id = @splat(0), .payload = location };
         const ack = app.handleLocation(handle, req);
-        const bytes = shared.wire.encode(&buf, ack);
-        try std.testing.expectEqual(@as(usize, 20), bytes.len);
-        try std.testing.expectEqualDeep(ack, try shared.wire.decodeResponse(bytes, &snapshot));
+        try std.testing.expect(ack == .ok);
+        const bytes = try wire.encodeReply(&buf, .update_location, req, ack);
+        try std.testing.expectEqualDeep(ack, try wire.decodeReply(bytes, .update_location, req.request_id, &snapshot));
         try std.testing.expectEqualDeep(@as(?p.Location, location), app.registry.get(handle).?.location);
         try std.testing.expect(app.lease() == null);
     }
@@ -247,39 +296,41 @@ test "production location helper bypasses sole leased world with no replay state
     const reused = app.lease().?;
     app.release(reused);
     try std.testing.expectEqual(before, stateCount(&fixture));
-    const wrong = p.Request{ .request_id = @splat(0), .operation = .{ .cut = .{ .x = 0, .y = 0 } } };
-    try std.testing.expectEqual(p.ErrorCode.invalid_request, app.handleLocation(handle, wrong).result.failure.code);
-    const loc = p.Request{ .request_id = @splat(0), .operation = .{ .update_location = .{ .x = 1, .y = 2 } } };
-    // Accidental world dispatch rejects without inspecting undefined state.
-    var state: @import("world_state.zig").WorldState = undefined;
-    try std.testing.expectEqual(p.ErrorCode.invalid_request, @import("actions.zig").handle(&state, &snapshot, loc).result.failure.code);
+    const loc = p.RequestFor(.update_location){ .request_id = @splat(0), .payload = .{ .x = 1, .y = 2 } };
     app.registry.release(handle);
-    try std.testing.expectEqual(p.ErrorCode.invalid_request, app.handleLocation(handle, loc).result.failure.code);
+    const failure = app.handleLocation(handle, loc);
+    try std.testing.expectEqual(p.LocationFailure.invalid_request, failure.failed);
+    const bytes = try wire.encodeReply(&buf, .update_location, loc, failure);
+    try std.testing.expectEqualDeep(failure, try wire.decodeReply(bytes, .update_location, loc.request_id, &snapshot));
     try std.testing.expectEqual(before, stateCount(&fixture));
 }
 test "production proof codec rejects malformed first messages without gameplay or claims" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     const before = stateCount(&fixture);
-    var dummy: ws = undefined;
-    var handler = try Handler.init(&dummy, &fixture.application);
+    var input = std.Io.Reader.fixed("");
+    var storage: [512]u8 = undefined;
+    var output = std.Io.Writer.fixed(&storage);
+    var websocket = ws{ .input = &input, .output = &output, .key = "" };
+    var handler = try Handler.init(&websocket, &fixture.application);
+    defer handler.close();
     handler.deadline = transport.freshDeadline(std.testing.io);
-    var challenge: [33]u8 = .{0xf0} ++ @as([32]u8, @splat(0));
-    var ack = [_]u8{0xf2};
-    try std.testing.expectError(error.InvalidAuthentication, handler.clientMessage(&challenge, .binary));
-    try std.testing.expectError(error.InvalidAuthentication, handler.clientMessage(&ack, .binary));
-    var proof: [129]u8 = @splat(0);
-    for ([_]usize{ 0, 1, 20, 97, 99, 128, 129 }) |length| {
-        try std.testing.expectError(error.InvalidAuthentication, handler.clientMessage(proof[0..length], .binary));
+    const deadline = handler.deadline;
+    var challenge: [39]u8 = undefined;
+    _ = try wire.encodeAuth(&challenge, .{ .challenge = @splat(0) });
+    var proof: [p.max_request_bytes]u8 = @splat(0);
+    const proof_len = (try wire.encodeAuth(&proof, .{ .proof = .{ .pubkey = @splat(0), .signature = @splat(0) } })).len;
+    for ([_][]const u8{ &challenge, auth_ack_frame[2..], "", proof[0..1], proof[0..20], proof[0 .. proof_len - 1], proof[0 .. proof_len + 1], proof[0 .. p.max_gameplay_request_bytes + 1], &proof }) |malformed| {
+        const start = output.buffered().len;
+        try handler.clientMessage(malformed, .binary);
+        try std.testing.expectEqualSlices(u8, protocol_error_frame, output.buffered()[start..]);
+        try std.testing.expect(!handler.authenticated and handler.session == null);
+        try std.testing.expectEqualDeep(deadline, handler.deadline);
     }
-    proof[0] = 0xf1;
-    try std.testing.expectError(error.InvalidAuthentication, handler.clientMessage(proof[0..98], .text));
-    // Invalid compressed prefix/point, no
-    // connection lifecycle access, no wallet, no world work or identity admission.
-    try std.testing.expectError(error.InvalidAuthentication, handler.clientMessage(proof[0..98], .binary));
-    proof[1] = 2;
-    @memset(proof[2..34], 0xff);
-    try std.testing.expectError(error.InvalidAuthentication, handler.clientMessage(proof[0..98], .binary));
+    // A structurally valid but unusable compressed key is a credential failure.
+    const start = output.buffered().len;
+    try std.testing.expectError(error.AuthenticationRejected, handler.clientMessage(proof[0..proof_len], .binary));
+    try expectAuthFailure(output.buffered()[start..], .invalid_credentials);
     for (fixture.application.registry.slots) |slot| try std.testing.expect(!slot.occupied);
     try std.testing.expectEqual(before, stateCount(&fixture));
     // Failure after provisional admission (e.g. ACK write/expiry) uses the
@@ -293,6 +344,197 @@ test "production proof codec rejects malformed first messages without gameplay o
     try std.testing.expect(fixture.application.registry.get(fresh) != null);
     fixture.application.registry.release(fresh);
 }
+fn expectChannelUnavailable(handler: *Handler, output: *std.Io.Writer, comptime kind: p.Kind, id: p.Id, reply_tag: u8) !void {
+    const start = output.buffered().len;
+    try handleNextFrame(handler);
+    const reply = output.buffered()[start..];
+    try std.testing.expect(reply.len >= 3 and reply.len <= 127);
+    try std.testing.expectEqualSlices(u8, &.{ 0x82, @intCast(reply.len - 2), reply_tag }, reply[0..3]);
+    var snapshot: p.Snapshot = undefined;
+    try std.testing.expectEqualDeep(p.Outcome(kind){ .failed = .unavailable }, try wire.decodeReply(reply[2..], kind, id, &snapshot));
+}
+
+test "Spilman messages require authentication and reject without touching tick or world state" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const before = stateCount(&fixture);
+    var slots: [1]transport.Slot = .{.{}};
+    const slot = &slots[0];
+    var dispatch: ticks.Dispatcher = .{ .io = std.testing.io, .stopping = true };
+    var frame_storage: [2 * config.max_payload + 1024]u8 = undefined;
+    var frames = std.Io.Writer.fixed(&frame_storage);
+    var request_storage: [config.max_payload]u8 = undefined;
+
+    const payment_id: p.Id = @splat(0x20);
+    const payment_request: p.RequestFor(.channel_payment) = .{
+        .request_id = payment_id,
+        .payload = .{ .id = @splat(3), .amount = 42, .signature = @splat(0x7e) },
+    };
+    const payment = try wire.encodeRequest(&request_storage, .channel_payment, payment_request);
+    try std.testing.expectEqual(@as(u8, 0x20), payment[0]);
+    try writeClientFrame(&frames, payment); // before authentication
+
+    var key: [33]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&key, test_pubkey_hex);
+    var signature: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&signature, test_signature_hex);
+    try writeClientFrame(&frames, try wire.encodeAuth(&request_storage, .{ .proof = .{ .pubkey = key, .signature = signature } }));
+
+    const open_id: p.Id = @splat(0x22);
+    const vectors = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("spilman_vectors.json"), .{});
+    defer vectors.deinit();
+    const funding_json = vectors.value.object.get("funding_proofs_json").?.string;
+    try std.testing.expectError(error.InvalidProofLength, wire.encodeRequest(&request_storage, .channel_open, .{
+        .request_id = open_id,
+        .payload = .{ .id = @splat(3), .proof = funding_json },
+    }));
+    const funding = try std.json.parseFromSlice([]std.json.Value, std.testing.allocator, funding_json, .{});
+    defer funding.deinit();
+    const open_proof = try std.json.Stringify.valueAlloc(std.testing.allocator, funding.value[0..1], .{});
+    defer std.testing.allocator.free(open_proof);
+    const open = try wire.encodeRequest(&request_storage, .channel_open, .{
+        .request_id = open_id,
+        .payload = .{ .id = @splat(3), .proof = open_proof },
+    });
+    try std.testing.expectEqual(@as(u8, 0x22), open[0]);
+    try std.testing.expectEqual(open_proof.len + 61, open.len);
+    try std.testing.expect(open.len > p.max_gameplay_request_bytes);
+    try writeClientFrame(&frames, open[0 .. open.len - 1]); // missing envelope terminator
+    try writeClientFrame(&frames, open);
+
+    try writeClientFrame(&frames, try wire.encodeRequest(&request_storage, .channel_payment, payment_request));
+    const requirements_id: p.Id = @splat(0x21);
+    const requirements = try wire.encodeRequest(&request_storage, .channel_requirements, .{
+        .request_id = requirements_id,
+        .payload = .{ .tool = .axe },
+    });
+    try std.testing.expectEqual(@as(u8, 0x21), requirements[0]);
+    try writeClientFrame(&frames, requirements);
+    const close_id: p.Id = @splat(0x23);
+    const close = try wire.encodeRequest(&request_storage, .channel_close, .{
+        .request_id = close_id,
+        .payload = .{ .id = @splat(3) },
+    });
+    try std.testing.expectEqual(@as(u8, 0x23), close[0]);
+    try writeClientFrame(&frames, close);
+    const location: p.RequestFor(.update_location) = .{ .request_id = @splat(3), .payload = .{ .x = 5, .y = -9 } };
+    try writeClientFrame(&frames, try wire.encodeRequest(&request_storage, .update_location, location));
+
+    var input = std.Io.Reader.fixed(frames.buffered());
+    var guard = transport.FrameInput.init(&input, &slot.ws_buffer);
+    var output = std.Io.Writer.fixed(&slot.output_buffer);
+    var websocket = ws{ .input = &guard.interface, .output = &output, .key = "" };
+    var handler = try Handler.init(&websocket, &fixture.application);
+    defer handler.close();
+    handler.nonce = @splat(7);
+    handler.deadline = transport.freshDeadline(std.testing.io);
+    handler.dispatch = &dispatch;
+    handler.mailbox = &slot.mailbox;
+
+    try handleNextFrame(&handler);
+    try std.testing.expectEqualSlices(u8, protocol_error_frame, output.buffered());
+    try std.testing.expect(!handler.authenticated and handler.session == null);
+    output.end = 0;
+    try handleNextFrame(&handler);
+    try std.testing.expectEqualSlices(u8, auth_ack_frame, output.buffered());
+    const session = handler.session.?;
+    output.end = 0;
+    try handleNextFrame(&handler);
+    try std.testing.expectEqualSlices(u8, protocol_error_frame, output.buffered());
+    try expectChannelUnavailable(&handler, &output, .channel_open, open_id, 0xa2);
+    try expectChannelUnavailable(&handler, &output, .channel_payment, payment_id, 0xa0);
+    try expectChannelUnavailable(&handler, &output, .channel_requirements, requirements_id, 0xa1);
+    try expectChannelUnavailable(&handler, &output, .channel_close, close_id, 0xa3);
+
+    try std.testing.expect(handler.authenticated);
+    try std.testing.expectEqualDeep(session, handler.session.?);
+    try std.testing.expectEqual(key, fixture.application.registry.get(session).?.pubkey);
+    try std.testing.expectEqual(@as(u64, 0), slot.mailbox.generation);
+    try std.testing.expect(slot.mailbox.state == .idle);
+    try std.testing.expectEqual(before, stateCount(&fixture));
+    try std.testing.expect(fixture.application.registry.get(session).?.location == null);
+
+    // A normal gameplay request on the same connection still reaches the tick.
+    const Tick = struct {
+        fn run(d: *ticks.Dispatcher, app: *transport.App, s: *[1]transport.Slot) void {
+            defer d.stop(s);
+            const deadline = transport.freshDeadline(d.io);
+            while (true) {
+                transport.checkDeadline(d.io, deadline) catch return;
+                var batch = d.beginBatch(s, 0);
+                if (d.claimNext(s, &batch, 0)) |work| {
+                    d.execute(app, &s[0].mailbox, work);
+                    return;
+                }
+                std.Io.sleep(d.io, .fromMilliseconds(1), .awake) catch return;
+            }
+        }
+    };
+    dispatch.stopping = false;
+    var group: std.Io.Group = .init;
+    defer group.cancel(std.testing.io);
+    try group.concurrent(std.testing.io, Tick.run, .{ &dispatch, &fixture.application, &slots });
+    output.end = 0;
+    try handleNextFrame(&handler);
+    var snapshot: p.Snapshot = undefined;
+    try std.testing.expectEqualDeep(p.Outcome(.update_location){ .ok = {} }, try wire.decodeReply(output.buffered()[2..], .update_location, location.request_id, &snapshot));
+    try std.testing.expectEqualDeep(location.payload, fixture.application.registry.get(session).?.location.?);
+}
+
+test "tick admission replies typed busy without taking ownership of a mailbox generation" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var input = std.Io.Reader.fixed("");
+    var storage: [512]u8 = undefined;
+    var output = std.Io.Writer.fixed(&storage);
+    var websocket = ws{ .input = &input, .output = &output, .key = "" };
+    var dispatch: @import("tick_mailbox.zig").Dispatcher = .{ .io = std.testing.io };
+    var box: @import("tick_mailbox.zig").Mailbox = .{};
+    var handler = try Handler.init(&websocket, &fixture.application);
+    handler.dispatch = &dispatch;
+    handler.mailbox = &box;
+    defer handler.close();
+    const req = p.RequestFor(.update_location){ .request_id = @splat(0x42), .payload = .{ .x = 1, .y = 2 } };
+    var request_storage: [p.max_request_bytes]u8 = undefined;
+    const request = try wire.encodeRequest(&request_storage, .update_location, req);
+    handler.deadline = transport.freshDeadline(std.testing.io);
+    try handler.clientMessage(request, .binary);
+    try std.testing.expectEqualSlices(u8, protocol_error_frame, output.buffered());
+    try std.testing.expect(!handler.authenticated and handler.session == null);
+
+    const session = try fixture.application.registry.claim(@splat(3));
+    handler.session = session;
+    handler.authenticated = true;
+    const pending_id: p.Id = @splat(0x17);
+    try dispatch.publish(&box, session, .{ .request_id = pending_id, .operation = .{ .update_location = req.payload } });
+    box.reply[0] = 0xa5;
+    box.len = 1;
+    const busy = p.Outcome(.update_location){ .failed = .server_busy };
+    var snapshot: p.Snapshot = undefined;
+    output.end = 0;
+    try handler.clientMessage(request, .binary);
+    try std.testing.expectEqualDeep(busy, try wire.decodeReply(output.buffered()[2..], .update_location, req.request_id, &snapshot));
+    try std.testing.expect(box.state == .queued);
+    try std.testing.expectEqual(@as(u64, 1), box.generation);
+    try std.testing.expectEqual(pending_id, box.request.request_id);
+    try std.testing.expectEqualSlices(u8, &.{0xa5}, box.reply[0..box.len]);
+    try std.testing.expect(handler.authenticated);
+
+    dispatch.cleanup(&box);
+    box.generation = std.math.maxInt(u64);
+    output.end = 0;
+    try std.testing.expectError(error.GenerationExhausted, handler.clientMessage(request, .binary));
+    try std.testing.expectEqualDeep(busy, try wire.decodeReply(output.buffered()[2..], .update_location, req.request_id, &snapshot));
+    try std.testing.expect(box.state == .idle);
+    try std.testing.expectEqual(std.math.maxInt(u64), box.generation);
+
+    dispatch.stopping = true;
+    output.end = 0;
+    try std.testing.expectError(error.ServerStopping, handler.clientMessage(request, .binary));
+    try std.testing.expectEqualDeep(busy, try wire.decodeReply(output.buffered()[2..], .update_location, req.request_id, &snapshot));
+    try std.testing.expect(fixture.application.registry.get(session).?.location == null);
+}
+
 test "frozen startup allocator admits updates reads and releases all 64 sessions" {
     const Guard = struct {
         frozen: bool = false,
@@ -319,8 +561,8 @@ test "frozen startup allocator admits updates reads and releases all 64 sessions
     for (&handles, 0..) |*handle, i| {
         handle.* = try fixture.application.registry.claim(@splat(@intCast(i)));
         try std.testing.expect(fixture.application.registry.get(handle.*).?.location == null);
-        const req = p.Request{ .request_id = @splat(0), .operation = .{ .update_location = .{ .x = @intCast(i), .y = -1 } } };
-        try std.testing.expect(fixture.application.handleLocation(handle.*, req).result == .location_updated);
+        const req = p.RequestFor(.update_location){ .request_id = @splat(0), .payload = .{ .x = @intCast(i), .y = -1 } };
+        try std.testing.expect(fixture.application.handleLocation(handle.*, req) == .ok);
         try std.testing.expectEqual(@as(i32, @intCast(i)), fixture.application.registry.get(handle.*).?.location.?.x);
         var snapshot: p.Snapshot = undefined;
         _ = try fixture.application.context.state.cut(@import("world_state.zig").request(i, @intCast(i), -1));

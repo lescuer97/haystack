@@ -21,7 +21,7 @@ Implemented today in `shared/world.zig`, `src/world.zig`, and `server/`:
   unloads everything outside a 2-chunk prefetch ring, then loads visible chunks
   first and the rest of the ring second.
 - Memory stats, allocation-free eviction scratch, and retry-after-OOM support.
-- Standalone loopback WebSocket server with binary v1, process-lifetime grass/tree cuts,
+- Standalone loopback WebSocket server with binary TLV messages, process-lifetime grass/tree cuts,
   fixed RAM budgets, volatile opaque-ID replay, and complete
   64-chunk bitmap area snapshots.
   See [server.md](server.md) for the implemented wire contract and limits.
@@ -204,7 +204,7 @@ ChunkRecord {
 Not implemented in the client. When game networking is added, incoming messages
 are collected without blocking and applied at the frame update boundary, before the local
 action for that frame; callbacks only enqueue. See `game-loop.md` for the loop
-ordering. The standalone rewardless binary v1 protocol exists in `server.md`;
+ordering. The standalone rewardless binary TLV protocol is documented in `server.md`;
 the diagram below is a future rewardful flow, not that protocol.
 
 ```

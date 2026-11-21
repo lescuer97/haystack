@@ -27,6 +27,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
     b.step("run-server", "Run the local server").dependOn(&run_server.step);
     const unit_mod = b.createModule(.{ .root_source_file = b.path("server/tests.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "shared", .module = shared }} });
     unit_mod.addImport("native_storage", storage);
+    unit_mod.addAnonymousImport("spilman_vectors.json", .{ .root_source_file = b.path("src/testdata/spilman_vectors.json") });
     native.link(unit_mod);
     secp.link(unit_mod);
     unit_mod.link_libc = true;

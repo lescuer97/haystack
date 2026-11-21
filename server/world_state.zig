@@ -8,7 +8,7 @@ const actions = @import("actions.zig");
 pub const WorldState = struct {
     pub const capacity = 512;
     pub const Chunk = struct { cx: i32, cy: i32, cuts: [32]u8 };
-    pub const Replay = struct { id: p.Id, version: u16, tile: p.Cut, result: p.CutResult };
+    pub const Replay = struct { id: p.Id, tile: p.Cut, result: p.Outcome(.cut) };
     chunks: [capacity]Chunk = undefined,
     replays: [capacity]Replay = undefined,
     chunk_count: usize = 0,
@@ -21,12 +21,12 @@ pub const WorldState = struct {
         return null;
     }
 
-    pub fn cut(self: *WorldState, req: p.Request) error{CapacityExceeded}!p.CutResult {
-        const tile = req.operation.cut;
+    pub fn cut(self: *WorldState, req: p.RequestFor(.cut)) error{CapacityExceeded}!p.Outcome(.cut) {
+        const tile = req.payload;
         for (self.replays[0..self.replay_count]) |entry| {
             if (!std.mem.eql(u8, &entry.id, &req.request_id)) continue;
-            if (entry.version != req.version or entry.tile.x != tile.x or entry.tile.y != tile.y)
-                return .{ .failure = .{ .code = .request_id_conflict } };
+            if (entry.tile.x != tile.x or entry.tile.y != tile.y)
+                return .{ .failed = .request_id_conflict };
             return entry.result;
         }
         const cx = @divFloor(tile.x, 16);
@@ -37,9 +37,9 @@ pub const WorldState = struct {
         const already = if (index) |i| self.chunks[i].cuts[bit / 8] & mask != 0 else false;
         const result = actions.cutRule(.{ .x = tile.x, .y = tile.y, .terrain = world.sampleTile(world.public_seed, tile.x, tile.y), .cut = already });
         if (self.replay_count == capacity) return error.CapacityExceeded;
-        if (result == .success and index == null and self.chunk_count == capacity) return error.CapacityExceeded;
+        if (result == .ok and index == null and self.chunk_count == capacity) return error.CapacityExceeded;
         // All admission checks precede publication; nothing below can fail.
-        if (result == .success) {
+        if (result == .ok) {
             const i = index orelse self.chunk_count;
             if (index == null) {
                 self.chunks[i] = .{ .cx = cx, .cy = cy, .cuts = @splat(0) };
@@ -47,16 +47,16 @@ pub const WorldState = struct {
             }
             self.chunks[i].cuts[bit / 8] |= mask;
         }
-        self.replays[self.replay_count] = .{ .id = req.request_id, .version = req.version, .tile = tile, .result = result };
+        self.replays[self.replay_count] = .{ .id = req.request_id, .tile = tile, .result = result };
         self.replay_count += 1;
         return result;
     }
 
     pub fn readArea(self: *const WorldState, area: world.ChunkRange, out: *p.Snapshot) error{InvalidArea}!void {
-        if (actions.validateArea(area) != null) return error.InvalidArea;
-        const cols: usize = @intCast(@as(i64, area.cx1) - area.cx0 + 1);
-        const rows: usize = @intCast(@as(i64, area.cy1) - area.cy0 + 1);
-        out.* = .{ .area = area, .count = @intCast(cols * rows) };
+        const geometry = p.areaGeometry(area) catch return error.InvalidArea;
+        const cols = geometry.cols;
+        const rows = geometry.rows;
+        out.* = .{ .area = area, .count = geometry.count };
         for (0..rows) |y| for (0..cols) |x| {
             const cx = area.cx0 + @as(i32, @intCast(x));
             const cy = area.cy0 + @as(i32, @intCast(y));
@@ -65,8 +65,8 @@ pub const WorldState = struct {
     }
 };
 
-pub fn request(id: u128, x: i32, y: i32) p.Request {
+pub fn request(id: u128, x: i32, y: i32) p.RequestFor(.cut) {
     var bytes: p.Id = undefined;
     std.mem.writeInt(u128, &bytes, id, .little);
-    return .{ .request_id = bytes, .operation = .{ .cut = .{ .x = x, .y = y } } };
+    return .{ .request_id = bytes, .payload = .{ .x = x, .y = y } };
 }

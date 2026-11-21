@@ -9,6 +9,15 @@ const TestSlot = struct { mailbox: ticks.Mailbox = .{} };
 const location = p.Request{ .request_id = @splat(0), .operation = .{ .update_location = .{ .x = 10, .y = -2 } } };
 const read = p.Request{ .request_id = @splat(1), .operation = .{ .read_area = .{ .cx0 = 0, .cy0 = 0, .cx1 = 0, .cy1 = 0 } } };
 
+fn cutRequest(id: u128, x: i32, y: i32) p.Request {
+    const req = @import("world_state.zig").request(id, x, y);
+    return .{ .request_id = req.request_id, .operation = .{ .cut = req.payload } };
+}
+
+fn reply(box: *const ticks.Mailbox, comptime kind: p.Kind, id: p.Id, snapshot: *p.Snapshot) !p.Outcome(kind) {
+    return shared.wire.decodeReply(box.reply[0..box.len], kind, id, snapshot);
+}
+
 test "owned requests wait for tick; cut read and location copy replies before releasing context" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
@@ -16,7 +25,7 @@ test "owned requests wait for tick; cut read and location copy replies before re
     const session = try app.registry.claim(@splat(2));
     var dispatcher = ticks.Dispatcher{ .io = t.io };
     var slots: [3]TestSlot = @splat(.{});
-    var cut = @import("world_state.zig").request(8, 0, 0);
+    var cut = cutRequest(8, 0, 0);
     try dispatcher.publish(&slots[0].mailbox, session, cut);
     cut.operation.cut.x = 1000;
     try dispatcher.publish(&slots[1].mailbox, session, read);
@@ -33,12 +42,19 @@ test "owned requests wait for tick; cut read and location copy replies before re
     try t.expectEqual(@as(i32, 0), slots[0].mailbox.request.operation.cut.x);
     try t.expectEqual(@as(usize, 1), app.context.state.replay_count);
     try t.expectEqualDeep(location.operation.update_location, app.registry.get(session).?.location.?);
-    const saved = slots[1].mailbox.reply;
+    var snapshot: p.Snapshot = undefined;
+    const cut_outcome = try reply(&slots[0].mailbox, .cut, cut.request_id, &snapshot);
+    try t.expectEqualDeep(app.context.state.replays[0].result, cut_outcome);
+    try t.expect((try reply(&slots[2].mailbox, .update_location, location.request_id, &snapshot)) == .ok);
+    const area_reply = &slots[1].mailbox;
+    const saved = (try reply(area_reply, .read_area, read.request_id, &snapshot)).ok.*;
+    try t.expectEqualDeep(read.operation.read_area, saved.area);
+    try t.expectEqual(@as(u16, 1), saved.count);
     const context = app.lease().?;
-    _ = context.handle(read);
+    _ = context.handle(.read_area, .{ .request_id = read.request_id, .payload = read.operation.read_area });
     @memset(&context.response, 0xaa);
     app.release(context);
-    try t.expectEqualSlices(u8, saved[0..slots[1].mailbox.len], slots[1].mailbox.reply[0..slots[1].mailbox.len]);
+    try t.expectEqualDeep(saved, (try reply(area_reply, .read_area, read.request_id, &snapshot)).ok.*);
     for (&slots) |*slot| {
         try slot.mailbox.completion.wait(t.io);
         dispatcher.cleanup(&slot.mailbox);
@@ -105,17 +121,30 @@ test "busy reply and stale sessions on all operations preserve bounded world sem
     const held = app.lease().?;
     var batch = dispatcher.beginBatch(&slots, 0);
     dispatcher.execute(app, box, dispatcher.claimNext(&slots, &batch, 0).?);
-    app.release(held);
-    var expected: [33]u8 = undefined;
-    try t.expectEqualSlices(u8, shared.wire.encode(&expected, shared.wire.failure(read.request_id, .server_busy)), box.reply[0..box.len]);
+    var snapshot: p.Snapshot = undefined;
+    try t.expectEqual(p.AreaFailure.server_busy, (try reply(box, .read_area, read.request_id, &snapshot)).failed);
+    try t.expect(!box.close_after_reply);
     dispatcher.cleanup(box);
+
+    try dispatcher.publish(box, session, location);
+    batch = dispatcher.beginBatch(&slots, 0);
+    dispatcher.execute(app, box, dispatcher.claimNext(&slots, &batch, 0).?);
+    try t.expect((try reply(box, .update_location, location.request_id, &snapshot)) == .ok);
+    try t.expect(!box.close_after_reply);
+    try t.expectEqualDeep(location.operation.update_location, app.registry.get(session).?.location.?);
+    dispatcher.cleanup(box);
+    app.release(held);
+
     app.registry.release(session);
     const replacement = try app.registry.claim(@splat(5));
-    for ([_]p.Request{ location, read, @import("world_state.zig").request(2, 0, 0) }) |request| {
+    for ([_]p.Request{ location, read, cutRequest(2, 0, 0) }) |request| {
         try dispatcher.publish(box, session, request);
         batch = dispatcher.beginBatch(&slots, 0);
         dispatcher.execute(app, box, dispatcher.claimNext(&slots, &batch, 0).?);
         try t.expect(box.close_after_reply);
+        switch (request.operation) {
+            inline else => |_, kind| try t.expect((try reply(box, kind, request.request_id, &snapshot)).failed == .invalid_request),
+        }
         dispatcher.cleanup(box);
     }
     try t.expect(app.registry.get(replacement).?.location == null);
@@ -124,7 +153,7 @@ test "busy reply and stale sessions on all operations preserve bounded world sem
     try t.expectError(error.GenerationExhausted, dispatcher.publish(box, replacement, read));
 }
 
-test "fixed writer emits unchanged location bytes and cleans ready mailbox on write failure" {
+test "fixed writer emits a typed location reply and cleans ready mailbox on write failure" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     var dispatcher = ticks.Dispatcher{ .io = t.io };
@@ -145,9 +174,13 @@ test "fixed writer emits unchanged location bytes and cleans ready mailbox on wr
     var batch = dispatcher.beginBatch(&slots, 0);
     dispatcher.execute(&fixture.application, box, dispatcher.claimNext(&slots, &batch, 0).?);
     try handler.finishReply();
-    var payload: [20]u8 = undefined;
-    const encoded = shared.wire.encode(&payload, .{ .request_id = location.request_id, .result = .location_updated });
-    try t.expectEqualSlices(u8, &.{ 0x82, 20 }, output.buffered()[0..2]);
+    var payload: [p.max_response_bytes]u8 = undefined;
+    const encoded = try shared.wire.encodeReply(&payload, .update_location, .{
+        .request_id = location.request_id,
+        .payload = location.operation.update_location,
+    }, .{ .ok = {} });
+    try t.expect(encoded.len <= 125);
+    try t.expectEqualSlices(u8, &.{ 0x82, @intCast(encoded.len) }, output.buffered()[0..2]);
     try t.expectEqualSlices(u8, encoded, output.buffered()[2..]);
     try dispatcher.publish(box, session, location);
     try t.expect(!box.completion.isSet());
@@ -267,6 +300,8 @@ test "stopping wakes queued work; ready cancellation and slot reuse retain monot
     dispatcher.stop(&slots);
     try box.completion.wait(t.io);
     try t.expect(box.close_after_reply);
+    var snapshot: p.Snapshot = undefined;
+    try t.expectEqual(p.AreaFailure.server_busy, (try reply(box, .read_area, read.request_id, &snapshot)).failed);
     dispatcher.cleanup(box);
     try t.expectEqual(@as(u64, 1), box.generation);
     try t.expectError(error.ServerStopping, dispatcher.publish(box, session, read));
@@ -283,21 +318,22 @@ test "full replay store still permits reads and replay while new cuts stay busy 
     var dispatcher = ticks.Dispatcher{ .io = t.io };
     var slots: [1]TestSlot = @splat(.{});
     const box = &slots[0].mailbox;
-    for ([_]p.Request{ request(512, 0, 0), read, request(0, 0, 0) }, 0..) |req, index| {
+    for ([_]p.Request{ cutRequest(512, 0, 0), read, cutRequest(0, 0, 0) }, 0..) |req, index| {
         try dispatcher.publish(box, session, req);
         var batch = dispatcher.beginBatch(&slots, 0);
         dispatcher.execute(app, box, dispatcher.claimNext(&slots, &batch, 0).?);
-        var expected: [p.max_response_bytes]u8 = undefined;
-        const bytes = if (index == 0)
-            shared.wire.encode(&expected, shared.wire.failure(req.request_id, .server_busy))
-        else blk: {
-            const context = app.lease().?;
-            defer app.release(context);
-            const encoded = context.handle(req);
-            @memcpy(expected[0..encoded.len], encoded);
-            break :blk expected[0..encoded.len];
-        };
-        try t.expectEqualSlices(u8, bytes, box.reply[0..box.len]);
+        var snapshot: p.Snapshot = undefined;
+        switch (index) {
+            0 => try t.expect((try reply(box, .cut, req.request_id, &snapshot)).failed == .server_busy),
+            1 => {
+                var expected: p.Snapshot = undefined;
+                try original.readArea(read.operation.read_area, &expected);
+                try t.expectEqualDeep(expected, (try reply(box, .read_area, req.request_id, &snapshot)).ok.*);
+            },
+            2 => try t.expectEqualDeep(original.replays[0].result, try reply(box, .cut, req.request_id, &snapshot)),
+            else => unreachable,
+        }
+        try t.expect(!box.close_after_reply);
         dispatcher.cleanup(box);
     }
     try t.expectEqual(original.chunk_count, app.context.state.chunk_count);

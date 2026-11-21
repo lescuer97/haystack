@@ -3,7 +3,8 @@ const std = @import("std");
 const shared = @import("shared");
 const p = shared.protocol;
 const sessions = @import("sessions.zig");
-const App = @import("app.zig").App;
+const application = @import("app.zig");
+const App = application.App;
 
 pub const Mailbox = struct {
     state: enum { idle, queued, executing, ready } = .idle,
@@ -32,6 +33,8 @@ pub const Dispatcher = struct {
     stopping: bool = false,
 
     pub fn publish(self: *Dispatcher, box: *Mailbox, session: sessions.Handle, request: p.Request) !void {
+        // Channel opens may borrow the WebSocket receive buffer.
+        if (p.isChannel(std.meta.activeTag(request.operation))) return error.NotGameplayRequest;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.stopping) return error.ServerStopping;
@@ -86,19 +89,27 @@ pub const Dispatcher = struct {
         var close = false;
         if (app.registry.get(work.session) == null) {
             close = true;
-            self.encodeFailure(box, work.request, .invalid_request);
-        } else if (work.request.operation == .update_location) {
-            const response = app.handleLocation(work.session, work.request);
-            close = response.result == .failure;
-            box.len = shared.wire.encode(&box.reply, response).len;
-        } else if (app.lease()) |context| {
-            // Copy the encoded snapshot before returning the reusable context.
-            const bytes = context.handle(work.request);
-            @memcpy(box.reply[0..bytes.len], bytes);
-            box.len = bytes.len;
-            app.release(context);
-        } else {
-            self.encodeFailure(box, work.request, .server_busy);
+            box.len = application.encodeCommonFailure(&box.reply, work.request, .invalid_request).len;
+        } else switch (work.request.operation) {
+            .update_location => |payload| {
+                const req: p.RequestFor(.update_location) = .{ .request_id = work.request.request_id, .payload = payload };
+                const outcome = app.handleLocation(work.session, req);
+                close = outcome == .failed;
+                const bytes = shared.wire.encodeReply(&box.reply, .update_location, req, outcome) catch unreachable;
+                box.len = bytes.len;
+            },
+            .channel_requirements, .channel_open, .channel_payment, .channel_close => unreachable,
+            inline .cut, .read_area => |payload, kind| {
+                if (app.lease()) |context| {
+                    defer app.release(context);
+                    // Copy the encoded snapshot before returning the reusable context.
+                    const bytes = context.handle(kind, .{ .request_id = work.request.request_id, .payload = payload });
+                    @memcpy(box.reply[0..bytes.len], bytes);
+                    box.len = bytes.len;
+                } else {
+                    box.len = application.encodeCommonFailure(&box.reply, work.request, .server_busy).len;
+                }
+            },
         }
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -106,10 +117,6 @@ pub const Dispatcher = struct {
         box.close_after_reply = close;
         box.state = .ready;
         box.completion.set(self.io);
-    }
-
-    fn encodeFailure(_: *Dispatcher, box: *Mailbox, request: p.Request, code: p.ErrorCode) void {
-        box.len = shared.wire.encode(&box.reply, shared.wire.failure(request.request_id, code)).len;
     }
 
     /// Caller has ended its cancelable wait and any socket write. The reservation
@@ -149,7 +156,7 @@ pub const Dispatcher = struct {
             const box = &slot.mailbox;
             std.debug.assert(box.state != .executing);
             if (box.state != .queued) continue;
-            self.encodeFailure(box, box.request, .server_busy);
+            box.len = application.encodeCommonFailure(&box.reply, box.request, .server_busy).len;
             box.close_after_reply = true;
             box.state = .ready;
             box.completion.set(self.io);

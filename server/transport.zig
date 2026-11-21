@@ -2,7 +2,8 @@
 const ws = std.http.Server.WebSocket;
 const wire = @import("shared").wire;
 const p = @import("shared").protocol;
-pub const App = @import("app.zig").App;
+const application = @import("app.zig");
+pub const App = application.App;
 const sessions = @import("sessions.zig");
 const std = @import("std");
 const auth = @import("ws_auth.zig");
@@ -49,7 +50,7 @@ pub const FrameInput = struct {
                     header_len = 4;
                     break :blk n;
                 },
-                // ponytail: canonical 64-bit lengths exceed the fixed 128-byte cap.
+                // Canonical 64-bit lengths exceed the fixed payload cap.
                 .len64 => return error.ReadFailed,
                 else => @backingInt(h1.payload_len),
             };
@@ -112,6 +113,7 @@ pub const Handler = struct {
     deadline: Deadline,
     session: ?sessions.Handle = null,
     authenticated: bool = false,
+    reported_decode_error: bool = false,
     dispatch: ?*ticks.Dispatcher = null,
     mailbox: ?*ticks.Mailbox = null,
     pub fn init(conn: *ws, app: *App) !Handler {
@@ -121,8 +123,8 @@ pub const Handler = struct {
     }
     pub fn sendChallenge(self: *Handler) !void {
         try checkDeadline(self.app.registry.io, self.deadline);
-        var challenge: [33]u8 = undefined;
-        try self.conn.writeMessage(wire.encodeAuth(&challenge, .{ .challenge = self.nonce }), .binary);
+        var challenge: [39]u8 = undefined;
+        try self.conn.writeMessage(try wire.encodeAuth(&challenge, .{ .challenge = self.nonce }), .binary);
     }
     pub fn close(self: *Handler) void {
         if (self.dispatch) |dispatch| dispatch.cleanup(self.mailbox.?);
@@ -130,36 +132,76 @@ pub const Handler = struct {
         self.session = null;
         self.authenticated = false;
     }
-    pub fn clientMessage(self: *Handler, data: []u8, tpe: ws.Opcode) !void {
+    fn sendAuthReply(self: *Handler, outcome: p.AuthOutcome) !void {
+        const io = self.app.registry.io;
+        try checkDeadline(io, self.deadline);
+        var reply: [9]u8 = undefined;
+        try self.conn.writeMessage(try wire.encodeAuth(&reply, .{ .reply = outcome }), .binary);
+        try checkDeadline(io, self.deadline);
+    }
+    fn rejectAuth(self: *Handler, failure: p.AuthFailure) !void {
+        try self.sendAuthReply(.{ .failed = failure });
+        return error.AuthenticationRejected;
+    }
+    fn sendProtocolError(self: *Handler, err: wire.DecodeError) !void {
+        if (!self.reported_decode_error) {
+            std.log.scoped(.wire).debug("rejected client message: {s}", .{@errorName(err)});
+            self.reported_decode_error = true;
+        }
+        try self.conn.writeMessage(&wire.protocol_error, .binary);
+    }
+    pub fn clientMessage(self: *Handler, data: []const u8, tpe: ws.Opcode) !void {
         if (!self.authenticated) {
             const io = self.app.registry.io;
             try checkDeadline(io, self.deadline);
-            const proof = switch (try wire.decodeAuth(data, tpe == .binary)) {
-                .proof => |proof| proof,
-                else => return error.InvalidAuthentication,
+            const message = (if (data.len > p.max_gameplay_request_bytes)
+                error.MessageTooLarge
+            else
+                wire.decodeAuth(data, tpe == .binary, .proof)) catch |err| {
+                try self.sendProtocolError(err);
+                return checkDeadline(io, self.deadline);
             };
-            const key = try auth.verifyAuth(proof.pubkey, self.nonce, proof.signature);
+            const proof = message.proof;
+            const key = auth.verifyAuth(proof.pubkey, self.nonce, proof.signature) catch
+                return self.rejectAuth(.invalid_credentials);
             try checkDeadline(io, self.deadline);
-            self.session = try self.app.registry.claimBefore(key, self.deadline);
+            self.session = self.app.registry.claimBefore(key, self.deadline) catch |err| switch (err) {
+                error.DeadlineExpired => return err,
+                error.DuplicatePubkey, error.SessionCapacity, error.GenerationExhausted => return self.rejectAuth(.unavailable),
+            };
             errdefer self.close();
-            var ack: [1]u8 = undefined;
-            try checkDeadline(io, self.deadline);
-            try self.conn.writeMessage(wire.encodeAuth(&ack, .authenticated), .binary);
-            try checkDeadline(io, self.deadline);
+            try self.sendAuthReply(.{ .ok = {} });
             self.authenticated = true;
             return;
         }
-        if (data.len > 0 and data[0] == @backingInt(p.AuthKind.proof)) return error.RepeatedAuthentication;
-        var error_storage: [33]u8 = undefined;
-        switch (wire.decodeMessage(data, tpe == .binary)) {
-            .failure => |f| try self.conn.writeMessage(wire.encode(&error_storage, f), .binary),
-            .request => |req| {
-                const dispatch = self.dispatch orelse return error.MissingTickDispatcher;
-                const box = self.mailbox.?;
-                try dispatch.publish(box, self.session.?, req);
-                try self.finishReply();
+        const req = wire.decodeMessage(data, tpe == .binary) catch |err|
+            return self.sendProtocolError(err);
+        if (p.isChannel(std.meta.activeTag(req.operation))) return self.rejectChannel(req);
+
+        const dispatch = self.dispatch orelse return error.MissingTickDispatcher;
+        const box = self.mailbox.?;
+        dispatch.publish(box, self.session.?, req) catch |err| switch (err) {
+            error.NotGameplayRequest => unreachable,
+            error.RequestPending, error.ServerStopping, error.GenerationExhausted => {
+                // A rejected publish owns no generation and must not touch the box.
+                var reply: [p.max_response_bytes]u8 = undefined;
+                try self.conn.writeMessage(application.encodeCommonFailure(&reply, req, .server_busy), .binary);
+                if (err != error.RequestPending) return err;
+                return;
             },
-        }
+        };
+        try self.finishReply();
+    }
+    fn rejectChannel(self: *Handler, req: p.Request) !void {
+        // Open proof bytes borrow the receive buffer until the next WebSocket read.
+        // Keep this route synchronous and never publish a channel request to the tick.
+        // No channel service or durable ledger is configured; the wallet alone is not one.
+        var reply: [28]u8 = undefined; // Envelope, ID TLV, and two-byte failure TLV.
+        const bytes = switch (req.operation) {
+            inline .channel_requirements, .channel_open, .channel_payment, .channel_close => |payload, kind| try wire.encodeReply(&reply, kind, .{ .request_id = req.request_id, .payload = payload }, .{ .failed = .unavailable }),
+            .cut, .read_area, .update_location => unreachable,
+        };
+        try self.conn.writeMessage(bytes, .binary);
     }
     pub fn finishReply(self: *Handler) !void {
         const box = self.mailbox.?;
@@ -331,7 +373,7 @@ const Connection = struct {
         self.websocket = try self.request.respondWebSocket(.{ .key = &self.slot.key });
         self.websocket.input = &self.guard.interface;
         try self.handler.sendChallenge(); // flushes HTTP101 and challenge together
-        while (true) {
+        while (!self.handler.authenticated) {
             const message = try self.websocket.readSmallMessage();
             try checkDeadline(self.io, self.handler.deadline);
             if (message.opcode == .ping) {
@@ -339,10 +381,38 @@ const Connection = struct {
                 continue;
             }
             try self.handler.clientMessage(message.data, message.opcode);
-            return;
         }
     }
 };
+
+test "connection authentication reads past malformed messages under the original deadline" {
+    var fixture = try @import("fixture.zig").Fixture.init();
+    defer fixture.deinit();
+    const head = "GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+    const malformed_frame = "\x82\x80\x00\x00\x00\x00";
+    const proof_header = "\x82\xeb\x00\x00\x00\x00";
+    var input_bytes: [head.len + malformed_frame.len + proof_header.len + 107]u8 = undefined;
+    const prefix = head ++ malformed_frame ++ proof_header;
+    @memcpy(input_bytes[0..prefix.len], prefix);
+    _ = try wire.encodeAuth(input_bytes[prefix.len..], .{ .proof = .{ .pubkey = @splat(0), .signature = @splat(0) } });
+    var input = std.Io.Reader.fixed(&input_bytes);
+    var slot: Slot = .{};
+    slot.deadline = freshDeadline(std.testing.io);
+    var output = std.Io.Writer.fixed(&slot.output_buffer);
+    var guard = FrameInput.init(&input, &slot.ws_buffer);
+    var connection = Connection{ .io = std.testing.io, .slot = &slot, .http = .init(&input, &output), .guard = &guard };
+    try connection.receive();
+    connection.handler = try Handler.init(&connection.websocket, &fixture.application);
+    defer connection.handler.close();
+    const deadline = freshDeadline(std.testing.io);
+    connection.handler.deadline = deadline;
+    try std.testing.expectError(error.AuthenticationRejected, connection.authenticate());
+    const reply_frames = "\x82\x04\xff\x00\x00\x7e" ++ "\x82\x09\xf2\x05\x00\x04\x02\x00\x01\x00\x7e";
+    try std.testing.expect(std.mem.endsWith(u8, output.buffered(), reply_frames));
+    try std.testing.expectEqualDeep(deadline, connection.handler.deadline);
+    try std.testing.expect(!connection.handler.authenticated and connection.handler.session == null);
+}
 
 fn race(io: std.Io, deadline: Deadline, comptime work: anytype, args: anytype) !void {
     const Result = union(enum) { work: anyerror!void, timer: std.Io.Cancelable!void };
