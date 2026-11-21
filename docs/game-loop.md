@@ -6,16 +6,18 @@ guide in `menu.md`.
 
 The demo is a chunk-streaming viewer: the camera pans over an endless,
 deterministically generated tile world, and only the chunks near the view are
-kept in memory. The player sprite follows the camera target; it does not yet
-have separate movement, collision, or server state.
+kept in memory. The player moves one tile at a time against generated terrain,
+and the camera follows accepted steps. Dragging pans the view without moving the
+player. The standalone server uses the same terrain rule, but the client does
+not connect to it yet.
 `Esc` toggles the demonstration menu; see `menu.md` for its controls and
 extension points.
 
 ## Player sprites
 
-WASD, arrows, and controller directions select the walk animation; releasing
-movement returns to idle facing the last direction. Mouse drag still pans the
-view. Press `Space` for the sword swing, `1` for pickaxe, `2` for axe, `3` for
+WASD, arrows, and controller directions attempt a step. Accepted steps play
+the walk animation; blocked attempts face the requested direction without
+walking. Releasing movement returns to idle. Mouse drag only pans the view. Press `Space` for the sword swing, `1` for pickaxe, `2` for axe, `3` for
 hoe, `4` for watering can, or `5` to preview the collapse. These play once and
 do not affect terrain, health, or inventory.
 
@@ -93,7 +95,7 @@ Why this order:
 2. **Update second.** An optional onboarding model receives input first and
    consumes each queued record while blocking, including transition records. Otherwise
    `GameState.update` applies that one input value to the
-   persistent camera, menu, and debug settings. The menu is modal: while it is
+   persistent player, camera, menu, and debug settings. The menu is modal: while it is
    open, and on the frame that opens or closes it, the update returns before the
    camera and toggles see the frame. Camera moves are whole-tile and validated;
    an unrepresentable move returns `error.CoordinateOutOfBounds` before any
@@ -150,9 +152,8 @@ page/focus and actionable copy/confirm identity provide a before-capture
 backstop, also on skipped ticks. Idle/stale wallet polls do not flush input.
 Trusted browser clipboard operations remain synchronous in the original gesture
 handler, outside the game clock. Wallet expiry, Unix time and worker dispatch
-also remain real-time. No animations currently require a time hook; future
-time-based simulation belongs once per tick with `tick.dt_seconds`, not once
-per queued input or draw.
+also remain real-time. Player animation time advances once per tick with
+`tick.dt_seconds`, not once per queued input or draw.
 
 ## Native wallet startup
 
@@ -263,12 +264,10 @@ cache. A non-resident chunk still exists conceptually; the deterministic generat
    next due tick, if no menu/onboarding blocks it, the repeater emits
    `FrameInput{ .right = true }`. Stable holds repeat every two executed ticks;
    missed ticks are dropped, not replayed. OS direction auto-repeat is unused.
-2. `GameState.update` calls `Camera.applyInput`. Each request moves the camera
-   exactly one tile on that axis. Opposing inputs cancel, and a held diagonal
-   (for example D plus S) moves one tile on both axes per step. A held left
-   mouse button takes precedence over keys and controller and resets the step
-   cadence. Here `tile_x` increases by 1, and the Raylib target becomes
-   `(tile_x * 32 + 16, tile_y * 32 + 16)` pixels.
+2. `GameState.update` checks the proposed tile with `shared.movement.canStep`.
+   If accepted, the player moves one tile and the camera follows. A diagonal
+   also needs both side tiles clear. A held left mouse button takes precedence,
+   resets the step cadence, and pans only the camera.
 3. `camera.calculate` builds the Raylib transform centered on the new camera
    position, converts the window corners to world pixels, floors them to chunks,
    validates the chunk range plus the 2-chunk prefetch ring, and returns a

@@ -132,18 +132,19 @@ blocks 43, teeth 6). No system installation, CMake, Cargo source path, Rust ABI 
 handwritten crypto is used. The browser/Wasm graph never requests this dependency.
 Warm Zig dependencies before using offline builds.
 
-Sessions are internal RAM only, with immutable connection identity and an optional
-packed 8-byte `Location{x:i32,y:i32}` in **tile** coordinates. Location is UNKNOWN
-until the first explicit update, distinct from known `(0,0)`. Every valid update
-is acknowledged; latest received wins, including reused or all-zero request IDs.
-An acknowledgement means RAM acceptance, not durability. All signed i32
-coordinates are accepted for tracking only: no terrain, speed, proximity or
-game-rule enforcement. Cut/read connections must first complete authentication.
+Sessions are internal RAM only, with immutable connection identity and a packed
+8-byte `Location{x:i32,y:i32}` in **tile** coordinates. Each session starts at
+the shared walkable spawn `(0,0)`. A location update may stay put or move one
+tile onto grass or dirt. A diagonal also needs both side tiles clear. Rejected
+moves return `invalid_request` without changing position or closing a live
+session. An acknowledgement means RAM acceptance, not durability. Location
+updates are not replay-cached and do not enforce movement cadence or consult
+cuts or other characters. Cut/read connections must first complete authentication.
 There is no listing, client query, subscription, broadcast or location history.
 
 Normal/error/shutdown cleanup and failed-upgrade cleanup after admission release
 the session. Generation-checked handles protect reused connection records from
-stale cleanup/update. Reconnect after close starts UNKNOWN, without a cache.
+stale cleanup/update. Reconnect after close starts at the spawn.
 An undetected authenticated old socket may temporarily block reconnect: no
 post-authentication heartbeat/idle deadline is added. Registry locking never spans
 world or socket operations. Cut replay history is global across sessions, not

@@ -37,14 +37,21 @@ fn deltaFitsI32(v: f64) bool {
 }
 
 /// True when the tile's center pixel (`tile * TILE_PX + TILE_PX/2`) fits the
-/// i32 world-pixel contract. `tile` is i64 so the product cannot overflow.
+/// i32 world-pixel contract. Both pixel bounds align with tile edges.
 fn tileCenterFitsI32(tile: i64) bool {
-    const px = tile * @as(i64, world.TILE_PX) + world.TILE_PX / 2;
-    return px >= std.math.minInt(i32) and px <= std.math.maxInt(i32);
+    return tile >= @divFloor(std.math.minInt(i32), world.TILE_PX) and
+        tile <= @divFloor(std.math.maxInt(i32), world.TILE_PX);
+}
+
+pub fn tileCenter(x: i32, y: i32) rl.Vector2 {
+    return .{
+        .x = @floatFromInt(@as(i64, x) * world.TILE_PX + world.TILE_PX / 2),
+        .y = @floatFromInt(@as(i64, y) * world.TILE_PX + world.TILE_PX / 2),
+    };
 }
 
 pub const Camera = struct {
-    /// Authoritative position in whole world tiles, not pixels.
+    /// View target in whole world tiles, not pixels.
     tile_x: i32 = 0,
     tile_y: i32 = 0,
 
@@ -105,13 +112,15 @@ pub const Camera = struct {
         // cannot leave the camera half-updated.
         const target_x = @as(i64, self.tile_x) + dx;
         const target_y = @as(i64, self.tile_y) + dy;
-        if (!tileCenterFitsI32(target_x) or !tileCenterFitsI32(target_y))
-            return error.CoordinateOutOfBounds;
-
-        self.tile_x = @intCast(target_x);
-        self.tile_y = @intCast(target_y);
+        try self.setTarget(target_x, target_y);
         self.drag_remainder_x = remainder_x;
         self.drag_remainder_y = remainder_y;
+    }
+
+    pub fn setTarget(self: *Camera, x: i64, y: i64) world.CoordinateError!void {
+        if (!tileCenterFitsI32(x) or !tileCenterFitsI32(y)) return error.CoordinateOutOfBounds;
+        self.tile_x = @intCast(x);
+        self.tile_y = @intCast(y);
     }
 
     /// Forget a partially accumulated drag. A modal menu consumes the frames
@@ -134,10 +143,7 @@ pub const Camera = struct {
     pub fn raylib(self: Camera, vw: f32, vh: f32) rl.Camera2D {
         return .{
             .offset = .{ .x = vw / 2, .y = vh / 2 },
-            .target = .{
-                .x = @floatFromInt(@as(i64, self.tile_x) * world.TILE_PX + world.TILE_PX / 2),
-                .y = @floatFromInt(@as(i64, self.tile_y) * world.TILE_PX + world.TILE_PX / 2),
-            },
+            .target = tileCenter(self.tile_x, self.tile_y),
             .rotation = 0,
             .zoom = 1,
         };

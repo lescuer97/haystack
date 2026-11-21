@@ -1,6 +1,7 @@
 //! Ephemeral, bounded verified connection identity and latest tile location.
 const std = @import("std");
-const Location = @import("shared").protocol.Location;
+const shared = @import("shared");
+const Location = shared.protocol.Location;
 pub const Pubkey = [33]u8;
 pub const Handle = struct { index: usize, generation: u64 };
 pub const SessionSnapshot = struct { pubkey: Pubkey, location: ?Location };
@@ -40,7 +41,7 @@ pub const Registry = struct {
             if (std.Io.Clock.Timestamp.now(self.io, end.clock).compare(.gte, end)) return error.DeadlineExpired;
         }
         self.generation += 1;
-        self.slots[index] = .{ .occupied = true, .generation = self.generation, .pubkey = key };
+        self.slots[index] = .{ .occupied = true, .generation = self.generation, .pubkey = key, .location = shared.movement.spawn };
         return .{ .index = index, .generation = self.generation };
     }
     fn slotFor(self: *Registry, handle: Handle) ?*Slot {
@@ -57,6 +58,7 @@ pub const Registry = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const slot = self.slotFor(handle) orelse return error.StaleSession;
+        if (!shared.movement.canStep(slot.location.?, location)) return error.BlockedMovement;
         slot.location = location;
     }
     pub fn get(self: *Registry, handle: Handle) ?SessionSnapshot {

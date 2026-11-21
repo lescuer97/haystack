@@ -94,7 +94,7 @@ pub const Dispatcher = struct {
             .update_location => |payload| {
                 const req: p.RequestFor(.update_location) = .{ .request_id = work.request.request_id, .payload = payload };
                 const outcome = app.handleLocation(work.session, req);
-                close = outcome == .failed;
+                close = outcome == .failed and app.registry.get(work.session) == null;
                 const bytes = shared.wire.encodeReply(&box.reply, .update_location, req, outcome) catch unreachable;
                 box.len = bytes.len;
             },

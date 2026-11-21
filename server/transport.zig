@@ -341,7 +341,7 @@ test "production tick owner executes queued work and group cancellation joins it
     const session = try fixture.application.registry.claim(@splat(19));
     try server.dispatch.publish(&slot.mailbox, session, .{
         .request_id = @splat(0),
-        .operation = .{ .update_location = .{ .x = 1, .y = 2 } },
+        .operation = .{ .update_location = .{ .x = 1, .y = 0 } },
     });
     var group: std.Io.Group = .init;
     defer group.cancel(std.testing.io);

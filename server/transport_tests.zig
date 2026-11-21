@@ -4,6 +4,8 @@ const ws = std.http.Server.WebSocket;
 const transport = @import("transport.zig");
 const shared = @import("shared");
 const p = shared.protocol;
+const spawn = shared.movement.spawn;
+const east: p.Location = .{ .x = 1, .y = 0 };
 const wire = shared.wire;
 const config = @import("ws_config.zig");
 const Handler = @import("transport.zig").Handler;
@@ -283,13 +285,19 @@ test "production location helper bypasses sole leased world with no replay state
     const handle = try app.registry.claim(@splat(0));
     var buf: [p.max_response_bytes]u8 = undefined;
     var snapshot: p.Snapshot = undefined;
-    for ([_]p.Location{ .{ .x = 0, .y = 0 }, .{ .x = -1, .y = -2 }, .{ .x = std.math.minInt(i32), .y = std.math.maxInt(i32) } }) |location| {
+    const far: p.Location = .{ .x = std.math.minInt(i32), .y = std.math.maxInt(i32) };
+    for ([_]p.Location{ east, far, spawn }, 0..) |location, i| {
         const req = p.RequestFor(.update_location){ .request_id = @splat(0), .payload = location };
         const ack = app.handleLocation(handle, req);
-        try std.testing.expect(ack == .ok);
         const bytes = try wire.encodeReply(&buf, .update_location, req, ack);
         try std.testing.expectEqualDeep(ack, try wire.decodeReply(bytes, .update_location, req.request_id, &snapshot));
-        try std.testing.expectEqualDeep(@as(?p.Location, location), app.registry.get(handle).?.location);
+        if (i == 1) {
+            try std.testing.expectEqual(p.LocationFailure.invalid_request, ack.failed);
+            try std.testing.expectEqualDeep(east, app.registry.get(handle).?.location.?);
+        } else {
+            try std.testing.expect(ack == .ok);
+            try std.testing.expectEqualDeep(location, app.registry.get(handle).?.location.?);
+        }
         try std.testing.expect(app.lease() == null);
     }
     app.release(held);
@@ -417,7 +425,7 @@ test "Spilman messages require authentication and reject without touching tick o
     });
     try std.testing.expectEqual(@as(u8, 0x23), close[0]);
     try writeClientFrame(&frames, close);
-    const location: p.RequestFor(.update_location) = .{ .request_id = @splat(3), .payload = .{ .x = 5, .y = -9 } };
+    const location: p.RequestFor(.update_location) = .{ .request_id = @splat(3), .payload = east };
     try writeClientFrame(&frames, try wire.encodeRequest(&request_storage, .update_location, location));
 
     var input = std.Io.Reader.fixed(frames.buffered());
@@ -452,7 +460,7 @@ test "Spilman messages require authentication and reject without touching tick o
     try std.testing.expectEqual(@as(u64, 0), slot.mailbox.generation);
     try std.testing.expect(slot.mailbox.state == .idle);
     try std.testing.expectEqual(before, stateCount(&fixture));
-    try std.testing.expect(fixture.application.registry.get(session).?.location == null);
+    try std.testing.expectEqualDeep(spawn, fixture.application.registry.get(session).?.location.?);
 
     // A normal gameplay request on the same connection still reaches the tick.
     const Tick = struct {
@@ -532,7 +540,7 @@ test "tick admission replies typed busy without taking ownership of a mailbox ge
     output.end = 0;
     try std.testing.expectError(error.ServerStopping, handler.clientMessage(request, .binary));
     try std.testing.expectEqualDeep(busy, try wire.decodeReply(output.buffered()[2..], .update_location, req.request_id, &snapshot));
-    try std.testing.expect(fixture.application.registry.get(session).?.location == null);
+    try std.testing.expectEqualDeep(spawn, fixture.application.registry.get(session).?.location.?);
 }
 
 test "frozen startup allocator admits updates reads and releases all 64 sessions" {
@@ -560,10 +568,10 @@ test "frozen startup allocator admits updates reads and releases all 64 sessions
     var handles: [64]sessions.Handle = undefined;
     for (&handles, 0..) |*handle, i| {
         handle.* = try fixture.application.registry.claim(@splat(@intCast(i)));
-        try std.testing.expect(fixture.application.registry.get(handle.*).?.location == null);
-        const req = p.RequestFor(.update_location){ .request_id = @splat(0), .payload = .{ .x = @intCast(i), .y = -1 } };
+        try std.testing.expectEqualDeep(spawn, fixture.application.registry.get(handle.*).?.location.?);
+        const req = p.RequestFor(.update_location){ .request_id = @splat(0), .payload = east };
         try std.testing.expect(fixture.application.handleLocation(handle.*, req) == .ok);
-        try std.testing.expectEqual(@as(i32, @intCast(i)), fixture.application.registry.get(handle.*).?.location.?.x);
+        try std.testing.expectEqualDeep(east, fixture.application.registry.get(handle.*).?.location.?);
         var snapshot: p.Snapshot = undefined;
         _ = try fixture.application.context.state.cut(@import("world_state.zig").request(i, @intCast(i), -1));
         try fixture.application.context.state.readArea(.{ .cx0 = 0, .cy0 = 0, .cx1 = 7, .cy1 = 7 }, &snapshot);

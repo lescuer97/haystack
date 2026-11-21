@@ -80,8 +80,8 @@ pub const Camera = struct {
 
 Facts about the current behaviour:
 
-- `tile_x`/`tile_y` are the only persistent position. The camera never stores a
-  fractional or pixel camera position.
+- `tile_x`/`tile_y` store the view target, separate from `GameState.player_pos`.
+  The camera never stores a fractional or pixel camera position.
 - Keyboard, D-pad, and left-stick directions are raw held flags. The loop-owned
   `input.Repeater` turns them into one-tile requests on a shared 10 steps/s
   cadence: a new vector steps on its first eligible tick, then every two
@@ -94,12 +94,12 @@ Facts about the current behaviour:
   in `input.zig`, the tuning knob); non-finite axis values and a disconnected
   controller are neutral.
 - Directions are independent flags. Opposing requests on one axis cancel, and
-  holding both axes moves one tile diagonally on each axis. Duplicate bindings
+  holding both axes requests a diagonal player step. Duplicate bindings
   (say, key and D-pad both right) never multiply a step.
 - Holding the left mouse button overrides keyboard and controller for that
   frame. Negative raw deltas accumulate in `f64`; whole `TILE_PX` steps become
   tile moves and the sub-tile remainder carries to later frames. A large drag
-  can move several tiles at once, symmetrically in both directions.
+  can pan several tiles at once without changing the player tile.
 - Any non-drag record resets both remainders, so one gesture cannot leak into the
   next. Ordered queued drag/release records preserve that boundary. A world drag
   or neutral record resets repeat; world dragging suppresses directions that tick.
@@ -110,8 +110,9 @@ Facts about the current behaviour:
   `error.CoordinateOutOfBounds` without changing state.
 - `input.zig` supplies the `FrameInput`; camera movement never polls devices.
 
-**Planned follow camera:** a future player-follow could replace the direct pan
-with a dead zone or lerp:
+The camera recenters when the player makes an accepted step; it stays where it
+was on idle, blocked steps, or in-place actions. A future follow mode could use
+a dead zone or lerp:
 
 ```zig
 // NOT IMPLEMENTED — future idea from the original design notes.

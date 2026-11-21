@@ -830,7 +830,7 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
 
     rl.beginMode2D(view.transform);
     drawWorld(&game.world, view.chunks, game.settings.debug, resources);
-    drawPlayer(view.transform.target, game.player_animation.frame(), resources);
+    drawPlayer(camera.tileCenter(game.player_pos.x, game.player_pos.y), game.player_animation.frame(), resources);
     rl.endMode2D();
 
     drawHud(&game.world, view.chunks, &game.camera, game.settings.debug);

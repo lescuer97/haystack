@@ -1,27 +1,25 @@
 const std = @import("std");
 const s = @import("sessions.zig");
-const Location = @import("shared").protocol.Location;
-test "registry bounded capacity unknown origin extremes stale and repeated cleanup" {
+const shared = @import("shared");
+const Location = shared.protocol.Location;
+const spawn = shared.movement.spawn;
+test "registry bounded capacity spawn stale and repeated cleanup" {
     var registry = s.Registry{ .io = std.testing.io };
     var handles: [64]s.Handle = undefined;
     for (&handles, 0..) |*handle, i| {
         handle.* = try registry.claim(@splat(@intCast(i)));
-        try std.testing.expect(registry.get(handle.*).?.location == null);
+        try std.testing.expectEqualDeep(@as(?Location, spawn), registry.get(handle.*).?.location);
     }
     try std.testing.expectError(error.SessionCapacity, registry.claim(@splat(64)));
     const old = handles[0];
-    try registry.update(old, .{ .x = 0, .y = 0 });
-    try std.testing.expectEqualDeep(@as(?Location, .{ .x = 0, .y = 0 }), registry.get(old).?.location);
+    try registry.update(old, .{ .x = 1, .y = 0 });
     try std.testing.expectError(error.DuplicatePubkey, registry.claim(@splat(0)));
     registry.release(old);
     const fresh = try registry.claim(@splat(0));
-    try std.testing.expect(registry.get(fresh).?.location == null);
+    try std.testing.expectEqualDeep(@as(?Location, spawn), registry.get(fresh).?.location);
     registry.release(old);
     try std.testing.expectError(error.StaleSession, registry.update(old, .{ .x = 1, .y = 2 }));
-    try registry.update(fresh, .{ .x = std.math.minInt(i32), .y = std.math.maxInt(i32) });
-    const copy = registry.get(fresh).?;
-    try registry.update(fresh, .{ .x = -1, .y = -2 });
-    try std.testing.expectEqual(std.math.minInt(i32), copy.location.?.x);
+
     const invalid = s.Handle{ .index = std.math.maxInt(usize), .generation = fresh.generation };
     registry.release(invalid);
     try std.testing.expect(registry.get(invalid) == null);
@@ -38,6 +36,21 @@ test "registry bounded capacity unknown origin extremes stale and repeated clean
     registry.generation = std.math.maxInt(u64);
     try std.testing.expectError(error.GenerationExhausted, registry.claim(@splat(0)));
 }
+test "location rejects a jump from spawn and a blocked tile without advancing" {
+    var registry = s.Registry{ .io = std.testing.io };
+    const handle = try registry.claim(@splat(0));
+    defer registry.release(handle);
+
+    try std.testing.expectError(error.BlockedMovement, registry.update(handle, .{ .x = 19, .y = 0 }));
+    try std.testing.expectEqualDeep(@as(?Location, spawn), registry.get(handle).?.location);
+    for (1..20) |x| try registry.update(handle, .{ .x = @intCast(x), .y = 0 });
+    try std.testing.expectError(error.BlockedMovement, registry.update(handle, .{ .x = 20, .y = 0 }));
+    try std.testing.expectError(error.BlockedMovement, registry.update(handle, .{ .x = 20, .y = 1 }));
+    try std.testing.expectEqualDeep(@as(?Location, .{ .x = 19, .y = 0 }), registry.get(handle).?.location);
+    try registry.update(handle, .{ .x = 19, .y = 1 });
+    try std.testing.expectEqualDeep(@as(?Location, .{ .x = 19, .y = 1 }), registry.get(handle).?.location);
+}
+
 test "two barrier synchronized duplicate claims exactly one winner preserves known location" {
     var registry = s.Registry{ .io = std.testing.io };
     const Worker = struct {
@@ -72,8 +85,8 @@ test "two barrier synchronized duplicate claims exactly one winner preserves kno
     try std.testing.expect((a.handle != null) != (b.handle != null));
     try std.testing.expectEqual(error.DuplicatePubkey, (if (a.handle == null) a.err else b.err).?);
     const winner = a.handle orelse b.handle.?;
-    try registry.update(winner, .{ .x = 12, .y = -34 });
+    try registry.update(winner, .{ .x = 1, .y = 0 });
     try std.testing.expectError(error.DuplicatePubkey, registry.claim(@splat(7)));
-    try std.testing.expectEqualDeep(@as(?Location, .{ .x = 12, .y = -34 }), registry.get(winner).?.location);
+    try std.testing.expectEqualDeep(@as(?Location, .{ .x = 1, .y = 0 }), registry.get(winner).?.location);
     registry.release(winner);
 }

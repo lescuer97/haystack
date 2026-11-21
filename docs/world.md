@@ -25,8 +25,10 @@ Implemented today in `shared/world.zig`, `src/world.zig`, and `server/`:
   fixed RAM budgets, volatile opaque-ID replay, and complete
   64-chunk bitmap area snapshots.
   See [server.md](server.md) for the implemented wire contract and limits.
-- The game client has no networking, delta/input/render integration, dirty
-  flags, or characters yet. Its resident chunks still contain generated terrain.
+- The local player and server session locations share tile movement rules:
+  grass and dirt are walkable; rock, trees, and water block. Diagonals need
+  both side tiles clear. The client has no networking or cut-delta integration;
+  its resident chunks still contain generated terrain.
 
 Sections 2–6 below describe **future rewardful gameplay**, not the current
 rewardless server contract. Terrain and coordinate types are shared now; the
@@ -42,8 +44,8 @@ applying its snapshots to the game client is **not implemented**.
 The unused starter draft also mentioned a `TileEntity` union
 (`Tree`/`Grass`/`Character` with `CutStatus`), per-chunk `dirty` flags, and a
 `Character{ yourself: bool }` entity. Those ideas are not implemented; today a
-tile is only the generated grass/dirt/rock/tree/water `Tile` enum above, with no tree
-entities, collision, harvesting, or separate layers.
+tile is only the generated grass/dirt/rock/tree/water `Tile` enum above, with no
+separate tree entities, harvesting rewards, or terrain layers.
 
 ---
 

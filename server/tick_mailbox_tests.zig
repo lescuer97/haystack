@@ -6,7 +6,7 @@ const Fixture = @import("fixture.zig").Fixture;
 const transport = @import("transport.zig");
 const t = std.testing;
 const TestSlot = struct { mailbox: ticks.Mailbox = .{} };
-const location = p.Request{ .request_id = @splat(0), .operation = .{ .update_location = .{ .x = 10, .y = -2 } } };
+const location = p.Request{ .request_id = @splat(0), .operation = .{ .update_location = .{ .x = 1, .y = 0 } } };
 const read = p.Request{ .request_id = @splat(1), .operation = .{ .read_area = .{ .cx0 = 0, .cy0 = 0, .cx1 = 0, .cy1 = 0 } } };
 
 fn cutRequest(id: u128, x: i32, y: i32) p.Request {
@@ -31,7 +31,7 @@ test "owned requests wait for tick; cut read and location copy replies before re
     try dispatcher.publish(&slots[1].mailbox, session, read);
     try dispatcher.publish(&slots[2].mailbox, session, location);
     try t.expectEqual(@as(usize, 0), app.context.state.replay_count);
-    try t.expect(app.registry.get(session).?.location == null);
+    try t.expectEqualDeep(shared.movement.spawn, app.registry.get(session).?.location.?);
     var batch = dispatcher.beginBatch(&slots, 0);
     var count: usize = 0;
     while (dispatcher.claimNext(&slots, &batch, 0)) |work| {
@@ -75,7 +75,7 @@ test "cutoff generations exclude new arrivals and same-slot republishes; pending
     dispatcher.cleanup(&slots[0].mailbox);
     try dispatcher.publish(&slots[0].mailbox, session, read);
     try t.expect(dispatcher.claimNext(&slots, &batch, 0) == null);
-    try t.expect(app.registry.get(session).?.location == null);
+    try t.expectEqualDeep(shared.movement.spawn, app.registry.get(session).?.location.?);
     batch = dispatcher.beginBatch(&slots, 50_000_000);
     const work = dispatcher.claimNext(&slots, &batch, 50_000_000).?;
     dispatcher.execute(app, &slots[work.record.index].mailbox, work);
@@ -126,6 +126,16 @@ test "busy reply and stale sessions on all operations preserve bounded world sem
     try t.expect(!box.close_after_reply);
     dispatcher.cleanup(box);
 
+    var blocked = location;
+    blocked.operation.update_location.x = 2;
+    try dispatcher.publish(box, session, blocked);
+    batch = dispatcher.beginBatch(&slots, 0);
+    dispatcher.execute(app, box, dispatcher.claimNext(&slots, &batch, 0).?);
+    try t.expectEqual(p.LocationFailure.invalid_request, (try reply(box, .update_location, blocked.request_id, &snapshot)).failed);
+    try t.expect(!box.close_after_reply);
+    try t.expectEqualDeep(shared.movement.spawn, app.registry.get(session).?.location.?);
+    dispatcher.cleanup(box);
+
     try dispatcher.publish(box, session, location);
     batch = dispatcher.beginBatch(&slots, 0);
     dispatcher.execute(app, box, dispatcher.claimNext(&slots, &batch, 0).?);
@@ -147,7 +157,7 @@ test "busy reply and stale sessions on all operations preserve bounded world sem
         }
         dispatcher.cleanup(box);
     }
-    try t.expect(app.registry.get(replacement).?.location == null);
+    try t.expectEqualDeep(shared.movement.spawn, app.registry.get(replacement).?.location.?);
     try t.expectEqual(@as(usize, 0), app.context.state.replay_count);
     box.generation = std.math.maxInt(u64);
     try t.expectError(error.GenerationExhausted, dispatcher.publish(box, replacement, read));
