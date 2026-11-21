@@ -200,7 +200,7 @@ const border_color = rl.Color.init(220, 60, 55, 255);
 const hud_bg = rl.Color.init(0, 0, 0, 170);
 
 const menu_backdrop = rl.Color.init(0, 0, 0, 165);
-const menu_panel_bg = rl.Color.init(28, 28, 34, 250);
+const menu_panel_bg = rl.Color.init(28, 28, 34, 255);
 const menu_panel_border = rl.Color.init(88, 92, 106, 255);
 const menu_item_bg = rl.Color.init(44, 46, 56, 255);
 const menu_item_hover = rl.Color.init(62, 66, 80, 255);
@@ -358,7 +358,9 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
 
     if (player_pending) drawPlayer(feet, frame, resources);
 
-    // ponytail: debug overlays may cover canopies.
+    if (!settings.tile_grid and !settings.chunk_borders) return;
+
+    // Debug overlays may cover canopies.
     var cy = vis.cy0;
     while (cy <= vis.cy1) : (cy += 1) {
         var cx = vis.cx0;
@@ -368,10 +370,12 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
         }
     }
 
-    // world origin marker, so negative coordinates are obvious
-    rl.drawLine(-40, 0, 40, 0, .red);
-    rl.drawLine(0, -40, 0, 40, .green);
-    rl.drawRectangleLinesEx(.{ .x = -5, .y = -5, .width = 10, .height = 10 }, 2.0, .yellow);
+    if (settings.chunk_borders) {
+        // Mark the world origin so negative coordinates are obvious.
+        rl.drawLine(-40, 0, 40, 0, .red);
+        rl.drawLine(0, -40, 0, 40, .green);
+        rl.drawRectangleLinesEx(.{ .x = -5, .y = -5, .width = 10, .height = 10 }, 2.0, .yellow);
+    }
 }
 
 fn drawPlayer(target: rl.Vector2, frame: player.Frame, resources: *const Resources) void {
@@ -619,7 +623,8 @@ fn drawTextInput(
     rl.endScissorMode();
 }
 
-fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, state: *const menu.Menu, selected: bool) void {
+fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, game: *const game_mod.GameState, selected: bool) void {
+    const state = &game.menu;
     const incoming = (item == .navigate and item.navigate == .Deposit) or (item == .action and item.action == .deposit);
     const outgoing = (item == .navigate and item.navigate == .Withdraw) or (item == .action and item.action == .confirm_withdrawal);
     if (incoming or outgoing) {
@@ -650,6 +655,20 @@ fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, state: *const menu.Menu, s
 
     drawSolidRect(rect, fill);
     rl.drawRectangleLinesEx(toRaylibRect(rect), if (focused) 2.0 else 1.0, border);
+
+    const debug_enabled: ?bool = if (item == .action) switch (item.action) {
+        .toggle_grid => game.settings.debug.tile_grid,
+        .toggle_borders => game.settings.debug.chunk_borders,
+        .toggle_minimap => game.show_minimap,
+        .toggle_hud => game.show_debug_hud,
+        else => null,
+    } else null;
+    if (debug_enabled) |enabled| {
+        var buf: [64]u8 = undefined;
+        const label = std.mem.printSentinel(&buf, "{s}: {s}", .{ menu.itemLabel(item), onOff(enabled) }, 0) catch unreachable;
+        drawCenteredText(label, rect, if (rect.height < 32) 14 else 20, menu_text_color);
+        return;
+    }
 
     switch (item) {
         .text_input => |field| drawTextInput(
@@ -688,13 +707,13 @@ fn drawMenu(game: *const game_mod.GameState, viewport_w: f32, viewport_h: f32) v
     drawSolidRect(layout.panel, menu_panel_bg);
     rl.drawRectangleLinesEx(toRaylibRect(layout.panel), 2.0, menu_panel_border);
     drawCenteredText(menu.pageTitle(state.currentPage), layout.title, 26, menu_title_color);
-    if (state.currentPage != .Main) drawWalletContent(state, layout.content);
+    if (state.currentPage != .Main and state.currentPage != .Debug) drawWalletContent(state, layout.content);
 
     const page_items = state.items();
 
     var index: usize = 0;
     while (index < layout.item_count) : (index += 1) {
-        drawMenuItem(layout.items[index], page_items[index], state, state.isSelected(index));
+        drawMenuItem(layout.items[index], page_items[index], game, state.isSelected(index));
     }
 }
 
@@ -853,8 +872,8 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
     drawWorld(&game.world, view.chunks, game.settings.debug, feet, game.player_animation.frame(), resources);
     rl.endMode2D();
 
-    drawHud(&game.world, view.chunks, &game.camera, game.settings.debug);
-    drawMinimap(&game.world, view.chunks, &game.camera, viewport_w);
+    if (game.show_debug_hud) drawHud(&game.world, view.chunks, &game.camera, game.settings.debug);
+    if (game.show_minimap) drawMinimap(&game.world, view.chunks, &game.camera, viewport_w);
 
     if (game.menu.opened) {
         drawMenu(game, viewport_w, viewport_h);

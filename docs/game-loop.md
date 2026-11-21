@@ -101,7 +101,7 @@ Why this order:
    `GameState.update` applies that one input value to the
    persistent player, camera, menu, and debug settings. The menu is modal: while it is
    open, and on the frame that opens or closes it, the update returns before the
-   camera and toggles see the frame. Camera moves are whole-tile and validated;
+   camera and gameplay hotkeys see the frame. Camera moves are whole-tile and validated;
    an unrepresentable move returns `error.CoordinateOutOfBounds` before any
    toggle is applied. This is one of only two places that mutate persistent
    state.
@@ -113,12 +113,15 @@ Why this order:
 5. **Render last.** Rendering receives `*const GameState`, a `View`, the
    viewport size, and an optional read-only onboarding model. It cannot move the camera or collect input, and its functions
    take read-only pointers, so the compiler helps prevent accidental mutation.
-   When the menu is open it is drawn after the world, HUD, and minimap, so its
-   dim backdrop covers them. A blocking onboarding overlay is drawn last.
+   Open **Debug Settings** from the pause menu to toggle the tile grid, chunk
+   borders, chunk minimap, and debug HUD. The minimap and HUD start hidden and
+   their visibility lasts for the current session. When the menu is open, it is
+   drawn over the world and any enabled overlays. A blocking onboarding overlay
+   is drawn last.
 
 Screenshot mode (`HAYSTACK_SHOT=/path.png`) runs a few frames, then captures
 **inside the drawing pass before `endDrawing` presents**, so the rendered world
-and HUD are included rather than a cleared black back buffer.
+and any enabled overlays are included rather than a cleared black back buffer.
 If native onboarding is blocking at the start of the capture frame, the capture
 is skipped and the screenshot budget is consumed; no PNG is written. A model
 that is blocking at capture time also prevents capture. This also

@@ -21,11 +21,11 @@ const wallet_ui = @import("wallet_ui.zig");
 /// backing array is the sentinel that makes `cString` possible.
 pub const max_text_bytes: usize = 128;
 
-pub const MenuPage = enum { Main, Wallet, Deposit, Invoice, History, Withdraw, Withdrawal };
+pub const MenuPage = enum { Main, Debug, Wallet, Deposit, Invoice, History, Withdraw, Withdrawal };
 
 /// Local menu actions. None of these touch a wallet, payment, or network layer;
 /// they only change menu-local UI state.
-pub const Action = enum { close_menu, balance, preset21, preset42, preset100, preset1000, deposit, previous, next, copy_invoice, review_withdrawal, confirm_withdrawal, cancel_withdrawal, review_again, paste_withdrawal, clear_withdrawal };
+pub const Action = enum { close_menu, toggle_grid, toggle_borders, toggle_minimap, toggle_hud, balance, preset21, preset42, preset100, preset1000, deposit, previous, next, copy_invoice, review_withdrawal, confirm_withdrawal, cancel_withdrawal, review_again, paste_withdrawal, clear_withdrawal };
 
 /// Editable fields. A field is a data key; its runtime value lives in `Menu`.
 pub const InputField = enum { deposit_sats, withdrawal_invoice };
@@ -115,7 +115,16 @@ fn isPrintable(codepoint: u21) bool {
 
 const main_items = [_]MenuItem{
     .{ .navigate = .Wallet },
+    .{ .navigate = .Debug },
     .{ .action = .close_menu },
+};
+
+const debug_items = [_]MenuItem{
+    .{ .action = .toggle_grid },
+    .{ .action = .toggle_borders },
+    .{ .action = .toggle_minimap },
+    .{ .action = .toggle_hud },
+    .{ .navigate = .Main },
 };
 
 const wallet_items = [_]MenuItem{
@@ -144,6 +153,7 @@ const withdrawal_detail_items = [_]MenuItem{ .{ .action = .review_again }, .{ .n
 pub fn pageTitle(page: MenuPage) [:0]const u8 {
     return switch (page) {
         .Main => "Main",
+        .Debug => "Debug Settings",
         .Wallet => "Wallet",
         .Deposit => "Deposit - sats",
         .Invoice => "Deposit - invoice",
@@ -156,6 +166,7 @@ pub fn pageTitle(page: MenuPage) [:0]const u8 {
 pub fn pageItems(page: MenuPage) []const MenuItem {
     return switch (page) {
         .Main => &main_items,
+        .Debug => &debug_items,
         .Wallet => &wallet_items,
         .Deposit => &deposit_items,
         .Invoice => &invoice_items,
@@ -169,6 +180,7 @@ pub fn itemLabel(item: MenuItem) [:0]const u8 {
     return switch (item) {
         .navigate => |page| switch (page) {
             .Main => "Back to Main",
+            .Debug => "Debug Settings",
             .Wallet => "Wallet",
             .Deposit => "Deposit",
             .Invoice => "Saved invoice",
@@ -178,6 +190,10 @@ pub fn itemLabel(item: MenuItem) [:0]const u8 {
         },
         .action => |action| switch (action) {
             .close_menu => "Resume",
+            .toggle_grid => "Tile grid",
+            .toggle_borders => "Chunk borders",
+            .toggle_minimap => "Chunk minimap",
+            .toggle_hud => "Debug HUD",
             .balance => "Balance (sat)",
             .preset21 => "21 sat",
             .preset42 => "42 sat",
@@ -289,7 +305,7 @@ fn calculateLayoutCount(page: MenuPage, viewport_w: f32, viewport_h: f32, item_c
     else
         0;
     const content_height: f32 = switch (page) {
-        .Main => 0,
+        .Main, .Debug => 0,
         .Wallet, .Deposit => 62,
         .Invoice => 340,
         .History => 352,
@@ -363,6 +379,7 @@ pub const Menu = struct {
     deposit_sats: TextField = .{},
     withdrawal_invoice: BoundedTextField(4096) = .{},
     paste_requested: bool = false,
+    debug_toggle: ?Action = null,
 
     /// Persistent row highlight. Opening a page selects its first row; it then
     /// moves only when a menu direction step or moving pointer selects another
@@ -553,6 +570,7 @@ pub const Menu = struct {
             },
             .action => |action| switch (action) {
                 .close_menu => self.close(),
+                .toggle_grid, .toggle_borders, .toggle_minimap, .toggle_hud => self.debug_toggle = action,
                 .balance => {},
                 .preset21, .preset42, .preset100, .preset1000 => {
                     self.deposit_sats.clear();
@@ -646,6 +664,8 @@ pub const Menu = struct {
 comptime {
     if (main_items.len > max_items_per_page)
         @compileError("Main page has more items than the fixed layout storage");
+    if (debug_items.len > max_items_per_page)
+        @compileError("Debug page has more items than the fixed layout storage");
     if (wallet_items.len > max_items_per_page)
         @compileError("Wallet page has more items than the fixed layout storage");
 }
@@ -729,7 +749,7 @@ fn expectInside(rect: Rect, container: Rect) !void {
 }
 
 test "layout centres a page and keeps every rect inside the panel" {
-    const pages = [_]MenuPage{ .Main, .Wallet };
+    const pages = [_]MenuPage{ .Main, .Debug, .Wallet };
     const viewports = [_]struct { w: f32, h: f32 }{
         .{ .w = 1000, .h = 640 },
         .{ .w = 800, .h = 600 },
@@ -785,7 +805,7 @@ test "layout centres a page and keeps every rect inside the panel" {
         }
     }
 
-    try std.testing.expectEqual(@as(usize, 2), calculateLayout(.Main, 1000, 640).item_count);
+    try std.testing.expectEqual(main_items.len, calculateLayout(.Main, 1000, 640).item_count);
     try std.testing.expectEqual(@as(usize, 5), calculateLayout(.Wallet, 1000, 640).item_count);
 }
 
@@ -975,7 +995,7 @@ test "focus resets on navigation and close" {
 
     // Resume also blurs; reopening starts on Main with nothing focused.
     menu.activate(.{ .navigate = .Main });
-    const resume_point = itemCenter(calculateLayout(.Main, 1000, 640), 1);
+    const resume_point = itemCenter(calculateLayout(.Main, 1000, 640), main_items.len - 1);
     _ = menu.applyInput(frameFor(resume_point.x, resume_point.y, 1000, 640));
     try std.testing.expect(!menu.opened);
     try std.testing.expectEqual(@as(?InputField, null), menu.focus);
@@ -1040,14 +1060,14 @@ test "directions wrap in both axes and idle frames preserve the highlight" {
     var menu = Menu{};
     _ = menu.applyInput(.{ .escape_clicked = true });
 
-    // Main has two rows: Down and Right mean next, Up and Left mean previous.
+    // Down and Right mean next; Up and Left mean previous.
     _ = menu.applyInput(.{ .down = true });
     try std.testing.expectEqual(@as(usize, 1), menu.selected_index);
-    _ = menu.applyInput(.{ .right = true }); // wrap next -> 0
+    _ = menu.applyInput(.{ .up = true });
     try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
-    _ = menu.applyInput(.{ .up = true }); // wrap previous -> 1
-    try std.testing.expectEqual(@as(usize, 1), menu.selected_index);
-    _ = menu.applyInput(.{ .left = true }); // previous -> 0
+    _ = menu.applyInput(.{ .left = true });
+    try std.testing.expectEqual(main_items.len - 1, menu.selected_index);
+    _ = menu.applyInput(.{ .right = true });
     try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
 
     // Releasing every direction leaves the highlight where it was.
@@ -1064,11 +1084,11 @@ test "diagonal directions step once and opposing directions cancel" {
 
     // Up+Left both mean previous: one row back, not two.
     _ = menu.applyInput(.{ .up = true, .left = true });
-    try std.testing.expectEqual(@as(usize, 1), menu.selected_index); // 0 -> wrap 1
+    try std.testing.expectEqual(main_items.len - 1, menu.selected_index);
 
     // Down+Right both mean next: one row forward.
     _ = menu.applyInput(.{ .down = true, .right = true });
-    try std.testing.expectEqual(@as(usize, 0), menu.selected_index); // 1 -> wrap 0
+    try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
 
     // Opposite pairs cancel, including a vertical/horizontal pair.
     _ = menu.applyInput(.{ .up = true, .down = true });
@@ -1111,7 +1131,7 @@ test "confirm navigates, runs actions, and focuses a text input" {
     menu.activate(.{ .navigate = .Main });
     try std.testing.expectEqual(MenuPage.Main, menu.currentPage);
     try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
-    _ = menu.applyInput(.{ .down = true }); // 0 -> 1 (Resume)
+    _ = menu.applyInput(.{ .up = true }); // Wrap to Resume.
     _ = menu.applyInput(.{ .confirm = true });
     try std.testing.expect(!menu.opened);
 }

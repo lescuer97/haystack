@@ -47,7 +47,7 @@ async function click(x, y) {
 // Shared layout's documented dimensions, used only to target real input events.
 async function row(page, index) {
   const [count, content, extra, width] = {
-    Main:[2,0,0,420], Wallet:[5,62,0,420], Deposit:[7,62,0,420],
+    Main:[3,0,0,420], Wallet:[5,62,0,420], Deposit:[7,62,0,420],
     Invoice:[3,340,0,760], Withdraw:[5,62,112,760], Withdrawal:[2,320,0,760],
   }[page];
   const height = Math.min(592,40+44+content+extra+count*56+(count-1)*10);

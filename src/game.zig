@@ -29,6 +29,8 @@ pub const GameState = struct {
     player_walking: bool = false,
     menu: menu.Menu,
     settings: Settings,
+    show_minimap: bool = true,
+    show_debug_hud: bool = true,
 
     /// Build the persistent state and size the world cache for the initial
     /// window. The view is calculated from the starting camera, then discarded;
@@ -73,11 +75,21 @@ pub const GameState = struct {
     /// applying the toggles.
     ///
     /// Menu input is modal. While the menu is open, and on the frame that opens
-    /// or closes it, neither the camera nor the debug toggles see the frame.
+    /// or closes it, neither the camera nor the gameplay hotkeys see the frame.
     /// Any half-finished drag is discarded so it cannot replay when the menu
     /// closes.
     pub fn update(self: *GameState, frame: input.FrameInput) world.CoordinateError!void {
         if (self.menu.applyInput(frame)) {
+            if (self.menu.debug_toggle) |action| {
+                self.menu.debug_toggle = null;
+                switch (action) {
+                    .toggle_grid => self.settings.debug.tile_grid = !self.settings.debug.tile_grid,
+                    .toggle_borders => self.settings.debug.chunk_borders = !self.settings.debug.chunk_borders,
+                    .toggle_minimap => self.show_minimap = !self.show_minimap,
+                    .toggle_hud => self.show_debug_hud = !self.show_debug_hud,
+                    else => unreachable,
+                }
+            }
             self.camera.resetDrag();
             return;
         }
@@ -326,12 +338,12 @@ test "menu navigation and confirm frames stay modal through Resume" {
     // Navigating to Resume cannot pan, drag, or toggle. The drag remainder is
     // discarded so it cannot replay after the menu closes.
     try game_state.update(.{
-        .down = true,
+        .up = true,
         .dragging = true,
         .drag_x = -32,
         .toggle_borders = true,
     });
-    try std.testing.expectEqual(@as(usize, 1), game_state.menu.selected_index);
+    try std.testing.expectEqual(menu.pageItems(.Main).len - 1, game_state.menu.selected_index);
     try std.testing.expectEqual(@as(i32, 0), game_state.camera.tile_y);
     try std.testing.expectEqual(@as(f64, 0), game_state.camera.drag_remainder_x);
     try std.testing.expectEqual(borders_before, game_state.settings.debug.chunk_borders);
@@ -352,6 +364,32 @@ test "menu navigation and confirm frames stay modal through Resume" {
     // The next ordinary frame works again.
     try game_state.update(.{ .right = true });
     try std.testing.expectEqual(@as(i32, 1), game_state.camera.tile_x);
+}
+
+test "debug menu toggles overlays independently by keyboard and pointer" {
+    var game_state = try GameState.init(std.testing.allocator, 1000, 640);
+    defer game_state.deinit();
+
+    const initial = game_state.settings.debug;
+    try std.testing.expect(!game_state.show_minimap and !game_state.show_debug_hud);
+    try game_state.update(.{ .escape_clicked = true });
+    try game_state.update(.{ .down = true, .confirm = true });
+    try std.testing.expectEqual(menu.MenuPage.Debug, game_state.menu.currentPage);
+
+    try game_state.update(.{ .confirm = true });
+    try game_state.update(.{ .down = true, .confirm = true });
+    try std.testing.expectEqual(!initial.tile_grid, game_state.settings.debug.tile_grid);
+    try std.testing.expectEqual(!initial.chunk_borders, game_state.settings.debug.chunk_borders);
+
+    try game_state.update(.{ .down = true, .confirm = true });
+    try std.testing.expect(game_state.show_minimap and !game_state.show_debug_hud);
+    const hud = game_state.menu.layoutFor(1000, 640).items[3];
+    try game_state.update(.{ .clicked = true, .pointer_x = hud.centerX(), .pointer_y = hud.centerY() });
+    try std.testing.expect(game_state.show_minimap and game_state.show_debug_hud);
+    try game_state.update(.{ .confirm = true });
+    try game_state.update(.{ .escape_clicked = true });
+    try std.testing.expect(!game_state.menu.opened);
+    try std.testing.expect(game_state.show_minimap and !game_state.show_debug_hud);
 }
 
 test "the same direction field drives the camera or the menu by mode" {
