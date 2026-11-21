@@ -200,8 +200,8 @@ pub const Model = struct {
     }
     pub fn create(self: *Model, text: []const u8) bool {
         if (self.reviewLive() or self.withdrawal_blocked) return false;
-        _ = positiveSats(text) catch {
-            _ = self.message.set("Enter positive integer sats (no decimals).");
+        _ = positiveMsats(text) catch {
+            _ = self.message.set("Enter positive integer msats (no decimals).");
             return false;
         };
         if (self.recovery != .none or self.recovery_pending) {
@@ -484,8 +484,8 @@ pub const Model = struct {
             .open, .snapshot => {
                 const mint = string(value, "mint_url") orelse return error.Invalid;
                 if (self.mint.len != 0 and !std.mem.eql(u8, mint, self.mint.slice())) return error.Invalid;
-                const sats = string(value, "sats") orelse return error.Invalid;
-                _ = try decimal(sats);
+                const msats = string(value, "msats") orelse return error.Invalid;
+                _ = try decimal(msats);
                 const recovery = try recoveryState(value);
                 if (value.object.get("recovery_pending")) |pending| {
                     if (pending != .bool) return error.Invalid;
@@ -493,7 +493,7 @@ pub const Model = struct {
                 }
                 if (mint.len > 256) return error.Invalid;
                 var buf: [100]u8 = undefined;
-                _ = self.balance.set(try std.fmt.bufPrint(&buf, "{s} sat", .{sats}));
+                _ = self.balance.set(try std.fmt.bufPrint(&buf, "{s} msat", .{msats}));
                 _ = self.mint.set(mint);
                 self.setRecovery(recovery, now);
                 self.available = true;
@@ -847,7 +847,7 @@ fn decimal(text: []const u8) !u64 {
     for (text) |c| if (c < '0' or c > '9') return error.InvalidAmount;
     return std.fmt.parseInt(u64, text, 10) catch error.InvalidAmount;
 }
-pub fn positiveSats(text: []const u8) !u64 {
+pub fn positiveMsats(text: []const u8) !u64 {
     const amount = try decimal(text);
     if (amount == 0 or amount > std.math.maxInt(i64)) return error.InvalidAmount;
     return amount;
@@ -862,10 +862,10 @@ fn formatTime(text: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC", .{ day.year, month.month.numeric(), month.day_index + 1, clock.getHoursIntoDay(), clock.getMinutesIntoHour() }) catch "Time unknown";
 }
 
-const screen = "{\"mint_url\":\"https://testnut.cashu.space\",\"sats\":\"0\",\"creation_recovery\":\"none\",\"recovery_pending\":false}";
+const screen = "{\"mint_url\":\"https://testnut.cashu.space\",\"msats\":\"0\",\"creation_recovery\":\"none\",\"recovery_pending\":false}";
 const unpaid = "{\"id\":\"saved\",\"invoice\":\"lnbc210n1test\",\"mint_url\":\"https://testnut.cashu.space\",\"state\":\"UNPAID\",\"confirmed\":false,\"expired\":false}";
 const update_error = "\"error\":{\"status\":7,\"message\":\"saved quote unavailable\"},\"invoice\":null,\"creation_recovery\":\"none\",\"recovery_pending\":false";
-const prepared_withdrawal = "{\"operation_id\":\"operation-uuid\",\"quote_id\":\"out-A\",\"mint_url\":\"https://testnut.cashu.space\",\"invoice\":\"lnbc-normalized\",\"unit\":\"sat\",\"amount\":\"100\",\"fee_reserve\":\"2\",\"swap_fee\":\"1\",\"input_fee\":\"1\",\"estimated_total\":\"104\",\"quote_expiry\":\"200\",\"invoice_expiry\":\"300\",\"requires_swap\":true}";
+const prepared_withdrawal = "{\"operation_id\":\"operation-uuid\",\"quote_id\":\"out-A\",\"mint_url\":\"https://testnut.cashu.space\",\"invoice\":\"lnbc-normalized\",\"unit\":\"msat\",\"amount\":\"100001\",\"fee_reserve\":\"2000\",\"swap_fee\":\"1000\",\"input_fee\":\"1000\",\"estimated_total\":\"104001\",\"quote_expiry\":\"200\",\"invoice_expiry\":\"300\",\"requires_swap\":true}";
 
 test "operation withdrawal classification preserves wire ordinals" {
     const cases = [_]struct { operation: Operation, withdrawal: bool }{
@@ -901,16 +901,19 @@ test "prepared withdrawal requires a boolean swap flag without retaining it" {
         const actual = try withdrawal.View.parse(parsed.value, mint, true);
         try std.testing.expectEqualDeep(expected, actual);
     }
+    parsed.value.object.getPtr("unit").?.* = .{ .string = "sat" };
+    try std.testing.expectError(error.Invalid, withdrawal.View.parse(parsed.value, mint, true));
+    parsed.value.object.getPtr("unit").?.* = .{ .string = "msat" };
     parsed.value.object.getPtr("requires_swap").?.* = .{ .string = "false" };
     try std.testing.expectError(error.Invalid, withdrawal.View.parse(parsed.value, mint, true));
     try std.testing.expect(parsed.value.object.swapRemove("requires_swap"));
     try std.testing.expectError(error.Invalid, withdrawal.View.parse(parsed.value, mint, true));
 }
-const saved_withdrawal = "{\"quote_id\":\"out-A\",\"mint_url\":\"https://testnut.cashu.space\",\"invoice\":\"lnbc-normalized\",\"unit\":\"sat\",\"amount\":\"100\",\"quote_state\":\"UNPAID\",\"payment_status\":\"pending\",\"quote_expiry\":\"200\",\"invoice_expiry\":\"300\",\"expired\":false,\"retry_review_allowed\":false}";
+const saved_withdrawal = "{\"quote_id\":\"out-A\",\"mint_url\":\"https://testnut.cashu.space\",\"invoice\":\"lnbc-normalized\",\"unit\":\"msat\",\"amount\":\"100000\",\"quote_state\":\"UNPAID\",\"payment_status\":\"pending\",\"quote_expiry\":\"200\",\"invoice_expiry\":\"300\",\"expired\":false,\"retry_review_allowed\":false}";
 fn withdrawalModel() Model {
     var model = Model{ .started = true, .available = true, .history_dirty = false, .unix_now = 100 };
     _ = model.mint.set("https://testnut.cashu.space");
-    _ = model.balance.set("500 sat");
+    _ = model.balance.set("500000 msat");
     return model;
 }
 test "withdrawal readiness explains gates and never queues deferred user authorization" {
@@ -945,14 +948,14 @@ test "definite invalid and insufficient preparation errors after close allow onl
         model.tick(true, 1);
         try std.testing.expect(model.operation == .snapshot);
         model.request = null;
-        model.accept(model.serial, "{\"mint_url\":\"https://testnut.cashu.space\",\"sats\":\"500\",\"recovery_pending\":true,\"creation_recovery\":\"none\"}", 1, std.testing.allocator);
+        model.accept(model.serial, "{\"mint_url\":\"https://testnut.cashu.space\",\"msats\":\"500000\",\"recovery_pending\":true,\"creation_recovery\":\"none\"}", 1, std.testing.allocator);
         const deadline = model.next_recover;
         model.tick(true, deadline);
         try std.testing.expect(model.operation == .recover);
         model.request = null;
         model.accept(model.serial, "{\"wallet_changed\":false,\"recovery_pending\":false,\"creation_recovery\":\"none\",\"invoice\":null}", deadline, std.testing.allocator);
         try std.testing.expect(model.canPrepareWithdrawal("invoice") and !model.pending and model.request == null);
-        try std.testing.expectEqualStrings("500 sat", model.balance.slice());
+        try std.testing.expectEqualStrings("500000 msat", model.balance.slice());
     }
 }
 test "lost preparation reply after close remains conservatively paused and malformed errors are not definite" {
@@ -1138,12 +1141,12 @@ test "withdrawal error metadata advances cursors and prioritizes actual wallet r
     model.accept(model.serial, "{\"cursor\":\"candidate\",\"checked_id\":\"candidate\",\"withdrawal\":null,\"wallet_changed\":true,\"recovery_pending\":true,\"error\":{\"status\":13,\"message\":\"unavailable\"}}", 1, std.testing.allocator);
     try std.testing.expect(model.balance_dirty and model.history_dirty and model.recovery_pending and model.recover_needed);
     try std.testing.expectEqualStrings("candidate", model.withdrawal_cursor.slice());
-    try std.testing.expectEqualStrings("500 sat", model.balance.slice());
+    try std.testing.expectEqualStrings("500000 msat", model.balance.slice());
     model.tick(true, 1);
     try std.testing.expect(model.operation == .snapshot);
     model.request = null;
-    model.accept(model.serial, "{\"mint_url\":\"https://testnut.cashu.space\",\"sats\":\"478\",\"recovery_pending\":true,\"creation_recovery\":\"none\"}", 1, std.testing.allocator);
-    try std.testing.expectEqualStrings("478 sat", model.balance.slice());
+    model.accept(model.serial, "{\"mint_url\":\"https://testnut.cashu.space\",\"msats\":\"478000\",\"recovery_pending\":true,\"creation_recovery\":\"none\"}", 1, std.testing.allocator);
+    try std.testing.expectEqualStrings("478000 msat", model.balance.slice());
     model.tick(true, model.next_recover);
     try std.testing.expect(model.operation == .recover);
 }
@@ -1198,7 +1201,7 @@ test "history displays authoritative payment status and expiry without inferring
         try std.testing.expect(model.enqueue(.history, "0"));
         model.request = null;
         var buf: [1024]u8 = undefined;
-        const raw = try std.fmt.bufPrint(&buf, "{{\"offset\":\"0\",\"total\":\"1\",\"limit\":8,\"rows\":[{{\"id\":\"saved\",\"amount\":\"21\",\"unit\":\"sat\",\"mint_url\":\"https://testnut.cashu.space\",{s}}}]}}", .{case.fields});
+        const raw = try std.fmt.bufPrint(&buf, "{{\"offset\":\"0\",\"total\":\"1\",\"limit\":8,\"rows\":[{{\"id\":\"saved\",\"amount\":\"21000\",\"unit\":\"msat\",\"mint_url\":\"https://testnut.cashu.space\",{s}}}]}}", .{case.fields});
         model.accept(model.serial, raw, 0, std.testing.allocator);
         try std.testing.expect(!model.history_error and model.row_count == 1);
         var expected: [64]u8 = undefined;
@@ -1262,20 +1265,20 @@ test "withdrawal review is explicit single-use and pauses conflicting background
     model.request = null;
     model.accept(model.serial, prepared_withdrawal, 0, std.testing.allocator);
     try std.testing.expect(model.reviewLive() and model.balance_dirty and model.history_dirty);
-    try std.testing.expectEqualStrings("104", model.withdrawal.estimated_total.slice());
-    try std.testing.expectEqualStrings("100", model.withdrawal.amount.slice());
-    try std.testing.expectEqualStrings("2", model.withdrawal.fee_reserve.slice());
-    try std.testing.expectEqualStrings("1", model.withdrawal.swap_fee.slice());
-    try std.testing.expectEqualStrings("1", model.withdrawal.input_fee.slice());
+    try std.testing.expectEqualStrings("104001", model.withdrawal.estimated_total.slice());
+    try std.testing.expectEqualStrings("100001", model.withdrawal.amount.slice());
+    try std.testing.expectEqualStrings("2000", model.withdrawal.fee_reserve.slice());
+    try std.testing.expectEqualStrings("1000", model.withdrawal.swap_fee.slice());
+    try std.testing.expectEqualStrings("1000", model.withdrawal.input_fee.slice());
     try std.testing.expectEqualStrings("200", model.withdrawal.quote_expiry.slice());
     try std.testing.expectEqualStrings("300", model.withdrawal.invoice_expiry.slice());
-    try std.testing.expectEqualStrings("500 sat", model.balance.slice());
+    try std.testing.expectEqualStrings("500000 msat", model.balance.slice());
     model.balance_dirty = false;
     model.recover_needed = true;
     model.resume_needed = true;
     model.tick(true, 100);
     try std.testing.expect(!model.pending);
-    try std.testing.expect(!model.create("21") and !model.enqueue(.poll, "") and !model.enqueue(.poll_withdrawals, ""));
+    try std.testing.expect(!model.create("21000") and !model.enqueue(.poll, "") and !model.enqueue(.poll_withdrawals, ""));
     try std.testing.expect(model.confirmWithdrawal());
     try std.testing.expect(!model.confirmWithdrawal());
     try std.testing.expectEqualStrings("operation-uuid", model.request.?.argument.slice());
@@ -1321,7 +1324,7 @@ test "failed cancel keeps conflicting work paused without inventing available fu
     model.balance_dirty = false;
     model.tick(true, 100);
     try std.testing.expect(model.withdrawal_blocked and !model.pending and !model.confirmWithdrawal() and !model.create("1"));
-    try std.testing.expectEqualStrings("500 sat", model.balance.slice());
+    try std.testing.expectEqualStrings("500000 msat", model.balance.slice());
 }
 test "unknown preparation needs explicit Back even after balance reread changed the current operation" {
     var model = withdrawalModel();
@@ -1416,7 +1419,7 @@ test "application poll errors advance selected cursors and preserve global recov
     var model = Model{ .started = true, .available = true, .history_active = true, .history_dirty = false };
     model.next_withdrawal_poll = std.math.inf(f64); // Isolate the deposit error deadline.
     _ = model.mint.set("https://testnut.cashu.space");
-    _ = model.balance.set("0 sat");
+    _ = model.balance.set("0 msat");
     try std.testing.expect(model.enqueue(.poll, ""));
     model.request = null;
     model.accept(model.serial, "{\"wallet_changed\":true,\"cursor\":\"A\"," ++ update_error ++ "}", 1, std.testing.allocator);
@@ -1484,7 +1487,7 @@ test "remote Issued without local transaction invalidates history but never clai
     for ([_]Operation{ .check, .poll }) |op| {
         var model = Model{ .started = true, .available = true, .history_active = true, .history_dirty = false };
         _ = model.mint.set("https://testnut.cashu.space");
-        _ = model.balance.set("7 sat");
+        _ = model.balance.set("7000 msat");
         try std.testing.expect(model.enqueue(.saved_invoice, "saved"));
         model.request = null;
         model.accept(model.serial, unpaid, 0, std.testing.allocator);
@@ -1492,19 +1495,19 @@ test "remote Issued without local transaction invalidates history but never clai
         model.request = null;
         model.accept(model.serial, "{\"wallet_changed\":true,\"recovery_pending\":false,\"creation_recovery\":\"none\",\"cursor\":\"saved\",\"error\":null,\"invoice\":" ++ remote_issued ++ "}", 1, std.testing.allocator);
         try std.testing.expect(model.balance_dirty and model.history_dirty and !model.issued);
-        try std.testing.expectEqualStrings("7 sat", model.balance.slice());
+        try std.testing.expectEqualStrings("7000 msat", model.balance.slice());
         try std.testing.expectEqualStrings("ISSUED", model.quote_state.slice());
         try std.testing.expect(std.mem.indexOf(u8, model.message.slice(), "local issuance unconfirmed") != null);
         model.tick(true, 1);
         try std.testing.expect(model.pending and model.operation == .snapshot);
         model.request = null;
         model.accept(model.serial, screen, 1, std.testing.allocator);
-        try std.testing.expectEqualStrings("0 sat", model.balance.slice());
+        try std.testing.expectEqualStrings("0 msat", model.balance.slice());
         try std.testing.expect(!model.issued);
         model.tick(true, 1);
         try std.testing.expect(model.pending and model.operation == .history);
         model.request = null;
-        model.accept(model.serial, "{\"offset\":\"0\",\"total\":\"1\",\"limit\":8,\"rows\":[{\"direction\":\"In\",\"id\":\"saved\",\"mint_url\":\"https://testnut.cashu.space\",\"state\":\"ISSUED\",\"unit\":\"sat\"}]}", 1, std.testing.allocator);
+        model.accept(model.serial, "{\"offset\":\"0\",\"total\":\"1\",\"limit\":8,\"rows\":[{\"direction\":\"In\",\"id\":\"saved\",\"mint_url\":\"https://testnut.cashu.space\",\"state\":\"ISSUED\",\"unit\":\"msat\"}]}", 1, std.testing.allocator);
         try std.testing.expect(!model.history_dirty and !model.history_error);
         try std.testing.expect(std.mem.indexOf(u8, model.rows[0].text.slice(), "ISSUED") != null);
     }
@@ -1516,7 +1519,7 @@ test "application metadata survives stale selection and operational error withou
         _ = model.mint.set("https://testnut.cashu.space");
         _ = model.invoice.set("invoice-A");
         _ = model.quote_id.set("A");
-        _ = model.balance.set("7 sat");
+        _ = model.balance.set("7000 msat");
         _ = model.rows[0].id.set("saved");
         _ = model.rows[0].mint.set(model.mint.slice());
         try std.testing.expect(model.enqueue(op, "A"));
@@ -1526,7 +1529,7 @@ test "application metadata survives stale selection and operational error withou
         model.request = null;
         model.accept(serial, "{\"wallet_changed\":true,\"recovery_pending\":true,\"creation_recovery\":\"none\",\"invoice\":null,\"cursor\":null,\"error\":{\"status\":7,\"message\":\"failed after partial recovery\"}}", 1, std.testing.allocator);
         try std.testing.expect(model.balance_dirty and model.history_dirty and model.recover_needed);
-        try std.testing.expectEqualStrings("7 sat", model.balance.slice());
+        try std.testing.expectEqualStrings("7000 msat", model.balance.slice());
         try std.testing.expect(model.operation == .saved_invoice and model.pending and !model.canCopyInvoice());
         model.request = null;
         model.fail(model.serial, 1);
@@ -1545,7 +1548,7 @@ test "pending mint recovery with no creation intent respects bounded deadline an
     var model = Model{};
     model.next_withdrawal_poll = std.math.inf(f64);
     model.tick(true, 0);
-    model.accept(model.serial, "{\"mint_url\":\"https://testnut.cashu.space\",\"sats\":\"0\",\"creation_recovery\":\"none\",\"recovery_pending\":true}", 0, std.testing.allocator);
+    model.accept(model.serial, "{\"mint_url\":\"https://testnut.cashu.space\",\"msats\":\"0\",\"creation_recovery\":\"none\",\"recovery_pending\":true}", 0, std.testing.allocator);
     model.resume_needed = false;
     model.history_dirty = false;
     model.request = null;
@@ -1559,7 +1562,7 @@ test "pending mint recovery with no creation intent respects bounded deadline an
     model.tick(true, 2);
     try std.testing.expect(model.operation == .snapshot);
     model.request = null;
-    model.accept(model.serial, "{\"mint_url\":\"https://testnut.cashu.space\",\"sats\":\"21\",\"creation_recovery\":\"none\",\"recovery_pending\":true}", 2, std.testing.allocator);
+    model.accept(model.serial, "{\"mint_url\":\"https://testnut.cashu.space\",\"msats\":\"21000\",\"creation_recovery\":\"none\",\"recovery_pending\":true}", 2, std.testing.allocator);
     model.tick(true, deadline - 0.01);
     try std.testing.expect(!model.pending and model.next_recover == deadline);
     model.tick(true, deadline);
@@ -1575,9 +1578,12 @@ test "pending mint recovery with no creation intent respects bounded deadline an
         try std.testing.expect(!model.balance_dirty and !model.history_dirty);
     }
 }
-test "decimal sats checked at UI boundary" {
-    for ([_][]const u8{ "", "0", "-1", "+1", "1.1", "1e3", " 1", "18446744073709551616", "9223372036854775808" }) |bad| try std.testing.expectError(error.InvalidAmount, positiveSats(bad));
-    try std.testing.expectEqual(@as(u64, 42), try positiveSats("42"));
+test "deposit accepts integer msats without scaling or rounding" {
+    for ([_][]const u8{ "", "0", "-1", "+1", "1.1", "1e3", " 1", "18446744073709551616", "9223372036854775808" }) |bad| try std.testing.expectError(error.InvalidAmount, positiveMsats(bad));
+    try std.testing.expectEqual(@as(u64, 1), try positiveMsats("1"));
+    var model = withdrawalModel();
+    try std.testing.expect(model.create("42001"));
+    try std.testing.expectEqualStrings("42001", model.request.?.argument.slice());
 }
 test "unchanged unpaid checks do not request balance or history; issued rereads actual balance" {
     var model = Model{};
@@ -1585,7 +1591,7 @@ test "unchanged unpaid checks do not request balance or history; issued rereads 
     model.tick(true, 0);
     model.accept(model.serial, screen, 0, std.testing.allocator);
     model.resume_needed = false;
-    _ = model.enqueue(.create, "21");
+    _ = model.enqueue(.create, "21000");
     model.accept(model.serial, unpaid, 0, std.testing.allocator);
     model.recover_needed = false;
     model.history_active = true;
@@ -1600,11 +1606,11 @@ test "unchanged unpaid checks do not request balance or history; issued rereads 
     model.tick(true, 20);
     model.accept(model.serial, "{\"cursor\":\"saved\",\"invoice\":{\"id\":\"saved\",\"invoice\":\"lnbc210n1test\",\"mint_url\":\"https://testnut.cashu.space\",\"state\":\"ISSUED\",\"confirmed\":true,\"expired\":false}}", 20, std.testing.allocator);
     try std.testing.expect(model.balance_dirty and model.history_dirty);
-    try std.testing.expectEqualStrings("0 sat", model.balance.slice());
+    try std.testing.expectEqualStrings("0 msat", model.balance.slice());
     model.tick(true, 20);
     try std.testing.expect(model.operation == .snapshot);
-    model.accept(model.serial, "{\"mint_url\":\"https://testnut.cashu.space\",\"sats\":\"19\",\"creation_recovery\":\"none\"}", 20, std.testing.allocator);
-    try std.testing.expectEqualStrings("19 sat", model.balance.slice());
+    model.accept(model.serial, "{\"mint_url\":\"https://testnut.cashu.space\",\"msats\":\"19000\",\"creation_recovery\":\"none\"}", 20, std.testing.allocator);
+    try std.testing.expectEqualStrings("19000 msat", model.balance.slice());
 }
 test "history paging keeps published offset immutable and validates clamp and stale callbacks" {
     var model = Model{};
@@ -1638,7 +1644,7 @@ test "scoped read failures retain wallet, invoice and balance" {
     model.tick(true, 0);
     model.accept(model.serial, screen, 0, std.testing.allocator);
     model.resume_needed = false;
-    _ = model.enqueue(.create, "21");
+    _ = model.enqueue(.create, "21000");
     model.accept(model.serial, unpaid, 0, std.testing.allocator);
     model.recover_needed = false;
     for ([_]Operation{ .history, .resume_saved, .recover, .snapshot, .check, .poll }) |op| {
@@ -1646,7 +1652,7 @@ test "scoped read failures retain wallet, invoice and balance" {
         model.fail(model.serial, 0);
         try std.testing.expect(model.available);
         try std.testing.expectEqualStrings("saved", model.quote_id.slice());
-        try std.testing.expectEqualStrings("0 sat", model.balance.slice());
+        try std.testing.expectEqualStrings("0 msat", model.balance.slice());
     }
     _ = model.enqueue(.resume_saved, "");
     model.accept(model.serial, "{\"invoice\":null,\"error\":\"too long\"}", 0, std.testing.allocator);
@@ -1709,7 +1715,7 @@ test "locally confirmed Issued transition refreshes balance even when state was 
     model.tick(true, 0);
     model.accept(model.serial, screen, 0, std.testing.allocator);
     model.resume_needed = false;
-    _ = model.enqueue(.create, "21");
+    _ = model.enqueue(.create, "21000");
     const unconfirmed = "{\"id\":\"saved\",\"invoice\":\"lnbc210n1test\",\"mint_url\":\"https://testnut.cashu.space\",\"state\":\"ISSUED\",\"confirmed\":false,\"expired\":false}";
     model.accept(model.serial, unconfirmed, 0, std.testing.allocator);
     model.recover_needed = false;
@@ -1729,9 +1735,9 @@ test "bounded history renders real times and unknown owners without opening unsu
     model.resume_needed = false;
     model.visit(true, false);
     model.tick(true, 0);
-    model.accept(model.serial, "{\"offset\":\"0\",\"total\":\"1\",\"limit\":8,\"rows\":[{\"id\":\"saved\",\"direction\":\"Out\",\"amount\":\"42\",\"unit\":\"sat\",\"state\":\"UNPAID\",\"created_at\":null,\"mint_url\":null}]}", 0, std.testing.allocator);
+    model.accept(model.serial, "{\"offset\":\"0\",\"total\":\"1\",\"limit\":8,\"rows\":[{\"id\":\"saved\",\"direction\":\"Out\",\"amount\":\"42000\",\"unit\":\"msat\",\"state\":\"UNPAID\",\"created_at\":null,\"mint_url\":null}]}", 0, std.testing.allocator);
     try std.testing.expect(model.rows[0].outgoing and model.row_count == 1);
-    try std.testing.expect(std.mem.indexOf(u8, model.rows[0].text.slice(), "Time unknown | 42 sat | UNPAID") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model.rows[0].text.slice(), "Time unknown | 42000 msat | UNPAID") != null);
     try std.testing.expect(std.mem.indexOf(u8, model.rows[0].text.slice(), "Mint unknown (not refreshed)") != null);
     var time: [32]u8 = undefined;
     try std.testing.expectEqualStrings("1970-01-01 00:00 UTC", formatTime("0", &time));
@@ -1786,7 +1792,7 @@ test "creation failure retries local recovery automatically with bounded backoff
     model.tick(true, 0);
     model.accept(model.serial, screen, 0, std.testing.allocator);
     model.resume_needed = false;
-    try std.testing.expect(model.create("21"));
+    try std.testing.expect(model.create("21000"));
     model.fail(model.serial, 1);
     try std.testing.expect(model.recovery == .unknown and model.recover_needed);
     model.tick(true, 1);
@@ -1800,7 +1806,7 @@ test "creation failure retries local recovery automatically with bounded backoff
     try std.testing.expect(model.operation == .recover and model.pending);
     model.fail(model.serial, 5);
     try std.testing.expectEqual(@as(f64, 13), model.next_recover);
-    try std.testing.expect(!model.create("21"));
+    try std.testing.expect(!model.create("21000"));
     try std.testing.expect(!model.pending);
     model.tick(true, 13);
     model.accept(model.serial, "{\"creation_recovery\":\"none\",\"invoice\":null}", 13, std.testing.allocator);
@@ -1813,9 +1819,9 @@ test "poll completes before one queued create publishes with a fresh serial" {
     try std.testing.expect(model.enqueue(.poll, ""));
     const serial = model.serial;
     const request = model.request.?;
-    try std.testing.expect(model.create("21"));
+    try std.testing.expect(model.create("21000"));
     try std.testing.expectEqualStrings("Creating saved invoice...", model.message.slice());
-    try std.testing.expect(!model.create("42"));
+    try std.testing.expect(!model.create("42000"));
     try std.testing.expectEqual(serial, model.serial);
     try std.testing.expectEqualDeep(request, model.request.?);
     try std.testing.expectEqual(Operation.poll, model.operation);
@@ -1826,8 +1832,8 @@ test "poll completes before one queued create publishes with a fresh serial" {
     try std.testing.expect(model.pending and model.queued == null);
     try std.testing.expectEqual(Operation.create, model.operation);
     try std.testing.expectEqual(serial +% 1, model.request.?.serial);
-    try std.testing.expectEqualStrings("21", model.request.?.argument.slice());
-    try std.testing.expect(!model.create("100"));
+    try std.testing.expectEqualStrings("21000", model.request.?.argument.slice());
+    try std.testing.expect(!model.create("100000"));
     model.accept(serial, "{}", 4, std.testing.allocator);
     try std.testing.expect(model.pending and model.operation == .create);
 }
@@ -1910,12 +1916,12 @@ test "deferred slot never overwrites an unconsumed published request" {
     var model = Model{ .started = true, .available = true };
     try std.testing.expect(model.enqueue(.poll, ""));
     const request = model.request.?;
-    try std.testing.expect(model.create("21"));
+    try std.testing.expect(model.create("21000"));
     model.fail(model.serial, 0);
     try std.testing.expect(!model.pending and model.queued != null);
     model.tick(true, 0);
     try std.testing.expectEqualDeep(request, model.request.?);
-    try std.testing.expect(!model.create("42"));
+    try std.testing.expect(!model.create("42000"));
     model.request = null;
     model.tick(true, 0);
     try std.testing.expect(model.pending and model.queued == null and model.operation == .create);
@@ -1927,7 +1933,7 @@ test "unknown startup and cleanup outcomes retry local recovery on bounded deadl
         model.next_withdrawal_poll = std.math.inf(f64);
         model.tick(true, 0);
         var buf: [256]u8 = undefined;
-        const snapshot = try std.fmt.bufPrint(&buf, "{{\"mint_url\":\"https://testnut.cashu.space\",\"sats\":\"0\",\"creation_recovery\":\"{s}\"}}", .{status});
+        const snapshot = try std.fmt.bufPrint(&buf, "{{\"mint_url\":\"https://testnut.cashu.space\",\"msats\":\"0\",\"creation_recovery\":\"{s}\"}}", .{status});
         model.accept(model.serial, snapshot, 0, std.testing.allocator);
         model.resume_needed = false;
         model.next_check = 10000;
@@ -1942,7 +1948,7 @@ test "unknown startup and cleanup outcomes retry local recovery on bounded deadl
             try std.testing.expect(model.pending and model.operation == .recover);
             const reply = try std.fmt.bufPrint(&buf, "{{\"creation_recovery\":\"{s}\",\"invoice\":null}}", .{status});
             model.accept(model.serial, reply, deadline, std.testing.allocator);
-            try std.testing.expect(!model.create("21"));
+            try std.testing.expect(!model.create("21000"));
             now = deadline;
         }
         try std.testing.expectEqual(@as(f64, 30), model.next_recover - now);
@@ -1951,7 +1957,7 @@ test "unknown startup and cleanup outcomes retry local recovery on bounded deadl
         model.tick(true, model.next_recover);
         model.accept(model.serial, "{\"creation_recovery\":\"unknown\",\"invoice\":" ++ unpaid ++ "}", now + 30, std.testing.allocator);
         try std.testing.expectEqualStrings("saved", model.quote_id.slice());
-        try std.testing.expect(model.invoice.len != 0 and !model.create("21"));
+        try std.testing.expect(model.invoice.len != 0 and !model.create("21000"));
         try std.testing.expect(model.enqueue(.check, "saved"));
         model.accept(model.serial, unpaid, now + 31, std.testing.allocator);
         try std.testing.expect(model.recovery == .unknown);
@@ -1970,7 +1976,7 @@ test "unknown startup and cleanup outcomes retry local recovery on bounded deadl
 test "local recovery preserves a different selected invoice while reconciling the creation gate" {
     var model = Model{ .started = true, .available = true };
     _ = model.mint.set("https://testnut.cashu.space");
-    _ = model.balance.set("7 sat");
+    _ = model.balance.set("7000 msat");
     try std.testing.expect(model.enqueue(.check, "selected-B"));
     model.accept(model.serial, "{\"id\":\"selected-B\",\"invoice\":\"lnbc-selected-B\",\"mint_url\":\"https://testnut.cashu.space\",\"state\":\"UNPAID\",\"confirmed\":false,\"expired\":false}", 0, std.testing.allocator);
     const selected_qr = model.qr;
@@ -1984,7 +1990,7 @@ test "local recovery preserves a different selected invoice while reconciling th
     try std.testing.expectEqualDeep(selected_qr, model.qr);
     try std.testing.expect(model.recovery == .unknown and model.recover_needed and model.next_recover > 2);
     try std.testing.expect(!model.balance_dirty and !model.issued);
-    try std.testing.expect(!model.create("21"));
+    try std.testing.expect(!model.create("21000"));
     model.history_dirty = false;
     const deadline = model.next_recover;
     model.tick(true, deadline);
@@ -1999,13 +2005,13 @@ test "local recovery preserves a different selected invoice while reconciling th
     try std.testing.expectEqual(@as(f64, 2), model.recover_backoff);
     try std.testing.expectEqual(@as(f64, 0), model.next_recover);
     try std.testing.expect(model.balance_dirty and model.history_dirty);
-    try std.testing.expectEqualStrings("7 sat", model.balance.slice());
+    try std.testing.expectEqualStrings("7000 msat", model.balance.slice());
     try std.testing.expect(!model.pending and model.queued == null);
     model.tick(true, deadline);
     try std.testing.expect(model.operation == .snapshot); // Reread, never increment or create.
 }
 
-const history_row = "{\"id\":\"saved\",\"direction\":\"In\",\"mint_url\":\"https://testnut.cashu.space\",\"amount\":\"21\",\"unit\":\"sat\",\"state\":\"UNPAID\"}";
+const history_row = "{\"id\":\"saved\",\"direction\":\"In\",\"mint_url\":\"https://testnut.cashu.space\",\"amount\":\"21000\",\"unit\":\"msat\",\"state\":\"UNPAID\"}";
 const placeholder_row = "{\"direction\":\"In\",\"identity\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"error\":\"Saved quote exceeds display limit\"}";
 const seven_history_rows = history_row ++ "," ++ history_row ++ "," ++ history_row ++ "," ++ history_row ++ "," ++ history_row ++ "," ++ history_row ++ "," ++ history_row;
 

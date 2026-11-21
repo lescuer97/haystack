@@ -26,7 +26,7 @@ it cannot move the world.
 | Backspace | delete the last codepoint in the focused field |
 
 `WASD` is **not** a menu direction: typing never moves the highlight. Amounts
-are validated separately as positive decimal integer sats. Held directions step on
+are validated separately as positive decimal integer millisats. Held directions step on
 the first eligible 20 Hz tick and then every two executed ticks (10 steps/s),
 using the same repeat allowance as the camera. `Space` types a
 space; it is not a confirm key. Arrow keys, D-pad, and stick
@@ -54,9 +54,9 @@ field that was previously focused; the caret appears only after activation.
 Pages and rows:
 
 - **Main**: `Wallet` (navigation), `Resume` (close).
-- **Wallet**: selected-mint sat balance, `Deposit`, `Withdraw`,
+- **Wallet**: selected-mint msat balance, `Deposit`, `Withdraw`,
   `History`, `Back to Main`.
-- **Deposit**: custom positive integer sats, presets 21/42/100/1000, `Deposit`, `Back`.
+- **Deposit**: custom positive integer millisats, presets 21000/42000/100000/500000, `Deposit`, `Back`.
 - **Invoice**: cached QR, bounded invoice preview, actual quote state,
   `Copy invoice`, new `Deposit`, `Back`.
 - **History**: eight saved mint/melt quotes per page, `Previous`, `Next`, `Back`.

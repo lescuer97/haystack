@@ -10,7 +10,7 @@ import {createWallet, deleteWallet, readWallet} from "./test-wallet.js";
 
 const faults = installSwapFaults();
 const MINT = location.origin;
-const sumBalances = balances => balances.reduce((total, entry) => total + Number(entry.sats), 0);
+const sumBalances = balances => balances.reduce((total, entry) => total + Number(entry.msats), 0);
 
 const json = async (operation, args = []) => {
   try {
@@ -42,11 +42,11 @@ const fund = async () => {
     return response.json();
   });
   const receipt = await must("receive", [token.token]);
-  if (receipt.net_sats !== "100") throw new Error(`unexpected funding amount ${receipt.net_sats}`);
+  if (receipt.net_msats !== "100") throw new Error(`unexpected funding amount ${receipt.net_msats}`);
 };
 const currentBalance = async () => {
   const balances = await must("list_balances");
-  return balances.balances.reduce((total, entry) => total + Number(entry.sats), 0);
+  return balances.balances.reduce((total, entry) => total + Number(entry.msats), 0);
 };
 const unspentOneCount = async name => {
   const {state} = await readWallet(name);
@@ -54,11 +54,11 @@ const unspentOneCount = async name => {
   return Object.values(record.proofs || {})
     .filter(proof => proof.state === "UNSPENT" && proof.proof.amount === 1).length;
 };
-// Move the four 1-sat refill proofs to a sink wallet so an odd 37-sat send
+// Move the four 1-msat refill proofs to a sink wallet so an odd 37-msat send
 // cannot be composed directly and must perform an online /v1/swap.
 async function shapeForSwap(name) {
   const ones = await unspentOneCount(name);
-  if (ones !== 4) throw new Error(`expected four 1-sat proofs for shaping, found ${ones}`);
+  if (ones !== 4) throw new Error(`expected four 1-msat proofs for shaping, found ${ones}`);
   const drained = [];
   for (let index = 0; index < ones; index += 1) {
     drained.push(await must("send", [MINT, "1", "0"]));
@@ -85,7 +85,7 @@ async function shapeForSwap(name) {
   // The drained sends are now claimed, so recovery clears their sagas.
   await must("recover");
   const shaped = await currentBalance();
-  if (shaped !== 96) throw new Error(`expected 96 sats after shaping, got ${shaped}`);
+  if (shaped !== 96) throw new Error(`expected 96 msats after shaping, got ${shaped}`);
   return {sinkName, drained: ones, expected: shaped};
 }
 
@@ -169,7 +169,7 @@ export async function inspectWallet(name, seedHex) {
   return {
     startup,
     mint: MINT,
-    sats: sumBalances(balances.balances),
+    msats: sumBalances(balances.balances),
     pending,
   };
 }
@@ -180,7 +180,7 @@ export async function recoverWallet() {
   const pending = await must("list_pending_tokens");
   return {
     reports: recovery.reports,
-    sats: sumBalances(balances.balances),
+    msats: sumBalances(balances.balances),
     pending,
   };
 }
@@ -208,7 +208,7 @@ export async function spendAllFromApp(recipientName, seedHex) {
   const recovered = await currentBalance();
   await recoverClean("repeated spend recovery");
   const repeat = await currentBalance();
-  return {before, net_sats: received.net_sats, after, recovered, repeat};
+  return {before, net_msats: received.net_msats, after, recovered, repeat};
 }
 
 export async function trySend(amount) {

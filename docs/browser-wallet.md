@@ -19,6 +19,13 @@ commit.
 
 ## Build
 
+The browser wallet uses integer millisatoshis (`msat`). At startup it checks the
+selected mint’s live `/v1/keysets` before onboarding. If the check fails or no
+active `msat` keyset exists, the game logs the error, stops, and shows a startup
+error without opening or creating a wallet. Existing sat-denominated proofs and
+quotes are not converted or deleted. A legacy, unfinished recovery result with
+sat totals is left intact rather than resumed as an msat result.
+
 The shared [wallet menu](menu.md) supports explicitly authorized BOLT11
 withdrawals: paste a complete invoice (4096-byte limit), Review the CDK quote,
 then explicitly Withdraw. Review reserves funds but does not pay. Cancel/Back
@@ -155,7 +162,7 @@ For manual interaction or browser MCP, start a persistent fake-mint server with
 `zig build test-mint -Dplatform=wasm`. It binds **127.0.0.1:18787**.
 `BROWSER_TEST_PORT` can override the port;
 use `0` to allocate an available port and read the printed address. It never
-connects to Lightning or holds real funds. `/test-token` dispenses 100 fake sats
+connects to Lightning or holds real funds. `/test-token` dispenses 100 fake msats
 from its finite in-memory test setup. Do not deploy this test server publicly.
 
 With that manually started server, the Node runner can also run independently:
@@ -263,7 +270,7 @@ Browser checks include:
 - Live Spilman channels against the running fake mint: active and by-id keyset
   agreement, a real `/test-token` funding swap (the token is never received before
   funding), 70/30 cooperative close, redemption into both wallets with live
-  balances, and a separate post-expiry refund channel whose 100 sats are redeemed,
+  balances, and a separate post-expiry refund channel whose 100 msats are redeemed,
   survive reopen, and remain unchanged across two explicit recoveries.
 - Test-only `/v1/swap` fault injection (same-origin POST only, one armed request,
   no request-body logging): malformed response after mint commit, generic network
@@ -290,7 +297,7 @@ Browser checks include:
 - Partial, truncated or incompatible v1 storage is rejected without rewriting the
   raw record (missing `proofs`, `counters`, `sagas`, etc.), while a complete
   record still loads; the same strictness is tested natively and in Chromium.
-- Browser Fetch to a real local CDK fake-mint HTTP server: receive 100 fake sats,
+- Browser Fetch to a real local CDK fake-mint HTTP server: receive 100 fake msats,
   send 40, persist/retrieve the outgoing token, redeem in another wallet, recover,
   and confirm the claimed token leaves the pending list.
 - Balance/mint persistence across reopen, exclusive locking across separate tabs,
@@ -487,15 +494,15 @@ production-safety claims.
   mark the swap inputs spent. The parent `Send(ProofsReserved)` saga is then
   compensated and releases those same already-spent inputs as unspent.
   Reproduction in `browser/fault-scenarios.js` and `browser/recovery.js`: fund
-  100 sats, spend the four 1-sat refill proofs locally so a 37-sat send cannot be
+  100 msats, spend the four 1-msat refill proofs locally so a 37-msat send cannot be
   composed from the remaining even denominations, then drop the committed
-  `/v1/swap` response. The required post-recovery balance is 96 sats; the observed
-  value is 130 sats (the in-page and document-destruction scenarios each record a
-  failure). The 34-sat difference is an observation of the stale inputs, not an
+  `/v1/swap` response. The required post-recovery balance is 96 msats; the observed
+  value is 130 msats (the in-page and document-destruction scenarios each record a
+  failure). The 34-msat difference is an observation of the stale inputs, not an
   expected contract. The tests do not assert that the over-counted proofs are
   spendable. No production fix is applied yet.
 - **A send interrupted before its swap request leaves the mint gated.** The send
-  reservation is compensated (the 96-sat balance is preserved), but the orphaned
+  reservation is compensated (the 96-msat balance is preserved), but the orphaned
   nested `Swap` saga owns no input proofs, so recovery tries `/restore`; an empty
   restore response is treated as an incomplete response and reported as `failed`,
   leaving the mint blocked. The expected invariants are clean startup/explicit

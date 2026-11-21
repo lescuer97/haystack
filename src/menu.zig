@@ -25,10 +25,10 @@ pub const MenuPage = enum { Main, Debug, Wallet, Deposit, Invoice, History, With
 
 /// Local menu actions. None of these touch a wallet, payment, or network layer;
 /// they only change menu-local UI state.
-pub const Action = enum { close_menu, toggle_grid, toggle_borders, toggle_debug_minimap, toggle_hud, balance, preset21, preset42, preset100, preset1000, deposit, previous, next, copy_invoice, review_withdrawal, confirm_withdrawal, cancel_withdrawal, review_again, paste_withdrawal, clear_withdrawal };
+pub const Action = enum { close_menu, toggle_grid, toggle_borders, toggle_debug_minimap, toggle_hud, balance, preset21, preset42, preset100, preset500k, deposit, previous, next, copy_invoice, review_withdrawal, confirm_withdrawal, cancel_withdrawal, review_again, paste_withdrawal, clear_withdrawal };
 
 /// Editable fields. A field is a data key; its runtime value lives in `Menu`.
-pub const InputField = enum { deposit_sats, withdrawal_invoice };
+pub const InputField = enum { deposit_msats, withdrawal_invoice };
 
 /// One menu row. The tag decides what activation does, so adding a new kind
 /// makes the exhaustive switches below require a decision.
@@ -135,11 +135,11 @@ const wallet_items = [_]MenuItem{
     .{ .navigate = .Main },
 };
 const deposit_items = [_]MenuItem{
-    .{ .text_input = .deposit_sats },
+    .{ .text_input = .deposit_msats },
     .{ .action = .preset21 },
     .{ .action = .preset42 },
     .{ .action = .preset100 },
-    .{ .action = .preset1000 },
+    .{ .action = .preset500k },
     .{ .action = .deposit },
     .{ .navigate = .Wallet },
 };
@@ -155,7 +155,7 @@ pub fn pageTitle(page: MenuPage) [:0]const u8 {
         .Main => "Main",
         .Debug => "Debug Settings",
         .Wallet => "Wallet",
-        .Deposit => "Deposit - sats",
+        .Deposit => "Deposit - msat",
         .Invoice => "Deposit - invoice",
         .History => "History",
         .Withdraw => "Withdraw - Lightning BOLT11",
@@ -194,11 +194,11 @@ pub fn itemLabel(item: MenuItem) [:0]const u8 {
             .toggle_borders => "Chunk borders",
             .toggle_debug_minimap => "Show debug minimap",
             .toggle_hud => "Debug HUD",
-            .balance => "Balance (sat)",
-            .preset21 => "21 sat",
-            .preset42 => "42 sat",
-            .preset100 => "100 sat",
-            .preset1000 => "1000 sat",
+            .balance => "Balance (msat)",
+            .preset21 => "21000 msat",
+            .preset42 => "42000 msat",
+            .preset100 => "100000 msat",
+            .preset500k => "500000 msat",
             .deposit => "Deposit",
             .previous => "Previous",
             .next => "Next",
@@ -211,7 +211,7 @@ pub fn itemLabel(item: MenuItem) [:0]const u8 {
             .clear_withdrawal => "Clear",
         },
         .text_input => |field| switch (field) {
-            .deposit_sats => "Custom sats",
+            .deposit_msats => "Custom msat",
             .withdrawal_invoice => "Lightning BOLT11 (up to 4096 bytes)",
         },
     };
@@ -376,7 +376,7 @@ pub const Menu = struct {
     opened: bool = false,
     currentPage: MenuPage = .Main,
     focus: ?InputField = null,
-    deposit_sats: TextField = .{},
+    deposit_msats: TextField = .{},
     withdrawal_invoice: BoundedTextField(4096) = .{},
     paste_requested: bool = false,
     debug_toggle: ?Action = null,
@@ -541,14 +541,14 @@ pub const Menu = struct {
 
     pub fn textField(self: *Menu, field: InputField) *TextField {
         return switch (field) {
-            .deposit_sats => &self.deposit_sats,
+            .deposit_msats => &self.deposit_msats,
             .withdrawal_invoice => unreachable,
         };
     }
 
     pub fn textFieldConst(self: *const Menu, field: InputField) *const TextField {
         return switch (field) {
-            .deposit_sats => &self.deposit_sats,
+            .deposit_msats => &self.deposit_msats,
             .withdrawal_invoice => unreachable,
         };
     }
@@ -572,20 +572,20 @@ pub const Menu = struct {
                 .close_menu => self.close(),
                 .toggle_grid, .toggle_borders, .toggle_debug_minimap, .toggle_hud => self.debug_toggle = action,
                 .balance => {},
-                .preset21, .preset42, .preset100, .preset1000 => {
-                    self.deposit_sats.clear();
+                .preset21, .preset42, .preset100, .preset500k => {
+                    self.deposit_msats.clear();
                     const text = switch (action) {
-                        .preset21 => "21",
-                        .preset42 => "42",
-                        .preset100 => "100",
-                        else => "1000",
+                        .preset21 => "21000",
+                        .preset42 => "42000",
+                        .preset100 => "100000",
+                        else => "500000",
                     };
-                    for (text) |c| _ = self.deposit_sats.appendCodepoint(c);
+                    for (text) |c| _ = self.deposit_msats.appendCodepoint(c);
                     self.focus = null;
                 },
                 .deposit => {
                     self.focus = null;
-                    if (self.wallet.create(self.deposit_sats.slice())) {
+                    if (self.wallet.create(self.deposit_msats.slice())) {
                         self.currentPage = .Invoice;
                         self.wallet.history_active = false;
                         self.selected_index = 0;
@@ -688,9 +688,9 @@ test "withdrawal paste is atomic UTF8 bounded and separate from deposit capacity
     try std.testing.expectEqualStrings("aé", state.withdrawal_invoice.slice());
     state.activate(.{ .action = .clear_withdrawal });
     try std.testing.expectEqualStrings("", state.withdrawal_invoice.slice());
-    state.focus = .deposit_sats;
+    state.focus = .deposit_msats;
     try std.testing.expect(!state.pasteWithdrawal("invoice"));
-    try std.testing.expectEqual(@as(usize, 129), state.deposit_sats.bytes.len);
+    try std.testing.expectEqual(@as(usize, 129), state.deposit_msats.bytes.len);
     state.close();
     try std.testing.expectEqualStrings("", state.withdrawal_invoice.slice());
 }
@@ -834,9 +834,9 @@ test "escape opens on Main and closes again" {
 }
 
 test "Deposit clears hidden focus and disables duplicates; Withdraw navigation requests no work" {
-    var state = Menu{ .opened = true, .currentPage = .Deposit, .focus = .deposit_sats };
+    var state = Menu{ .opened = true, .currentPage = .Deposit, .focus = .deposit_msats };
     state.wallet.available = true;
-    for ("21") |c| _ = state.deposit_sats.appendCodepoint(c);
+    for ("21000") |c| _ = state.deposit_msats.appendCodepoint(c);
     state.activate(.{ .action = .deposit });
     try std.testing.expectEqual(MenuPage.Invoice, state.currentPage);
     try std.testing.expectEqual(@as(?InputField, null), state.focus);
@@ -845,17 +845,17 @@ test "Deposit clears hidden focus and disables duplicates; Withdraw navigation r
     state.activate(.{ .action = .deposit });
     try std.testing.expectEqual(serial, state.wallet.serial);
     try typeText(&state, "7");
-    try std.testing.expectEqualStrings("21", state.deposit_sats.slice());
+    try std.testing.expectEqualStrings("21000", state.deposit_msats.slice());
     state.wallet.fail(serial, 0);
     try typeText(&state, "8");
-    try std.testing.expectEqualStrings("21", state.deposit_sats.slice());
+    try std.testing.expectEqualStrings("21000", state.deposit_msats.slice());
     state.wallet.request = null;
     state.activate(.{ .navigate = .Wallet });
     state.activate(pageItems(.Wallet)[2]);
     try std.testing.expectEqual(MenuPage.Withdraw, state.currentPage);
     try std.testing.expectEqual(@as(?InputField, null), state.focus);
     try typeText(&state, "9");
-    try std.testing.expectEqualStrings("21", state.deposit_sats.slice());
+    try std.testing.expectEqualStrings("21000", state.deposit_msats.slice());
     try std.testing.expectEqualStrings("", state.withdrawal_invoice.slice());
     try std.testing.expectEqual(serial, state.wallet.serial);
     try std.testing.expect(state.wallet.request == null);
@@ -877,7 +877,7 @@ test "Main navigates to Wallet and Back returns to Main" {
     try std.testing.expectEqual(MenuPage.Main, menu.currentPage);
 }
 
-test "Resume closes and preset replaces custom sats" {
+test "Resume closes and preset replaces custom msat" {
     var menu = Menu{};
     _ = menu.applyInput(.{ .escape_clicked = true });
 
@@ -896,11 +896,11 @@ test "Resume closes and preset replaces custom sats" {
     const field_point = itemCenter(wallet_layout, 0);
     _ = menu.applyInput(frameFor(field_point.x, field_point.y, 1000, 640));
     try typeText(&menu, "Ada");
-    try std.testing.expectEqualStrings("Ada", menu.deposit_sats.slice());
+    try std.testing.expectEqualStrings("Ada", menu.deposit_msats.slice());
 
     const clear_point = itemCenter(wallet_layout, 1);
     _ = menu.applyInput(frameFor(clear_point.x, clear_point.y, 1000, 640));
-    try std.testing.expectEqualStrings("21", menu.deposit_sats.slice());
+    try std.testing.expectEqualStrings("21000", menu.deposit_msats.slice());
     try std.testing.expect(menu.opened);
 }
 
@@ -910,29 +910,29 @@ test "typing only reaches a focused input field" {
 
     // No focus on Main: keystrokes are consumed but ignored.
     try typeText(&menu, "ignored");
-    try std.testing.expectEqualStrings("", menu.deposit_sats.slice());
+    try std.testing.expectEqualStrings("", menu.deposit_msats.slice());
 
     // Navigating to Wallet still leaves fields unfocused.
     const main_layout = calculateLayout(.Main, 1000, 640);
     const wallet_point = itemCenter(main_layout, 0);
     _ = menu.applyInput(frameFor(wallet_point.x, wallet_point.y, 1000, 640));
     try typeText(&menu, "still-ignored");
-    try std.testing.expectEqualStrings("", menu.deposit_sats.slice());
+    try std.testing.expectEqualStrings("", menu.deposit_msats.slice());
 
     // Clicking the field gives it focus.
     menu.currentPage = .Deposit;
     const wallet_layout = calculateLayout(.Deposit, 1000, 640);
     const field_point = itemCenter(wallet_layout, 0);
     _ = menu.applyInput(frameFor(field_point.x, field_point.y, 1000, 640));
-    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
+    try std.testing.expectEqual(@as(?InputField, .deposit_msats), menu.focus);
     try typeText(&menu, "Ada");
-    try std.testing.expectEqualStrings("Ada", menu.deposit_sats.slice());
+    try std.testing.expectEqualStrings("Ada", menu.deposit_msats.slice());
 
     // Clicking outside every item blurs; later typing is ignored.
     _ = menu.applyInput(frameFor(1, 1, 1000, 640));
     try std.testing.expectEqual(@as(?InputField, null), menu.focus);
     try typeText(&menu, "zzz");
-    try std.testing.expectEqualStrings("Ada", menu.deposit_sats.slice());
+    try std.testing.expectEqualStrings("Ada", menu.deposit_msats.slice());
 }
 
 test "Unicode text appends, backspaces, and respects capacity" {
@@ -986,7 +986,7 @@ test "focus resets on navigation and close" {
     const wallet_layout = calculateLayout(.Deposit, 1000, 640);
     const field_point = itemCenter(wallet_layout, 0);
     _ = menu.applyInput(frameFor(field_point.x, field_point.y, 1000, 640));
-    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
+    try std.testing.expectEqual(@as(?InputField, .deposit_msats), menu.focus);
 
     // Navigation blurs.
     const back_point = itemCenter(wallet_layout, pageItems(.Deposit).len - 1);
@@ -1022,8 +1022,8 @@ test "non-input frames leave menu state untouched but stay consumed" {
     }
     try std.testing.expect(menu.opened);
     try std.testing.expectEqual(MenuPage.Deposit, menu.currentPage);
-    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
-    try std.testing.expectEqualStrings("Ada", menu.deposit_sats.slice());
+    try std.testing.expectEqual(@as(?InputField, .deposit_msats), menu.focus);
+    try std.testing.expectEqualStrings("Ada", menu.deposit_msats.slice());
 
     // A closed menu does not consume unrelated frames.
     _ = menu.applyInput(.{ .escape_clicked = true });
@@ -1113,9 +1113,9 @@ test "confirm navigates, runs actions, and focuses a text input" {
     // Selected row 0 is the text input: confirm focuses it.
     menu.currentPage = .Deposit;
     _ = menu.applyInput(.{ .confirm = true });
-    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
+    try std.testing.expectEqual(@as(?InputField, .deposit_msats), menu.focus);
     try typeText(&menu, "Ada");
-    try std.testing.expectEqualStrings("Ada", menu.deposit_sats.slice());
+    try std.testing.expectEqualStrings("Ada", menu.deposit_msats.slice());
 
     // Moving away blurs the field.
     _ = menu.applyInput(.{ .down = true });
@@ -1124,7 +1124,7 @@ test "confirm navigates, runs actions, and focuses a text input" {
 
     // Selected action clears the name and leaves the menu open.
     _ = menu.applyInput(.{ .confirm = true });
-    try std.testing.expectEqualStrings("21", menu.deposit_sats.slice());
+    try std.testing.expectEqualStrings("21000", menu.deposit_msats.slice());
     try std.testing.expect(menu.opened);
 
     // Back to Main, then Resume closes through the same action handler.
@@ -1168,7 +1168,7 @@ test "mouse movement selects a row and clicks activate it" {
         .pointer_y = field.y,
         .clicked = true,
     });
-    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
+    try std.testing.expectEqual(@as(?InputField, .deposit_msats), menu.focus);
     _ = menu.applyInput(.{ .pointer_x = 1, .pointer_y = 1, .clicked = true });
     try std.testing.expectEqual(@as(?InputField, null), menu.focus);
     try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
@@ -1211,12 +1211,12 @@ test "typing letters do not navigate and moving away clears focus" {
     _ = menu.applyInput(.{ .confirm = true }); // Wallet navigation
     menu.currentPage = .Deposit;
     _ = menu.applyInput(.{ .confirm = true }); // focus the name field
-    try std.testing.expectEqual(@as(?InputField, .deposit_sats), menu.focus);
+    try std.testing.expectEqual(@as(?InputField, .deposit_msats), menu.focus);
 
     // WASD and space type normally and never move the highlight.
     try typeText(&menu, "wasd xyz");
     try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
-    try std.testing.expectEqualStrings("wasd xyz", menu.deposit_sats.slice());
+    try std.testing.expectEqualStrings("wasd xyz", menu.deposit_msats.slice());
 
     // A direction step blurs the field; later typing goes nowhere and still
     // does not move the highlight.
@@ -1224,7 +1224,7 @@ test "typing letters do not navigate and moving away clears focus" {
     try std.testing.expectEqual(@as(?InputField, null), menu.focus);
     try std.testing.expectEqual(@as(usize, 1), menu.selected_index);
     try typeText(&menu, "ignored");
-    try std.testing.expectEqualStrings("wasd xyz", menu.deposit_sats.slice());
+    try std.testing.expectEqualStrings("wasd xyz", menu.deposit_msats.slice());
     try std.testing.expectEqual(@as(usize, 1), menu.selected_index);
 }
 
@@ -1321,13 +1321,13 @@ test "local deposit input and invoice copy remain active during background polli
     state.wallet.available = true;
     try std.testing.expect(state.wallet.enqueue(.poll, ""));
     state.activate(.{ .action = .preset42 });
-    try std.testing.expectEqualStrings("42", state.deposit_sats.slice());
-    state.activate(.{ .text_input = .deposit_sats });
-    try std.testing.expectEqual(@as(?InputField, .deposit_sats), state.focus);
+    try std.testing.expectEqualStrings("42000", state.deposit_msats.slice());
+    state.activate(.{ .text_input = .deposit_msats });
+    try std.testing.expectEqual(@as(?InputField, .deposit_msats), state.focus);
     try typeText(&state, "1");
-    try std.testing.expectEqualStrings("421", state.deposit_sats.slice());
-    state.applyTyping(.deposit_sats, .{ .backspace = true });
-    try std.testing.expectEqualStrings("42", state.deposit_sats.slice());
+    try std.testing.expectEqualStrings("420001", state.deposit_msats.slice());
+    state.applyTyping(.deposit_msats, .{ .backspace = true });
+    try std.testing.expectEqualStrings("42000", state.deposit_msats.slice());
     _ = state.wallet.invoice.set("lnbc-saved");
     state.activate(.{ .action = .copy_invoice });
     try std.testing.expect(state.wallet.copy_requested);

@@ -71,7 +71,7 @@ export async function runWalletIntegration(app) {
     assert(JSON.parse(await text("token_to_proofs_json",[token,keyset])).length === 3, "Cashu token decoding runs");
     const channel = JSON.parse(await text("spilman_compute_channel_from_token",[token,v.charlie_pubkey,v.alice_pubkey,v.channel_secret,String(v.expiry_timestamp),keyset,"64"]));
     assert(channel.params_json !== undefined, "Channel reconstruction runs in browser");
-    assert((await pure("spilman_compute_funding_token_amount",["100",keyset,"64"])).net_sats === "100", "Funding amount matches native vector");
+    assert((await pure("spilman_compute_funding_token_amount",["100",keyset,"64"])).amount === "100", "Funding amount matches native vector");
     const id = await text("spilman_channel_parameters_get_channel_id",[v.params_json,v.channel_secret,keyset]);
     assert(id.length === 64, "Deterministic channel ID runs");
     const outputs = await text("spilman_create_funding_outputs",[v.params_json,v.alice_secret,keyset]);
@@ -115,7 +115,9 @@ export async function runWalletIntegration(app) {
     try { const duplicate=await open_wallet(seed,name); await duplicate.close(); duplicate.free(); } catch { locked=true; }
     assert(locked, "Second wallet handle is rejected by Web Locks");
     assert((await app.call("add_mint",["https://mint.example.com?secret=invalid"])).status === 9, "Mint URL policy rejects query before networking");
-    assert((await app.call("receive",[token])).status === 18, "Unknown-mint token is rejected before networking");
+    assert((await app.call("receive",[token])).status === 17, "Sat token is rejected before networking");
+    const unknownMintToken = await text("spilman_build_cashu_b_token",[v.mint_url,"msat",synth]);
+    assert((await app.call("receive",[unknownMintToken])).status === 18, "Unknown-mint token is rejected before networking");
     assert((await app.call("get_active_keyset_info_json",[v.mint_url])).status === 11, "Wallet-backed Spilman helpers enforce mint approval");
     await app.close();
 
@@ -151,19 +153,19 @@ export async function runWalletIntegration(app) {
     const active=await call("get_active_keyset_info_json",[mint]);
     assert(JSON.parse(active.value).keys !== undefined, "Browser Fetch retrieves approved mint keyset");
     const issued=await fetch("/test-token").then(r => { if(!r.ok) throw new Error("Local fake mint is required for network tests"); return r.json(); });
-    assert((await call("receive",[issued.token])).net_sats === "100", "Browser receives 100 test sats through real Cashu HTTP protocol");
+    assert((await call("receive",[issued.token])).net_msats === "100", "Browser receives 100 test msats through real Cashu HTTP protocol");
     const sent=await call("send",[mint,"40","0"]);
-    assert(sent.token.startsWith("cashu"), "Browser sends a real 40-sat test token");
+    assert(sent.token.startsWith("cashu"), "Browser sends a real 40-msat test token");
     assert((await call("list_pending_tokens")).pending.some(p => p.operation_id === sent.operation_id), "Outgoing token is persisted and retrievable");
     assert((await call("get_pending_token",[sent.operation_id])).token === sent.token, "Pending token retrieval preserves bearer payload");
     await app.close();
     await app.open(seed,name);
     assert((await call("list_mints")).mints.includes(mint), "Mint approval survives close/reopen");
-    assert((await call("list_balances")).balances.some(b => b.sats === "60"), "60-sat balance survives persisted reopen and startup recovery");
+    assert((await call("list_balances")).balances.some(b => b.msats === "60"), "60-msat balance survives persisted reopen and startup recovery");
     second=await open_wallet(receiverSeed,secondName);
     const secondCall=async (op,args=[]) => ok(JSON.parse(await second.call(op,JSON.stringify(args))));
     await secondCall("add_mint",[mint]);
-    assert((await secondCall("receive",[sent.token])).net_sats === "40", "Second browser wallet receives sender token");
+    assert((await secondCall("receive",[sent.token])).net_msats === "40", "Second browser wallet receives sender token");
     const recovery=await call("recover");
     assert(recovery.reports.every(r => r.failed === 0 && r.skipped === 0), "Explicit recovery succeeds after recipient redeems token");
     assert((await call("list_pending_tokens")).pending.length === 0, "Recovered claimed token leaves pending list");

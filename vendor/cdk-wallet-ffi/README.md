@@ -4,7 +4,7 @@ A minimal, boring **C ABI** over a small subset of
 [`cdk::wallet::WalletRepository`] (CDK from Git tag `v0.18.1`), designed to be
 linked into the Zig application as a Rust `staticlib`.
 
-It is deliberately small: one SQLite database, one 64-byte seed, Sat-only
+It is deliberately small: one SQLite database, one 64-byte seed, Msat-only
 balances, explicit mint approval, BIP-39 mnemonic generation plus
 entropy/seed derivation, and a handful of synchronous calls. Everything else
 (Lightning, history, mnemonic storage/backup/restore, multi-unit,
@@ -24,8 +24,9 @@ Supported:
 | `cdk_wallet_close` | Flush rate limits and destroy a handle. |
 | `cdk_wallet_add_mint` | Durably approve a mint (network fetch on first add). |
 | `cdk_wallet_list_mints` | List approved mints. |
-| `cdk_wallet_list_balances` | List approved mints with locally spendable sats. |
-| `cdk_wallet_receive` | Receive a token, returning the **net** spendable sats. |
+| `cdk_wallet_check_mint_keysets` | Check the live mint for an active `msat` keyset, without opening a wallet. |
+| `cdk_wallet_list_balances` | List approved mints with locally spendable msats. |
+| `cdk_wallet_receive` | Receive a token, returning the **net** spendable msats. |
 | `cdk_wallet_send` | Send from one explicit mint, returning the bearer token. |
 | `cdk_wallet_list_pending_tokens` | List outgoing tokens not yet claimed. |
 | `cdk_wallet_get_pending_token` | Retrieve one pending token by operation id. |
@@ -42,7 +43,7 @@ Supported:
 
 Explicitly **not** supported: Lightning, transaction history, mint/seed deletion,
 mnemonic **storage / backup / restore** (the wallet-fund restore engine),
-spending conditions / signing keys, currencies other than Sat,
+spending conditions / signing keys, currencies other than Msat,
 callbacks/jobs/futures across the FFI boundary, and cross-compilation machinery.
 Mnemonic *generation* and entropy/seed *conversion* **are** supported (see
 [Mnemonics](#mnemonics-bip-39) below). There is **no** production test-mint or
@@ -130,11 +131,11 @@ The numeric values are part of the ABI and must not be renumbered:
 | 7 | `SEED_MISMATCH` | Stored seed fingerprint does not match. |
 | 8 | `UNSUPPORTED_FORMAT_VERSION` | Written by an incompatible wrapper version. |
 | 9 | `INVALID_MINT_URL` | Rejected by URL policy. |
-| 10 | `MINT_UNSUPPORTED_UNIT` | Mint does not advertise Sat. |
+| 10 | `MINT_UNSUPPORTED_UNIT` | The requested msat operation is not supported by the mint or keyset. |
 | 11 | `MINT_NOT_REGISTERED` | Mint not approved with this wallet. |
 | 12 | `MINT_REGISTRATION_FAILED` | Registering the mint failed. |
 | 13 | `NETWORK_ERROR` | Network operation failed. |
-| 14 | `INSUFFICIENT_FUNDS` | Not enough locally spendable sats. |
+| 14 | `INSUFFICIENT_FUNDS` | Not enough locally spendable msats. |
 | 15 | `FEE_LIMIT_EXCEEDED` | Sender fee would exceed the caller maximum. |
 | 16 | `INVALID_TOKEN` | Token could not be parsed. |
 | 17 | `UNSUPPORTED_TOKEN` | Multi-mint / wrong-unit token. |
@@ -157,23 +158,23 @@ calls cannot race on diagnostics.
 
 ## Send / receive / fee semantics
 
-`cdk_wallet_send(mint_url, amount_sats, max_sender_fee_sats)` is a single
+`cdk_wallet_send(mint_url, amount_msats, max_sender_fee_msats)` is a single
 one-shot call that internally does **prepare → check fee → confirm**:
 
-1. Validate locally, before any network access: `amount_sats` must be non-zero,
-   and `amount_sats` / `max_sender_fee_sats` must fit the signed integer storage
+1. Validate locally, before any network access: `amount_msats` must be non-zero,
+   and `amount_msats` / `max_sender_fee_msats` must fit the signed integer storage
    used by SQLite (`i64`). Violations return `INVALID_ARGUMENT` locally.
 2. Prepare a send using upstream's default `SendKind::OnlineExact` with
-   `include_fee = false`. The requested `amount_sats` is therefore the **token
+   `include_fee = false`. The requested `amount_msats` is therefore the **token
    face value**; the sender pays the fee on top.
 3. Compare the prepared total fee (`prepared.fee()`, i.e. swap fee + send fee)
-   against `max_sender_fee_sats`.
+   against `max_sender_fee_msats`.
    * If it is over the limit, the send is **cancelled** and `FEE_LIMIT_EXCEEDED`
      is returned, preserving the operation id and the known fee. If cancellation
      itself fails, the mint is marked unresolved and `CANCELLATION_FAILED` is
      returned.
 4. Confirm the send and return the bearer token, the operation id, and the
-   actual `sender_fee_sats`.
+   actual `sender_fee_msats`.
 
 Every failure **after** a successful prepare routes through the same explicit
 cancellation path (releasing the reserved proofs), so a rejected send never
@@ -182,11 +183,11 @@ exists). An ambiguous outcome is `SEND_UNCERTAIN`; the mint is marked unresolved
 and the caller must run recovery rather than repeat the send.
 
 `cdk_wallet_receive(token)` validates the token **locally first** (length bound,
-parse, single mint, Sat unit, mint approved) and rejects unknown mints with
+parse, single mint, Msat unit, mint approved) and rejects unknown mints with
 `TOKEN_UNKNOWN_MINT` **before any network access**. Tokens longer than the
 documented 1 MiB bound are rejected with `INVALID_ARGUMENT` before any
 base64/CBOR parsing or large allocation. On success it returns the actual **net**
-sats credited.
+msats credited.
 
 Amounts and fees use checked arithmetic: values that do not fit the signed
 integer storage used by SQLite, and `amount + fee` overflows, are rejected

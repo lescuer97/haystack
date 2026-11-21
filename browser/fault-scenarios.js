@@ -6,7 +6,7 @@
 import {open_wallet} from "./wallet/cdk_wallet_browser.js";
 import {createWallet, deleteWallet, readWallet} from "./test-wallet.js";
 
-const sumBalances = balances => balances.reduce((total, entry) => total + Number(entry.sats), 0);
+const sumBalances = balances => balances.reduce((total, entry) => total + Number(entry.msats), 0);
 
 export async function runFaultScenarios({assert, faults, recordFailure}) {
   const mint = location.origin;
@@ -41,12 +41,12 @@ export async function runFaultScenarios({assert, faults, recordFailure}) {
       .filter(proof => proof.state === "UNSPENT")
       .map(proof => proof.proof.amount);
   };
-  // CDK's receive refill leaves four 1-sat proofs. Spending them locally makes
+  // CDK's receive refill leaves four 1-msat proofs. Spending them locally makes
   // an odd amount like 37 impossible to compose from the remaining even
   // denominations, so the send must perform an online swap.
   const shapeForSwap = async (wallet, label) => {
     const ones = (await unspentAmounts(wallet)).filter(amount => amount === 1).length;
-    assert(ones === 4, `${label}: funding produces four 1-sat proofs`);
+    assert(ones === 4, `${label}: funding produces four 1-msat proofs`);
     const drained = [];
     for (let index = 0; index < ones; index += 1) {
       drained.push(await must(wallet, "send", [mint, "1", "0"]));
@@ -55,7 +55,7 @@ export async function runFaultScenarios({assert, faults, recordFailure}) {
     await must(sink, "add_mint", [mint]);
     for (const token of drained) await must(sink, "receive", [token.token]);
     await recover(wallet, `${label} shaping cleanup`);
-    assert(await balance(wallet) === 100 - ones, `${label}: shaped wallet holds ${100 - ones} sats`);
+    assert(await balance(wallet) === 100 - ones, `${label}: shaped wallet holds ${100 - ones} msats`);
     return {sink, drained: ones};
   };
   const newToken = () => fetch("/test-token").then(response => {
@@ -70,7 +70,7 @@ export async function runFaultScenarios({assert, faults, recordFailure}) {
     const recipient = await open();
     await must(recipient, "add_mint", [mint]);
     const received = await must(recipient, "receive", [sent.token]);
-    assert(received.net_sats === String(before), `${label}: full recovered balance redeems into a fresh wallet`);
+    assert(received.net_msats === String(before), `${label}: full recovered balance redeems into a fresh wallet`);
     assert(await balance(wallet) === 0, `${label}: source wallet is emptied by the full send`);
     assert(await balance(recipient) === before, `${label}: recipient holds the full recovered balance`);
     await recover(wallet, `${label} spend cleanup`);
@@ -125,7 +125,7 @@ export async function runFaultScenarios({assert, faults, recordFailure}) {
   const fund = async (wallet, label) => {
     await must(wallet, "add_mint", [mint]);
     const receipt = await must(wallet, "receive", [(await newToken()).token]);
-    assert(receipt.net_sats === "100", `${label}: wallet is funded with 100 test sats`);
+    assert(receipt.net_msats === "100", `${label}: wallet is funded with 100 test msats`);
   };
 
   try {
@@ -174,8 +174,8 @@ export async function runFaultScenarios({assert, faults, recordFailure}) {
 
     // --- Send: dropped response after the swap committed --------------------
     //
-    // The wallet is shaped to 96 sats first (four 1-sat refill proofs moved to
-    // a sink) so the 37-sat send must perform an online swap. The mint commits
+    // The wallet is shaped to 96 msats first (four 1-msat refill proofs moved to
+    // a sink) so the 37-msat send must perform an online swap. The mint commits
     // the swap and the response is rejected.
     //
     // CDK's nested send-swap saga owns no input proofs, so recovery restores
@@ -209,9 +209,9 @@ export async function runFaultScenarios({assert, faults, recordFailure}) {
       if (recoveredSend !== expected) {
         recordFailure({
           scenario: "dropped send after mint commit",
-          expected: `${expected} sats restored`,
-          actual: `${recoveredSend} sats restored`,
-          message: `nested send-swap recovery released already-spent swap inputs as unspent (${recoveredSend - expected} extra sats); recovered value spendability is not established`,
+          expected: `${expected} msats restored`,
+          actual: `${recoveredSend} msats restored`,
+          message: `nested send-swap recovery released already-spent swap inputs as unspent (${recoveredSend - expected} extra msats); recovered value spendability is not established`,
         });
       }
       assert((await must(wallet, "list_pending_tokens")).pending.length === 0,

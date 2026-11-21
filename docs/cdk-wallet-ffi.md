@@ -27,6 +27,12 @@ const c = cdk.c;              // the translated C ABI
 The main application already imports it (see the `exe` in `build.zig`), and the
 C-ABI consumer test (`src/wallet_test.zig`) is a complete, runnable example.
 
+The desktop client and server require a live active `msat` keyset at startup.
+Balances, deposits, withdrawal amounts and fees are integer millisatoshis.
+Sat-denominated proofs and saved quotes remain in storage but are not used by
+the msat wallet. There is no automatic conversion; retain your backups and use
+a sat-capable wallet to access legacy funds.
+
 ---
 
 ## Build steps
@@ -72,7 +78,7 @@ const Worker = struct {
                 .receive => |token| {
                     const res = c.cdk_wallet_receive(self.handle, token.ptr);
                     defer if (res.@"error") |e| c.cdk_string_free(e);
-                    // ... report res.status / res.net_sats back to the UI ...
+                    // ... report res.status / res.net_msats back to the UI ...
                 },
                 // ...
             }
@@ -120,7 +126,7 @@ pub fn main() !void {
     }
 
     // Startup recovery reports live in opened.reports (one entry per approved
-    // Sat mint) and are freed by the defer above. skipped > 0 or failed > 0
+    // Msat mint) and are freed by the defer above. skipped > 0 or failed > 0
     // means the corresponding mint is fail-closed until an explicit recovery
     // succeeds.
 
@@ -129,7 +135,7 @@ pub fn main() !void {
     defer if (add.@"error") |e| c.cdk_string_free(e);
     if (add.status != c.CDK_STATUS_OK) return error.MintNotApproved;
 
-    // Send 1000 sats from that mint, allowing at most 5 sats of sender fee.
+    // Send 1000 msats from that mint, allowing at most 5 msats of sender fee.
     const sent = c.cdk_wallet_send(handle, "https://mint.example.com".ptr, 1000, 5);
     defer if (sent.@"error") |e| c.cdk_string_free(e);
     switch (sent.status) {
@@ -146,10 +152,10 @@ pub fn main() !void {
         else => {},
     }
 
-    // Receive a token; the return value is the net spendable sats.
+    // Receive a token; the return value is the net spendable msats.
     const recv = c.cdk_wallet_receive(handle, "cashuB...".ptr);
     defer if (recv.@"error") |e| c.cdk_string_free(e);
-    const credited = if (recv.status == c.CDK_STATUS_OK) recv.net_sats else 0;
+    const credited = if (recv.status == c.CDK_STATUS_OK) recv.net_msats else 0;
     _ = credited;
 }
 ```
@@ -260,7 +266,7 @@ These need a live `CdkWallet_t` and a mint that has already been approved with
 
 | Function | Returns | Notes |
 | --- | --- | --- |
-| `cdk_wallet_get_active_keyset_info_json(handle, mint_url)` | `CdkStringResult` | Active Sat keyset as Spilman `KeysetInfo` JSON (`keysetId`, `unit`, `keys`, `amounts`, `inputFeePpk`, `finalExpiry`). |
+| `cdk_wallet_get_active_keyset_info_json(handle, mint_url)` | `CdkStringResult` | Active Msat keyset as Spilman `KeysetInfo` JSON (`keysetId`, `unit`, `keys`, `amounts`, `inputFeePpk`, `finalExpiry`). |
 | `cdk_wallet_get_keyset_info_json(handle, mint_url, keyset_id)` | `CdkStringResult` | A single keyset by id. |
 | `cdk_wallet_post_swap(handle, mint_url, swap_request_json)` | `CdkStringResult` | Posts a raw NUT-03 `SwapRequest` and returns the raw response. Stateless: it does not persist proofs. |
 | `cdk_wallet_receive_with_keys(handle, token, signing_key_hex)` | `CdkReceiveResult` | `cdk_wallet_receive` with P2PK signing keys. |

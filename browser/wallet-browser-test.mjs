@@ -161,7 +161,7 @@ const work=(async () => {
   }
 
   // Send interrupted before its swap request reached the mint. The wallet is
-  // shaped to 96 sats so the 37-sat send must attempt an online swap. The
+  // shaped to 96 msats so the 37-msat send must attempt an online swap. The
   // required invariants are the pre-send balance at startup, first explicit
   // recovery and repeated recovery, with clean reports and no gating at each
   // step. Observed deviations are structured failures, never accepted values.
@@ -189,9 +189,9 @@ const work=(async () => {
       sendStatus:0,
     };
     const actual={
-      startupBalance:info.sats, startupFailed:startup.failed, startupSkipped:startup.skipped,
-      firstBalance:first.sats, firstFailed:firstReport.failed, firstSkipped:firstReport.skipped,
-      repeatedBalance:repeated.sats, repeatedFailed:repeatedReport.failed, repeatedSkipped:repeatedReport.skipped,
+      startupBalance:info.msats, startupFailed:startup.failed, startupSkipped:startup.skipped,
+      firstBalance:first.msats, firstFailed:firstReport.failed, firstSkipped:firstReport.skipped,
+      repeatedBalance:repeated.msats, repeatedFailed:repeatedReport.failed, repeatedSkipped:repeatedReport.skipped,
       sendStatus,
     };
     if(!same(expected,actual)) addFailure({
@@ -204,7 +204,7 @@ const work=(async () => {
       const recipient=recoveryName("send-before-spend");
       const recipientSeed=await evaluate(sessionId,`testWallet.createWalletHex(${q(recipient)})`);
       const spend=await evaluate(sessionId,`recoveryScenarios.spendAllFromApp(${q(recipient)},${q(recipientSeed)})`);
-      if(spend.before !== started.expected || spend.net_sats !== String(started.expected) || spend.after !== 0 || spend.recovered !== 0 || spend.repeat !== 0) throw new Error(`Send-before recovery proofs were not fully spendable: ${JSON.stringify(spend)}`);
+      if(spend.before !== started.expected || spend.net_msats !== String(started.expected) || spend.after !== 0 || spend.recovered !== 0 || spend.repeat !== 0) throw new Error(`Send-before recovery proofs were not fully spendable: ${JSON.stringify(spend)}`);
       await evaluate(sessionId,`recoveryScenarios.removeWallet(${q(recipient)})`);
       result.checks.push("Destroyed send-before recovery proofs are fully spendable");
     }
@@ -221,20 +221,20 @@ const work=(async () => {
     await openRecoveryPage("recovery-receive-before-resume");
     const info=await inspect(name,seedHex);
     requireCleanReports(info.startup,"Receive interrupted before request");
-    if(info.sats !== 100) throw new Error(`Receive interrupted before request expected 100 recovered sats, got ${info.sats}`);
+    if(info.msats !== 100) throw new Error(`Receive interrupted before request expected 100 recovered msats, got ${info.msats}`);
     if(info.pending.pending.length !== 0) throw new Error("Receive interrupted before request left a pending token");
     const recovery=await recoverNow();
     requireCleanReports(recovery.reports,"Receive interrupted before request explicit recovery");
-    if(recovery.sats !== 100) throw new Error(`Receive interrupted before request recovery expected 100 sats, got ${recovery.sats}`);
+    if(recovery.msats !== 100) throw new Error(`Receive interrupted before request recovery expected 100 msats, got ${recovery.msats}`);
     const repeat=await recoverNow();
-    if(repeat.sats !== 100 || repeat.pending.pending.length !== 0) throw new Error("Repeated receive-before recovery changed the wallet");
+    if(repeat.msats !== 100 || repeat.pending.pending.length !== 0) throw new Error("Repeated receive-before recovery changed the wallet");
     const recipient=recoveryName("receive-before-spend");
     const recipientSeed=await evaluate(sessionId,`testWallet.createWalletHex(${q(recipient)})`);
     const spend=await evaluate(sessionId,`recoveryScenarios.spendAllFromApp(${q(recipient)},${q(recipientSeed)})`);
-    if(spend.before !== 100 || spend.net_sats !== "100" || spend.after !== 0 || spend.recovered !== 0 || spend.repeat !== 0) throw new Error(`Receive-before recovery proofs were not fully spendable: ${JSON.stringify(spend)}`);
+    if(spend.before !== 100 || spend.net_msats !== "100" || spend.after !== 0 || spend.recovered !== 0 || spend.repeat !== 0) throw new Error(`Receive-before recovery proofs were not fully spendable: ${JSON.stringify(spend)}`);
     await evaluate(sessionId,`recoveryScenarios.removeWallet(${q(recipient)})`);
     await closeAndRemove(name);
-    result.checks.push("Destroyed receive before any mint request recovers exactly 100 sats on reload");
+    result.checks.push("Destroyed receive before any mint request recovers exactly 100 msats on reload");
     result.checks.push("Destroyed receive-before recovery proofs are fully spendable");
   }
 
@@ -264,9 +264,9 @@ const work=(async () => {
       repeatedBalance:started.expected, repeatedFailed:0, repeatedSkipped:0,
     };
     const actual={
-      startupBalance:info.sats, startupFailed:startup.failed, startupSkipped:startup.skipped,
-      firstBalance:first.sats, firstFailed:firstReport.failed, firstSkipped:firstReport.skipped,
-      repeatedBalance:repeated.sats, repeatedFailed:repeatedReport.failed, repeatedSkipped:repeatedReport.skipped,
+      startupBalance:info.msats, startupFailed:startup.failed, startupSkipped:startup.skipped,
+      firstBalance:first.msats, firstFailed:firstReport.failed, firstSkipped:firstReport.skipped,
+      repeatedBalance:repeated.msats, repeatedFailed:repeatedReport.failed, repeatedSkipped:repeatedReport.skipped,
     };
     if(!same(expected,actual)) addFailure({
       scenario:"send interrupted after mint commit",
@@ -278,7 +278,7 @@ const work=(async () => {
       const recipient=recoveryName("send-commit-spend");
       const recipientSeed=await evaluate(sessionId,`testWallet.createWalletHex(${q(recipient)})`);
       const spend=await evaluate(sessionId,`recoveryScenarios.spendAllFromApp(${q(recipient)},${q(recipientSeed)})`);
-      if(spend.before !== started.expected || spend.net_sats !== String(started.expected) || spend.after !== 0 || spend.recovered !== 0 || spend.repeat !== 0) throw new Error(`Send-after-commit recovery proofs were not fully spendable: ${JSON.stringify(spend)}`);
+      if(spend.before !== started.expected || spend.net_msats !== String(started.expected) || spend.after !== 0 || spend.recovered !== 0 || spend.repeat !== 0) throw new Error(`Send-after-commit recovery proofs were not fully spendable: ${JSON.stringify(spend)}`);
       await evaluate(sessionId,`recoveryScenarios.removeWallet(${q(recipient)})`);
       result.checks.push("Destroyed send-after-commit recovery proofs are fully spendable");
     }
@@ -295,20 +295,20 @@ const work=(async () => {
     await openRecoveryPage("recovery-receive-commit-resume");
     const info=await inspect(name,seedHex);
     requireCleanReports(info.startup,"Receive interrupted after commit");
-    if(info.sats !== 100) throw new Error(`Receive interrupted after commit expected 100 sats, got ${info.sats}`);
+    if(info.msats !== 100) throw new Error(`Receive interrupted after commit expected 100 msats, got ${info.msats}`);
     if(info.pending.pending.length !== 0) throw new Error("Receive interrupted after commit left a pending token");
     const recovery=await recoverNow();
     requireCleanReports(recovery.reports,"Receive interrupted after commit explicit recovery");
-    if(recovery.sats !== 100) throw new Error(`Receive interrupted after commit recovery expected 100 sats, got ${recovery.sats}`);
+    if(recovery.msats !== 100) throw new Error(`Receive interrupted after commit recovery expected 100 msats, got ${recovery.msats}`);
     const repeat=await recoverNow();
-    if(repeat.sats !== 100 || repeat.pending.pending.length !== 0) throw new Error("Repeated receive-after-commit recovery changed the wallet");
+    if(repeat.msats !== 100 || repeat.pending.pending.length !== 0) throw new Error("Repeated receive-after-commit recovery changed the wallet");
     const recipient=recoveryName("receive-commit-spend");
     const recipientSeed=await evaluate(sessionId,`testWallet.createWalletHex(${q(recipient)})`);
     const spend=await evaluate(sessionId,`recoveryScenarios.spendAllFromApp(${q(recipient)},${q(recipientSeed)})`);
-    if(spend.before !== 100 || spend.net_sats !== "100" || spend.after !== 0 || spend.recovered !== 0 || spend.repeat !== 0) throw new Error(`Receive-after-commit recovery proofs were not fully spendable: ${JSON.stringify(spend)}`);
+    if(spend.before !== 100 || spend.net_msats !== "100" || spend.after !== 0 || spend.recovered !== 0 || spend.repeat !== 0) throw new Error(`Receive-after-commit recovery proofs were not fully spendable: ${JSON.stringify(spend)}`);
     await evaluate(sessionId,`recoveryScenarios.removeWallet(${q(recipient)})`);
     await closeAndRemove(name);
-    result.checks.push("Destroyed receive after mint commit recovers exactly 100 sats on reload");
+    result.checks.push("Destroyed receive after mint commit recovers exactly 100 msats on reload");
     result.checks.push("Destroyed receive-after-commit recovery proofs are fully spendable");
   }
 
@@ -321,7 +321,7 @@ const work=(async () => {
     await openRecoveryPage("recovery-send-delivery-resume");
     const info=await inspect(name,seedHex);
     requireCleanReports(info.startup,"Send interrupted before result delivery");
-    if(info.sats !== 63) throw new Error(`Send interrupted before delivery expected 63 sats, got ${info.sats}`);
+    if(info.msats !== 63) throw new Error(`Send interrupted before delivery expected 63 msats, got ${info.msats}`);
     if(info.pending.pending.length !== 1) throw new Error(`Send interrupted before delivery expected one pending token, got ${info.pending.pending.length}`);
     const token=info.pending.pending[0].token;
     if(typeof token !== "string" || !token.startsWith("cashu")) throw new Error("Pending token is not a Cashu bearer token");
@@ -329,7 +329,7 @@ const work=(async () => {
     const recipient=recoveryName("send-delivery-recipient");
     const recipientSeed=await evaluate(sessionId,`testWallet.createWalletHex(${q(recipient)})`);
     const redeemed=await evaluate(sessionId,`recoveryScenarios.redeemToken(${q(recipient)},${q(recipientSeed)},${q(token)})`);
-    if(redeemed.net_sats !== "37") throw new Error("Pending token was not redeemable exactly once");
+    if(redeemed.net_msats !== "37") throw new Error("Pending token was not redeemable exactly once");
     const secondRecipient=recoveryName("send-delivery-second");
     const secondSeed=await evaluate(sessionId,`testWallet.createWalletHex(${q(secondRecipient)})`);
     const second=await evaluate(sessionId,`recoveryScenarios.redeemTokenResult(${q(secondRecipient)},${q(secondSeed)},${q(token)})`);
@@ -346,15 +346,15 @@ const work=(async () => {
     const recovery=await recoverNow();
     requireCleanReports(recovery.reports,"Pending token explicit recovery");
     if(recovery.pending.pending.length !== 0) throw new Error("Recovery did not remove the claimed pending token");
-    if(recovery.sats !== 63) throw new Error(`Pending token recovery expected 63 sats, got ${recovery.sats}`);
+    if(recovery.msats !== 63) throw new Error(`Pending token recovery expected 63 msats, got ${recovery.msats}`);
     const repeat=await recoverNow();
-    if(repeat.pending.pending.length !== 0 || repeat.sats !== 63) throw new Error("Repeated pending-token recovery changed the wallet");
+    if(repeat.pending.pending.length !== 0 || repeat.msats !== 63) throw new Error("Repeated pending-token recovery changed the wallet");
 
     const spend=await evaluate(sessionId,`recoveryScenarios.sendFromApp(37)`);
     const finalRecipient=recoveryName("send-delivery-final");
     const finalSeed=await evaluate(sessionId,`testWallet.createWalletHex(${q(finalRecipient)})`);
     const finalRedeemed=await evaluate(sessionId,`recoveryScenarios.redeemToken(${q(finalRecipient)},${q(finalSeed)},${q(spend.token)})`);
-    if(finalRedeemed.net_sats !== "37") throw new Error("Recovered pending-token balance was not spendable");
+    if(finalRedeemed.net_msats !== "37") throw new Error("Recovered pending-token balance was not spendable");
     await evaluate(sessionId,`recoveryScenarios.removeWallet(${q(finalRecipient)})`);
     await evaluate(sessionId,`recoveryScenarios.removeWallet(${q(recipient)})`);
     await closeAndRemove(name);

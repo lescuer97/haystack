@@ -98,9 +98,9 @@ struct ResultMarker {
     id: String,
     fingerprint: String,
     mint: String,
-    spendable_sats: String,
-    pending_sats: String,
-    spent_sats: String,
+    spendable_msats: String,
+    pending_msats: String,
+    spent_msats: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -116,9 +116,13 @@ struct Retired {
     id: String,
     fingerprint: String,
     mint: String,
-    spendable_sats: String,
-    pending_sats: String,
-    spent_sats: String,
+    // Retired markers are accepted only with zero totals in either unit.
+    #[serde(alias = "spendable_sats")]
+    spendable_msats: String,
+    #[serde(alias = "pending_sats")]
+    pending_msats: String,
+    #[serde(alias = "spent_sats")]
+    spent_msats: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -211,9 +215,9 @@ enum View {
     },
     ResumeFailed,
     ResumeResult {
-        spendable_sats: String,
-        pending_sats: String,
-        spent_sats: String,
+        spendable_msats: String,
+        pending_msats: String,
+        spent_msats: String,
         can_generate_new: bool,
     },
 }
@@ -305,9 +309,9 @@ fn audit(raw: &str, selected_mint: &str) -> Result<Audited, ()> {
             || entry.key != format!("retired:{}", marker.id)
             || !ids.insert(marker.id.clone())
             || marker.mint.is_empty()
-            || marker.spendable_sats != "0"
-            || marker.pending_sats != "0"
-            || marker.spent_sats != "0"
+            || marker.spendable_msats != "0"
+            || marker.pending_msats != "0"
+            || marker.spent_msats != "0"
         {
             return Err(());
         }
@@ -388,24 +392,24 @@ fn audit(raw: &str, selected_mint: &str) -> Result<Audited, ()> {
                 || user.has_mnemonic
                 || user.has_state
                 || ids.contains(&marker.id)
-                || !canonical_amount(&marker.spendable_sats)
-                || !canonical_amount(&marker.pending_sats)
-                || !canonical_amount(&marker.spent_sats)
+                || !canonical_amount(&marker.spendable_msats)
+                || !canonical_amount(&marker.pending_msats)
+                || !canonical_amount(&marker.spent_msats)
             {
                 return Err(());
             }
             let stage_name = format!("{PREFIX}{}", marker.id);
             let stage = wallets.remove(&stage_name).ok_or(())?;
             let (_, state, mnemonic) = pair(stage, Some(&marker.fingerprint))?;
-            let can_generate_new = marker.spendable_sats == "0"
-                && marker.pending_sats == "0"
-                && marker.spent_sats == "0"
+            let can_generate_new = marker.spendable_msats == "0"
+                && marker.pending_msats == "0"
+                && marker.spent_msats == "0"
                 && browser_db::onboarding_store_can_abandon(&state.data, &marker.fingerprint)
                     .map_err(|_| ())?;
             let view = View::ResumeResult {
-                spendable_sats: marker.spendable_sats.clone(),
-                pending_sats: marker.pending_sats.clone(),
-                spent_sats: marker.spent_sats.clone(),
+                spendable_msats: marker.spendable_msats.clone(),
+                pending_msats: marker.pending_msats.clone(),
+                spent_msats: marker.spent_msats.clone(),
                 can_generate_new,
             };
             let (_, seed) = browser_db::parse_mnemonic(&mnemonic).map_err(|_| ())?;
@@ -445,9 +449,9 @@ fn retry_marker(marker: &serde_json::Value) -> Option<serde_json::Value> {
     let fields = scanning.as_object_mut()?;
     fields.insert("revision".into(), json!(revision + 1));
     fields.insert("step".into(), json!("scanning"));
-    fields.remove("spendable_sats");
-    fields.remove("pending_sats");
-    fields.remove("spent_sats");
+    fields.remove("spendable_msats");
+    fields.remove("pending_msats");
+    fields.remove("spent_msats");
     Some(scanning)
 }
 
@@ -561,9 +565,9 @@ impl BrowserOnboarding {
             let mut result = stage.marker.clone();
             result["revision"] = json!(revision);
             result["step"] = json!("result");
-            result["spendable_sats"] = json!(spendable.to_string());
-            result["pending_sats"] = json!(pending.to_string());
-            result["spent_sats"] = json!(spent.to_string());
+            result["spendable_msats"] = json!(spendable.to_string());
+            result["pending_msats"] = json!(pending.to_string());
+            result["spent_msats"] = json!(spent.to_string());
             let fingerprint = stage.marker["fingerprint"].as_str().unwrap_or("");
             let can_generate_new = spendable == 0
                 && pending == 0
@@ -575,7 +579,7 @@ impl BrowserOnboarding {
                     .await
                     .is_ok()
                 {
-                    return json!({"event":"restore_finished","report":{"spendable_sats":spendable.to_string(),"pending_sats":pending.to_string(),"spent_sats":spent.to_string(),"can_generate_new":can_generate_new}}).to_string();
+                    return json!({"event":"restore_finished","report":{"spendable_msats":spendable.to_string(),"pending_msats":pending.to_string(),"spent_msats":spent.to_string(),"can_generate_new":can_generate_new}}).to_string();
                 }
             }
         }
@@ -669,6 +673,10 @@ pub async fn start_onboarding(mint: &str) -> Result<BrowserOnboarding, JsValue> 
     let mint = wallet::parse_mint_url(mint)
         .map_err(|_| unavailable())?
         .to_string();
+    if let Err(error) = wallet::check_mint_keysets(&mint).await {
+        web_sys::console::error_1(&format!("Wallet mint {mint}: {}", error.message).into());
+        return Err(JsValue::from_str("mint-keyset-check-failed"));
+    }
     let lock = browser_platform::onboarding_lock()
         .await
         .map_err(|_| unavailable())?;
@@ -769,15 +777,15 @@ impl BrowserOnboarding {
         }
         if matches!(op, "finish_restore" | "generate") {
             let View::ResumeResult {
-                spendable_sats,
-                pending_sats,
-                spent_sats,
+                spendable_msats,
+                pending_msats,
+                spent_msats,
                 can_generate_new,
             } = &audited.view
             else {
                 return Ok(event(fail));
             };
-            let nonzero = spendable_sats != "0" || pending_sats != "0" || spent_sats != "0";
+            let nonzero = spendable_msats != "0" || pending_msats != "0" || spent_msats != "0";
             if (op == "finish_restore" && !nonzero)
                 || (op == "generate" && (nonzero || !can_generate_new))
             {
@@ -835,7 +843,7 @@ impl BrowserOnboarding {
             }
             ("inspect", View::Ready) => Ok(event("ready")),
             ("inspect", View::ResumeFailed) => Ok(json!({"event":"resume_failed","can_generate_new":false}).to_string()),
-            ("inspect", View::ResumeResult { spendable_sats, pending_sats, spent_sats, can_generate_new }) => Ok(json!({"event":"resume_result","report":{"spendable_sats":spendable_sats,"pending_sats":pending_sats,"spent_sats":spent_sats,"can_generate_new":can_generate_new}}).to_string()),
+            ("inspect", View::ResumeResult { spendable_msats, pending_msats, spent_msats, can_generate_new }) => Ok(json!({"event":"resume_result","report":{"spendable_msats":spendable_msats,"pending_msats":pending_msats,"spent_msats":spent_msats,"can_generate_new":can_generate_new}}).to_string()),
             ("inspect", View::Backup { mnemonic, .. }) => {
                 Ok(backup(&mnemonic).unwrap_or_else(|_| event(fail)))
             }
@@ -900,7 +908,7 @@ mod tests {
 
     #[test]
     fn retry_marker_removes_results_and_checks_revision() {
-        let mut marker = json!({"version":1,"revision":4,"step":"result","id":"id","fingerprint":"fingerprint","mint":"mint","spendable_sats":"1","pending_sats":"2","spent_sats":"3"});
+        let mut marker = json!({"version":1,"revision":4,"step":"result","id":"id","fingerprint":"fingerprint","mint":"mint","spendable_msats":"1","pending_msats":"2","spent_msats":"3"});
         assert_eq!(
             retry_marker(&marker).unwrap(),
             json!({"version":1,"revision":5,"step":"scanning","id":"id","fingerprint":"fingerprint","mint":"mint"})
@@ -971,7 +979,7 @@ mod tests {
         let (_, seed) = browser_db::parse_mnemonic(WORDS).unwrap();
         let fingerprint = cdk::util::hex::encode(wallet::seed_fingerprint(&seed));
         let id = "0123456789abcdef0123456789abcdef";
-        s["entries"] = json!([{"key":format!("retired:{id}"),"marker":{"version":1,"step":"retired","id":id,"fingerprint":fingerprint,"mint":"https://example.com","spendable_sats":"0","pending_sats":"0","spent_sats":"0"}}]);
+        s["entries"] = json!([{"key":format!("retired:{id}"),"marker":{"version":1,"step":"retired","id":id,"fingerprint":fingerprint,"mint":"https://example.com","spendable_msats":"0","pending_msats":"0","spent_msats":"0"}}]);
         assert!(audit(&s.to_string(), "https://example.com/").is_err());
         s["wallets"].as_array_mut().unwrap().push(json!({"name":format!("{PREFIX}{id}"),"hasMnemonic":true,"mnemonic":WORDS,"hasState":true,"state":{"revision":3,"data":data}}));
         assert!(matches!(
@@ -1014,9 +1022,9 @@ mod tests {
             View::ResumeFailed
         ));
         s["marker"]["step"] = json!("result");
-        s["marker"]["spendable_sats"] = json!("0");
-        s["marker"]["pending_sats"] = json!("0");
-        s["marker"]["spent_sats"] = json!("0");
+        s["marker"]["spendable_msats"] = json!("0");
+        s["marker"]["pending_msats"] = json!("0");
+        s["marker"]["spent_msats"] = json!("0");
         let active = audit(&s.to_string(), mint).unwrap().active.unwrap();
         assert_eq!(active.marker, s["marker"]);
         assert_eq!(active.mnemonic, WORDS);
@@ -1029,7 +1037,7 @@ mod tests {
                 ..
             }
         ));
-        s["marker"]["spent_sats"] = json!("1");
+        s["marker"]["spent_msats"] = json!("1");
         assert!(matches!(
             audit(&s.to_string(), mint).unwrap().view,
             View::ResumeResult {
@@ -1037,9 +1045,9 @@ mod tests {
                 ..
             }
         ));
-        s["marker"]["spent_sats"] = json!("00");
+        s["marker"]["spent_msats"] = json!("00");
         assert!(audit(&s.to_string(), mint).is_err());
-        s["marker"]["spent_sats"] = json!("0");
+        s["marker"]["spent_msats"] = json!("0");
         s["marker"]["fingerprint"] = json!("0".repeat(64));
         assert!(audit(&s.to_string(), mint).is_err());
         s["marker"]["fingerprint"] = json!(fingerprint);

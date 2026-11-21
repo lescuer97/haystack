@@ -73,6 +73,9 @@ fn quote_expired(quote: &cdk_common::wallet::MintQuote, now: u64) -> bool {
     quote.expiry != 0 && quote.state == MintQuoteState::Unpaid && quote.is_expired(now)
 }
 
+/// Keep legacy sat deposit intents intact and separate from msat deposits.
+const DEPOSIT_INTENT_NAMESPACE: &str = "deposit_intent_v2";
+
 /// Key-value namespace used for this wrapper's metadata.
 const KV_NAMESPACE: &str = "cdk_wallet_ffi";
 /// On-disk format version of the wrapper metadata.
@@ -84,7 +87,24 @@ const FINGERPRINT_PREFIX: &[u8] = b"cdk-wallet-ffi:v1:seed:";
 /// Length of the marker record: 4-byte little-endian version + 32-byte hash.
 const MARKER_LEN: usize = 4 + 32;
 /// The only currency unit this wrapper supports.
-const UNIT: CurrencyUnit = CurrencyUnit::Sat;
+const UNIT: CurrencyUnit = CurrencyUnit::Msat;
+/// Check the live mint, not cached wallet metadata or NUT payment settings.
+pub(crate) async fn check_mint_keysets(url: &str) -> FfiResult<()> {
+    require_active_keyset(&parse_mint_url(url)?, NETWORK_DEADLINE).await
+}
+
+async fn require_active_keyset(mint: &MintUrl, deadline: Duration) -> FfiResult<()> {
+    let client = HttpClient::new(mint.clone(), None);
+    let response = timeout(deadline, client.get_mint_keysets())
+        .await
+        .map_err(|_| FfiErr::new(CdkStatus::NetworkError, "mint keyset request timed out"))?
+        .map_err(|e| FfiErr::new(CdkStatus::NetworkError, format!("could not fetch mint keysets: {e}")))?;
+    if !response.keysets.iter().any(|k| k.active && k.unit == UNIT) {
+        return Err(FfiErr::new(CdkStatus::MintUnsupportedUnit, "mint has no active msat keyset"));
+    }
+    Ok(())
+}
+
 /// Maximum accepted token string length (1 MiB).
 ///
 /// Tokens are far smaller; this bounds the base64/CBOR work and the allocation
@@ -133,7 +153,7 @@ pub(crate) struct FfiErr {
     /// Operation id, when the failure still identifies a send operation.
     pub operation_id: Option<[u8; 16]>,
     /// Sender fee associated with the operation, when known.
-    pub sender_fee_sats: u64,
+    pub sender_fee_msats: u64,
 }
 
 impl FfiErr {
@@ -143,7 +163,7 @@ impl FfiErr {
             status,
             message: message.into(),
             operation_id: None,
-            sender_fee_sats: 0,
+            sender_fee_msats: 0,
         }
     }
 
@@ -152,13 +172,13 @@ impl FfiErr {
         status: CdkStatus,
         message: impl Into<String>,
         operation_id: [u8; 16],
-        sender_fee_sats: u64,
+        sender_fee_msats: u64,
     ) -> Self {
         Self {
             status,
             message: message.into(),
             operation_id: Some(operation_id),
-            sender_fee_sats,
+            sender_fee_msats,
         }
     }
 }
@@ -210,7 +230,7 @@ pub(crate) fn aggregate_counts(reports: &[MintRecoveryReport]) -> (u32, u32, u32
 #[derive_ReprC]
 #[repr(opaque)]
 pub struct CdkWallet {
-    /// The multi-mint wallet repository (one [`Wallet`] per approved Sat mint).
+    /// The multi-mint wallet repository (one [`Wallet`] per approved Msat mint).
     repo: WalletRepository,
     /// The underlying database, retained for mint registration and saga reads.
     db: Arc<WalletSqliteDatabase>,
@@ -298,7 +318,7 @@ impl CdkWallet {
         if text.is_empty() || text.len() > 20 || !text.bytes().all(|c| c.is_ascii_digit()) {
             return Err(FfiErr::new(
                 CdkStatus::InvalidArgument,
-                "expected positive decimal sats",
+                "expected positive decimal msats",
             ));
         }
         let amount = text
@@ -412,7 +432,7 @@ impl CdkWallet {
             .nuts
             .nut04
             .get_settings(&UNIT, &PaymentMethod::BOLT11)
-            .ok_or_else(|| FfiErr::new(CdkStatus::InvalidArgument, "BOLT11 sats unavailable"))?;
+            .ok_or_else(|| FfiErr::new(CdkStatus::InvalidArgument, "BOLT11 msats unavailable"))?;
         if info.nuts.nut04.disabled
             || settings
                 .min_amount
@@ -439,7 +459,7 @@ impl CdkWallet {
         let record = DepositIntent {
             version: 2,
             mint_url: mint.to_string(),
-            unit: "sat".into(),
+            unit: "msat".into(),
             payment_method: "bolt11".into(),
             amount,
             created_at: cdk::util::unix_time(),
@@ -449,7 +469,7 @@ impl CdkWallet {
         self.db
             .kv_write(
                 KV_NAMESPACE,
-                "deposit_intent_v1",
+                DEPOSIT_INTENT_NAMESPACE,
                 &intent,
                 &serde_json::to_vec(&record).map_err(db_error)?,
             )
@@ -479,7 +499,7 @@ impl CdkWallet {
                 q.mint_url == mint && record.before_quote_ids.binary_search(&q.id).is_err()
             }) {
                 self.db
-                    .kv_remove(KV_NAMESPACE, "deposit_intent_v1", &intent)
+                    .kv_remove(KV_NAMESPACE, DEPOSIT_INTENT_NAMESPACE, &intent)
                     .await
                     .map_err(db_error)?;
                 return Err(FfiErr::new(
@@ -504,7 +524,7 @@ impl CdkWallet {
         if let Ok(bytes) = serde_json::to_vec(&record) {
             let _ = self
                 .db
-                .kv_write(KV_NAMESPACE, "deposit_intent_v1", &key, &bytes)
+                .kv_write(KV_NAMESPACE, DEPOSIT_INTENT_NAMESPACE, &key, &bytes)
                 .await;
         }
         let time_key = Self::quote_key("In", &record.mint_url, &quote.id);
@@ -526,7 +546,7 @@ impl CdkWallet {
                 .await;
         }
         self.db
-            .kv_remove(KV_NAMESPACE, "deposit_intent_v1", &key)
+            .kv_remove(KV_NAMESPACE, DEPOSIT_INTENT_NAMESPACE, &key)
             .await
             .is_ok()
     }
@@ -543,7 +563,7 @@ impl CdkWallet {
         let key = Self::quote_key("In", &mint.to_string(), "creation_intent");
         let Some(bytes) = self
             .db
-            .kv_read(KV_NAMESPACE, "deposit_intent_v1", &key)
+            .kv_read(KV_NAMESPACE, DEPOSIT_INTENT_NAMESPACE, &key)
             .await
             .map_err(db_error)?
         else {
@@ -557,7 +577,7 @@ impl CdkWallet {
         };
         if record.version != 2
             || record.mint_url != mint.to_string()
-            || record.unit != "sat"
+            || record.unit != "msat"
             || record.payment_method != "bolt11"
             || record.amount == 0
             || record.amount > i64::MAX as u64
@@ -1088,7 +1108,7 @@ impl CdkWallet {
     pub(crate) async fn wallet_screen(&self, mint: &str) -> FfiResult<String> {
         let mint = parse_mint_url(mint)?;
         let (status, _) = self.reconcile_deposit(&mint).await?;
-        let sats = if self.repo.has_wallet(&mint, &UNIT).await {
+        let msats = if self.repo.has_wallet(&mint, &UNIT).await {
             self.approved_wallet(&mint)
                 .await?
                 .total_balance()
@@ -1098,7 +1118,7 @@ impl CdkWallet {
         } else {
             0
         };
-        Ok(serde_json::json!({"mint_url":mint.to_string(),"sats":sats.to_string(),"creation_recovery":status,"recovery_pending":self.unresolved.contains(&mint)}).to_string())
+        Ok(serde_json::json!({"mint_url":mint.to_string(),"msats":msats.to_string(),"creation_recovery":status,"recovery_pending":self.unresolved.contains(&mint)}).to_string())
     }
 
     /// Share this handle's poison flag with an FFI guard.
@@ -1172,7 +1192,7 @@ mod deposit_tests {
                 assert_eq!(update["invoice"]["confirmed"],false);
                 assert!(update["error"].is_null());
                 let screen:Value = serde_json::from_str(&h.wallet_screen(&mint).await.unwrap()).unwrap();
-                assert_eq!(screen["sats"],"0");
+                assert_eq!(screen["msats"],"0");
                 let history:Value = serde_json::from_str(&h.quote_history().await.unwrap()).unwrap();
                 assert_eq!(history[0]["state"],"ISSUED");
                 assert!(h.db.list_transactions(None,None,None).await.unwrap().is_empty());
@@ -1208,7 +1228,7 @@ mod deposit_tests {
             for case in ["unit","method","mint","request"] {
                 let mut q=quote(case,&parse_mint_url(&mint).unwrap());
                 match case {
-                    "unit"=>q.unit=CurrencyUnit::Msat,
+                    "unit"=>q.unit=CurrencyUnit::Sat,
                     "method"=>q.payment_method=PaymentMethod::BOLT12,
                     "mint"=>q.mint_url=parse_mint_url("http://127.0.0.1:9").unwrap(),
                     _=>{q.request="x".repeat(4097); q.expiry=unix_now()-1;},
@@ -1327,7 +1347,7 @@ mod deposit_tests {
                 }
                 assert_eq!(h.list_balances().await.unwrap()[0].1,21);
                 let screen:Value=serde_json::from_str(&h.wallet_screen(&mint).await.unwrap()).unwrap();
-                assert_eq!(screen["sats"],"21");
+                assert_eq!(screen["msats"],"21");
                 let history:Value=serde_json::from_str(&h.quote_history().await.unwrap()).unwrap();
                 assert!(history.as_array().unwrap().iter().any(|r|r["id"]==id && r["state"]==if outcome=="error" || outcome=="unchanged" {"PAID"} else {"ISSUED"}), "{outcome}: {history}");
                 let completed=CdkWallet::completed_quotes(h.db.list_transactions(None,None,None).await.unwrap());
@@ -1373,7 +1393,7 @@ mod deposit_tests {
             let dir=tempfile::tempdir().unwrap(); let path=dir.path().join("wallet.sqlite"); let path=path.to_str().unwrap();
             let (mut h,_) = CdkWallet::open(&[61;64],path).await.unwrap(); h.add_mint(&mint).await.unwrap();
             let conn=rusqlite::Connection::open(path).unwrap();
-            conn.execute_batch("CREATE TRIGGER fail_intent_delete BEFORE DELETE ON kv_store WHEN OLD.secondary_namespace = 'deposit_intent_v1' BEGIN SELECT RAISE(FAIL, 'injected cleanup failure'); END;").unwrap();
+            conn.execute_batch("CREATE TRIGGER fail_intent_delete BEFORE DELETE ON kv_store WHEN OLD.secondary_namespace = 'deposit_intent_v2' BEGIN SELECT RAISE(FAIL, 'injected cleanup failure'); END;").unwrap();
             let first:Value=serde_json::from_str(&h.create_deposit(&mint,"21").await.unwrap()).unwrap(); drop(h);
             let (mut h,_)=CdkWallet::open(&[61;64],path).await.unwrap();
             let recovered:Value=serde_json::from_str(&h.recover_deposit(&mint).await.unwrap()).unwrap();
@@ -1462,7 +1482,7 @@ mod deposit_tests {
                 let record = DepositIntent {
                     version: 2,
                     mint_url: mint.to_string(),
-                    unit: "sat".into(),
+                    unit: "msat".into(),
                     payment_method: "bolt11".into(),
                     amount: 21,
                     created_at: 7,
@@ -1480,7 +1500,7 @@ mod deposit_tests {
                     match case {
                         "amount" => q.amount = Some(Amount::from(42)),
                         "method" => q.payment_method = PaymentMethod::BOLT12,
-                        "unit" => q.unit = CurrencyUnit::Msat,
+                        "unit" => q.unit = CurrencyUnit::Sat,
                         "mint" => {
                             q.mint_url = parse_mint_url("http://127.0.0.1:8").unwrap();
                             h.db.add_mint(q.mint_url.clone(), None).await.unwrap();
@@ -1498,7 +1518,7 @@ mod deposit_tests {
                 } else {
                     serde_json::to_vec(&record).unwrap()
                 };
-                h.db.kv_write(KV_NAMESPACE, "deposit_intent_v1", &key, &bytes)
+                h.db.kv_write(KV_NAMESPACE, DEPOSIT_INTENT_NAMESPACE, &key, &bytes)
                     .await
                     .unwrap();
                 let (state, recovered) = h.reconcile_deposit(&mint).await.unwrap();
@@ -1516,7 +1536,7 @@ mod deposit_tests {
                     );
                     assert!(recovered.is_none());
                     assert_eq!(
-                        h.db.kv_read(KV_NAMESPACE, "deposit_intent_v1", &key)
+                        h.db.kv_read(KV_NAMESPACE, DEPOSIT_INTENT_NAMESPACE, &key)
                             .await
                             .unwrap(),
                         Some(bytes)
@@ -2303,7 +2323,7 @@ impl CdkWallet {
         Ok((handle, reports))
     }
 
-    /// List approved mint URLs (Sat wallets), sorted and de-duplicated.
+    /// List approved mint URLs (Msat wallets), sorted and de-duplicated.
     pub(crate) async fn list_mints(&self) -> Vec<String> {
         let mut urls: Vec<String> = self
             .repo
@@ -2318,7 +2338,7 @@ impl CdkWallet {
         urls
     }
 
-    /// List approved mints with their locally spendable Sat balance.
+    /// List approved mints with their locally spendable Msat balance.
     pub(crate) async fn list_balances(&self) -> FfiResult<Vec<(String, u64)>> {
         let balances = self.repo.get_balances().await.map_err(db_error)?;
         let mut out: Vec<(String, u64)> = balances
@@ -2379,17 +2399,18 @@ impl CdkWallet {
             && p2pk_keys.is_empty())
     }
 
-    /// Register (approve) a mint after validating its URL and advertised units.
+    /// Register (approve) a mint after validating its URL and live keysets.
     pub(crate) async fn add_mint(&mut self, url_str: &str) -> FfiResult<()> {
         let mint_url = parse_mint_url(url_str)?;
         self.guard_prepared_withdrawal(Some(&mint_url))?;
 
         // Idempotent: an already-approved mint is a local no-op, no network.
-        if self.repo.has_mint(&mint_url).await {
+        if self.repo.has_wallet(&mint_url, &UNIT).await {
             return Ok(());
         }
 
         let deadline = self.network_deadline();
+        require_active_keyset(&mint_url, deadline).await?;
         let info = match timeout(deadline, self.repo.fetch_mint_info(&mint_url)).await {
             Ok(result) => result.map_err(|e| {
                 let status = match &e {
@@ -2411,7 +2432,7 @@ impl CdkWallet {
         if !info.supported_units().iter().any(|u| **u == UNIT) {
             return Err(FfiErr::new(
                 CdkStatus::MintUnsupportedUnit,
-                "mint does not advertise the Sat unit",
+                "mint does not advertise msat payment support",
             ));
         }
 
@@ -2426,7 +2447,7 @@ impl CdkWallet {
         Ok(())
     }
 
-    /// Scan deterministic proofs for one Sat mint. Earlier batches may persist
+    /// Scan deterministic proofs for one Msat mint. Earlier batches may persist
     /// even if a later batch fails or the deadline expires.
     pub(crate) async fn restore_seed(&mut self, url: &str) -> FfiResult<(u64, u64, u64)> {
         let mint = parse_mint_url(url)?;
@@ -2455,7 +2476,7 @@ impl CdkWallet {
         self.db.restore_can_abandon().await.map_err(db_error)
     }
 
-    /// Receive a token, returning the net Sat amount credited.
+    /// Receive a token, returning the net Msat amount credited.
     ///
     /// The token is fully validated (parse, unit, mint, approval) before any
     /// network access. This is the common case with no P2PK signing keys.
@@ -2483,11 +2504,12 @@ impl CdkWallet {
         let token = Token::from_str(token_str)
             .map_err(|e| FfiErr::new(CdkStatus::InvalidToken, format!("invalid token: {e}")))?;
 
-        let unit = token.unit().unwrap_or(UNIT);
+        // A Cashu token with no explicit unit defaults to sat, not the wallet unit.
+        let unit = token.unit().unwrap_or(CurrencyUnit::Sat);
         if unit != UNIT {
             return Err(FfiErr::new(
                 CdkStatus::UnsupportedToken,
-                "token is not denominated in Sat",
+                "token is not denominated in Msat",
             ));
         }
         // A multi-mint token errors here; no network access has happened yet.
@@ -2535,7 +2557,7 @@ impl CdkWallet {
         self.finish_receive(mint_url, outcome)
     }
 
-    /// Fetch the mint's active Sat keyset and return it as Spilman keyset JSON.
+    /// Fetch the mint's active Msat keyset and return it as Spilman keyset JSON.
     ///
     /// The JSON uses the camelCase `KeysetInfo` shape accepted by the Spilman
     /// conversion helpers (`keysetId`, `unit`, `keys`, `amounts`,
@@ -2557,7 +2579,7 @@ impl CdkWallet {
         keyset_to_json(keyset)
     }
 
-    /// Fetch a single Sat keyset by id and return it as Spilman keyset JSON.
+    /// Fetch a single Msat keyset by id and return it as Spilman keyset JSON.
     pub(crate) async fn keyset_info_json(
         &self,
         mint_url_str: &str,
@@ -2585,7 +2607,7 @@ impl CdkWallet {
         keyset_to_json(keyset)
     }
 
-    /// Resolve an approved Sat wallet for `mint_url`.
+    /// Resolve an approved Msat wallet for `mint_url`.
     async fn approved_wallet(&self, mint_url: &MintUrl) -> FfiResult<Wallet> {
         if !self.repo.has_wallet(mint_url, &UNIT).await {
             return Err(FfiErr::new(
@@ -2648,7 +2670,7 @@ impl CdkWallet {
         }
     }
 
-    /// Receive raw proofs from a mint, returning the net Sat amount credited.
+    /// Receive raw proofs from a mint, returning the net Msat amount credited.
     ///
     /// Like [`receive`](Self::receive) but takes already-parsed proofs plus an
     /// explicit mint URL. Fails closed on an ambiguous outcome exactly as
@@ -2737,27 +2759,27 @@ impl CdkWallet {
 
     /// One-shot send from an explicitly selected mint.
     ///
-    /// Prepares the send, compares the total fee against `max_sender_fee_sats`
+    /// Prepares the send, compares the total fee against `max_sender_fee_msats`
     /// (cancelling if exceeded), then confirms. Ambiguous outcomes are reported
     /// as [`CdkStatus::SendUncertain`] and the mint is marked unresolved; the
     /// call is never retried automatically.
     pub(crate) async fn send(
         &mut self,
         mint_url_str: &str,
-        amount_sats: u64,
-        max_sender_fee_sats: u64,
+        amount_msats: u64,
+        max_sender_fee_msats: u64,
     ) -> FfiResult<SendOutcome> {
         let mint_url = parse_mint_url(mint_url_str)?;
 
         // Validate every caller-provided value locally, before any network use.
-        if amount_sats == 0 {
+        if amount_msats == 0 {
             return Err(FfiErr::new(
                 CdkStatus::InvalidArgument,
                 "send amount must be greater than zero",
             ));
         }
-        ensure_fits_i64(amount_sats, "send amount")?;
-        ensure_fits_i64(max_sender_fee_sats, "maximum sender fee")?;
+        ensure_fits_i64(amount_msats, "send amount")?;
+        ensure_fits_i64(max_sender_fee_msats, "maximum sender fee")?;
 
         if !self.repo.has_wallet(&mint_url, &UNIT).await {
             return Err(FfiErr::new(
@@ -2788,7 +2810,7 @@ impl CdkWallet {
         let deadline = self.network_deadline();
         let prepared = match timeout(
             deadline,
-            wallet.prepare_send(Amount::from(amount_sats), opts),
+            wallet.prepare_send(Amount::from(amount_msats), opts),
         )
         .await
         {
@@ -2821,7 +2843,7 @@ impl CdkWallet {
 
         // From here on, every failure must release the prepared reservations
         // through the same explicit cancellation path.
-        let overflow = match amount_sats.checked_add(total_fee) {
+        let overflow = match amount_msats.checked_add(total_fee) {
             Some(total) => total > i64::MAX as u64,
             None => true,
         };
@@ -2838,7 +2860,7 @@ impl CdkWallet {
                 .await);
         }
 
-        if total_fee > max_sender_fee_sats {
+        if total_fee > max_sender_fee_msats {
             return Err(self
                 .cancel_prepared(
                     prepared,
@@ -2847,7 +2869,7 @@ impl CdkWallet {
                     total_fee,
                     CdkStatus::FeeLimitExceeded,
                     format!(
-                        "send fee {total_fee} sats exceeds the maximum of {max_sender_fee_sats} sats"
+                        "send fee {total_fee} msats exceeds the maximum of {max_sender_fee_msats} msats"
                     ),
                 )
                 .await);
@@ -2857,7 +2879,7 @@ impl CdkWallet {
             Ok(Ok(token)) => Ok(SendOutcome {
                 token: token.to_string(),
                 operation_id,
-                sender_fee_sats: total_fee,
+                sender_fee_msats: total_fee,
             }),
             Ok(Err(e)) => {
                 if e.is_definitive_failure() {
@@ -2970,7 +2992,7 @@ impl CdkWallet {
         ) {
             return Ok(None);
         }
-        if saga.unit != UNIT || !self.repo.has_mint(&saga.mint_url).await {
+        if saga.unit != UNIT || !self.repo.has_wallet(&saga.mint_url, &UNIT).await {
             return Ok(None);
         }
         match saga.data {
@@ -2982,7 +3004,7 @@ impl CdkWallet {
         }
     }
 
-    /// Run recovery for every approved Sat wallet, or just one mint.
+    /// Run recovery for every approved Msat wallet, or just one mint.
     ///
     /// Updates the per-mint unresolved set and returns one report per mint.
     /// Diagnostics are returned to the caller; nothing is written to stderr.
@@ -3084,7 +3106,7 @@ impl CdkWallet {
     pub(crate) async fn test_interrupt_prepare(
         &mut self,
         mint_url_str: &str,
-        amount_sats: u64,
+        amount_msats: u64,
     ) -> FfiResult<()> {
         let mint_url = parse_mint_url(mint_url_str)?;
         let wallet = self
@@ -3098,7 +3120,7 @@ impl CdkWallet {
             ..SendOptions::default()
         };
         let prepared = wallet
-            .prepare_send(Amount::from(amount_sats), opts)
+            .prepare_send(Amount::from(amount_msats), opts)
             .await
             .map_err(|e| map_prepare_error(&e))?;
         // Drop without confirm/cancel: the persisted saga and its reserved
@@ -3114,8 +3136,8 @@ pub(crate) struct SendOutcome {
     pub token: String,
     /// 16 raw UUID bytes identifying the operation.
     pub operation_id: [u8; 16],
-    /// Total fee charged for the send, in sats.
-    pub sender_fee_sats: u64,
+    /// Total fee charged for the send, in msats.
+    pub sender_fee_msats: u64,
 }
 
 impl std::fmt::Debug for SendOutcome {
@@ -3123,7 +3145,7 @@ impl std::fmt::Debug for SendOutcome {
         f.debug_struct("SendOutcome")
             .field("token", &"<redacted>")
             .field("operation_id", &self.operation_id)
-            .field("sender_fee_sats", &self.sender_fee_sats)
+            .field("sender_fee_msats", &self.sender_fee_msats)
             .finish()
     }
 }
@@ -3596,6 +3618,9 @@ fn receive_options(signing_keys: &[SecretKey]) -> ReceiveOptions {
 
 /// Convert a CDK [`KeySet`](cdk::nuts::KeySet) into Spilman `KeysetInfo` JSON.
 fn keyset_to_json(keyset: cdk::nuts::KeySet) -> FfiResult<String> {
+    if keyset.unit != UNIT {
+        return Err(FfiErr::new(CdkStatus::MintUnsupportedUnit, "keyset is not denominated in msat"));
+    }
     let info = cdk_spilman::KeysetInfo::new(
         keyset.id,
         keyset.unit,

@@ -292,7 +292,7 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   await assert.rejects(create());
   const retiredKey = `retired:${"a".repeat(32)}`;
   fake.seed(ONBOARDING_STORE, retiredKey, {version: 1, step: "retired", id: "a".repeat(32), fingerprint,
-    mint: "https://mint.example", spendable_sats: "0", pending_sats: "0", spent_sats: "0"});
+    mint: "https://mint.example", spendable_msats: "0", pending_msats: "0", spent_msats: "0"});
   expected = JSON.stringify([{id: "a".repeat(32), mnemonic: MNEMONIC, state: {revision: 0, data}, marker: fake.peek(ONBOARDING_STORE, retiredKey)}]);
   fake.peek(ONBOARDING_STORE, retiredKey).extra = true;
   await assert.rejects(create());
@@ -371,8 +371,8 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   const scan = {version: 1, revision: 0, step: "scanning", id, fingerprint, mint: "https://mint.example"};
   const failed = {...scan, revision: 1, step: "failed"};
   const retry = {...scan, revision: 2};
-  const result = {...retry, revision: 3, step: "result", spendable_sats: "1", pending_sats: "0", spent_sats: "0"};
-  const zero = {...result, spendable_sats: "0"};
+  const result = {...retry, revision: 3, step: "result", spendable_msats: "1", pending_msats: "0", spent_msats: "0"};
+  const zero = {...result, spendable_msats: "0"};
   const backup = {version: 1, revision: 0, step: "backup_seed", fingerprint: "cd".repeat(32)};
   let expected = '[]';
   const stage = () => platform.stageOnboardingWallet(user, id, MNEMONIC, data, scan, expected);
@@ -397,7 +397,7 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   await update(scan, failed);
   assert.equal(fake.peek(MNEMONIC_STORE, key), MNEMONIC);
   await update(failed, retry);
-  await assert.rejects(update(retry, {...result, spendable_sats: "18446744073709551616"}));
+  await assert.rejects(update(retry, {...result, spendable_msats: "18446744073709551616"}));
   await update(retry, result);
   // The expected snapshot and the replacement wallet both have strict field keys.
   await assert.rejects(platform.finishOnboardingRestore(user, {...expectedPayload(result), extra: true}));
@@ -442,13 +442,13 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   const user = "haystack-user", id = "2".repeat(32), active = "3".repeat(32);
   const key = `haystack-recovery-${id}`, activeKey = `haystack-recovery-${active}`;
   const fingerprint = "ab".repeat(32), mint = "mint";
-  const retired = {version: 1, step: "retired", id, fingerprint, mint, spendable_sats: "0", pending_sats: "0", spent_sats: "0"};
+  const retired = {version: 1, step: "retired", id, fingerprint, mint, spendable_msats: "0", pending_msats: "0", spent_msats: "0"};
   const entry = {id, mnemonic: MNEMONIC, state: {revision: 4, data: "raw"}, marker: retired};
   const expected = JSON.stringify([entry]);
   const backup = {version: 1, revision: 0, step: "backup_seed", fingerprint};
   const scan = {version: 1, revision: 0, step: "scanning", id: active, fingerprint, mint};
-  const result = {...scan, step: "result", spendable_sats: "1", pending_sats: "0", spent_sats: "0"};
-  const zero = {...result, spendable_sats: "0"};
+  const result = {...scan, step: "result", spendable_msats: "1", pending_msats: "0", spent_msats: "0"};
+  const zero = {...result, spendable_msats: "0"};
   const payload = (e, marker, revision = 0, mnemonic = MNEMONIC, state = "data") =>
     ({marker, state: {revision, data: state}, mnemonic, retired: e});
   const cases = [
@@ -461,7 +461,7 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   ];
   const clear = () => {
     for (const store of [MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE]) {
-      for (const k of [user, key, activeKey, `retired:${id}`]) fake.store(store).delete(k);
+      for (const k of [user, key, activeKey, `retired:${id}`, `retired:${active}`]) fake.store(store).delete(k);
     }
   };
   for (let i = 0; i < cases.length; i++) {
@@ -505,6 +505,11 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
     // Marker property order is not significant.
     const reversed = Object.fromEntries(Object.entries(retired).reverse());
     await run(JSON.stringify([{...entry, marker: reversed}]));
+    setup();
+    // Rust serializes audited retired records with the new field names.
+    const legacy = Object.fromEntries(Object.entries(retired).map(([k, v]) => [k.replace(/_msats$/, "_sats"), v]));
+    fake.seed(ONBOARDING_STORE, `retired:${id}`, legacy);
+    await run(expected);
   }
   clear();
   check("All onboarding transitions bind retired records to the audited snapshot");
@@ -543,7 +548,7 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
       {version: 1, revision: 0, step: "backup_seed", fingerprint: fingerprint + end}, "[]"));
     const marker = {version: 1, revision: 0, step: "scanning", id, fingerprint, mint: "mint"};
     await assert.rejects(platform.stageOnboardingWallet("haystack-user", id + end, MNEMONIC, "raw", {...marker, id: id + end}, "[]"));
-    const result = {...marker, step: "result", spendable_sats: "1" + end, pending_sats: "0", spent_sats: "0"};
+    const result = {...marker, step: "result", spendable_msats: "1" + end, pending_msats: "0", spent_msats: "0"};
     await assert.rejects(platform.finishOnboardingRestore("haystack-user", {
       marker: result, state: original, mnemonic: MNEMONIC, retired: "[]",
     }), /invalid onboarding restore input/);
@@ -691,7 +696,7 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   const scan = {version: 1, revision: 0, step: "scanning", id, fingerprint: "e".repeat(64), mint: "mint"};
   const staged = p.stageOnboardingWallet("haystack-user", id, MNEMONIC, "stage", scan, "[]");
   const scanSnapshot = {marker: {...scan}, state: {revision: 0, data: "stage"}, mnemonic: MNEMONIC, retired: "[]"};
-  const result = {...scan, revision: 1, step: "result", spendable_sats: "0", pending_sats: "0", spent_sats: "0"};
+  const result = {...scan, revision: 1, step: "result", spendable_msats: "0", pending_msats: "0", spent_msats: "0"};
   const updated = p.updateOnboardingScan("haystack-user", scanSnapshot, result);
   const generationSnapshot = {...scanSnapshot, marker: {...result}, state: {...scanSnapshot.state}};
   const replacement = {mnemonic: OTHER_MNEMONIC, state: "replacement", marker: {...marker, fingerprint: "f".repeat(64)}};
@@ -699,8 +704,8 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   scan.id = "0".repeat(32);
   scanSnapshot.state.data = "changed";
   scanSnapshot.marker.mint = "changed";
-  result.pending_sats = "1";
-  generationSnapshot.marker.spendable_sats = "1";
+  result.pending_msats = "1";
+  generationSnapshot.marker.spendable_msats = "1";
   generationSnapshot.state.data = "changed";
   replacement.mnemonic = MNEMONIC;
   replacement.state = "changed";

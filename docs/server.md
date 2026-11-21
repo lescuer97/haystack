@@ -56,7 +56,10 @@ to bypass a failure unless intentionally abandoning that identity and its funds.
 No config.json, content directory, onboarding state, UI, wallet worker, wallet
 actions or endpoints are added. Mint selection matches the native client:
 `https://testnut.cashu.space/`, or the existing isolated `-Dapp-fixture-mint`
-override. Opening does not eagerly add a mint, poll or scan for restoration.
+override. Before opening or creating the wallet, startup fetches the mint’s live
+`/v1/keysets` and requires an active `msat` keyset. If the mint cannot be
+verified, the server logs the failure and exits without starting the listener.
+Opening does not eagerly add a mint, poll or scan for restoration.
 
 Main owns the wallet; App borrows it. WebSocket task cancellation/join and App
 cleanup precede wallet close; the root lock is released last. CDK/Rust's runtime,

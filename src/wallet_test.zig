@@ -208,7 +208,7 @@ test "C ABI: documented result-handling idioms compile and behave" {
 
     // Sending from an unregistered mint fails locally (no network), and the
     // documented switch/free idiom must compile.
-    const sent = c.cdk_wallet_send(handle, "https://mint.example.com".ptr, 1000, 5);
+    const sent = c.cdk_wallet_send(handle, "https://mint.example.com".ptr, 1_000_000, 5_000);
     defer if (sent.@"error") |e| c.cdk_string_free(e);
     switch (sent.status) {
         c.CDK_STATUS_OK => {
@@ -478,7 +478,8 @@ test "cdk + spilman integration: token/proof conversion, channel id, and funding
     const funding = c.cdk_spilman_compute_funding_token_amount(3, keyset_json.ptr, 64);
     defer freeError(funding.@"error");
     try std.testing.expectEqual(@as(c.CdkStatus_t, c.CDK_STATUS_OK), funding.status);
-    try std.testing.expectEqual(@as(u64, 3), funding.net_sats);
+    // The generic Spilman helper returns a keyset-unit amount (sat in this fixture).
+    try std.testing.expectEqual(@as(u64, 3), funding.amount);
 
     // Alice sends, Charlie receives; ECDH gives both sides the same 32-byte
     // channel secret.

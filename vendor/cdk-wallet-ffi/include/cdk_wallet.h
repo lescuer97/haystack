@@ -14,7 +14,7 @@ extern "C" {
 #include <stdint.h>
 
 /** \brief
- *  One approved mint and its locally spendable Sat balance.
+ *  One approved mint and its locally spendable Msat balance.
  */
 typedef struct CdkBalanceEntry {
     /** \brief
@@ -23,9 +23,9 @@ typedef struct CdkBalanceEntry {
     char * mint_url;
 
     /** \brief
-     *  Locally spendable (unspent, non-reserved) sats at this mint.
+     *  Locally spendable (unspent, non-reserved) msats at this mint.
      */
-    uint64_t balance_sats;
+    uint64_t balance_msats;
 } CdkBalanceEntry_t;
 
 /** \brief
@@ -124,7 +124,7 @@ enum CdkStatus {
      */
     CDK_STATUS_INVALID_MINT_URL = 9,
     /** \brief
-     *  The mint does not advertise the Sat unit.
+     *  The mint does not advertise the Msat unit.
      */
     CDK_STATUS_MINT_UNSUPPORTED_UNIT = 10,
     /** \brief
@@ -358,7 +358,7 @@ cdk_pending_list_free (
 /** \brief
  *  Per-mint recovery outcome.
  *
- *  One entry per approved Sat mint, describing how recovery went for that mint
+ *  One entry per approved Msat mint, describing how recovery went for that mint
  *  specifically. A mint whose `failed`/`skipped` counters are non-zero (or whose
  *  `status` is not [`CdkStatus::Ok`]) is left fail-closed until recovery
  *  succeeds.
@@ -510,30 +510,25 @@ cdk_spilman_compute_channel_secret (
     char const * their_pubkey_hex);
 
 /** \brief
- *  Result of receiving a token.
+ *  Result of a stateless Spilman funding calculation.
  */
-typedef struct CdkReceiveResult {
-    /** \brief
-     *  Call status.
-     */
+typedef struct CdkSpilmanAmountResult {
+    /** <No documentation available> */
     CdkStatus_t status;
 
-    /** \brief
-     *  Human-readable error message. `NULL` on success.
-     */
+    /** <No documentation available> */
     char * error;
 
     /** \brief
-     *  Net spendable sats credited to the wallet, valid only when `status` is
-     *  [`CdkStatus::Ok`].
+     *  Minimum funding-token amount, in the supplied keyset's unit.
      */
-    uint64_t net_sats;
-} CdkReceiveResult_t;
+    uint64_t amount;
+} CdkSpilmanAmountResult_t;
 
 /** \brief
  *  Compute the minimum funding-token amount for a channel capacity.
  */
-CdkReceiveResult_t
+CdkSpilmanAmountResult_t
 cdk_spilman_compute_funding_token_amount (
     uint64_t capacity,
     char const * keyset_info_json,
@@ -802,12 +797,20 @@ typedef struct CdkWallet CdkWallet_t;
 /** \brief
  *  Approve (register) a mint.
  *
- *  Idempotent for an already-approved mint. Requires network access to fetch
- *  the mint's advertised units.
+ *  Idempotent for an already-approved msat wallet. Requires network access to
+ *  fetch the mint's keysets and payment settings otherwise.
  */
 CdkStatusResult_t
 cdk_wallet_add_mint (
     CdkWallet_t * handle,
+    char const * mint_url);
+
+/** \brief
+ *  Check that the mint currently advertises an active msat keyset over NUT-02.
+ *  Does not open or mutate a wallet.
+ */
+CdkStatusResult_t
+cdk_wallet_check_mint_keysets (
     char const * mint_url);
 
 /** \brief
@@ -823,7 +826,7 @@ cdk_wallet_close (
     CdkWallet_t * handle);
 
 /** \brief
- *  Return the mint's active Sat keyset as Spilman `KeysetInfo` JSON.
+ *  Return the mint's active Msat keyset as Spilman `KeysetInfo` JSON.
  */
 CdkStringResult_t
 cdk_wallet_get_active_keyset_info_json (
@@ -831,7 +834,7 @@ cdk_wallet_get_active_keyset_info_json (
     char const * mint_url);
 
 /** \brief
- *  Return a single Sat keyset, by id, as Spilman `KeysetInfo` JSON.
+ *  Return a single Msat keyset, by id, as Spilman `KeysetInfo` JSON.
  */
 CdkStringResult_t
 cdk_wallet_get_keyset_info_json (
@@ -900,7 +903,7 @@ typedef struct CdkBalanceListResult {
 } CdkBalanceListResult_t;
 
 /** \brief
- *  List approved mints with their locally spendable Sat balance.
+ *  List approved mints with their locally spendable Msat balance.
  */
 CdkBalanceListResult_t
 cdk_wallet_list_balances (
@@ -1005,7 +1008,7 @@ typedef struct CdkOpenResult {
     uint32_t failed;
 
     /** \brief
-     *  Per-mint startup recovery reports (one entry per approved Sat mint).
+     *  Per-mint startup recovery reports (one entry per approved Msat mint).
      *  Free with
      *  [`cdk_recovery_reports_free`](crate::cdk_recovery_reports_free).
      */
@@ -1045,14 +1048,14 @@ cdk_wallet_post_swap (
 /** \brief
  *  Deposit/history adapter. Arguments and results are JSON strings containing
  *  decimal-string amounts; returned strings use the ordinary Rust string free.
- *  Operations: create_deposit [mint, sats], check_deposit [mint, quote_id] (expired-unpaid is local-only),
+ *  Operations: create_deposit [mint, msats], check_deposit [mint, quote_id] (expired-unpaid is local-only),
  *  unfinished_deposits [mint], quote_history [] (generic compatibility),
  *  wallet_screen [mint] (small selected balance/recovery status),
  *  quote_history_page [offset], resume_deposit [mint] (newest non-expired unfinished),
  *  poll_deposits [mint, after_id] (one background check, never creates),
  *  recover_deposit [mint] (local reconciliation only, never a quote POST).
  *  deposit_update [mint, check|poll|recover, id|cursor|empty] returns bounded application recovery metadata,
- *  saved_invoice [mint, id] reads one exact local Sat/BOLT11 quote without network or recovery.
+ *  saved_invoice [mint, id] reads one exact local Msat/BOLT11 quote without network or recovery.
  *  prepare_withdrawal [mint, invoice] reserves CDK proofs for review, never pays;
  *  confirm_withdrawal [mint, operation_uuid] consumes that review exactly once;
  *  cancel_withdrawal [mint, operation_uuid] releases the CDK reservation;
@@ -1068,7 +1071,28 @@ cdk_wallet_quotes (
     char const * arguments);
 
 /** \brief
- *  Receive a token, returning the net Sat amount credited.
+ *  Result of receiving a token.
+ */
+typedef struct CdkReceiveResult {
+    /** \brief
+     *  Call status.
+     */
+    CdkStatus_t status;
+
+    /** \brief
+     *  Human-readable error message. `NULL` on success.
+     */
+    char * error;
+
+    /** \brief
+     *  Net spendable msats credited to the wallet, valid only when `status` is
+     *  [`CdkStatus::Ok`].
+     */
+    uint64_t net_msats;
+} CdkReceiveResult_t;
+
+/** \brief
+ *  Receive a token, returning the net Msat amount credited.
  */
 CdkReceiveResult_t
 cdk_wallet_receive (
@@ -1194,23 +1218,23 @@ typedef struct CdkSeedRestoreResult {
     uint8_t incomplete;
 
     /** \brief
-     *  Scanned proof totals in sats, valid only when incomplete is 0.
+     *  Scanned proof totals in msats, valid only when incomplete is 0.
      */
-    uint64_t unspent_sats;
+    uint64_t unspent_msats;
 
     /** \brief
-     *  Scanned pending proof total in sats, valid only when incomplete is 0.
+     *  Scanned pending proof total in msats, valid only when incomplete is 0.
      */
-    uint64_t pending_sats;
+    uint64_t pending_msats;
 
     /** \brief
-     *  Scanned spent proof total in sats, valid only when incomplete is 0.
+     *  Scanned spent proof total in msats, valid only when incomplete is 0.
      */
-    uint64_t spent_sats;
+    uint64_t spent_msats;
 } CdkSeedRestoreResult_t;
 
 /** \brief
- *  Scan a Sat mint for deterministic seed-derived proofs using NUT-13.
+ *  Scan a Msat mint for deterministic seed-derived proofs using NUT-13.
  *  This is not saga recovery. Failure may leave previously restored proofs in
  *  the database; totals are valid only when the scan completed. Free `error`
  *  with `cdk_string_free`.
@@ -1249,16 +1273,16 @@ typedef struct CdkSendResult {
     uint8_16_array_t operation_id;
 
     /** \brief
-     *  Sender fee actually charged, in sats. Only meaningful on success or
+     *  Sender fee actually charged, in msats. Only meaningful on success or
      *  [`CdkStatus::SendUncertain`].
      */
-    uint64_t sender_fee_sats;
+    uint64_t sender_fee_msats;
 } CdkSendResult_t;
 
 /** \brief
- *  Send `amount_sats` from an explicitly selected mint.
+ *  Send `amount_msats` from an explicitly selected mint.
  *
- *  The total send fee must not exceed `max_sender_fee_sats`, otherwise the send
+ *  The total send fee must not exceed `max_sender_fee_msats`, otherwise the send
  *  is cancelled. On success the returned `token` is a bearer secret owned by
  *  the caller and must be freed with [`cdk_string_free`].
  */
@@ -1266,8 +1290,8 @@ CdkSendResult_t
 cdk_wallet_send (
     CdkWallet_t * handle,
     char const * mint_url,
-    uint64_t amount_sats,
-    uint64_t max_sender_fee_sats);
+    uint64_t amount_msats,
+    uint64_t max_sender_fee_msats);
 
 
 #ifdef __cplusplus

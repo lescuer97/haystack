@@ -36,12 +36,12 @@ struct App {
 }
 
 fn withdrawal_invoice(query: &HashMap<String, String>) -> Result<String, StatusCode> {
-    let sats = query
-        .get("sats")
+    let msats = query
+        .get("msats")
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| (1..=10_000).contains(n))
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let amount_msat = sats.checked_mul(1000).ok_or(StatusCode::BAD_REQUEST)?;
+
     let description_bytes = match query.get("description_bytes") {
         Some(s) => s
             .parse::<usize>()
@@ -68,7 +68,7 @@ fn withdrawal_invoice(query: &HashMap<String, String>) -> Result<String, StatusC
     } else {
         "x".repeat(description_bytes)
     };
-    Ok(cdk_fake_wallet::create_fake_invoice(amount_msat, description).to_string())
+    Ok(cdk_fake_wallet::create_fake_invoice(msats, description).to_string())
 }
 
 fn withdrawal_mode(query: &HashMap<String, String>) -> Result<bool, StatusCode> {
@@ -85,11 +85,11 @@ mod tests {
 
     #[test]
     fn withdrawal_fixture_validates_before_building_invoice() {
-        let mut query = HashMap::from([("sats".into(), "21".into())]);
+        let mut query = HashMap::from([("msats".into(), "21".into())]);
         let invoice = withdrawal_invoice(&query).unwrap();
         assert!((1025..=4096).contains(&invoice.len()));
         let parsed: cdk::lightning_invoice::Bolt11Invoice = invoice.parse().unwrap();
-        assert_eq!(parsed.amount_milli_satoshis(), Some(21_000));
+        assert_eq!(parsed.amount_milli_satoshis(), Some(21));
         for bytes in ["601", "1300", "2000", "-1", "invalid", "18446744073709551616"] {
             query.insert("description_bytes".into(), bytes.into());
             assert_eq!(withdrawal_invoice(&query), Err(StatusCode::BAD_REQUEST));
@@ -98,17 +98,17 @@ mod tests {
             query.insert("description_bytes".into(), bytes.into());
             assert!(withdrawal_invoice(&query).is_ok());
         }
-        for sats in ["0", "-1", "10001", "18446744073709551615", "18446744073709551616", "invalid"] {
-            query.insert("sats".into(), sats.into());
+        for msats in ["0", "-1", "10001", "18446744073709551615", "18446744073709551616", "invalid"] {
+            query.insert("msats".into(), msats.into());
             assert_eq!(withdrawal_invoice(&query), Err(StatusCode::BAD_REQUEST));
         }
-        query.remove("sats");
+        query.remove("msats");
         assert_eq!(withdrawal_invoice(&query), Err(StatusCode::BAD_REQUEST));
     }
 
     #[test]
     fn withdrawal_pending_description_is_long_valid_json_and_modes_are_exact() {
-        let mut query = HashMap::from([("sats".into(), "21".into()), ("pending".into(), "true".into())]);
+        let mut query = HashMap::from([("msats".into(), "21".into()), ("pending".into(), "true".into())]);
         let invoice = withdrawal_invoice(&query).unwrap();
         assert!((1025..=4096).contains(&invoice.len()));
         let parsed: cdk::lightning_invoice::Bolt11Invoice = invoice.parse().unwrap();
@@ -140,7 +140,7 @@ async fn token(State(app): State<App>) -> Result<Json<serde_json::Value>, Status
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(
-        serde_json::json!({"token":token.to_string(),"sats":"100"}),
+        serde_json::json!({"token":token.to_string(),"msats":"100"}),
     ))
 }
 
@@ -186,9 +186,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Arc::new(cdk_sqlite::mint::memory::empty().await?);
     let mut builder = MintBuilder::new(db.clone());
     builder.configure_unit(
-        CurrencyUnit::Sat,
+        CurrencyUnit::Msat,
         UnitConfig {
-            amounts: (0..16).map(|i| 2u64.pow(i)).collect(),
+            // Enough denominations for the renderer's largest deposit preset (1,000,000 msat).
+            amounts: (0..20).map(|i| 2u64.pow(i)).collect(),
             input_fee_ppk: 0,
         },
     )?;
@@ -200,13 +201,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         HashMap::new(),
         HashSet::new(),
         0,
-        CurrencyUnit::Sat,
+        CurrencyUnit::Msat,
     );
     builder
         .add_payment_processor(
-            CurrencyUnit::Sat,
+            CurrencyUnit::Msat,
             PaymentMethod::BOLT11,
-            MintMeltLimits::new(1, 10_000),
+            MintMeltLimits::new(1, 1_000_000),
             Arc::new(fake),
         )
         .await?;
@@ -241,6 +242,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let except = except.clone();
         async move {
             let path = req.uri().path().to_owned();
+            if path == "/v1/keysets" && req.method() == axum::http::Method::GET {
+                // Alternate startup responses for individual browser contexts.
+                // All other requests still use the live msat mint.
+                let keyset = match req.headers().get("x-browser-test-keysets").and_then(|v| v.to_str().ok()) {
+                    Some("sat-only") => Some(("sat", true)),
+                    Some("inactive-msat") => Some(("msat", false)),
+                    _ => None,
+                };
+                if let Some((unit, active)) = keyset {
+                    return (
+                        [(header::CACHE_CONTROL, "no-store")],
+                        Json(serde_json::json!({"keysets":[{
+                            "id":"00916bbf7ef91a36", "unit":unit, "active":active, "input_fee_ppk":0
+                        }]})),
+                    ).into_response();
+                }
+            }
             let withdrawal_get = path.starts_with("/v1/melt/quote/bolt11/") && req.method() == axum::http::Method::GET;
             let withdrawal_post = path == "/v1/melt/bolt11" && req.method() == axum::http::Method::POST;
             if req.method() == axum::http::Method::POST {
@@ -396,7 +414,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
     let wallet = repo
-        .get_or_create_wallet(url.parse()?, CurrencyUnit::Sat, None)
+        .get_or_create_wallet(url.parse()?, CurrencyUnit::Msat, None)
         .await?;
     let quote = wallet
         .mint_quote(

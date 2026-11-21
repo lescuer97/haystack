@@ -68,8 +68,8 @@ async function run() {
     const resumed = await request('inspect');
     check('reload resumes retry-only failure', resumed.event === 'resume_failed' && resumed.can_generate_new === false);
     const result = await request('retry');
-    const zero = result.event === 'restore_finished' && result.report?.spendable_sats === '0' && result.report?.pending_sats === '0' && result.report?.spent_sats === '0' && result.report?.can_generate_new === true;
-    if (!zero) window.onboardingSafeResult = {event: ['restore_finished', 'restore_failed', 'blocked'].includes(result.event) ? result.event : 'unexpected', spendable: result.report?.spendable_sats === '0' ? 'zero' : 'nonzero-or-missing', pending: result.report?.pending_sats === '0' ? 'zero' : 'nonzero-or-missing', spent: result.report?.spent_sats === '0' ? 'zero' : 'nonzero-or-missing', can_generate_new: result.report?.can_generate_new === true};
+    const zero = result.event === 'restore_finished' && result.report?.spendable_msats === '0' && result.report?.pending_msats === '0' && result.report?.spent_msats === '0' && result.report?.can_generate_new === true;
+    if (!zero) window.onboardingSafeResult = {event: ['restore_finished', 'restore_failed', 'blocked'].includes(result.event) ? result.event : 'unexpected', spendable: result.report?.spendable_msats === '0' ? 'zero' : 'nonzero-or-missing', pending: result.report?.pending_msats === '0' ? 'zero' : 'nonzero-or-missing', spent: result.report?.spent_msats === '0' ? 'zero' : 'nonzero-or-missing', can_generate_new: result.report?.can_generate_new === true};
     check('retry returns zero result eligible for generation', zero);
     check('generate displays backup', (await request('generate')).event === 'backup');
     check('complete generated backup', (await request('complete_backup')).event === 'complete_success');

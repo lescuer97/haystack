@@ -733,6 +733,12 @@ mergeInto(LibraryManager.library, {
     haystackStorage.start(callback, defaultTileGrid, defaultChunkBorders);
   },
 
+  haystack_storage_close__deps: ["$haystackStorage"],
+  haystack_storage_close__sig: "v",
+  haystack_storage_close: function () {
+    haystackStorage.failLock();
+  },
+
   haystack_storage_save__deps: ["$haystackStorage"],
   haystack_storage_save__sig: "vii",
   haystack_storage_save: function (tileGrid, chunkBorders) {

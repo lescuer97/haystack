@@ -62,8 +62,8 @@ async function counts() {
   if (!reply.ok) throw new Error('Fixture counts unavailable');
   return reply.json();
 }
-async function invoice(sats = 21, pending = false) {
-  const reply = await fetch(new URL(`/test-withdrawal-invoice?sats=${sats}&description_bytes=600&pending=${pending}`,origin));
+async function invoice(msats = 21, pending = false) {
+  const reply = await fetch(new URL(`/test-withdrawal-invoice?msats=${msats}&description_bytes=600&pending=${pending}`,origin));
   if (!reply.ok) throw new Error('Fixture invoice unavailable');
   const value = await reply.json();
   if (typeof value.invoice !== 'string' || value.invoice.length <= 1024 || value.invoice.length > 4096) throw new Error('Fixture invoice length invalid');
@@ -91,7 +91,7 @@ const instrumentation = `(() => {
         checks.replies.push({operation,serial:s,value});
         if(typeof value?.recovery_pending==='boolean'){checks.recoveryPending=value.recovery_pending;checks.recoverySerial=s}
         if(typeof value?.creation_recovery==='string')checks.creationRecovery=value.creation_recovery;
-        if(value?.sats!==undefined)checks.snapshot=value;
+        if(value?.msats!==undefined)checks.snapshot=value;
         if(Array.isArray(value?.rows))checks.history=value;
       }else if(typeof text==='string')checks.events.push(JSON.parse(text).event);
       return deliver.apply(this,arguments);
@@ -133,18 +133,20 @@ async function run() {
   await evaluate(`(async()=>{const m=await import('/wallet/cdk_wallet_browser.js');await m.default();const s=await m.start_onboarding(m.onboarding_mint());try{await s.request('inspect','{}');await s.request('create','{}');const r=JSON.parse(await s.request('complete_backup','{}'));if(r.event!=='complete_success')throw 0}finally{await s.close();s.free()}return true})()`);
   await send('Page.addScriptToEvaluateOnNewDocument',{source:gameSocketFixture + '\n' + instrumentation});
   await send('Page.navigate',{url:new URL('/renderer/index.html',origin).href});
-  await expect('Ready real renderer wallet','window.checks?.snapshot?.sats==="0" && checks.events.includes("ready")');
+  await expect('Ready real renderer wallet','window.checks?.snapshot?.msats==="0" && checks.events.includes("ready")');
   await evaluate('document.getElementById("canvas").focus()');
-  await openWallet();await row('Wallet',1);await row('Deposit',4);
+  await openWallet();await row('Wallet',1);await row('Deposit',0);
+  for (const text of '1000') await send('Input.dispatchKeyEvent',{type:'char',text,unmodifiedText:text});
+  await settleTicks();
   // Wallet navigation requests a snapshot. Wait for its reply to be consumed
   // before the one explicit Create click; busy actions must not be replayed.
   await idle();
   const fundingStart = await evaluate('({generation:checks.generation,creates:checks.requests.filter(n=>n===2).length,replies:checks.replies.length})');
   await row('Deposit',5);
   await expect('one explicit funding deposit request is published',`checks.generation===${JSON.stringify(fundingStart.generation)} && checks.requests.filter(n=>n===2).length===${fundingStart.creates+1}`);
-  await expect('funding reply saves the requested 1000-sat quote',`checks.generation===${JSON.stringify(fundingStart.generation)} && checks.replies.slice(${fundingStart.replies}).some(r=>r.operation===2&&r.value?.amount==='1000'&&typeof r.value.id==='string'&&r.value.id.length>0&&typeof r.value.invoice==='string'&&r.value.invoice.length>0)`);
+  await expect('funding reply saves the requested 1000-msat quote',`checks.generation===${JSON.stringify(fundingStart.generation)} && checks.replies.slice(${fundingStart.replies}).some(r=>r.operation===2&&r.value?.amount==='1000'&&typeof r.value.id==='string'&&r.value.id.length>0&&typeof r.value.invoice==='string'&&r.value.invoice.length>0)`);
   const funding = await evaluate(`(()=>{const r=checks.replies.slice(${fundingStart.replies}).find(r=>r.operation===2&&r.value?.amount==='1000');return {serial:r.serial,id:r.value.id,amount:r.value.amount}})()`);
-  await expect('actual CDK funding balance','checks.snapshot?.sats==="1000"');
+  await expect('actual CDK funding balance','checks.snapshot?.msats==="1000"');
   await expect('funding retains its original reply and has no duplicate create',`checks.generation===${JSON.stringify(fundingStart.generation)} && checks.requests.filter(n=>n===2).length===${fundingStart.creates+1} && checks.replies.some(r=>r.operation===2&&r.serial===${funding.serial}&&r.value?.id===${JSON.stringify(funding.id)}&&r.value.amount===${JSON.stringify(funding.amount)})`);
   await idle();await row('Invoice',2);await openWithdraw();
   await paste('not-a-lightning-invoice');await reviewWithdrawal();
@@ -164,16 +166,17 @@ async function run() {
   for (const field of ['amount','fee_reserve','swap_fee','input_fee','estimated_total','quote_expiry','invoice_expiry']) {
     if (typeof review[field]!=='string' || !/^\d+$/.test(review[field])) throw new Error('Invalid CDK review decimal field');
   }
+  if (review.unit!=='msat' || review.amount!=='21') throw new Error('Withdrawal quote did not preserve the 21-msat invoice amount');
   if ((await counts()).melt_posts!==0) throw new Error('Review submitted payment');
   await row('Withdrawal',1);
-  await expect('Cancel uses exact ephemeral operation and rereads actual funds','checks.replies.some(r=>r.operation===11&&r.value?.cancelled) && checks.snapshot?.sats==="1000"');
+  await expect('Cancel uses exact ephemeral operation and rereads actual funds','checks.replies.some(r=>r.operation===11&&r.value?.cancelled) && checks.snapshot?.msats==="1000"');
   if ((await counts()).melt_posts!==0) throw new Error('Cancel submitted payment');
   // Delay only delivery, not Rust/CDK: close during preparation must cancel on arrival.
   await evaluate('checks.holdPrepare=true');await paste(await invoice());await reviewWithdrawal();
   await expect('preparation reply held at renderer boundary','!!checks.release');
   const cancels = await evaluate('checks.requests.filter(n=>n===11).length');
   await key('Escape','Escape',27);await evaluate('checks.release();true');
-  await expect('closed inflight preparation cancelled before recovery',`checks.requests.filter(n=>n===11).length===${cancels+1} && checks.snapshot?.sats==="1000" && !checks.active`);
+  await expect('closed inflight preparation cancelled before recovery',`checks.requests.filter(n=>n===11).length===${cancels+1} && checks.snapshot?.msats==="1000" && !checks.active`);
   if ((await counts()).melt_posts!==0) throw new Error('Abandoned review submitted payment');
   await openWallet();await openWithdraw();
   const paidInvoice = await invoice();await paste(paidInvoice);await reviewWithdrawal();
@@ -185,16 +188,15 @@ async function run() {
     const view=r.operation===13?r.value?.withdrawal:r.operation===10?r.value:null;
     return view?.quote_id===${JSON.stringify(paid.quote_id)}&&view.payment_status==='completed';
   })`);
-  // Native CDK primary test: zero-input-fee FakeWallet spends 64 for a 63-sat invoice.
-  // This fixture uses the same one-sat routing fee, so 21 sat settles at 978, not a reservation balance.
-  await expect('actual completed-payment balance is 978 sat','checks.snapshot?.sats==="978" && !checks.active');
-  const balance = await evaluate('checks.snapshot.sats');
+  // The first payment settles with a 1-msat fee in addition to the 21-msat invoice.
+  await expect('actual completed-payment balance is 978 msat','checks.snapshot?.msats==="978" && !checks.active');
+  const balance = await evaluate('checks.snapshot.msats');
   if ((await counts()).melt_posts!==1) throw new Error('Explicit payment was not exactly once');
   await row('Withdrawal',1);await row('Wallet',3);
   const paidHistory = `checks.history?.rows.some(r=>r.direction==='Out'&&r.id===${JSON.stringify(paid.quote_id)}&&r.payment_status==='completed'&&typeof r.quote_expiry==='string'&&/^[0-9]+$/.test(r.quote_expiry)&&r.expired===false&&typeof r.created_at==='string'&&/^[0-9]+$/.test(r.created_at))`;
   await expect('outgoing history persists completed status and expiry from CDK',paidHistory);
   const generation = await evaluate('checks.generation');await send('Page.reload');
-  await expect('reload rereads authoritative balance',`window.checks?.generation!==${JSON.stringify(generation)} && checks.snapshot?.sats===${JSON.stringify(balance)}`);
+  await expect('reload rereads authoritative balance',`window.checks?.generation!==${JSON.stringify(generation)} && checks.snapshot?.msats===${JSON.stringify(balance)}`);
   await evaluate('document.getElementById("canvas").focus()');await openWallet();await row('Wallet',3);
   await expect('withdrawal survives restart with completed status and expiry',`${paidHistory} && !checks.active`);
   const index = await evaluate(`checks.history.rows.findIndex(r=>r.id===${JSON.stringify(paid.quote_id)})`);
@@ -221,8 +223,8 @@ async function run() {
   if((await counts()).melt_posts!==2)throw new Error('Pending polling or reload duplicated POST');
   const release = await fetch(new URL('/test-withdrawal-mode?mode=paid',origin));
   if(!release.ok)throw new Error('Pending fixture release unavailable');
-  // The native fixture verifies CDK's second selection needs no paid routing fee: 957 sat.
-  await expect('released Pending completes through CDK checks without confirmation',`checks.replies.some(r=>(r.operation===13?r.value?.withdrawal:r.operation===12?r.value:null)?.quote_id===${JSON.stringify(pending.quote_id)}&&(r.operation===13?r.value?.withdrawal:r.value)?.payment_status==='completed') && checks.snapshot?.sats==='957' && !checks.active`);
+  // The second payment deducts only its 21-msat invoice from the settled balance.
+  await expect('released Pending completes through CDK checks without confirmation',`checks.replies.some(r=>(r.operation===13?r.value?.withdrawal:r.operation===12?r.value:null)?.quote_id===${JSON.stringify(pending.quote_id)}&&(r.operation===13?r.value?.withdrawal:r.value)?.payment_status==='completed') && checks.snapshot?.msats==='957' && !checks.active`);
   if((await counts()).melt_posts!==2)throw new Error('Recovery issued another payment POST');
   await expect('no uncaught renderer error or overlapping wallet request','!checks.errors && !checks.overlap');
 }
@@ -235,7 +237,7 @@ catch (_) {
     state = await bounded(evaluate(`(()=>{
       const c=window.checks;if(!c)return null;
       const id=value=>typeof value==='string'?value.slice(0,128).replace(/[^a-zA-Z0-9_.:/-]/g,'?'):null;
-      const balance=c.snapshot?.sats;
+      const balance=c.snapshot?.msats;
       return {active:c.active,overlap:c.overlap,errors:c.errors,
         knownBalance:typeof balance==='string'&&/^[0-9]{1,20}$/.test(balance)?balance:null,
         requests:c.requests.slice(-64),pendingFlags:{heldPrepare:!!c.release,holdNextPrepare:c.holdPrepare,recovery:c.recoveryPending,creationRecovery:c.creationRecovery},

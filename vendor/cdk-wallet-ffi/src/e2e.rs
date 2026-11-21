@@ -66,8 +66,7 @@ pub(crate) enum SwapFault {
 
 /// Start a fake mint on a random loopback port and return its URL.
 ///
-/// `input_fee_ppk` is applied to the Sat keyset so that every send pays a
-/// non-zero fee (one sat per input).
+/// `input_fee_ppk` is applied to the msat keyset (1000 costs one msat per input).
 pub(crate) async fn start_fake_mint(input_fee_ppk: u64) -> String {
     start_fake_mint_ctl(input_fee_ppk, SwapFault::None).await.0
 }
@@ -89,7 +88,7 @@ pub(crate) async fn start_fake_mint_counted(
     let mut builder = MintBuilder::new(db.clone());
     builder
         .configure_unit(
-            CurrencyUnit::Sat,
+            CurrencyUnit::Msat,
             UnitConfig {
                 amounts: (0..32).map(|i| 2u64.pow(i)).collect(),
                 input_fee_ppk,
@@ -105,11 +104,11 @@ pub(crate) async fn start_fake_mint_counted(
         HashMap::default(),
         HashSet::default(),
         0,
-        CurrencyUnit::Sat,
+        CurrencyUnit::Msat,
     );
     builder
         .add_payment_processor(
-            CurrencyUnit::Sat,
+            CurrencyUnit::Msat,
             PaymentMethod::Known(KnownMethod::Bolt11),
             MintMeltLimits::new(1, 10_000),
             Arc::new(fake),
@@ -281,7 +280,7 @@ async fn open_repo(db_path: &Path, seed: [u8; 64]) -> cdk::wallet::WalletReposit
         .unwrap()
 }
 
-/// Fund a wallet at `mint_url` by minting `amount` sats through the fake mint.
+/// Fund a wallet at `mint_url` by minting `amount` msats through the fake mint.
 ///
 /// The returned [`Wallet`] shares the database at `db_path` with the wrapper
 /// handle, so the minted proofs are visible to the wrapper.
@@ -296,7 +295,7 @@ pub(crate) async fn fund_wallet(
     let wallet = repo
         .get_or_create_wallet(
             MintUrl::from_str(mint_url).unwrap(),
-            CurrencyUnit::Sat,
+            CurrencyUnit::Msat,
             None,
         )
         .await
@@ -326,14 +325,14 @@ pub(crate) async fn fund_wallet(
     wallet
 }
 
-/// Create a token of `amount` sats from an already-funded database, using a
+/// Create a token of `amount` msats from an already-funded database, using a
 /// `SendKind::OnlineExact` send (same shape as the wrapper's own `send`).
 async fn make_token(db_path: &Path, seed: [u8; 64], mint_url: &str, amount: u64) -> String {
     let repo = open_repo(db_path, seed).await;
     let wallet = repo
         .get_or_create_wallet(
             MintUrl::from_str(mint_url).unwrap(),
-            CurrencyUnit::Sat,
+            CurrencyUnit::Msat,
             None,
         )
         .await
@@ -389,7 +388,7 @@ fn e2e_seed_restore_funds_and_spend() {
     crate::api::cdk_string_free(result.error);
     assert_eq!(result.status, CdkStatus::Ok, "restore failed: {error:?}");
     assert_eq!(result.incomplete, 0);
-    assert_eq!(result.unspent_sats, 1000);
+    assert_eq!(result.unspent_msats, 1000);
     let balances = block_on(restored.list_balances()).unwrap();
     assert_eq!(balances.len(), 1);
     assert_eq!(balances[0], (mint_url.clone(), 1000));
@@ -406,11 +405,11 @@ fn e2e_seed_restore_funds_and_spend() {
         "restore failed: {error:?}"
     );
     assert_eq!(other_result.incomplete, 0);
-    assert_eq!(other_result.unspent_sats, 0);
+    assert_eq!(other_result.unspent_msats, 0);
 
     let outcome = block_on(restored.send(&mint_url, 100, 1000)).unwrap();
     assert!(!outcome.token.is_empty());
-    assert_eq!(outcome.sender_fee_sats, 0);
+    assert_eq!(outcome.sender_fee_msats, 0);
     assert_eq!(block_on(restored.list_balances()).unwrap()[0].1, 900);
     drop(restored);
 
@@ -429,7 +428,7 @@ fn e2e_send_receive_roundtrip() {
     let mut a = open_wallet([11u8; 64], &path_a);
     block_on(a.add_mint(&mint_url)).unwrap();
 
-    // Fund the wrapper's database with 1000 sats through a second connection.
+    // Fund the wrapper's database with 1000 msats through a second connection.
     block_on(fund_wallet(
         &path_a,
         [11u8; 64],
@@ -443,10 +442,10 @@ fn e2e_send_receive_roundtrip() {
     assert_eq!(balances[0].0, mint_url);
     assert_eq!(balances[0].1, 1000);
 
-    // Send 100 sats, allowing a generous fee. With a zero-fee mint the sender
+    // Send 100 msats, allowing a generous fee. With a zero-fee mint the sender
     // fee is zero and the recipient receives the full face value.
     let outcome = block_on(a.send(&mint_url, 100, 1000)).unwrap();
-    assert_eq!(outcome.sender_fee_sats, 0);
+    assert_eq!(outcome.sender_fee_msats, 0);
 
     // Receive into a second, independent wrapper wallet.
     let mut b = open_wallet([22u8; 64], &path_b);
@@ -466,8 +465,8 @@ fn e2e_fee_limit_cancels_and_preserves_balance() {
 
     let mut handle = open_wallet([33u8; 64], &path);
     block_on(handle.add_mint(&mint_url)).unwrap();
-    // A single 512-sat proof: sending 300 must swap it, which costs one input
-    // fee (one sat at ppk = 1000), so a zero ceiling must cancel the send.
+    // A single 512-msat proof: sending 300 must swap it, which costs one input
+    // fee (one msat at ppk = 1000), so a zero ceiling must cancel the send.
     block_on(fund_wallet(
         &path,
         [33u8; 64],
@@ -480,7 +479,7 @@ fn e2e_fee_limit_cancels_and_preserves_balance() {
     assert_eq!(err.status, CdkStatus::FeeLimitExceeded);
     assert!(err.operation_id.is_some(), "cancelled send keeps its op id");
     assert!(
-        err.sender_fee_sats >= 1,
+        err.sender_fee_msats >= 1,
         "the reported fee should be non-zero"
     );
 
@@ -544,7 +543,7 @@ fn e2e_unknown_mint_token_rejected_before_network() {
         MintUrl::from_str("http://127.0.0.1:1").unwrap(),
         proofs.clone(),
         None,
-        Some(CurrencyUnit::Sat),
+        Some(CurrencyUnit::Msat),
     )
     .unwrap();
     let err = block_on(handle.receive(&unknown.to_string())).unwrap_err();
@@ -576,14 +575,46 @@ fn e2e_multi_mint_and_wrong_unit_tokens_rejected() {
             TokenV3Token::new(b, proofs.clone()),
         ],
         memo: None,
-        unit: Some(CurrencyUnit::Sat),
+        unit: Some(CurrencyUnit::Msat),
     };
     let err = block_on(handle.receive(&multi.to_string())).unwrap_err();
     assert_eq!(err.status, CdkStatus::UnsupportedToken);
 
-    let wrong_unit = TokenV3::new(a, proofs, None, Some(CurrencyUnit::Usd)).unwrap();
-    let err = block_on(handle.receive(&wrong_unit.to_string())).unwrap_err();
-    assert_eq!(err.status, CdkStatus::UnsupportedToken);
+    for unit in [Some(CurrencyUnit::Sat), None] {
+        let wrong_unit = TokenV3::new(a.clone(), proofs.clone(), None, unit).unwrap();
+        let err = block_on(handle.receive(&wrong_unit.to_string())).unwrap_err();
+        assert_eq!(err.status, CdkStatus::UnsupportedToken);
+    }
+}
+
+#[test]
+fn mint_check_requires_a_live_active_msat_keyset() {
+    block_on(async {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+
+        let active_msat = Arc::new(AtomicBool::new(false));
+        let mint_state = active_msat.clone();
+        let app = Router::new().route("/v1/keysets", get(move || {
+            let active = mint_state.load(Ordering::SeqCst);
+            async move {
+                Json(json!({"keysets": [
+                    {"id":"0085070c8d13121a", "unit":"sat", "active":true},
+                    {"id":"009a1f293253e41e", "unit":"msat", "active":active}
+                ]}))
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let err = crate::wallet::check_mint_keysets(&mint).await.unwrap_err();
+        assert_eq!(err.status, CdkStatus::MintUnsupportedUnit);
+        active_msat.store(true, Ordering::SeqCst);
+        crate::wallet::check_mint_keysets(&mint).await.unwrap();
+        active_msat.store(false, Ordering::SeqCst);
+        assert_eq!(crate::wallet::check_mint_keysets(&mint).await.unwrap_err().status, CdkStatus::MintUnsupportedUnit);
+        server.abort();
+    });
 }
 
 #[test]
@@ -816,7 +847,7 @@ fn e2e_interrupted_prepare_is_compensated_on_reopen() {
 
 #[test]
 fn e2e_fee_charging_receive_nets_less_than_face() {
-    // 1 sat of input fee per proof.
+    // 1 msat of input fee per proof.
     let mint_url = block_on(start_fake_mint(1000));
     let (_dir_w, path_w) = temp_db();
     let (_dir, path) = temp_db();
@@ -830,7 +861,7 @@ fn e2e_fee_charging_receive_nets_less_than_face() {
     ));
     let token = block_on(make_token(&path_w, [96u8; 64], &mint_url, 100));
 
-    // Count the proofs in the token; the receiver pays one sat per proof.
+    // Count the proofs in the token; the receiver pays one msat per proof.
     let parsed = Token::from_str(&token).unwrap();
     let proof_count: u64 = match &parsed {
         Token::TokenV3(v3) => v3.token.iter().map(|t| t.proofs.len() as u64).sum(),
@@ -1075,7 +1106,7 @@ struct FundedChannel {
 /// Fund a channel end to end through the wallet ABI.
 ///
 /// `handle` must already be open over the wallet database, have `mint_url`
-/// approved, and hold at least `capacity` sats of spendable funds. The required
+/// approved, and hold at least `capacity` msats of spendable funds. The required
 /// funding-token amount is computed from the mint's active keyset and then
 /// created with `handle.send`, so the resulting channel is funded from the
 /// wrapper's own CDK wallet rather than a raw test helper.
@@ -1120,12 +1151,12 @@ fn fund_channel(
         CdkStatus::Ok,
         "unexpected status: {funding_error:?}"
     );
-    assert_eq!(funding.net_sats, capacity);
-    let required_sats = funding.net_sats;
+    assert_eq!(funding.amount, capacity);
+    let required_msats = funding.amount;
 
     // Alice's own CDK wallet creates the funding token; the sent proofs are
     // reserved locally, exactly as the channel funding swap will consume them.
-    let token = block_on(handle.send(mint_url, required_sats, 10))
+    let token = block_on(handle.send(mint_url, required_msats, 10))
         .expect("wallet send for channel funding must succeed")
         .token;
 
@@ -1216,7 +1247,7 @@ fn spilman_channel_full_lifecycle_cooperative_close_and_receive() {
     // helper funds it over the same file.
     let mut handle = open_wallet(seed, &path);
     block_on(handle.add_mint(&mint_url)).unwrap();
-    // Fund Alice's wallet with 200 sats: 100 to fund the channel and 100 kept
+    // Fund Alice's wallet with 200 msats: 100 to fund the channel and 100 kept
     // behind so the wallet half of the handoff is observable.
     block_on(fund_wallet(
         &path,
@@ -1229,7 +1260,7 @@ fn spilman_channel_full_lifecycle_cooperative_close_and_receive() {
     let mut channel = fund_channel(handle, &mint_url, 100, now_seconds() + 3600);
     assert_eq!(
         channel.capacity, 100,
-        "channel must be funded with 100 sats"
+        "channel must be funded with 100 msats"
     );
 
     // The funding proofs form a valid, verifiable channel.
@@ -1365,7 +1396,7 @@ fn spilman_channel_full_lifecycle_cooperative_close_and_receive() {
         CdkStatus::Ok,
         "receive of close proofs failed: {receive_error:?}"
     );
-    assert_eq!(received.net_sats, balance);
+    assert_eq!(received.net_msats, balance);
 
     // The sender reclaims the remainder, signing with Alice's P2PK key.
     let sender_proofs_json = serde_json::to_string(&closed.sender).unwrap();
@@ -1385,9 +1416,9 @@ fn spilman_channel_full_lifecycle_cooperative_close_and_receive() {
         CdkStatus::Ok,
         "receive of sender proofs failed: {receive_sender_error:?}"
     );
-    assert_eq!(received_sender.net_sats, channel.capacity - balance);
+    assert_eq!(received_sender.net_msats, channel.capacity - balance);
 
-    // The handoff is now observable on both sides: Charlie holds the 70 sats he
+    // The handoff is now observable on both sides: Charlie holds the 70 msats he
     // received, and Alice's wallet holds the 100 she kept plus the 30 the close
     // returned to her.
     let charlie_balance = block_on(charlie_wallet.list_balances()).unwrap();
@@ -1410,7 +1441,7 @@ fn spilman_channel_post_expiry_sender_refund() {
 
     let mut handle = open_wallet(seed, &path);
     block_on(handle.add_mint(&mint_url)).unwrap();
-    // Fund Alice's wallet with 200 sats: 100 to fund the channel and 100 kept
+    // Fund Alice's wallet with 200 msats: 100 to fund the channel and 100 kept
     // behind so the refund's effect on her wallet is observable.
     block_on(fund_wallet(
         &path,
@@ -1425,7 +1456,7 @@ fn spilman_channel_post_expiry_sender_refund() {
     let mut channel = fund_channel(handle, &mint_url, 100, expiry);
     assert_eq!(
         channel.capacity, 100,
-        "channel must be funded with 100 sats"
+        "channel must be funded with 100 msats"
     );
 
     // Pass `NULL` for the derivation context to exercise the default
@@ -1469,7 +1500,7 @@ fn spilman_channel_post_expiry_sender_refund() {
     // Round-trip the refund proofs back into Alice's wallet as a cashuB token.
     let refund_token = take_string(crate::spilman::cdk_spilman_build_cashu_b_token(
         Some(cstr_ref(&with_nul(&mint_url))),
-        Some(cstr_ref(&with_nul("sat"))),
+        Some(cstr_ref(&with_nul("msat"))),
         Some(cstr_ref(&with_nul(&refund))),
     ));
     let received = crate::spilman::cdk_wallet_receive_with_keys(
@@ -1484,7 +1515,7 @@ fn spilman_channel_post_expiry_sender_refund() {
         CdkStatus::Ok,
         "receive of refund failed: {receive_error:?}"
     );
-    assert_eq!(received.net_sats, total);
+    assert_eq!(received.net_msats, total);
 
     // The refund makes Alice whole again: the 100 she kept plus the full refund.
     let restored = block_on(channel.handle.list_balances()).unwrap();

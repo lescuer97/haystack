@@ -39,6 +39,11 @@ pub const callback_sig = *const fn (status: c_int, tile_grid: c_int, chunk_borde
 extern "c" fn haystack_storage_start(callback: callback_sig, default_tile_grid: c_int, default_chunk_borders: c_int) void;
 extern "c" fn haystack_storage_save(tile_grid: c_int, chunk_borders: c_int) void;
 extern "c" fn haystack_storage_reset() void;
+extern "c" fn haystack_storage_close() void;
+
+pub fn close() void {
+    haystack_storage_close();
+}
 
 /// Start the Web Lock + settings load. The callback runs exactly once from the
 /// JS async continuation. Built-in defaults are passed across so a missing or

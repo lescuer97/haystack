@@ -414,13 +414,13 @@ const id = 'a'.repeat(32);
 const scanning = {version: 1, revision: 0, step: 'scanning', id, fingerprint: 'c'.repeat(64), mint: 'https://mint.invalid'};
 await platform.stageOnboardingWallet(USER, id, MNEMONIC, 'stage-state', scanning, '[]');
 const first = JSON.parse(await platform.loadOnboardingSnapshot());
-const resultMarker = {version: 1, revision: 1, step: 'result', id, fingerprint: 'c'.repeat(64), mint: 'https://mint.invalid', spendable_sats: '0', pending_sats: '0', spent_sats: '0'};
+const resultMarker = {version: 1, revision: 1, step: 'result', id, fingerprint: 'c'.repeat(64), mint: 'https://mint.invalid', spendable_msats: '0', pending_msats: '0', spent_msats: '0'};
 await platform.updateOnboardingScan(USER, {marker: first.marker, state: {revision: 0, data: 'stage-state'}, mnemonic: MNEMONIC, retired: '[]'}, resultMarker);
 const second = JSON.parse(await platform.loadOnboardingSnapshot());
 const snapshot = {marker: second.marker, state: {revision: 0, data: 'stage-state'}, mnemonic: MNEMONIC, retired: '[]'};
 const replacement = {mnemonic: OTHER_MNEMONIC, state: 'replacement-state', marker: {version: 1, revision: 0, step: 'backup_seed', fingerprint: 'd'.repeat(64)}};
 const generation = platform.generateOnboardingWallet(USER, snapshot, replacement);
-snapshot.marker.spendable_sats = '5';
+snapshot.marker.spendable_msats = '5';
 snapshot.state.data = 'swapped';
 replacement.state = 'swapped';
 replacement.marker.fingerprint = 'e'.repeat(64);
@@ -432,7 +432,7 @@ eq(await rawGet(database, 'states', USER), {revision: 0, data: 'replacement-stat
 eq(await rawGet(database, 'onboarding', USER), {version: 1, revision: 0, step: 'backup_seed', fingerprint: 'd'.repeat(64)}, 'replacement marker swapped');
 eq(await rawGet(database, 'onboarding', 'retired:' + id), {
   version: 1, step: 'retired', id, fingerprint: 'c'.repeat(64), mint: 'https://mint.invalid',
-  spendable_sats: '0', pending_sats: '0', spent_sats: '0',
+  spendable_msats: '0', pending_msats: '0', spent_msats: '0',
 }, 'retired marker swapped');
 const STAGE = 'haystack-recovery-' + id;
 eq(await rawKeys(database, 'mnemonics'), [STAGE, USER].sort(), 'staged mnemonic missing');

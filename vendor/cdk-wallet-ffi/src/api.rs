@@ -181,7 +181,7 @@ pub(crate) fn receive_error(status: CdkStatus, message: impl Into<String>) -> Cd
     CdkReceiveResult {
         status,
         error: string_to_box(message.into()),
-        net_sats: 0,
+        net_msats: 0,
     }
 }
 
@@ -227,29 +227,29 @@ fn seed_restore_error(status: CdkStatus, message: impl Into<String>) -> CdkSeedR
         status,
         error: string_to_box(message.into()),
         incomplete: 1,
-        unspent_sats: 0,
-        pending_sats: 0,
-        spent_sats: 0,
+        unspent_msats: 0,
+        pending_msats: 0,
+        spent_msats: 0,
     }
 }
 
 fn send_error(e: FfiErr) -> CdkSendResult {
     match e.operation_id {
-        Some(op) => CdkSendResult::err_with_op(e.status, e.message, op, e.sender_fee_sats),
+        Some(op) => CdkSendResult::err_with_op(e.status, e.message, op, e.sender_fee_msats),
         None => CdkSendResult::err(e.status, e.message),
     }
 }
 
 /// Deposit/history adapter. Arguments and results are JSON strings containing
 /// decimal-string amounts; returned strings use the ordinary Rust string free.
-/// Operations: create_deposit [mint, sats], check_deposit [mint, quote_id] (expired-unpaid is local-only),
+/// Operations: create_deposit [mint, msats], check_deposit [mint, quote_id] (expired-unpaid is local-only),
 /// unfinished_deposits [mint], quote_history [] (generic compatibility),
 /// wallet_screen [mint] (small selected balance/recovery status),
 /// quote_history_page [offset], resume_deposit [mint] (newest non-expired unfinished),
 /// poll_deposits [mint, after_id] (one background check, never creates),
 /// recover_deposit [mint] (local reconciliation only, never a quote POST).
 /// deposit_update [mint, check|poll|recover, id|cursor|empty] returns bounded application recovery metadata,
-/// saved_invoice [mint, id] reads one exact local Sat/BOLT11 quote without network or recovery.
+/// saved_invoice [mint, id] reads one exact local Msat/BOLT11 quote without network or recovery.
 /// prepare_withdrawal [mint, invoice] reserves CDK proofs for review, never pays;
 /// confirm_withdrawal [mint, operation_uuid] consumes that review exactly once;
 /// cancel_withdrawal [mint, operation_uuid] releases the CDK reservation;
@@ -426,10 +426,29 @@ pub fn cdk_wallet_close(handle: Option<repr_c::Box<crate::wallet::CdkWallet>>) -
     )
 }
 
+/// Check that the mint currently advertises an active msat keyset over NUT-02.
+/// Does not open or mutate a wallet.
+#[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cdk_wallet_check_mint_keysets(mint_url: Option<char_p::Ref<'_>>) -> CdkStatusResult {
+    guard(
+        || CdkStatusResult::err(CdkStatus::InternalError, "internal panic"),
+        || {
+            let result = opt_cstr_to_string(mint_url).and_then(|url| {
+                crate::wallet::runtime().block_on(crate::wallet::check_mint_keysets(&url))
+            });
+            match result {
+                Ok(()) => CdkStatusResult::ok(),
+                Err(e) => CdkStatusResult::err(e.status, e.message),
+            }
+        },
+    )
+}
+
 /// Approve (register) a mint.
 ///
-/// Idempotent for an already-approved mint. Requires network access to fetch
-/// the mint's advertised units.
+/// Idempotent for an already-approved msat wallet. Requires network access to
+/// fetch the mint's keysets and payment settings otherwise.
 #[ffi_export]
 #[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_add_mint(
@@ -487,7 +506,7 @@ pub fn cdk_wallet_list_mints(handle: Option<&crate::wallet::CdkWallet>) -> CdkMi
     )
 }
 
-/// List approved mints with their locally spendable Sat balance.
+/// List approved mints with their locally spendable Msat balance.
 #[ffi_export]
 #[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_list_balances(handle: Option<&crate::wallet::CdkWallet>) -> CdkBalanceListResult {
@@ -507,9 +526,9 @@ pub fn cdk_wallet_list_balances(handle: Option<&crate::wallet::CdkWallet>) -> Cd
                 Ok(entries) => {
                     let balances = entries
                         .into_iter()
-                        .map(|(mint_url, balance_sats)| CdkBalanceEntry {
+                        .map(|(mint_url, balance_msats)| CdkBalanceEntry {
                             mint_url: char_p::new(mint_url),
-                            balance_sats,
+                            balance_msats,
                         })
                         .collect::<Vec<_>>();
                     CdkBalanceListResult {
@@ -524,7 +543,7 @@ pub fn cdk_wallet_list_balances(handle: Option<&crate::wallet::CdkWallet>) -> Cd
     )
 }
 
-/// Receive a token, returning the net Sat amount credited.
+/// Receive a token, returning the net Msat amount credited.
 #[ffi_export]
 #[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_receive(
@@ -548,10 +567,10 @@ pub fn cdk_wallet_receive(
                 Err(e) => return receive_error(e.status, e.message),
             };
             match crate::wallet::runtime().block_on(handle.receive(&token)) {
-                Ok(net_sats) => CdkReceiveResult {
+                Ok(net_msats) => CdkReceiveResult {
                     status: CdkStatus::Ok,
                     error: None,
-                    net_sats,
+                    net_msats,
                 },
                 Err(e) => receive_error(e.status, e.message),
             }
@@ -559,9 +578,9 @@ pub fn cdk_wallet_receive(
     )
 }
 
-/// Send `amount_sats` from an explicitly selected mint.
+/// Send `amount_msats` from an explicitly selected mint.
 ///
-/// The total send fee must not exceed `max_sender_fee_sats`, otherwise the send
+/// The total send fee must not exceed `max_sender_fee_msats`, otherwise the send
 /// is cancelled. On success the returned `token` is a bearer secret owned by
 /// the caller and must be freed with [`cdk_string_free`].
 #[ffi_export]
@@ -569,8 +588,8 @@ pub fn cdk_wallet_receive(
 pub fn cdk_wallet_send(
     handle: Option<&mut crate::wallet::CdkWallet>,
     mint_url: Option<char_p::Ref<'_>>,
-    amount_sats: u64,
-    max_sender_fee_sats: u64,
+    amount_msats: u64,
+    max_sender_fee_msats: u64,
 ) -> CdkSendResult {
     let poison = handle.as_ref().map(|h| h.poison_flag());
     guard_poison(
@@ -590,15 +609,15 @@ pub fn cdk_wallet_send(
             };
             match crate::wallet::runtime().block_on(handle.send(
                 &url,
-                amount_sats,
-                max_sender_fee_sats,
+                amount_msats,
+                max_sender_fee_msats,
             )) {
                 Ok(outcome) => CdkSendResult {
                     status: CdkStatus::Ok,
                     error: None,
                     token: string_to_box(outcome.token),
                     operation_id: outcome.operation_id,
-                    sender_fee_sats: outcome.sender_fee_sats,
+                    sender_fee_msats: outcome.sender_fee_msats,
                 },
                 Err(e) => send_error(e),
             }
@@ -726,7 +745,7 @@ pub fn cdk_wallet_restore_can_abandon(
     )
 }
 
-/// Scan a Sat mint for deterministic seed-derived proofs using NUT-13.
+/// Scan a Msat mint for deterministic seed-derived proofs using NUT-13.
 /// This is not saga recovery. Failure may leave previously restored proofs in
 /// the database; totals are valid only when the scan completed. Free `error`
 /// with `cdk_string_free`.
@@ -753,13 +772,13 @@ pub fn cdk_wallet_restore_seed(
                 Err(e) => return seed_restore_error(e.status, e.message),
             };
             match crate::wallet::runtime().block_on(handle.restore_seed(&url)) {
-                Ok((unspent_sats, pending_sats, spent_sats)) => CdkSeedRestoreResult {
+                Ok((unspent_msats, pending_msats, spent_msats)) => CdkSeedRestoreResult {
                     status: CdkStatus::Ok,
                     error: None,
                     incomplete: 0,
-                    unspent_sats,
-                    pending_sats,
-                    spent_sats,
+                    unspent_msats,
+                    pending_msats,
+                    spent_msats,
                 },
                 Err(e) => seed_restore_error(e.status, e.message),
             }

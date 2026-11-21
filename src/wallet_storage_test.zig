@@ -39,7 +39,7 @@ test "application worker owns one locked handle across reads and joins before re
             try testing.io.sleep(.fromMilliseconds(20), .awake);
         }
         try testing.expect(model.available and !model.pending);
-        try testing.expectEqualStrings("0 sat", model.balance.slice());
+        try testing.expectEqualStrings("0 msat", model.balance.slice());
         try testing.expectError(error.CdkFailure, wallet.inspect(testing.io, testing.allocator, h.paths, true));
         try testing.expect(model.enqueue(.snapshot, ""));
         for (0..250) |_| {

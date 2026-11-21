@@ -21,6 +21,17 @@ const std = @import("std");
 pub const c = @import("cdk_c");
 pub const app_mint: [:0]const u8 = @import("app_options").mint ++ "";
 
+/// Fail startup before opening a wallet if the configured mint cannot issue msats.
+pub fn requireAppMint() !void {
+    const result = c.cdk_wallet_check_mint_keysets(app_mint);
+    defer c.cdk_string_free(result.@"error");
+    if (result.status != c.CDK_STATUS_OK) {
+        const message = if (result.@"error") |ptr| std.mem.span(ptr) else "unknown error";
+        std.log.err("wallet mint {s}: {s}", .{ app_mint, message });
+        return if (result.status == c.CDK_STATUS_MINT_UNSUPPORTED_UNIT) error.MintUnsupportedUnit else error.MintVerificationFailed;
+    }
+}
+
 /// The seed length, in bytes, required by `cdk_wallet_open`.
 pub const seed_len = 64;
 

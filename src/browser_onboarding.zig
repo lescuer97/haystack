@@ -211,7 +211,7 @@ fn decimal(obj: std.json.Value, name: []const u8) !u64 {
 
 fn report(obj: std.json.Value) !onboarding.RestoreReport {
     try exact(obj, 4);
-    return .{ .spendable_sats = try decimal(obj, "spendable_sats"), .pending_sats = try decimal(obj, "pending_sats"), .spent_sats = try decimal(obj, "spent_sats"), .can_generate_new = try boolean(obj, "can_generate_new") };
+    return .{ .spendable_msats = try decimal(obj, "spendable_msats"), .pending_msats = try decimal(obj, "pending_msats"), .spent_msats = try decimal(obj, "spent_msats"), .can_generate_new = try boolean(obj, "can_generate_new") };
 }
 
 /// Decode before delivery; no JSON or mnemonic is logged. Backup ownership is
@@ -372,10 +372,10 @@ test "strict event decoding and operation gating" {
         .{ .inspect, "{\"event\":\"ready\"}" },
         .{ .inspect, "{\"event\":\"blocked\"}" },
         .{ .inspect, "{\"event\":\"resume_failed\",\"can_generate_new\":false}" },
-        .{ .inspect, "{\"event\":\"resume_result\",\"report\":{\"spendable_sats\":\"18446744073709551615\",\"pending_sats\":\"0\",\"spent_sats\":\"1\",\"can_generate_new\":false}}" },
+        .{ .inspect, "{\"event\":\"resume_result\",\"report\":{\"spendable_msats\":\"18446744073709551615\",\"pending_msats\":\"0\",\"spent_msats\":\"1\",\"can_generate_new\":false}}" },
         .{ .restore, "{\"event\":\"invalid_phrase\"}" },
         .{ .retry, "{\"event\":\"restore_failed\",\"stage_created\":true,\"can_generate_new\":false}" },
-        .{ .restore, "{\"event\":\"restore_finished\",\"report\":{\"spendable_sats\":\"0\",\"pending_sats\":\"0\",\"spent_sats\":\"0\",\"can_generate_new\":true}}" },
+        .{ .restore, "{\"event\":\"restore_finished\",\"report\":{\"spendable_msats\":\"0\",\"pending_msats\":\"0\",\"spent_msats\":\"0\",\"can_generate_new\":true}}" },
         .{ .complete_backup, "{\"event\":\"complete_success\"}" },
         .{ .finish_restore, "{\"event\":\"complete_fail\"}" },
     };
@@ -389,8 +389,9 @@ test "strict event decoding and operation gating" {
         .{ .inspect, "{\"event\":\"choice\",\"recover_enabled\":false}" },
         .{ .inspect, "{\"event\":\"resume_failed\",\"can_generate_new\":true}" },
         .{ .restore, "{\"event\":\"restore_failed\",\"stage_created\":false,\"can_generate_new\":false}" },
-        .{ .inspect, "{\"event\":\"resume_result\",\"report\":{\"spendable_sats\":\"01\",\"pending_sats\":\"0\",\"spent_sats\":\"0\",\"can_generate_new\":false}}" },
-        .{ .inspect, "{\"event\":\"resume_result\",\"report\":{\"spendable_sats\":\"18446744073709551616\",\"pending_sats\":\"0\",\"spent_sats\":\"0\",\"can_generate_new\":false}}" },
+        .{ .inspect, "{\"event\":\"resume_result\",\"report\":{\"spendable_sats\":\"1\",\"pending_sats\":\"0\",\"spent_sats\":\"0\",\"can_generate_new\":false}}" },
+        .{ .inspect, "{\"event\":\"resume_result\",\"report\":{\"spendable_msats\":\"01\",\"pending_msats\":\"0\",\"spent_msats\":\"0\",\"can_generate_new\":false}}" },
+        .{ .inspect, "{\"event\":\"resume_result\",\"report\":{\"spendable_msats\":\"18446744073709551616\",\"pending_msats\":\"0\",\"spent_msats\":\"0\",\"can_generate_new\":false}}" },
         .{ .inspect, "{\"event\":\"ready\"}\xff" },
     };
     for (bad) |c| {

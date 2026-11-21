@@ -204,7 +204,7 @@ mod tests {
             mint_url: Some("http://127.0.0.1:1234".parse().unwrap()),
             unit: UNIT,
             amount: Amount::from(21),
-            request: test_invoice(Some(21_000), false),
+            request: test_invoice(Some(21), false),
             fee_reserve: Amount::from(1),
             state: MeltQuoteState::Unpaid,
             expiry: 0,
@@ -353,7 +353,7 @@ mod tests {
                     t.mint_url = s.mint_url.clone();
                 }
                 1 => {
-                    s.unit = CurrencyUnit::Msat;
+                    s.unit = CurrencyUnit::Sat;
                     t.unit = s.unit.clone();
                 }
                 2 => {
@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn withdrawal_validation_prefix_and_bounds() {
-        let valid = cdk_fake_wallet::create_fake_invoice(21_000, "x".repeat(600)).to_string();
+        let valid = cdk_fake_wallet::create_fake_invoice(21, "x".repeat(600)).to_string();
         assert!(valid.len() > 1024 && valid.len() < 4096);
         assert_eq!(invoice(&format!("  LiGhTnInG:{valid}  ")).unwrap(), valid);
         for text in [
@@ -717,7 +717,7 @@ mod tests {
             64,
             SplitTarget::default(),
         ));
-        let request = cdk_fake_wallet::create_fake_invoice(63_000, "x".repeat(600)).to_string();
+        let request = cdk_fake_wallet::create_fake_invoice(63, "x".repeat(600)).to_string();
         let call = |h: &mut CdkWallet, operation: &str, raw: String| {
             let op: char_p::Box = operation.to_owned().try_into().unwrap();
             let args: char_p::Box = raw.try_into().unwrap();
@@ -827,7 +827,7 @@ mod tests {
             h.add_mint(&mint).await.unwrap();
             // Single primary denomination avoids upstream nested-swap edge cases.
             let funding = fund_wallet(&path, [81; 64], &mint, 64, SplitTarget::default()).await;
-            let request = cdk_fake_wallet::create_fake_invoice(63_000, "x".repeat(600)).to_string();
+            let request = cdk_fake_wallet::create_fake_invoice(63, "x".repeat(600)).to_string();
             for bad in [
                 "bad".to_owned(),
                 test_invoice(None, false),
@@ -861,7 +861,7 @@ mod tests {
             assert!(!reserved.is_empty());
             let gets = counts.gets.load(Ordering::SeqCst);
             let screen = value(h.wallet_screen(&mint).await.unwrap());
-            assert_eq!(screen["sats"], "0");
+            assert_eq!(screen["msats"], "0");
             assert_eq!(screen["creation_recovery"], "none");
             let history = value(h.quote_history_page("0").await.unwrap());
             assert!(history["rows"]
@@ -921,7 +921,7 @@ mod tests {
             assert_eq!(counts.posts(), 0);
             h.cancel_withdrawal(&mint, token).await.unwrap();
             assert_eq!(funding.total_balance().await.unwrap().to_u64(), 64);
-            assert_eq!(value(h.wallet_screen(&mint).await.unwrap())["sats"], "64");
+            assert_eq!(value(h.wallet_screen(&mint).await.unwrap())["msats"], "64");
             assert!(h.confirm_withdrawal(&mint, token).await.is_err());
             let review = value(h.prepare_withdrawal(&mint, &request).await.unwrap());
             let token = review["operation_id"].as_str().unwrap();
@@ -988,10 +988,10 @@ mod tests {
                 .unwrap();
             h.add_mint(&mint).await.unwrap();
             let funding = fund_wallet(&path, [82; 64], &mint, 64, SplitTarget::default()).await;
-            let expensive = cdk_fake_wallet::create_fake_invoice(63_000, String::new()).to_string();
+            let expensive = cdk_fake_wallet::create_fake_invoice(63, String::new()).to_string();
             assert!(h.prepare_withdrawal(&mint, &expensive).await.is_err());
             assert_eq!(counts.posts(), 0);
-            let request = cdk_fake_wallet::create_fake_invoice(31_000, String::new()).to_string();
+            let request = cdk_fake_wallet::create_fake_invoice(31, String::new()).to_string();
             let review = value(h.prepare_withdrawal(&mint, &request).await.unwrap());
             assert_eq!(review["input_fee"], "1");
             let token = review["operation_id"].as_str().unwrap();
@@ -1004,7 +1004,7 @@ mod tests {
             assert_eq!(counts.posts(), 0);
             assert_eq!(funding.total_balance().await.unwrap().to_u64(), 64);
             let request =
-                cdk_fake_wallet::create_fake_invoice(31_000, "another".into()).to_string();
+                cdk_fake_wallet::create_fake_invoice(31, "another".into()).to_string();
             let review = value(h.prepare_withdrawal(&mint, &request).await.unwrap());
             h.unresolved.insert(mint.parse().unwrap());
             h.cancel_withdrawal(&mint, review["operation_id"].as_str().unwrap())
@@ -1029,7 +1029,7 @@ mod tests {
                 h.add_mint(&mint).await.unwrap();
                 let funding = fund_wallet(&path, [87; 64], &mint, 64, SplitTarget::default()).await;
                 let request =
-                    cdk_fake_wallet::create_fake_invoice(63_000, String::new()).to_string();
+                    cdk_fake_wallet::create_fake_invoice(63, String::new()).to_string();
                 let review = value(h.prepare_withdrawal(&mint, &request).await.unwrap());
                 let token = review["operation_id"].as_str().unwrap();
                 let operation = Uuid::parse_str(token).unwrap();
@@ -1180,7 +1180,7 @@ mod tests {
                     description.push_str(&" ".repeat(600 - description.len()));
                     description
                 } else { "x".repeat(600) };
-                let request = cdk_fake_wallet::create_fake_invoice(21_000, description).to_string();
+                let request = cdk_fake_wallet::create_fake_invoice(21, description).to_string();
                 let review = value(h.prepare_withdrawal(&mint, &request).await.unwrap());
                 let id = review["quote_id"].as_str().unwrap();
                 if !pending {
@@ -1211,7 +1211,7 @@ mod tests {
                 let balance = funding.total_balance().await.unwrap().to_u64();
                 assert_eq!(balance, if pending { 957 } else { 978 });
                 assert_eq!(outgoing.fee.to_u64(), if pending { 0 } else { 1 });
-                println!("default 21-sat withdrawal {}: balance={balance}, CDK outgoing fee={}, review reserve={}, swap_fee={}, input_fee={}", index + 1, outgoing.fee.to_u64(), review["fee_reserve"], review["swap_fee"], review["input_fee"]);
+                println!("default 21-msat withdrawal {}: balance={balance}, CDK outgoing fee={}, review reserve={}, swap_fee={}, input_fee={}", index + 1, outgoing.fee.to_u64(), review["fee_reserve"], review["swap_fee"], review["input_fee"]);
                 assert_eq!(counts.posts(), index + 1);
             }
             server.abort();
@@ -1237,7 +1237,7 @@ mod tests {
                 check_err: false,
             })
             .unwrap();
-            let request = cdk_fake_wallet::create_fake_invoice(63_000, description).to_string();
+            let request = cdk_fake_wallet::create_fake_invoice(63, description).to_string();
             let review = value(h.prepare_withdrawal(&mint, &request).await.unwrap());
             let id = review["quote_id"].as_str().unwrap();
             counts.hold.store(true, Ordering::SeqCst);
@@ -1545,7 +1545,7 @@ impl CdkWallet {
             .and_then(|v| v.checked_add(p.input_fee.to_u64()))
             .ok_or_else(|| invalid("withdrawal estimate overflow"))?;
         bounded(
-            json!({"operation_id":p.operation_id.to_string(),"quote_id":q.id,"mint_url":p.wallet.mint_url.to_string(),"invoice":q.request,"unit":"sat","amount":q.amount.to_u64().to_string(),"fee_reserve":q.fee_reserve.to_u64().to_string(),"swap_fee":p.swap_fee.to_u64().to_string(),"input_fee":p.input_fee.to_u64().to_string(),"estimated_total":total.to_string(),"quote_expiry":q.expiry.to_string(),"invoice_expiry":invoice_expiry(&q.request).map(|n| n.to_string()).ok_or_else(|| invalid("invalid prepared invoice"))?,"requires_swap":!p.proofs_to_swap.is_empty()}),
+            json!({"operation_id":p.operation_id.to_string(),"quote_id":q.id,"mint_url":p.wallet.mint_url.to_string(),"invoice":q.request,"unit":"msat","amount":q.amount.to_u64().to_string(),"fee_reserve":q.fee_reserve.to_u64().to_string(),"swap_fee":p.swap_fee.to_u64().to_string(),"input_fee":p.input_fee.to_u64().to_string(),"estimated_total":total.to_string(),"quote_expiry":q.expiry.to_string(),"invoice_expiry":invoice_expiry(&q.request).map(|n| n.to_string()).ok_or_else(|| invalid("invalid prepared invoice"))?,"requires_swap":!p.proofs_to_swap.is_empty()}),
         )
     }
 

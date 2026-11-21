@@ -20,7 +20,7 @@ pub const View = struct {
 
     pub fn parse(value: std.json.Value, mint: []const u8, prepared: bool) !View {
         var result: View = .{};
-        if (!std.mem.eql(u8, try string(value, "mint_url"), mint) or !std.mem.eql(u8, try string(value, "unit"), "sat")) return error.Invalid;
+        if (!std.mem.eql(u8, try string(value, "mint_url"), mint) or !std.mem.eql(u8, try string(value, "unit"), "msat")) return error.Invalid;
         try put(&result.quote_id, try string(value, "quote_id"));
         try put(&result.invoice, try string(value, "invoice"));
         try number(&result.amount, try string(value, "amount"));

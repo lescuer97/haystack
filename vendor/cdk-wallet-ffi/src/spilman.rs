@@ -36,7 +36,7 @@ use crate::api::{
     guard, guard_poison, null_handle, opt_cstr_to_string_bounded, poisoned_handle, receive_error,
 };
 use crate::status::{
-    string_to_box, CdkReceiveResult, CdkSpilmanCloseResult, CdkSpilmanKeypairResult, CdkStatus,
+    string_to_box, CdkReceiveResult, CdkSpilmanAmountResult, CdkSpilmanCloseResult, CdkSpilmanKeypairResult, CdkStatus,
     CdkStatusResult, CdkStringResult,
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -126,12 +126,12 @@ fn spilman_string(result: Result<String, String>) -> CdkStringResult {
     }
 }
 
-/// A success [`CdkReceiveResult`] carrying `net_sats`.
-fn receive_sats(net_sats: u64) -> CdkReceiveResult {
+/// A success [`CdkReceiveResult`] carrying `net_msats`.
+fn receive_msats(net_msats: u64) -> CdkReceiveResult {
     CdkReceiveResult {
         status: CdkStatus::Ok,
         error: None,
-        net_sats,
+        net_msats,
     }
 }
 
@@ -759,7 +759,7 @@ fn verify_balance_update_result(
 // Wallet-backed exports
 // ---------------------------------------------------------------------------
 
-/// Return the mint's active Sat keyset as Spilman `KeysetInfo` JSON.
+/// Return the mint's active Msat keyset as Spilman `KeysetInfo` JSON.
 #[ffi_export]
 #[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_get_active_keyset_info_json(
@@ -790,7 +790,7 @@ pub fn cdk_wallet_get_active_keyset_info_json(
     )
 }
 
-/// Return a single Sat keyset, by id, as Spilman `KeysetInfo` JSON.
+/// Return a single Msat keyset, by id, as Spilman `KeysetInfo` JSON.
 #[ffi_export]
 #[cfg(not(target_arch = "wasm32"))]
 pub fn cdk_wallet_get_keyset_info_json(
@@ -891,7 +891,7 @@ pub fn cdk_wallet_receive_with_keys(
                 Err(e) => return receive_error(e.status, e.message),
             };
             match runtime().block_on(handle.receive_with_keys(&token, &signing_keys)) {
-                Ok(net_sats) => receive_sats(net_sats),
+                Ok(net_msats) => receive_msats(net_msats),
                 Err(e) => receive_error(e.status, e.message),
             }
         },
@@ -941,7 +941,7 @@ pub fn cdk_wallet_receive_proofs(
                 Err(e) => return receive_error(e.status, e.message),
             };
             match runtime().block_on(handle.receive_proofs(&mint_url, proofs, &signing_keys)) {
-                Ok(net_sats) => receive_sats(net_sats),
+                Ok(net_msats) => receive_msats(net_msats),
                 Err(e) => receive_error(e.status, e.message),
             }
         },
@@ -1129,21 +1129,26 @@ pub fn cdk_spilman_compute_funding_token_amount(
     capacity: u64,
     keyset_info_json: Option<char_p::Ref<'_>>,
     maximum_amount_for_one_output: u64,
-) -> CdkReceiveResult {
+) -> CdkSpilmanAmountResult {
+    let error = |status, message: String| CdkSpilmanAmountResult {
+        status,
+        error: string_to_box(message),
+        amount: 0,
+    };
     guard(
-        || receive_error(CdkStatus::InternalError, "internal panic"),
+        || error(CdkStatus::InternalError, "internal panic".into()),
         || {
             let keyset_info_json = match json_arg(keyset_info_json, "keyset info") {
                 Ok(value) => value,
-                Err(e) => return receive_error(e.status, e.message),
+                Err(e) => return error(e.status, e.message),
             };
             match compute_funding_token_amount(
                 capacity,
                 &keyset_info_json,
                 maximum_amount_for_one_output,
             ) {
-                Ok(amount) => receive_sats(amount),
-                Err(e) => receive_error(CdkStatus::InvalidArgument, e),
+                Ok(amount) => CdkSpilmanAmountResult { status: CdkStatus::Ok, error: None, amount },
+                Err(e) => error(CdkStatus::InvalidArgument, e),
             }
         },
     )

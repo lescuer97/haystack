@@ -38,6 +38,7 @@ pub fn main(init: std.process.Init) !void {
     defer lock.release(init.io);
     startup_log.info("storage prepared and instance lock acquired", .{});
 
+    try native.wallet.cdk.requireAppMint();
     var wallet = try wallet_storage.open(init.io, init.gpa, locations);
     defer wallet.close() catch {};
     startup_log.info("wallet opened", .{});

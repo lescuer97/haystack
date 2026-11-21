@@ -87,7 +87,7 @@ fn large_history_bulk_read_loads_one_validated_store_and_preserves_records() {
             mint.clone(),
             PaymentMethod::BOLT11,
             Some(Amount::from(21)),
-            CurrencyUnit::Sat,
+            CurrencyUnit::Msat,
             "a".repeat(1024),
             0,
             None,
@@ -150,7 +150,7 @@ fn abandonment_audits_fresh_raw_snapshot_and_identity() {
         mint.clone(),
         method.clone(),
         Some(Amount::from(1)),
-        CurrencyUnit::Sat,
+        CurrencyUnit::Msat,
         "invoice".into(),
         1,
         None,
@@ -158,7 +158,7 @@ fn abandonment_audits_fresh_raw_snapshot_and_identity() {
     let melt = MeltQuote {
         id: "q".into(),
         mint_url: Some(mint.clone()),
-        unit: CurrencyUnit::Sat,
+        unit: CurrencyUnit::Msat,
         amount: Amount::from(1),
         request: "invoice".into(),
         fee_reserve: Amount::from(0),
@@ -176,7 +176,7 @@ fn abandonment_audits_fresh_raw_snapshot_and_identity() {
         direction: TransactionDirection::Incoming,
         amount: Amount::from(1),
         fee: Amount::from(0),
-        unit: CurrencyUnit::Sat,
+        unit: CurrencyUnit::Msat,
         ys: vec![secret.public_key()],
         timestamp: 1,
         memo: None,
@@ -193,7 +193,7 @@ fn abandonment_audits_fresh_raw_snapshot_and_identity() {
         WalletSagaState::Swap(SwapSagaState::ProofsReserved),
         Amount::from(1),
         mint.clone(),
-        CurrencyUnit::Sat,
+        CurrencyUnit::Msat,
         OperationData::Swap(SwapOperationData {
             input_amount: Amount::from(1),
             output_amount: Amount::from(1),
@@ -217,7 +217,7 @@ fn abandonment_audits_fresh_raw_snapshot_and_identity() {
         State::Reserved,
         State::PendingSpent,
     ] {
-        let info = ProofInfo::new(proof.clone(), mint.clone(), state, CurrencyUnit::Sat).unwrap();
+        let info = ProofInfo::new(proof.clone(), mint.clone(), state, CurrencyUnit::Msat).unwrap();
         let mut record: Value = serde_json::from_str(&valid).unwrap();
         record["proofs"] = json!({"raw": info});
         test_set_state(key, &record.to_string());

@@ -296,6 +296,11 @@ fn browserFrame() callconv(.c) void {
     if (browser_onboarding.take()) |value| {
         var result = value;
         defer std.crypto.secureZero(u8, &result.bytes);
+        if (result.op == .inspect and result.status == 1 and std.mem.eql(u8, result.bytes[0..result.len], "{\"event\":\"mint_unavailable\"}")) {
+            stopBrowser();
+            haystack_ui_result(0);
+            return;
+        }
         browser_onboarding.deliver(&result, &ctx.model);
         ctx.driver.invalidateInput();
     }
@@ -402,6 +407,7 @@ fn stopBrowser() void {
 
     ctx.connection.stop();
     browser_onboarding.close();
+    browser_storage.close();
     emscripten_cancel_main_loop();
     ctx.model.deinit();
     ctx.driver.deinit();
@@ -840,6 +846,8 @@ pub fn main() anyerror!void {
         return err;
     };
     defer storage_lock.release(io);
+
+    try native_wallet.cdk.requireAppMint();
 
     const loaded_config = config.load(io, allocator, locations.config_path);
     if (!loaded_config.autosaveAllowed()) {

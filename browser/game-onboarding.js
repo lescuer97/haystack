@@ -135,7 +135,9 @@ mergeInto(LibraryManager.library, {
           s.mint = mod.onboarding_mint();
           s.service = await mod.start_onboarding(s.mint);
           result = await s.service.request('inspect', '{}');
-        } catch (_) {}
+        } catch (error) {
+          if (error === 'mint-keyset-check-failed') result = '{"event":"mint_unavailable"}';
+        }
         self.deliver(callback, generation, 0, result, true);
       }).catch(function () {});
     },

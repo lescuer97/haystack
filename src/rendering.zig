@@ -982,9 +982,9 @@ fn drawWalletContent(state: *const menu.Menu, rect: menu.Rect) void {
         if (view.quote_id.len == 0) return;
         var buf: [1024:0]u8 = @splat(0);
         const text = if (model.reviewLive())
-            std.fmt.bufPrint(&buf, "Amount: {s} sat\nRouting fee reserve: {s} sat\nCashu swap fee: {s} sat | input fee: {s} sat\nEstimated total: {s} sat (not a guaranteed cap)\nQuote expiry (Unix): {s} | invoice expiry: {s}\nCDK status: {s} | quote: {s}{s}", .{ view.amount.slice(), view.fee_reserve.slice(), view.swap_fee.slice(), view.input_fee.slice(), view.estimated_total.slice(), view.quote_expiry.slice(), view.invoice_expiry.slice(), @tagName(view.status), view.quote_state.slice(), if (view.expired) " | expired" else "" }) catch "Details exceed display limit"
+            std.fmt.bufPrint(&buf, "Amount: {s} msat\nRouting fee reserve: {s} msat\nCashu swap fee: {s} msat | input fee: {s} msat\nEstimated total: {s} msat (not a guaranteed cap)\nQuote expiry (Unix): {s} | invoice expiry: {s}\nCDK status: {s} | quote: {s}{s}", .{ view.amount.slice(), view.fee_reserve.slice(), view.swap_fee.slice(), view.input_fee.slice(), view.estimated_total.slice(), view.quote_expiry.slice(), view.invoice_expiry.slice(), @tagName(view.status), view.quote_state.slice(), if (view.expired) " | expired" else "" }) catch "Details exceed display limit"
         else
-            std.fmt.bufPrint(&buf, "Amount: {s} sat\nQuote expiry (Unix): {s}\nInvoice expiry (Unix): {s}\nCDK status: {s} | quote: {s}{s}", .{ view.amount.slice(), view.quote_expiry.slice(), view.invoice_expiry.slice(), @tagName(view.status), view.quote_state.slice(), if (view.expired) " | expired" else "" }) catch "Details exceed display limit";
+            std.fmt.bufPrint(&buf, "Amount: {s} msat\nQuote expiry (Unix): {s}\nInvoice expiry (Unix): {s}\nCDK status: {s} | quote: {s}{s}", .{ view.amount.slice(), view.quote_expiry.slice(), view.invoice_expiry.slice(), @tagName(view.status), view.quote_state.slice(), if (view.expired) " | expired" else "" }) catch "Details exceed display limit";
         drawWrapped(text, .{ .x = rect.x, .y = rect.y + 56, .width = rect.width, .height = @max(1, rect.height - 56) }, 16, false);
         return;
     }
@@ -1184,16 +1184,16 @@ fn drawOnboarding(model: *const onboarding.Onboarding, vw: f32, vh: f32) void {
         },
         .restore_failed, .restore_result => {
             const r = model.report;
-            const has_history = if (r) |v| v.spendable_sats != 0 or v.pending_sats != 0 or v.spent_sats != 0 else false;
+            const has_history = if (r) |v| v.spendable_msats != 0 or v.pending_msats != 0 or v.spent_msats != 0 else false;
             drawCenteredText(if (model.phase == .restore_failed) "Restore failed" else "Recovery result", onboardingRect(layout.title), size, menu_title_color);
             if (model.phase == .restore_failed) {
                 drawCenteredText("Restore failed. Retry to check again.", onboardingRect(layout.seed), size, menu_text_color);
             } else if (r) |v| {
                 var buf: [192]u8 = undefined;
-                const text = std.fmt.bufPrint(buf[0 .. buf.len - 1], "Spendable: {d} sats  Pending: {d}  Spent: {d}", .{ v.spendable_sats, v.pending_sats, v.spent_sats }) catch unreachable;
+                const text = std.fmt.bufPrint(buf[0 .. buf.len - 1], "Spendable: {d} msat  Pending: {d} msat  Spent: {d} msat", .{ v.spendable_msats, v.pending_msats, v.spent_msats }) catch unreachable;
                 buf[text.len] = 0;
                 drawCenteredText(buf[0..text.len :0], onboardingRect(layout.seed), @max(1, @divTrunc(size * 3, 4)), menu_text_color);
-                if (v.spendable_sats == 0 and has_history) drawCenteredText("No spendable sats; pending or spent history exists.", onboardingRect(layout.message), @max(1, @divTrunc(size * 3, 4)), menu_muted);
+                if (v.spendable_msats == 0 and has_history) drawCenteredText("No spendable msat; pending or spent history exists.", onboardingRect(layout.message), @max(1, @divTrunc(size * 3, 4)), menu_muted);
             }
         },
         .blocked => {

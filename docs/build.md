@@ -611,7 +611,7 @@ machine (Zig 0.17.0, Rust 1.99.0); these counts are not post-migration results:
   tests passed.
 - `zig build test -Dplatform=wasm -Doffline` reproduced the known CDK recovery
   defects: **220** checks ran and **3** failed (dropped send after mint commit
-  restored 130 instead of 96 sats; send interrupted before request reported a
+  restored 130 instead of 96 msats; send interrupted before request reported a
   failed mint; send interrupted after mint commit restored 130 instead of 96).
   The command exits nonzero as intended, and the fake mint's ephemeral port was
   closed afterwards. These failures are not masked.

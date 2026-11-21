@@ -107,7 +107,7 @@ const instrumentation = `(() => {
            const value=JSON.parse(text);
            const operation=walletUiChecks.operations[serial];
            walletUiChecks.replies.push({serial,operation,value,started:walletUiChecks.requestTimes[serial],finished:Date.now()});
-          if(typeof value.sats==='string')walletUiChecks.snapshot=value;
+          if(typeof value.msats==='string')walletUiChecks.snapshot=value;
           if(Array.isArray(value.rows))walletUiChecks.history=value;
            if(operation===5)walletUiChecks.resumed=value;
           const invoice=typeof value.invoice==='string'?value:(value.invoice&&typeof value.invoice==='object'?value.invoice:null);
@@ -149,15 +149,15 @@ async function run() {
   await expect('Ready opens Rust-owned wallet after onboarding lock release','walletUiChecks.events.includes("ready") && !!walletUiChecks.snapshot && walletUiChecks.active===0');
   await evaluate('document.getElementById("canvas").focus()');
   await openWallet();
-  await expect('zero selected-mint balance','walletUiChecks.snapshot.sats==="0" && !walletUiChecks.errors');
+  await expect('zero selected-mint balance','walletUiChecks.snapshot.msats==="0" && !walletUiChecks.errors');
    await down(); await enter(); // Wallet -> Deposit
-  await enter(); // Custom sats
+  await enter(); // Custom msats
   for (const text of '1.5') await send('Input.dispatchKeyEvent',{type:'char',text,unmodifiedText:text});
   await settleTicks();
    await depositRow(5);
   await expect('custom decimal rejected before Rust/network','!walletUiChecks.requests.includes(2)');
-   await depositRow(2); // preset 42
-  const initial=await createDeposit('initial','42');
+   await depositRow(2); // preset 42000 msat
+  const initial=await createDeposit('initial','42000');
   const {id,invoice}=initial;
   await enter();
   await expect('trusted copy uses complete invoice',`walletUiChecks.copied && walletUiChecks.copiedText===${JSON.stringify(invoice)}`);
@@ -173,12 +173,12 @@ async function run() {
   await openWallet(); await down(); await enter();
   await expect('reloaded invoice watcher preserves identity',`walletUiChecks.invoice?.id===${JSON.stringify(id)}`);
   await fetch(new URL('/test-pay',origin));
-  await expect('paid is actually minted, then balance reread','walletUiChecks.invoice?.state==="ISSUED" && walletUiChecks.invoice.confirmed===true && walletUiChecks.snapshot?.sats==="42" && walletUiChecks.active===0');
+  await expect('paid is actually minted, then balance reread','walletUiChecks.invoice?.state==="ISSUED" && walletUiChecks.invoice.confirmed===true && walletUiChecks.snapshot?.msats==="42000" && walletUiChecks.active===0');
   counts=await depositCounts();
   if(counts.quotes!==1||counts.claims!==1)throw new Error('Deposit was not exactly once');
    await down(); await down(); await enter(); // Invoice Back -> Wallet
   await down(); await down(); await down(); await enter(); // History
-  await expect('history uses persisted quote state and creation metadata',`walletUiChecks.history?.rows.some(q=>q.id===${JSON.stringify(id)}&&q.direction==='In'&&q.amount==='42'&&q.state==='ISSUED'&&q.created_at) && walletUiChecks.active===0`);
+  await expect('history uses persisted quote state and creation metadata',`walletUiChecks.history?.rows.some(q=>q.id===${JSON.stringify(id)}&&q.direction==='In'&&q.amount==='42000'&&q.state==='ISSUED'&&q.created_at) && walletUiChecks.active===0`);
    const savedReads=await evaluate('walletUiChecks.requests.filter(n=>n===8).length');
    const savedReplyStart=await evaluate('walletUiChecks.replies.length');
    await enter(); // Selected History row -> Invoice
@@ -186,7 +186,7 @@ async function run() {
    await down(); await down(); await enter(); // Invoice Back -> Wallet
   await escape();
    await reloadWallet();
-   await expect('issued reload has real balance, no unfinished invoice','walletUiChecks.snapshot?.sats==="42" && walletUiChecks.resumed?.invoice===null && walletUiChecks.active===0');
+   await expect('issued reload has real balance, no unfinished invoice','walletUiChecks.snapshot?.msats==="42000" && walletUiChecks.resumed?.invoice===null && walletUiChecks.active===0');
   counts=await depositCounts();
   if(counts.quotes!==1||counts.claims!==1)throw new Error('Reload duplicated persisted payment');
   // Both quotes belong to the real Rust wallet. The fixture only masks the mint's
@@ -197,18 +197,18 @@ async function run() {
   await evaluate('document.getElementById("canvas").focus()');
    await openWallet(); await down(); await enter(); // Wallet -> Deposit form
    const additionalStart=await evaluate('({generation:walletUiChecks.generation,index:walletUiChecks.replies.length})');
-   await depositRow(1); // preset 21
-   const first=await createDeposit('first','21',[id]);
+   await depositRow(1); // preset 21000 msat
+   const first=await createDeposit('first','21000',[id]);
   await activateRow(505); // Invoice Deposit -> form, not resume
-  await depositRow(3); // preset 100
-   const second=await createDeposit('second','100',[id,first.id]);
+  await depositRow(3); // preset 100000 msat
+   const second=await createDeposit('second','100000',[id,first.id]);
   await activateRow(505); // Invoice Deposit -> another independent quote
-  await depositRow(1); // preset 21
-   const chosen=await createDeposit('chosen','21',[id,first.id,second.id]);
+  await depositRow(1); // preset 21000 msat
+   const chosen=await createDeposit('chosen','21000',[id,first.id,second.id]);
    if(new Set([first.id,second.id,chosen.id]).size!==3)throw new Error('Additional quote identities are not distinct');
    await expect('three distinct authoritative create replies have requested amounts',`walletUiChecks.generation===${JSON.stringify(additionalStart.generation)} && (()=>{
      const created=walletUiChecks.replies.slice(${additionalStart.index}).filter(r=>r.operation===2 && typeof r.value.invoice==='string' && r.value.state==='UNPAID');
-     return created.length===3 && created.every((r,i)=>r.value.id===${JSON.stringify([first.id,second.id,chosen.id])}[i] && r.value.amount===['21','100','21'][i]);
+     return created.length===3 && created.every((r,i)=>r.value.id===${JSON.stringify([first.id,second.id,chosen.id])}[i] && r.value.amount===['21000','100000','21000'][i]);
    })()`);
   await enter(); // Copy the displayed, chosen invoice before background settlement.
   await expect('chosen invoice clipboard is exact before settlement',`walletUiChecks.copiedText===${JSON.stringify(chosen.invoice)}`);
@@ -223,7 +223,7 @@ async function run() {
    const selectiveResponse=await fetch(selectivePay);
    fixtureTrace.gates.push({action:'pay-others',heldId:chosen.id,status:selectiveResponse.status,at:Date.now()});
    if(!selectiveResponse.ok)throw new Error('Could not selectively release payment gate');
-  await expect('closed-menu service locally confirms both other real deposits',`[${JSON.stringify(first.id)},${JSON.stringify(second.id)}].every(id=>walletUiChecks.replies.slice(${replyStart}).some(r=>r.operation===7 && r.value.invoice?.id===id && r.value.invoice.state==='ISSUED' && r.value.invoice.confirmed===true)) && walletUiChecks.invoices[${JSON.stringify(chosen.id)}]?.state==='UNPAID' && walletUiChecks.snapshot?.sats==='163' && walletUiChecks.active===0 && !walletUiChecks.overlap`);
+  await expect('closed-menu service locally confirms both other real deposits',`[${JSON.stringify(first.id)},${JSON.stringify(second.id)}].every(id=>walletUiChecks.replies.slice(${replyStart}).some(r=>r.operation===7 && r.value.invoice?.id===id && r.value.invoice.state==='ISSUED' && r.value.invoice.confirmed===true)) && walletUiChecks.invoices[${JSON.stringify(chosen.id)}]?.state==='UNPAID' && walletUiChecks.snapshot?.msats==='163000' && walletUiChecks.active===0 && !walletUiChecks.overlap`);
    counts=await depositCounts();
   if(counts.quotes!==4||counts.claims!==3)throw new Error('Closed-menu deposits were not claimed exactly once');
   console.log('ok - closed-menu balance sum and exactly two additional claims, no quote replacement');
@@ -232,9 +232,9 @@ async function run() {
   await enter();
   await expect('background results preserve visible chosen invoice clipboard',`walletUiChecks.copiedText===${JSON.stringify(chosen.invoice)}`);
   await fetch(new URL('/test-pay',origin));
-  await expect('chosen invoice settles once after releasing its gate',`walletUiChecks.invoices[${JSON.stringify(chosen.id)}]?.confirmed===true && walletUiChecks.snapshot?.sats==='184' && walletUiChecks.active===0 && !walletUiChecks.overlap`);
+  await expect('chosen invoice settles once after releasing its gate',`walletUiChecks.invoices[${JSON.stringify(chosen.id)}]?.confirmed===true && walletUiChecks.snapshot?.msats==='184000' && walletUiChecks.active===0 && !walletUiChecks.overlap`);
    await reloadWallet();
-  await expect('multi-deposit balance and completion survive restart','walletUiChecks.events.includes("ready") && walletUiChecks.snapshot?.sats==="184" && walletUiChecks.resumed?.invoice===null && walletUiChecks.active===0');
+  await expect('multi-deposit balance and completion survive restart','walletUiChecks.events.includes("ready") && walletUiChecks.snapshot?.msats==="184000" && walletUiChecks.resumed?.invoice===null && walletUiChecks.active===0');
   await evaluate('document.getElementById("canvas").focus()');
   await openWallet(); await down(); await down(); await down(); await enter();
   await expect('all additional deposit states persist in real Rust history',`[${JSON.stringify(first.id)},${JSON.stringify(second.id)},${JSON.stringify(chosen.id)}].every(id=>walletUiChecks.history?.rows.some(row=>row.id===id && row.state==='ISSUED')) && walletUiChecks.active===0`);
@@ -248,7 +248,7 @@ work.catch(()=>{});
 try { await Promise.race([work,timer.promise]); }
 catch (_) {
   let state=null;
-    try{state=await bounded(evaluate(`({generation:window.walletUiChecks?.generation,errors:window.walletUiChecks?.errors,events:window.walletUiChecks?.events,requests:window.walletUiChecks?.requests,sats:window.walletUiChecks?.snapshot?.sats,replies:window.walletUiChecks?.replies.map(r=>{const invoice=typeof r.value.invoice==='string'?r.value:r.value.invoice;return {serial:r.serial,operation:r.operation,id:invoice?.id,amount:invoice?.amount,state:invoice?.state,confirmed:invoice?.confirmed,cursor:r.value.cursor,wallet_changed:r.value.wallet_changed,recovery_pending:r.value.recovery_pending,errorStatus:r.value.error?.status};}),startupFailed:document.getElementById('startup')?.textContent==='Unable to start game.'})`),1000,'diagnostics');}catch(_){}
+    try{state=await bounded(evaluate(`({generation:window.walletUiChecks?.generation,errors:window.walletUiChecks?.errors,events:window.walletUiChecks?.events,requests:window.walletUiChecks?.requests,msats:window.walletUiChecks?.snapshot?.msats,replies:window.walletUiChecks?.replies.map(r=>{const invoice=typeof r.value.invoice==='string'?r.value:r.value.invoice;return {serial:r.serial,operation:r.operation,id:invoice?.id,amount:invoice?.amount,state:invoice?.state,confirmed:invoice?.confirmed,cursor:r.value.cursor,wallet_changed:r.value.wallet_changed,recovery_pending:r.value.recovery_pending,errorStatus:r.value.error?.status};}),startupFailed:document.getElementById('startup')?.textContent==='Unable to start game.'})`),1000,'diagnostics');}catch(_){}
   console.error(`Wallet UI regression failed: ${label}`);
    console.error(JSON.stringify({diagnostics,state,captures,fixtureTrace}));
    try{console.error(JSON.stringify(await bounded(evaluate('walletUiChecks.replies.map(r=>({serial:r.serial,op:r.operation,started:r.started,finished:r.finished}))'),1000,'request timing diagnostics')));}catch(_){}

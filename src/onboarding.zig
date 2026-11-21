@@ -26,9 +26,9 @@ pub const Controls = struct {
 pub const Effect = union(enum) { copy_requested, copy_word_requested: u8, complete_requested, create_requested, paste_requested, restore_requested, retry_requested, generate_requested, finish_restore_requested };
 
 pub const RestoreReport = struct {
-    spendable_sats: u64,
-    pending_sats: u64,
-    spent_sats: u64,
+    spendable_msats: u64,
+    pending_msats: u64,
+    spent_msats: u64,
     can_generate_new: bool,
 };
 
@@ -316,7 +316,7 @@ pub const Onboarding = struct {
             .resume_result => |report| if (self.phase == .loading) {
                 self.stage_created = true;
                 self.report = report;
-                self.can_generate_new = report.can_generate_new and report.spendable_sats == 0 and report.pending_sats == 0 and report.spent_sats == 0;
+                self.can_generate_new = report.can_generate_new and report.spendable_msats == 0 and report.pending_msats == 0 and report.spent_msats == 0;
                 self.selected = if (self.hasFundsOrHistory()) .finish_restore else .retry_recovery;
                 self.phase = .restore_result;
             },
@@ -347,7 +347,7 @@ pub const Onboarding = struct {
                 self.clearPhrase();
                 self.report = result.report;
                 self.stage_created = true;
-                self.can_generate_new = result.report.can_generate_new and result.report.spendable_sats == 0 and result.report.pending_sats == 0 and result.report.spent_sats == 0;
+                self.can_generate_new = result.report.can_generate_new and result.report.spendable_msats == 0 and result.report.pending_msats == 0 and result.report.spent_msats == 0;
                 self.phase = .restore_result;
                 self.selected = if (self.hasFundsOrHistory()) .finish_restore else .retry_recovery;
             },
@@ -356,7 +356,7 @@ pub const Onboarding = struct {
 
     fn hasFundsOrHistory(self: *const Onboarding) bool {
         const r = self.report orelse return false;
-        return r.spendable_sats != 0 or r.pending_sats != 0 or r.spent_sats != 0;
+        return r.spendable_msats != 0 or r.pending_msats != 0 or r.spent_msats != 0;
     }
 
     pub fn controls(self: *const Onboarding, layout: Layout) Controls {
@@ -677,13 +677,13 @@ test "capacity and recovery outcomes gate destructive actions" {
     try std.testing.expect(m.applyInput(.{ .confirm = true }).effect == null);
     m.selected = .retry_recovery;
     try std.testing.expectEqual(@as(?Effect, .retry_requested), m.applyInput(.{ .confirm = true }).effect);
-    m.receive(.{ .restore_finished = .{ .attempt_id = first, .report = .{ .spendable_sats = 0, .pending_sats = 0, .spent_sats = 0, .can_generate_new = true } } });
+    m.receive(.{ .restore_finished = .{ .attempt_id = first, .report = .{ .spendable_msats = 0, .pending_msats = 0, .spent_msats = 0, .can_generate_new = true } } });
     try std.testing.expectEqual(Phase.restoring, m.phase);
-    m.receive(.{ .restore_finished = .{ .attempt_id = m.attempt_id, .report = .{ .spendable_sats = 0, .pending_sats = 3, .spent_sats = 0, .can_generate_new = true } } });
+    m.receive(.{ .restore_finished = .{ .attempt_id = m.attempt_id, .report = .{ .spendable_msats = 0, .pending_msats = 3, .spent_msats = 0, .can_generate_new = true } } });
     try std.testing.expect(!m.can_generate_new);
     m.selected = .retry_recovery;
     try std.testing.expectEqual(@as(?Effect, .retry_requested), m.applyInput(.{ .confirm = true }).effect);
-    m.receive(.{ .restore_finished = .{ .attempt_id = m.attempt_id, .report = .{ .spendable_sats = 0, .pending_sats = 0, .spent_sats = 0, .can_generate_new = true } } });
+    m.receive(.{ .restore_finished = .{ .attempt_id = m.attempt_id, .report = .{ .spendable_msats = 0, .pending_msats = 0, .spent_msats = 0, .can_generate_new = true } } });
     m.selected = .generate_wallet;
     try std.testing.expectEqual(@as(?Effect, .generate_requested), m.applyInput(.{ .confirm = true }).effect);
     try std.testing.expectEqual(Phase.loading, m.phase);
@@ -704,7 +704,7 @@ test "recovery resume events initialize only loading model" {
     try std.testing.expect(failed.controls(calculateLayout(1000, 640)).find(.generate_wallet) == null);
     var result = Onboarding.init(std.testing.allocator);
     defer result.deinit();
-    result.receive(.{ .resume_result = .{ .spendable_sats = 0, .pending_sats = 1, .spent_sats = 0, .can_generate_new = true } });
+    result.receive(.{ .resume_result = .{ .spendable_msats = 0, .pending_msats = 1, .spent_msats = 0, .can_generate_new = true } });
     try std.testing.expect(result.phase == .restore_result and result.stage_created and !result.can_generate_new);
 }
 
@@ -753,7 +753,7 @@ test "successful resumed recovery clears preparation pending" {
     model.receive(.{ .paste = try std.testing.allocator.dupe(u8, "one") });
     model.selected = .restore_phrase;
     _ = model.applyInput(.{ .confirm = true });
-    model.receive(.{ .restore_finished = .{ .attempt_id = model.attempt_id, .report = .{ .spendable_sats = 0, .pending_sats = 0, .spent_sats = 0, .can_generate_new = false } } });
+    model.receive(.{ .restore_finished = .{ .attempt_id = model.attempt_id, .report = .{ .spendable_msats = 0, .pending_msats = 0, .spent_msats = 0, .can_generate_new = false } } });
     try std.testing.expect(!model.recovery_preparation_pending);
     try std.testing.expectEqual(Phase.restore_result, model.phase);
 }
@@ -797,7 +797,7 @@ test "semantic controls describe every phase and reject stale or disabled action
     try std.testing.expectEqual(Phase.phrase_entry, m.phase);
     try std.testing.expectEqual(@as(?Action, .paste_phrase), m.selected);
     _ = m.activateAction(.restore_phrase);
-    m.receive(.{ .restore_finished = .{ .attempt_id = m.attempt_id, .report = .{ .spendable_sats = 1, .pending_sats = 0, .spent_sats = 0, .can_generate_new = true } } });
+    m.receive(.{ .restore_finished = .{ .attempt_id = m.attempt_id, .report = .{ .spendable_msats = 1, .pending_msats = 0, .spent_msats = 0, .can_generate_new = true } } });
     list = m.controls(layout);
     try std.testing.expectEqualStrings("Continue", list.items[0].label);
     try std.testing.expectEqualStrings("Retry", list.items[1].label);

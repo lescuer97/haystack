@@ -34,7 +34,7 @@ pub enum CdkStatus {
     UnsupportedFormatVersion = 8,
     /// The mint URL was rejected by URL policy validation.
     InvalidMintUrl = 9,
-    /// The mint does not advertise the Sat unit.
+    /// The mint does not advertise the Msat unit.
     MintUnsupportedUnit = 10,
     /// The mint has not been approved/registered with this wallet.
     MintNotRegistered = 11,
@@ -212,7 +212,7 @@ pub struct CdkOpenResult {
     pub skipped: u32,
     /// Sagas that failed recovery during startup recovery.
     pub failed: u32,
-    /// Per-mint startup recovery reports (one entry per approved Sat mint).
+    /// Per-mint startup recovery reports (one entry per approved Msat mint).
     /// Free with
     /// [`cdk_recovery_reports_free`](crate::cdk_recovery_reports_free).
     pub reports: repr_c::Vec<CdkMintRecovery>,
@@ -242,9 +242,19 @@ pub struct CdkReceiveResult {
     pub status: CdkStatus,
     /// Human-readable error message. `NULL` on success.
     pub error: Option<char_p::Box>,
-    /// Net spendable sats credited to the wallet, valid only when `status` is
+    /// Net spendable msats credited to the wallet, valid only when `status` is
     /// [`CdkStatus::Ok`].
-    pub net_sats: u64,
+    pub net_msats: u64,
+}
+
+/// Result of a stateless Spilman funding calculation.
+#[derive_ReprC]
+#[repr(C)]
+pub struct CdkSpilmanAmountResult {
+    pub status: CdkStatus,
+    pub error: Option<char_p::Box>,
+    /// Minimum funding-token amount, in the supplied keyset's unit.
+    pub amount: u64,
 }
 
 /// Result of sending a token.
@@ -263,9 +273,9 @@ pub struct CdkSendResult {
     /// Operation identifier for the send, always populated (zeroes on
     /// pre-prepare failure). 16 raw UUID bytes.
     pub operation_id: [u8; 16],
-    /// Sender fee actually charged, in sats. Only meaningful on success or
+    /// Sender fee actually charged, in msats. Only meaningful on success or
     /// [`CdkStatus::SendUncertain`].
-    pub sender_fee_sats: u64,
+    pub sender_fee_msats: u64,
 }
 
 impl fmt::Debug for CdkSendResult {
@@ -275,7 +285,7 @@ impl fmt::Debug for CdkSendResult {
             .field("error", &self.error)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("operation_id", &self.operation_id)
-            .field("sender_fee_sats", &self.sender_fee_sats)
+            .field("sender_fee_msats", &self.sender_fee_msats)
             .finish()
     }
 }
@@ -288,7 +298,7 @@ impl CdkSendResult {
             error: string_to_box(message.into()),
             token: None,
             operation_id: [0u8; 16],
-            sender_fee_sats: 0,
+            sender_fee_msats: 0,
         }
     }
 
@@ -297,27 +307,27 @@ impl CdkSendResult {
         status: CdkStatus,
         message: impl Into<String>,
         operation_id: [u8; 16],
-        sender_fee_sats: u64,
+        sender_fee_msats: u64,
     ) -> Self {
         Self {
             status,
             error: string_to_box(message.into()),
             token: None,
             operation_id,
-            sender_fee_sats,
+            sender_fee_msats,
         }
     }
 }
 
-/// One approved mint and its locally spendable Sat balance.
+/// One approved mint and its locally spendable Msat balance.
 #[derive_ReprC]
 #[repr(C)]
 #[derive(Debug)]
 pub struct CdkBalanceEntry {
     /// Approved mint URL. Free with [`cdk_balance_list_free`](crate::cdk_balance_list_free).
     pub mint_url: char_p::Box,
-    /// Locally spendable (unspent, non-reserved) sats at this mint.
-    pub balance_sats: u64,
+    /// Locally spendable (unspent, non-reserved) msats at this mint.
+    pub balance_msats: u64,
 }
 
 /// One pending outgoing token.
@@ -386,7 +396,7 @@ pub struct CdkPendingListResult {
 
 /// Per-mint recovery outcome.
 ///
-/// One entry per approved Sat mint, describing how recovery went for that mint
+/// One entry per approved Msat mint, describing how recovery went for that mint
 /// specifically. A mint whose `failed`/`skipped` counters are non-zero (or whose
 /// `status` is not [`CdkStatus::Ok`]) is left fail-closed until recovery
 /// succeeds.
@@ -461,12 +471,12 @@ pub struct CdkSeedRestoreResult {
     pub error: Option<char_p::Box>,
     /// 1 if the scan did not complete, otherwise 0. Partial proofs may persist.
     pub incomplete: u8,
-    /// Scanned proof totals in sats, valid only when incomplete is 0.
-    pub unspent_sats: u64,
-    /// Scanned pending proof total in sats, valid only when incomplete is 0.
-    pub pending_sats: u64,
-    /// Scanned spent proof total in sats, valid only when incomplete is 0.
-    pub spent_sats: u64,
+    /// Scanned proof totals in msats, valid only when incomplete is 0.
+    pub unspent_msats: u64,
+    /// Scanned pending proof total in msats, valid only when incomplete is 0.
+    pub pending_msats: u64,
+    /// Scanned spent proof total in msats, valid only when incomplete is 0.
+    pub spent_msats: u64,
 }
 
 /// Result of generating a Spilman channel keypair.

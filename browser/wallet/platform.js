@@ -247,12 +247,16 @@ function validMarker(value, step) {
     && value.version === 1 && validRevision(value.revision)
     && value.step === step && exactHex(value.fingerprint, 64);
 }
+const RETIRED_IDENTITY_FIELDS = ["version", "step", "id", "fingerprint", "mint"];
 function validRetired(key, value) {
-  return exactKeys(value, ["version", "step", "id", "fingerprint", "mint", "spendable_sats", "pending_sats", "spent_sats"])
+  const zeroTotals = unit => {
+    const totals = ["spendable", "pending", "spent"].map(kind => `${kind}_${unit}`);
+    return exactKeys(value, [...RETIRED_IDENTITY_FIELDS, ...totals]) && totals.every(field => value[field] === "0");
+  };
+  return (zeroTotals("msats") || zeroTotals("sats"))
     && value.version === 1 && value.step === "retired" && exactHex(value.id, 32)
     && key === `retired:${value.id}` && exactHex(value.fingerprint, 64)
-    && typeof value.mint === "string" && value.mint.length > 0
-    && value.spendable_sats === "0" && value.pending_sats === "0" && value.spent_sats === "0";
+    && typeof value.mint === "string" && value.mint.length > 0;
 }
 
 function parseRetired(json) {
@@ -280,7 +284,8 @@ function matchesRetired([mnemonics, states, onboarding], expected) {
       && mnemonics.get(key) === entry.mnemonic && isStateRecord(state)
       && exactKeys(state, ["revision", "data"]) && state.revision === entry.state.revision
       && state.data === entry.state.data && validRetired(`retired:${entry.id}`, marker)
-      && Object.keys(entry.marker).every(k => marker[k] === entry.marker[k]);
+      // Both markers have validated zero totals, even if one uses legacy field names.
+      && RETIRED_IDENTITY_FIELDS.every(k => marker[k] === entry.marker[k]);
   });
 }
 
@@ -329,7 +334,7 @@ function withSnapshot(name, snapshot, prepare, action) {
   return serialize(name, () => action(retired, captured));
 }
 
-const TOTALS = ["spendable_sats", "pending_sats", "spent_sats"];
+const TOTALS = ["spendable_msats", "pending_msats", "spent_msats"];
 function validScan(value) {
   const result = value?.step === "result";
   return exactKeys(value, ["version", "revision", "step", "id", "fingerprint", "mint", ...(result ? TOTALS : [])])
@@ -518,7 +523,7 @@ export function generateOnboardingWallet(name, snapshot, replacement) {
     await onboardingTransition(retired, (stores, records, fail) => {
       if (!matchesStage(records, marker, captured.state.revision, captured.mnemonic, captured.state.data)) return fail();
       stores[2].add({version: 1, step: "retired", id: marker.id, fingerprint: marker.fingerprint, mint: marker.mint,
-        spendable_sats: "0", pending_sats: "0", spent_sats: "0"}, `retired:${marker.id}`);
+        spendable_msats: "0", pending_msats: "0", spent_msats: "0"}, `retired:${marker.id}`);
       stores[0].add(next.mnemonic, USER); stores[1].add({revision: 0, data: next.state}, USER);
       stores[2].put(next.marker, USER);
     });

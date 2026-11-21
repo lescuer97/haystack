@@ -60,7 +60,7 @@ pub fn onboarding_mint() -> Result<String, JsValue> {
     }
 }
 fn failure(e: FfiErr) -> Value {
-    json!({"status":e.status as u8,"error":e.message,"operation_id":e.operation_id.map(|v| uuid::Uuid::from_bytes(v).to_string()),"sender_fee_sats":e.sender_fee_sats.to_string()})
+    json!({"status":e.status as u8,"error":e.message,"operation_id":e.operation_id.map(|v| uuid::Uuid::from_bytes(v).to_string()),"sender_fee_msats":e.sender_fee_msats.to_string()})
 }
 fn reports(reports: Vec<MintRecoveryReport>) -> Value {
     Value::Array(reports.into_iter().map(|r| json!({"mint_url":r.mint_url,"recovered":r.recovered,"compensated":r.compensated,"skipped":r.skipped,"failed":r.failed,"status":r.status as u8,"error":r.message})).collect())
@@ -144,8 +144,8 @@ fn take(value: Option<char_p::Box>) -> Option<String> {
 fn string_result(r: CdkStringResult) -> Value {
     json!({"status":r.status as u8,"error":take(r.error),"value":take(r.value)})
 }
-fn amount_result(r: CdkReceiveResult) -> Value {
-    json!({"status":r.status as u8,"error":take(r.error),"net_sats":r.net_sats.to_string()})
+fn amount_result(r: CdkSpilmanAmountResult) -> Value {
+    json!({"status":r.status as u8,"error":take(r.error),"amount":r.amount.to_string()})
 }
 fn status_result(r: CdkStatusResult) -> Value {
     json!({"status":r.status as u8,"error":take(r.error)})
@@ -400,10 +400,10 @@ impl BrowserWallet {
             "poll_deposits" => match h.poll_deposits(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
             "recover_deposit" => match h.recover_deposit(a.text(0)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
             "list_mints" => json!({"status":0,"mints":h.list_mints().await}),
-            "list_balances" => match h.list_balances().await { Ok(b) => json!({"status":0,"balances":b.into_iter().map(|(mint,sats)| json!({"mint_url":mint,"sats":sats.to_string()})).collect::<Vec<_>>()}), Err(e) => failure(e) },
+            "list_balances" => match h.list_balances().await { Ok(b) => json!({"status":0,"balances":b.into_iter().map(|(mint,msats)| json!({"mint_url":mint,"msats":msats.to_string()})).collect::<Vec<_>>()}), Err(e) => failure(e) },
             "add_mint" => match h.add_mint(a.text(0)?).await { Ok(()) => json!({"status":0}), Err(e) => failure(e) },
-            "receive" => match h.receive(a.text(0)?).await { Ok(n) => json!({"status":0,"net_sats":n.to_string()}), Err(e) => failure(e) },
-            "send" => match h.send(a.text(0)?,a.number(1)?,a.number(2)?).await { Ok(r) => json!({"status":0,"token":r.token,"operation_id":uuid::Uuid::from_bytes(r.operation_id).to_string(),"sender_fee_sats":r.sender_fee_sats.to_string()}), Err(e) => failure(e) },
+            "receive" => match h.receive(a.text(0)?).await { Ok(n) => json!({"status":0,"net_msats":n.to_string()}), Err(e) => failure(e) },
+            "send" => match h.send(a.text(0)?,a.number(1)?,a.number(2)?).await { Ok(r) => json!({"status":0,"token":r.token,"operation_id":uuid::Uuid::from_bytes(r.operation_id).to_string(),"sender_fee_msats":r.sender_fee_msats.to_string()}), Err(e) => failure(e) },
             "list_pending_tokens" => match h.list_pending_tokens().await { Ok(p) => json!({"status":0,"pending":p.into_iter().map(|p| json!({"operation_id":uuid::Uuid::from_bytes(p.operation_id).to_string(),"token":p.token})).collect::<Vec<_>>()}), Err(e) => failure(e) },
             "get_pending_token" => {
                 let id=uuid::Uuid::parse_str(a.text(0)?).map_err(|_| js_error("invalid operation UUID"))?;
@@ -415,15 +415,15 @@ impl BrowserWallet {
                 let mint=if a.0.is_empty() || a.c(0)?.is_none() { None } else { Some(wallet::parse_mint_url(a.text(0)?).map_err(|e| js_error(&failure(e).to_string()))?) };
                 match h.recover(mint.as_ref()).await { Ok(r) => json!({"status":0,"reports":reports(r)}), Err(e) => failure(e) }
             }
-            "restore_seed" => match h.restore_seed(a.text(0)?).await { Ok((spendable,pending,spent)) => json!({"status":0,"spendable_sats":spendable.to_string(),"pending_sats":pending.to_string(),"spent_sats":spent.to_string()}), Err(e) => failure(e) },
+            "restore_seed" => match h.restore_seed(a.text(0)?).await { Ok((spendable,pending,spent)) => json!({"status":0,"spendable_msats":spendable.to_string(),"pending_msats":pending.to_string(),"spent_msats":spent.to_string()}), Err(e) => failure(e) },
             "restore_can_abandon" => match h.browser_restore_can_abandon().await { Ok((_revision,can_abandon)) => json!({"status":0,"can_abandon":can_abandon}), Err(e) => failure(e) },
             "get_active_keyset_info_json" => match h.active_keyset_info_json(a.text(0)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
             "get_keyset_info_json" => match h.keyset_info_json(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
             "post_swap" => match h.post_swap(a.text(0)?,a.text(1)?).await { Ok(v) => json!({"status":0,"value":v}), Err(e) => failure(e) },
-            "receive_with_keys" => match h.receive_with_keys(a.text(0)?,&a.keys(1)?).await { Ok(n) => json!({"status":0,"net_sats":n.to_string()}), Err(e) => failure(e) },
+            "receive_with_keys" => match h.receive_with_keys(a.text(0)?,&a.keys(1)?).await { Ok(n) => json!({"status":0,"net_msats":n.to_string()}), Err(e) => failure(e) },
             "receive_proofs" => {
                 let proofs=serde_json::from_str(a.text(1)?).map_err(|_| js_error("invalid proofs JSON"))?;
-                match h.receive_proofs(a.text(0)?,proofs,&a.keys(2)?).await { Ok(n) => json!({"status":0,"net_sats":n.to_string()}), Err(e) => failure(e) }
+                match h.receive_proofs(a.text(0)?,proofs,&a.keys(2)?).await { Ok(n) => json!({"status":0,"net_msats":n.to_string()}), Err(e) => failure(e) }
             }
             _ => return Err(js_error("unknown wallet operation")),
         }};

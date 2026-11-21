@@ -4,7 +4,7 @@
 //! The crate builds as a `staticlib` (plus an `rlib`) for the Zig application
 //! to link. It wraps:
 //!
-//! * one SQLite database, one 64-byte seed, Sat-only balances;
+//! * one SQLite database, one 64-byte seed, Msat-only balances;
 //! * explicit, durable mint approval;
 //! * `open`/`close`, `add_mint`, `list_mints`, `list_balances`, `receive`,
 //!   `send`, pending-token listing/retrieval, and explicit recovery;
@@ -62,9 +62,10 @@ pub fn header_contents() -> String {
     // Referencing every exported symbol forces the linker to keep the `api`
     // object file (and therefore the `inventory` registrations that the header
     // generator iterates over).
-    let force: [*const (); 49] = [
+    let force: [*const (); 50] = [
         cdk_wallet_open as *const (),
         cdk_wallet_close as *const (),
+        cdk_wallet_check_mint_keysets as *const (),
         cdk_wallet_add_mint as *const (),
         cdk_wallet_list_mints as *const (),
         cdk_wallet_list_balances as *const (),

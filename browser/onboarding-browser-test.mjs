@@ -65,6 +65,9 @@ async function run() {
   for (const flow of selectedFlow === 'all' ? ['create', 'recovery'] : [selectedFlow]) {
     await runGame(flow);
   }
+  if (!fault && selectedFlow === 'all') {
+    for (const mode of ['sat-only', 'inactive-msat']) await runGame(mode);
+  }
   for (const [sessionId, report] of runtimeReports) {
     await flushRuntime(sessionId);
     assertRuntimeClean(sessionId, `${report.flow}: no uncaught runtime errors across reload`);
@@ -120,7 +123,7 @@ const gameInstrumentation = `(() => {
       const deliver = bridge.deliver, request = bridge.request;
       bridge.deliver = function(callback, generation, token, text, startup) {
         const event = typeof text === 'string' ? JSON.parse(text).event : 'transport_error';
-        const allowed = ['choice', 'backup', 'ready', 'complete_success', 'blocked', 'invalid_phrase', 'transport_error', 'restore_failed', 'resume_failed', 'restore_finished'];
+        const allowed = ['choice', 'backup', 'ready', 'complete_success', 'blocked', 'invalid_phrase', 'transport_error', 'restore_failed', 'resume_failed', 'restore_finished', 'mint_unavailable'];
         window.gameOnboardingChecks.events.push(allowed.includes(event) ? event : 'other');
         const drop = (fault === 'drop-ready' && event === 'ready') || (fault === 'drop-complete' && event === 'complete_success');
         if (!injected && (drop || (event === 'backup' && (fault === 'backup-error' || fault === 'backup-rejection')))) {
@@ -230,7 +233,36 @@ async function runGame(flow) {
     await expect(`${flow}: gameplay after ${transition} restores grid baseline`, `${gridSetting}.then(setting => setting.persisted && setting.value === ${baseline})`);
   }
   await prepareGame(sessionId, flow);
-  await send('Page.navigate', {url:new URL('/renderer/index.html', input.origin).href}, sessionId);
+  const renderer = new URL('/renderer/index.html', input.origin).href;
+  if (flow === 'sat-only' || flow === 'inactive-msat') {
+    await send('Network.enable', {}, sessionId);
+    await send('Network.setExtraHTTPHeaders', {headers:{'x-browser-test-keysets':flow}}, sessionId);
+    const keysetsUrl = new URL('/v1/keysets', input.origin).href;
+    let keysetsRequest;
+    const unsubscribe = connection.on('Network.responseReceived', message => {
+      const {response, requestId} = message.params;
+      if (message.sessionId === sessionId && response.url.split('?')[0] === keysetsUrl && response.status === 200) {
+        keysetsRequest = requestId;
+      }
+    });
+    try {
+      await send('Page.navigate', {url:renderer}, sessionId);
+      await expect(`${flow}: startup refuses to begin onboarding`, `window.gameOnboardingChecks?.events.includes('mint_unavailable') && !window.haystackOnboarding?.session && document.getElementById('startup')?.textContent === 'Unable to start game.'`);
+      failureLabel = `${flow}: startup checked live keysets and never offered wallet setup`;
+      if (!keysetsRequest) throw new Error('missing live keysets response');
+      const response = await send('Network.getResponseBody', {requestId:keysetsRequest}, sessionId);
+      const {keysets} = JSON.parse(response.base64Encoded ? Buffer.from(response.body, 'base64').toString() : response.body);
+      const expected = flow === 'sat-only' ? {unit:'sat', active:true} : {unit:'msat', active:false};
+      if (keysets.length !== 1 || keysets[0].unit !== expected.unit || keysets[0].active !== expected.active) throw new Error('unexpected keysets fixture');
+      if (!await evaluate(`gameOnboardingChecks.operations.length === 0 && !gameOnboardingChecks.events.some(event => ['choice', 'backup', 'ready'].includes(event))`)) throw new Error('wallet setup was offered');
+      checks.push(failureLabel);
+    } finally {
+      unsubscribe();
+    }
+    console.log(JSON.stringify({flow, ok:true, checks}));
+    return;
+  }
+  await send('Page.navigate', {url:renderer}, sessionId);
   if (flow === 'create') {
     await expect('game startup delivers choice', 'window.gameOnboardingChecks?.events.includes("choice")');
     await click(344); // Create new: panel.y + 252 + 22

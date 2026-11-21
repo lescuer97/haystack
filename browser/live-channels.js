@@ -52,7 +52,7 @@ export async function runLiveChannels({app, pure, text, assert}) {
     assert(keyset === byId, "Live active keyset matches its by-id lookup");
 
     const fundingAmount = await pure("spilman_compute_funding_token_amount", ["100", keyset, "64"]);
-    assert(fundingAmount.status === 0 && fundingAmount.net_sats === "100", "Live funding amount covers 100 sats");
+    assert(fundingAmount.status === 0 && fundingAmount.amount === "100", "Live funding amount covers 100 msats");
 
     const aliceKeys = await pure("spilman_generate_keypair");
     const charlieKeys = await pure("spilman_generate_keypair");
@@ -65,7 +65,7 @@ export async function runLiveChannels({app, pure, text, assert}) {
       token, charlieKeys.pubkey_hex, aliceKeys.pubkey_hex, channelSecret,
       String(closeExpiry), keyset, "64",
     ]));
-    assert(computed.capacity === 100, "Live token derives a 100-sat channel");
+    assert(computed.capacity === 100, "Live token derives a 100-msat channel");
 
     const tokenProofs = await text("token_to_proofs_json", [token, keyset]);
     assert(
@@ -90,7 +90,7 @@ export async function runLiveChannels({app, pure, text, assert}) {
     ]));
     assert((await pure("spilman_verify_balance_update", [
       params, channelSecret, keyset, fundingProofs, signed.channel_id, "70", signed.signature,
-    ])).status === 0, "Live channel verifies the sender's 70-sat balance update");
+    ])).status === 0, "Live channel verifies the sender's 70-msat balance update");
 
     const close = JSON.parse(await text("spilman_prepare_close_swap", [
       params, channelSecret, keyset, keyset, fundingProofs, "70", signed.signature, charlieKeys.secret_key_hex,
@@ -104,14 +104,14 @@ export async function runLiveChannels({app, pure, text, assert}) {
     assert(closed.receiver_sum === "70" && closed.sender_sum === "30", "Live close splits 70/30");
 
     const receiver = await must(wallets.charlie, "receive_proofs", [mint, closed.receiver_proofs_json, null]);
-    assert(receiver.net_sats === "70", "Receiver wallet redeems the live close proofs");
+    assert(receiver.net_msats === "70", "Receiver wallet redeems the live close proofs");
     const sender = await must(wallets.alice, "receive_proofs", [mint, closed.sender_proofs_json, aliceKeys.secret_key_hex]);
-    assert(sender.net_sats === "30", "Sender wallet reclaims the live close remainder");
+    assert(sender.net_msats === "30", "Sender wallet reclaims the live close remainder");
 
     const charlieBalance = (await must(wallets.charlie, "list_balances")).balances;
     const aliceBalance = (await must(wallets.alice, "list_balances")).balances;
-    assert(charlieBalance.some(entry => entry.sats === "70"), "Live close leaves the receiver wallet with 70 sats");
-    assert(aliceBalance.some(entry => entry.sats === "30"), "Live close leaves the sender wallet with 30 sats");
+    assert(charlieBalance.some(entry => entry.msats === "70"), "Live close leaves the receiver wallet with 70 msats");
+    assert(aliceBalance.some(entry => entry.msats === "30"), "Live close leaves the sender wallet with 30 msats");
 
     // --- Live post-expiry refund -----------------------------------------
     seeds.refund = await createWallet(names.refund);
@@ -126,7 +126,7 @@ export async function runLiveChannels({app, pure, text, assert}) {
       refundToken, charlieKeys.pubkey_hex, refundKeys.pubkey_hex, refundSecret,
       String(refundExpiry), keyset, "64",
     ]));
-    assert(refundChannel.capacity === 100, "Expired live token derives a 100-sat channel");
+    assert(refundChannel.capacity === 100, "Expired live token derives a 100-msat channel");
 
     const refundFunding = JSON.parse(await text("spilman_create_funding_swap", [
       refundChannel.params_json, refundSecret, keyset, refundChannel.proofs_json,
@@ -158,21 +158,21 @@ export async function runLiveChannels({app, pure, text, assert}) {
       refundChannel.params_json, refundSecret, keyset, refundProofs,
       refundKeys.secret_key_hex, preparedRefund, refundResponse,
     ]));
-    assert(sumAmounts(refunded) === 100, "Live post-expiry refund returns the full 100 sats");
+    assert(sumAmounts(refunded) === 100, "Live post-expiry refund returns the full 100 msats");
 
-    const refundTokenB = await text("spilman_build_cashu_b_token", [mint, "sat", JSON.stringify(refunded)]);
+    const refundTokenB = await text("spilman_build_cashu_b_token", [mint, "msat", JSON.stringify(refunded)]);
     const refundedReceive = await must(wallets.refund, "receive_with_keys", [refundTokenB, null]);
-    assert(refundedReceive.net_sats === "100", "Refund proofs redeem into the sender wallet");
+    assert(refundedReceive.net_msats === "100", "Refund proofs redeem into the sender wallet");
 
     const restored = (await must(wallets.refund, "list_balances")).balances;
-    assert(restored.some(entry => entry.sats === "100"), "Refund restores the sender wallet to 100 sats");
+    assert(restored.some(entry => entry.msats === "100"), "Refund restores the sender wallet to 100 msats");
 
     // Persistence and repeated explicit recovery must not change the balance.
     await wallets.refund.close();
     wallets.refund.free();
     wallets.refund = await open_wallet(seeds.refund, names.refund);
     const reopened = (await must(wallets.refund, "list_balances")).balances;
-    assert(reopened.some(entry => entry.sats === "100"), "Refunded balance survives reopen and startup recovery");
+    assert(reopened.some(entry => entry.msats === "100"), "Refunded balance survives reopen and startup recovery");
 
     for (let run = 0; run < 2; run += 1) {
       const recovery = await must(wallets.refund, "recover");
@@ -180,7 +180,7 @@ export async function runLiveChannels({app, pure, text, assert}) {
       assert(recovery.reports.every(report => report.failed === 0 && report.skipped === 0),
         `Refund recovery has no failed or skipped mints (run ${run + 1})`);
       const unchanged = (await must(wallets.refund, "list_balances")).balances;
-      assert(unchanged.some(entry => entry.sats === "100"), `Repeated refund recovery is unchanged (run ${run + 1})`);
+      assert(unchanged.some(entry => entry.msats === "100"), `Repeated refund recovery is unchanged (run ${run + 1})`);
     }
   } finally {
     for (const wallet of Object.values(wallets)) {

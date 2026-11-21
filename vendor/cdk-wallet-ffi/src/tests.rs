@@ -542,7 +542,7 @@ fn secret_types_do_not_debug_print_tokens() {
         error: None,
         token: crate::status::string_to_box(SECRET.to_string()),
         operation_id: [1u8; 16],
-        sender_fee_sats: 0,
+        sender_fee_msats: 0,
     };
     let rendered = format!("{send:?}");
     assert!(!rendered.contains(SECRET), "send token leaked: {rendered}");

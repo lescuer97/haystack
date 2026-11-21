@@ -334,7 +334,7 @@ test "spilman keyset JSON accepts snake_case, camelCase, and unordered keys" {
         const funding = c.cdk_spilman_compute_funding_token_amount(100, keyset_z, 64);
         defer freeError(funding.@"error");
         try std.testing.expectEqual(@as(c.CdkStatus_t, c.CDK_STATUS_OK), funding.status);
-        try std.testing.expectEqual(@as(u64, 100), funding.net_sats);
+        try std.testing.expectEqual(@as(u64, 100), funding.amount);
     }
 }
 
@@ -369,19 +369,19 @@ test "spilman funding amount covers capacity plus input fees" {
         const no_fee = c.cdk_spilman_compute_funding_token_amount(vector[0], fee0_z, 64);
         defer freeError(no_fee.@"error");
         try std.testing.expectEqual(@as(c.CdkStatus_t, c.CDK_STATUS_OK), no_fee.status);
-        try std.testing.expectEqual(vector[1], no_fee.net_sats);
+        try std.testing.expectEqual(vector[1], no_fee.amount);
 
         const with_fee = c.cdk_spilman_compute_funding_token_amount(vector[0], fee1000_z, 64);
         defer freeError(with_fee.@"error");
         try std.testing.expectEqual(@as(c.CdkStatus_t, c.CDK_STATUS_OK), with_fee.status);
-        try std.testing.expectEqual(vector[2], with_fee.net_sats);
+        try std.testing.expectEqual(vector[2], with_fee.amount);
     }
 
     // A zero-capacity channel needs no funding at all.
     const zero = c.cdk_spilman_compute_funding_token_amount(0, fee0_z, 64);
     defer freeError(zero.@"error");
     try std.testing.expectEqual(@as(c.CdkStatus_t, c.CDK_STATUS_OK), zero.status);
-    try std.testing.expectEqual(@as(u64, 0), zero.net_sats);
+    try std.testing.expectEqual(@as(u64, 0), zero.amount);
 }
 
 test "spilman channel id is deterministic and binds params, keyset, and secret" {
@@ -803,7 +803,7 @@ test "wallet Spilman helpers fail closed on unapproved mints" {
     defer alloc.free(funding_proofs);
     const token = try takeString(alloc, c.cdk_spilman_build_cashu_b_token(
         mint,
-        @as([*:0]const u8, "sat"),
+        @as([*:0]const u8, "msat"),
         funding_proofs,
     ));
     defer alloc.free(token);

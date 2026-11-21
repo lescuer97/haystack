@@ -568,7 +568,7 @@ fn funding_amount_vectors() {
                 Some(cstr_ref(&fee0_nul)),
                 64
             )
-            .net_sats,
+            .amount,
             no_fee,
             "capacity {capacity} without fees"
         );
@@ -578,7 +578,7 @@ fn funding_amount_vectors() {
                 Some(cstr_ref(&fee999_nul)),
                 64
             )
-            .net_sats,
+            .amount,
             with_fee,
             "capacity {capacity} with fees"
         );
