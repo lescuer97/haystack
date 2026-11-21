@@ -41,6 +41,8 @@ pub const Registry = struct {
             if (std.Io.Clock.Timestamp.now(self.io, end.clock).compare(.gte, end)) return error.DeadlineExpired;
         }
         self.generation += 1;
+        // TODO: Persist player positions by authenticated key and return the
+        // restored position to the client when creating a new session.
         self.slots[index] = .{ .occupied = true, .generation = self.generation, .pubkey = key, .location = shared.movement.spawn };
         return .{ .index = index, .generation = self.generation };
     }

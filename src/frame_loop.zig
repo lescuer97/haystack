@@ -7,6 +7,7 @@ const camera = @import("camera.zig");
 const game_mod = @import("game.zig");
 const onboarding = @import("onboarding.zig");
 const menu_mod = @import("menu.zig");
+const Location = @import("shared").protocol.Location;
 
 pub const capacity = 64;
 pub const EffectSink = struct {
@@ -14,6 +15,8 @@ pub const EffectSink = struct {
     dispatch: *const fn (?*anyopaque, *onboarding.Onboarding, onboarding.Effect) void,
     // Native clipboard work must run before the next ordered record too.
     after_input: ?*const fn (?*anyopaque, *game_mod.GameState) void = null,
+    // Runs only after GameState has accepted and committed a step.
+    commit_movement: ?*const fn (?*anyopaque, Location) bool = null,
 };
 
 pub const Queue = struct {
@@ -86,6 +89,7 @@ pub const Driver = struct {
     viewport_w: f32 = 1000,
     viewport_h: f32 = 640,
     routing: ?Routing = null,
+    movement_blocked: bool = false,
 
     pub fn deinit(self: *Driver) void {
         self.queue.clear();
@@ -136,8 +140,28 @@ pub const Driver = struct {
         const modal = game.menu.opened or (if (model) |m| m.isBlocking() else false);
         var frame = self.repeat.route(sample, modal);
         frame.dt = dt;
+        if (self.movement_blocked and !modal) {
+            frame.left = false;
+            frame.right = false;
+            frame.up = false;
+            frame.down = false;
+        }
         defer std.crypto.secureZero(u21, &frame.characters);
+        const before = game.player_pos;
+        const before_camera = game.camera;
         const effect = try routeFrame(game, model, frame);
+        if (sink) |s| if (s.commit_movement) |commit| {
+            if (!std.meta.eql(before, game.player_pos)) {
+                // A disconnect can race with local validation. Never keep a
+                // prediction that wasn't accepted by the worker's mailbox.
+                if (!commit(s.context, game.player_pos)) {
+                    game.player_pos = before;
+                    game.camera = before_camera;
+                    game.player_walking = false;
+                }
+                self.movement_blocked = true;
+            }
+        };
         if (model) |m| {
             privacy_blocked.* = privacy_blocked.* or m.isBlocking();
             if (effect) |e| if (sink) |s| s.dispatch(s.context, m, e);
@@ -271,6 +295,52 @@ test "no between-tick updates; initial preparation and viewport remain coherent"
     try std.testing.expect(try d.advance(0.05, &g, null, null, &privacy));
     try std.testing.expect(std.meta.eql(settings, g.settings));
     try std.testing.expect(d.viewport_w == 800);
+}
+
+test "only committed movement reaches the worker sink" {
+    const Sink = struct {
+        last: ?Location = null,
+        accept: bool = false,
+
+        fn dispatch(_: ?*anyopaque, _: *onboarding.Onboarding, _: onboarding.Effect) void {}
+
+        fn submit(context: ?*anyopaque, destination: Location) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.last = destination;
+            return self.accept;
+        }
+    };
+    var driver: Driver = .{};
+    defer driver.deinit();
+    var game = try game_mod.GameState.init(std.testing.allocator, 1000, 640);
+    defer game.deinit();
+    var record: Sink = .{};
+    const sink: EffectSink = .{ .context = &record, .dispatch = Sink.dispatch, .commit_movement = Sink.submit };
+    var privacy = false;
+    const right: input.RawSample = .{ .navigation = .{ .right = true } };
+    game.player_pos = .{ .x = 19, .y = 0 }; // (20, 0) is blocked.
+    driver.repeat.beginTick();
+    try driver.consume(right, 0, &game, null, sink, &privacy);
+    try std.testing.expect(record.last == null);
+
+    game.player_pos = .{ .x = 0, .y = 0 };
+    driver.repeat = .{};
+    driver.repeat.beginTick();
+    try driver.consume(right, 0, &game, null, sink, &privacy);
+    try std.testing.expectEqual(Location{ .x = 1, .y = 0 }, record.last.?);
+    try std.testing.expectEqual(Location{ .x = 0, .y = 0 }, game.player_pos);
+
+    record = .{ .accept = true };
+    driver.repeat = .{};
+    driver.repeat.beginTick();
+    try driver.consume(right, 0, &game, null, sink, &privacy);
+    try std.testing.expect(record.last == null); // Mailbox is still blocked.
+    driver.movement_blocked = false;
+    driver.repeat = .{};
+    driver.repeat.beginTick();
+    try driver.consume(right, 0, &game, null, sink, &privacy);
+    try std.testing.expectEqual(game.player_pos, record.last.?);
+    try std.testing.expectEqual(Location{ .x = 1, .y = 0 }, game.player_pos);
 }
 
 test "short tap survives release and many taps permit at most one step per tick" {

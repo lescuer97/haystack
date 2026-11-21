@@ -35,6 +35,8 @@ const native_onboarding = if (builtin.os.tag != .emscripten) @import("onboarding
 const native_wallet = if (builtin.os.tag != .emscripten) @import("wallet.zig") else struct {};
 const wallet_ui = @import("wallet_ui.zig");
 const wallet_service = if (builtin.os.tag != .emscripten) @import("wallet_service.zig") else struct {};
+const ws_worker = if (builtin.os.tag != .emscripten) @import("ws_worker.zig") else struct {};
+const Location = @import("shared").protocol.Location;
 
 // `zig build test` collects tests from files referenced by this root module.
 // Import every source file explicitly so no test file is silently skipped.
@@ -56,6 +58,10 @@ comptime {
     _ = @import("browser_storage.zig");
     _ = @import("storage_home_test.zig");
     _ = @import("onboarding.zig");
+    if (builtin.os.tag != .emscripten) {
+        _ = @import("ws_worker.zig");
+        _ = @import("ws_auth.zig");
+    }
 }
 
 // ── browser lifetime ─────────────────────────────────────────────────────────
@@ -322,6 +328,7 @@ fn browserFrame() callconv(.c) void {
         &ctx.model,
         .{ .dispatch = browserDispatch },
         &privacy_blocked,
+        null,
     ) catch |err| {
         std.log.err("browser frame failed: {s}", .{@errorName(err)});
         stopBrowser();
@@ -447,18 +454,24 @@ fn stepFrame(
     model: ?*onboarding.Onboarding,
     sink: ?frame_loop.EffectSink,
     privacy_blocked: *bool,
+    connection_detail: ?[:0]const u8,
 ) !void {
     const vw: f32 = @floatFromInt(rl.getScreenWidth());
     const vh: f32 = @floatFromInt(rl.getScreenHeight());
 
     driver.observeRouting(game_state, model);
-    var sample = input_reader.read();
-    driver.queue.push(&sample);
-    // Initial preparation is safe even with an invalid startup clock: no
-    // simulation input is consumed, but drawing never uses an undefined view.
     const settings_before = game_state.settings;
-    const advanced = try driver.advance(rl.getTime(), game_state, model, sink, privacy_blocked);
-    if (driver.view == null) try driver.prepare(game_state, vw, vh);
+    const advanced = if (connection_detail == null) blk: {
+        var sample = input_reader.read();
+        driver.queue.push(&sample);
+        break :blk try driver.advance(rl.getTime(), game_state, model, sink, privacy_blocked);
+    } else blk: {
+        driver.skipPast(rl.getTime());
+        break :blk false;
+    };
+    if (driver.view == null or (connection_detail != null and (vw != driver.viewport_w or vh != driver.viewport_h))) {
+        try driver.prepare(game_state, vw, vh);
+    }
 
     // A save follows an actual toggle only; modal frames and idle frames leave
     // the settings untouched and produce no write.
@@ -474,6 +487,7 @@ fn stepFrame(
     resources.prepareMinimap(&game_state.world, driver.view.?.minimap);
     rl.beginDrawing();
     rendering.draw(game_state, driver.view.?, driver.viewport_w, driver.viewport_h, model, resources);
+    if (connection_detail) |detail| rendering.drawDisconnected(detail, driver.viewport_w, driver.viewport_h);
     // Capture after drawing and before `endDrawing` swaps/presents, otherwise
     // the framebuffer read is the cleared back buffer (a black screenshot).
     // The 2D overlay (HUD/minimap) is still batched at this point;
@@ -695,6 +709,13 @@ const NativeEffects = struct {
     allocator: std.mem.Allocator,
     native: native_onboarding.Native,
     scan_job: *?*ScanJob,
+    connection: *ws_worker.Worker,
+    session: u64 = 0,
+
+    fn commitMovement(context: ?*anyopaque, destination: Location) bool {
+        const self: *NativeEffects = @ptrCast(@alignCast(context.?));
+        return self.connection.submit(self.session, destination);
+    }
 
     fn dispatch(context: ?*anyopaque, model: *onboarding.Onboarding, action: onboarding.Effect) void {
         const self: *NativeEffects = @ptrCast(@alignCast(context.?));
@@ -876,7 +897,11 @@ pub fn main() anyerror!void {
     var input_reader = input.Reader{};
     var driver = frame_loop.Driver{};
     defer driver.deinit();
-    var effects = NativeEffects{ .allocator = allocator, .native = native, .scan_job = &scan_job };
+    var connection: ws_worker.Worker = .{ .io = io, .paths = wallet_paths };
+    try connection.start();
+    defer connection.stop();
+    var effects = NativeEffects{ .allocator = allocator, .native = native, .scan_job = &scan_job, .connection = &connection };
+    var last_status: ws_worker.Status = .disabled;
     var onboarding_hand_cursor = false;
 
     while (!rl.windowShouldClose()) {
@@ -910,6 +935,36 @@ pub fn main() anyerror!void {
             job.destroy();
             scan_job = null;
         };
+        // Reconcile server output before capturing or consuming new input.
+        connection.setEnabled(!model.isBlocking());
+        const network = connection.snapshot();
+        if ((last_status == .ready) != (network.status == .ready)) {
+            driver.invalidateInput();
+            game_state.camera.resetDrag();
+            game_state.player_walking = false;
+        }
+        last_status = network.status;
+        const new_session = network.session != effects.session;
+        if (network.status == .ready and (new_session or
+            (!network.pending and !std.meta.eql(game_state.player_pos, network.confirmed))))
+        {
+            try game_state.camera.setTarget(network.confirmed.x, network.confirmed.y);
+            game_state.camera.resetDrag();
+            game_state.player_pos = network.confirmed;
+            game_state.player_walking = false;
+            driver.invalidateInput();
+            driver.view = null;
+        }
+        effects.session = network.session;
+        driver.movement_blocked = network.pending;
+        const connection_detail: ?[:0]const u8 = switch (network.status) {
+            .disabled, .ready => null,
+            .connecting => "Connecting to the game server...",
+            .authenticating => "Authenticating your wallet...",
+            .retrying => "Server unavailable. Retrying...",
+            .wallet_error => "Could not sign with the wallet. Retrying...",
+            .credentials_rejected => "Server rejected the wallet proof. Retrying...",
+        };
         // Capture on the last requested frame, inside stepFrame's drawing pass.
         privacy_blocked = privacy_blocked or model.isBlocking();
         try stepFrame(
@@ -920,8 +975,9 @@ pub fn main() anyerror!void {
             if (shot_frames == 0) shot_path else null,
             persister,
             &model,
-            .{ .context = &effects, .dispatch = NativeEffects.dispatch, .after_input = NativeEffects.afterInput },
+            .{ .context = &effects, .dispatch = NativeEffects.dispatch, .after_input = NativeEffects.afterInput, .commit_movement = NativeEffects.commitMovement },
             &privacy_blocked,
+            connection_detail,
         );
 
         if (!started) {

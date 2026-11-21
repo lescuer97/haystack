@@ -11,8 +11,11 @@ The independent [local server](docs/server.md) builds with
 `zig build server -Dgame=false` and has socket-free tests via `test-server`.
 It requires the native Rust/CDK toolchain and initializes a separate headless
 `haystack-server` wallet before listening; operators must back up its seed and DB.
-Native desktop configurations expose these explicit steps without adding the
-server to the default install; the game client does not connect to it yet.
+The server is not part of the default desktop install. For local desktop play,
+run `zig build run-server` in one terminal and `zig build run` in another. After
+wallet onboarding, the desktop client authenticates to `ws://127.0.0.1:9224/`
+and syncs movement. It shows a disconnected screen and retries if the server is
+unavailable. Browser gameplay remains local-only.
 
 The browser graph is selected **only** by `-Dplatform=wasm`. A Wasm
 `-Dtarget` alone (including `-Dtarget=wasm32-emscripten`, `wasm64-*` or WASI)
@@ -30,9 +33,9 @@ installed `desktop` directory can be moved outside the repository.
 
 On Linux and macOS the desktop binary creates its window and world first, then
 runs native wallet startup inspection. A validated existing wallet proceeds to
-the game. A new or pending wallet shows a blocking onboarding overlay that
-requires saving and acknowledging the recovery words (or recovering an existing
-wallet) before gameplay. The desktop wallet is persistent: a plaintext BIP-39
+server authentication. A new or pending wallet shows a blocking onboarding
+overlay that requires saving and acknowledging the recovery words (or recovering
+an existing wallet) before gameplay. The desktop wallet is persistent: a plaintext BIP-39
 mnemonic (`seed-words.txt`) and a CDK SQLite database (`wallet.sqlite`) live in a
 Haystack-owned wallet directory with owner-only permissions; macOS extended ACLs
 are rejected. Startup inspection is local and makes no mint request. Invalid or

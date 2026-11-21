@@ -1,4 +1,4 @@
-//! Native server-only Bitcoin Core libsecp256k1, directly compiled by Zig.
+//! Native Bitcoin Core libsecp256k1, directly compiled by Zig.
 const std = @import("std");
 
 pub const Graph = struct {
@@ -26,6 +26,6 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     translated.addIncludePath(dep.path("include"));
     return .{
         .library = b.addLibrary(.{ .name = "haystack_secp256k1", .linkage = .static, .root_module = module }),
-        .bindings = translated.addModule("secp256k1"),
+        .bindings = translated.createModule(),
     };
 }

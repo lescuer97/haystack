@@ -37,6 +37,10 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     if (preflight) |step| raylib_artifact.step.dependOn(&step.step);
     const root = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = options.optimize });
     root.addImport("shared", shared);
+    const websocket = b.lazyDependency("websocket", .{ .target = target, .optimize = options.optimize }) orelse return;
+    root.addImport("websocket", websocket.module("websocket"));
+    const secp = @import("secp256k1.zig").create(b, target, options.optimize) orelse return;
+    secp.link(root);
     root.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
     root.addImport("haystack_game", mod);
     root.addImport("raylib", raylib_module);

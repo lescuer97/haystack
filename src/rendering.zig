@@ -1110,6 +1110,19 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
     };
 }
 
+pub fn drawDisconnected(detail: [:0]const u8, vw: f32, vh: f32) void {
+    rl.drawRectangle(0, 0, @intFromFloat(@max(vw, 0)), @intFromFloat(@max(vh, 0)), menu_backdrop);
+    const width = @max(0, @min(vw - 16, 460));
+    const height = @max(0, @min(vh - 16, 120));
+    const panel = menu.Rect{ .x = (vw - width) / 2, .y = (vh - height) / 2, .width = width, .height = height };
+    drawSolidRect(panel, menu_panel_bg);
+    rl.drawRectangleLinesEx(toRaylibRect(panel), 2, menu_panel_border);
+    const title = menu.Rect{ .x = panel.x, .y = panel.y, .width = width, .height = height / 2 };
+    const body = menu.Rect{ .x = panel.x, .y = panel.y + height / 2, .width = width, .height = height / 2 };
+    drawCenteredText("Disconnected", title, 22, menu_title_color);
+    drawCenteredText(detail, body, 16, menu_text_color);
+}
+
 fn onboardingRect(r: onboarding.Rect) menu.Rect {
     return .{ .x = r.x, .y = r.y, .width = r.width, .height = r.height };
 }

@@ -14,6 +14,11 @@
 
 ## Local patches
 
+- `src/client/client.zig`: close the stream on EOF or a connection reset before
+  marking it closed, so desktop retries do not leak socket descriptors. Omit
+  `Content-Length: 0` from the bodyless WebSocket upgrade; the local server
+  rejects HTTP body-framing headers on upgrades.
+
 - `src/server/server.zig`: prewarm connection records and, by default, small
   reader buffers from existing `max_conn` settings; enforce the connection
   record limit including pending handshakes. Prewarm handshake states for at

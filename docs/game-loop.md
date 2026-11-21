@@ -316,13 +316,30 @@ cache. A non-resident chunk still exists conceptually; the deterministic generat
   coordinate error is a program invariant and propagates out of the loop.
 - See `memory.md` for the HUD accounting details.
 
-## Future: incoming server messages (not implemented)
+## Native movement synchronization
 
-There is **no networking code today**. The following is the planned shape, not
-a protocol.
+The desktop loop owns a WebSocket worker that is disabled while onboarding
+blocks input. After onboarding, it connects to the local server and answers its
+challenge with a dedicated BIP340 key derived from the wallet's existing BIP-39
+seed. The desktop worker retains the key in memory across reconnects, without
+changing the wallet or writing another credential to disk. The worker publishes
+connection and movement state without mutating
+`GameState`; the frame thread never waits for socket or wallet I/O.
 
-A future WebSocket client is an independent input source alongside the local
-keyboard/mouse:
+Before capturing input, each desktop frame applies the latest worker state.
+While unauthenticated it shows a disconnected overlay and does not run gameplay
+updates. Only a committed local step is sent, and no second move can commit
+until its reply. An explicit rejection restores the last acknowledged position.
+On a disconnect or reply timeout, the worker retries with capped backoff; on
+successful authentication the game resets to spawn, clears queued input, and
+does not replay any previous move. The browser remains local-only.
+
+## Future: authoritative world changes
+
+Movement replies are implemented; terrain messages and resync are not.
+
+Future terrain messages should follow the same update boundary as movement
+replies:
 
 ```text
 local devices ──► input_reader.read() ────┐
