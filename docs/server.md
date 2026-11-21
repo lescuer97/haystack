@@ -142,6 +142,13 @@ updates are not replay-cached and do not enforce movement cadence or consult
 cuts or other characters. Cut/read connections must first complete authentication.
 There is no listing, client query, subscription, broadcast or location history.
 
+The default Debug server (`zig build run-server -Dgame=false`) writes
+`debug(gameplay)` logs to stderr. Each entry identifies the authenticated player
+by their lowercase hex public key and reports the old and new movement tiles,
+the newly cut tile, or the requested chunk bounds for a successful area read.
+Rejected actions, movement no-ops, and cached cut replays are not logged.
+Release builds suppress these debug logs.
+
 Normal/error/shutdown cleanup and failed-upgrade cleanup after admission release
 the session. Generation-checked handles protect reused connection records from
 stale cleanup/update. Reconnect after close starts at the spawn.

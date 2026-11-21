@@ -57,11 +57,23 @@ pub const Registry = struct {
         if (self.slotFor(handle)) |slot| slot.* = .{};
     }
     pub fn update(self: *Registry, handle: Handle, location: Location) !void {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        const slot = self.slotFor(handle) orelse return error.StaleSession;
-        if (!shared.movement.canStep(slot.location.?, location)) return error.BlockedMovement;
-        slot.location = location;
+        const move = capture: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            const slot = self.slotFor(handle) orelse return error.StaleSession;
+            const from = slot.location.?;
+            if (!shared.movement.canStep(from, location)) return error.BlockedMovement;
+            if (from.x == location.x and from.y == location.y) return;
+            slot.location = location;
+            break :capture .{ .from = from, .pubkey = slot.pubkey };
+        };
+        std.log.scoped(.gameplay).debug("move pubkey={s} tile=({d},{d}) -> ({d},{d})", .{
+            std.fmt.bytesToHex(move.pubkey, .lower),
+            move.from.x,
+            move.from.y,
+            location.x,
+            location.y,
+        });
     }
     pub fn get(self: *Registry, handle: Handle) ?SessionSnapshot {
         self.mutex.lockUncancelable(self.io);

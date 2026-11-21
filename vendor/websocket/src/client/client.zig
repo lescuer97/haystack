@@ -89,14 +89,16 @@ fn connectAddrTimeout(addr: Io.net.IpAddress, timeout_ms: u32) ConnectAddrError!
             .port = std.mem.nativeToBig(u16, a.port),
             .addr = @bitCast(a.bytes),
         } },
-        .ip6 => |a| .{ .in6 = .{
-            .port = std.mem.nativeToBig(u16, a.port),
-            .flowinfo = a.flow,
-            .addr = a.bytes,
-            // Required for link-local (fe80::) addresses to pick the right
-            // interface; Interface.none has index 0.
-            .scope_id = a.interface.index,
-        } },
+        .ip6 => |a| .{
+            .in6 = .{
+                .port = std.mem.nativeToBig(u16, a.port),
+                .flowinfo = a.flow,
+                .addr = a.bytes,
+                // Required for link-local (fe80::) addresses to pick the right
+                // interface; Interface.none has index 0.
+                .scope_id = a.interface.index,
+            },
+        },
     };
 
     const sock_type = posix.SOCK.STREAM | posix.NONBLOCK | posix.CLOEXEC;
@@ -122,7 +124,7 @@ fn connectAddrTimeout(addr: Io.net.IpAddress, timeout_ms: u32) ConnectAddrError!
                 .SUCCESS => {},
                 else => return error.ConnectFailed,
             }
-            if (so_err != 0) return switch (@as(std.posix.E, @enumFromInt(so_err))) {
+            if (so_err != 0) return switch (@as(std.posix.E, @fromBackingInt(@intCast(so_err)))) {
                 .CONNREFUSED => error.ConnectionRefused,
                 .TIMEDOUT => error.ConnectTimeout,
                 .HOSTUNREACH, .NETUNREACH => error.NetworkUnreachable,

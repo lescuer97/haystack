@@ -87,7 +87,8 @@ pub const Dispatcher = struct {
     /// uncancelable, world actions are bounded RAM, and completion always signals.
     pub fn execute(self: *Dispatcher, app: *App, box: *Mailbox, work: Work) void {
         var close = false;
-        if (app.registry.get(work.session) == null) {
+        const session = app.registry.get(work.session);
+        if (session == null) {
             close = true;
             box.len = application.encodeCommonFailure(&box.reply, work.request, .invalid_request).len;
         } else switch (work.request.operation) {
@@ -103,7 +104,7 @@ pub const Dispatcher = struct {
                 if (app.lease()) |context| {
                     defer app.release(context);
                     // Copy the encoded snapshot before returning the reusable context.
-                    const bytes = context.handle(kind, .{ .request_id = work.request.request_id, .payload = payload });
+                    const bytes = context.handle(kind, .{ .request_id = work.request.request_id, .payload = payload }, session.?.pubkey);
                     @memcpy(box.reply[0..bytes.len], bytes);
                     box.len = bytes.len;
                 } else {

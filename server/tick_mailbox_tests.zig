@@ -51,7 +51,7 @@ test "owned requests wait for tick; cut read and location copy replies before re
     try t.expectEqualDeep(read.operation.read_area, saved.area);
     try t.expectEqual(@as(u16, 1), saved.count);
     const context = app.lease().?;
-    _ = context.handle(.read_area, .{ .request_id = read.request_id, .payload = read.operation.read_area });
+    _ = context.handle(.read_area, .{ .request_id = read.request_id, .payload = read.operation.read_area }, app.registry.get(session).?.pubkey);
     @memset(&context.response, 0xaa);
     app.release(context);
     try t.expectEqualDeep(saved, (try reply(area_reply, .read_area, read.request_id, &snapshot)).ok.*);

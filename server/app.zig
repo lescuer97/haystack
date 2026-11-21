@@ -26,13 +26,31 @@ pub const Context = struct {
     state: WorldState = .{},
     response: [p.max_response_bytes]u8 = undefined,
     snapshot: p.Snapshot = undefined,
-    pub fn handle(self: *Context, comptime kind: p.Kind, req: p.RequestFor(kind)) []const u8 {
+    pub fn handle(self: *Context, comptime kind: p.Kind, req: p.RequestFor(kind), pubkey: sessions.Pubkey) []const u8 {
+        const replays_before = self.state.replay_count;
         const outcome = switch (kind) {
             .cut => actions.handleCut(&self.state, req),
             .read_area => actions.handleReadArea(&self.state, &self.snapshot, req),
             else => @compileError("only cut and read_area use the world context"),
             .channel_requirements, .channel_open, .channel_payment, .channel_close => @compileError("channel requests do not use the world context"),
         };
+        if (comptime std.log.logEnabled(.debug, .gameplay)) {
+            const log = std.log.scoped(.gameplay);
+            if (outcome == .ok) switch (kind) {
+                // A cached success doesn't cut the tile again.
+                .cut => if (self.state.replay_count != replays_before) {
+                    log.debug("cut pubkey={s} tile=({d},{d})", .{ std.fmt.bytesToHex(pubkey, .lower), req.payload.x, req.payload.y });
+                },
+                .read_area => log.debug("read_area pubkey={s} chunks=({d},{d})..({d},{d})", .{
+                    std.fmt.bytesToHex(pubkey, .lower),
+                    req.payload.cx0,
+                    req.payload.cy0,
+                    req.payload.cx1,
+                    req.payload.cy1,
+                }),
+                else => unreachable,
+            };
+        }
         return shared.wire.encodeReply(&self.response, kind, req, outcome) catch unreachable;
     }
 };
