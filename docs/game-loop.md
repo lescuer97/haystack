@@ -21,6 +21,10 @@ walking. Releasing movement returns to idle. Mouse drag only pans the view. Pres
 hoe, `4` for watering can, or `5` to preview the collapse. These play once and
 do not affect terrain, health, or inventory.
 
+Oaks and the player are drawn back to front using the tree roots and the
+player's feet. An oak in front of the player fades to 40% opacity if its art
+would cover the player, and stays in front while faded. Other oaks stay opaque.
+
 The local asset pack supplies both files in `assets/Player/`. Rows below are
 zero-based; each source rectangle starts at `(column × cell size, row × cell
 size)`. Left-facing frames mirror the right-facing ones.

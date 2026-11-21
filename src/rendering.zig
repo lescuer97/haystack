@@ -52,6 +52,17 @@ fn oakDest(x: f32, y: f32) rl.Rectangle {
     return .{ .x = x - 48, .y = y - 96, .width = 128, .height = 160 };
 }
 
+const occluding_oak_tint = rl.Color.init(255, 255, 255, 102);
+
+fn oakTint(dest: rl.Rectangle, feet: rl.Vector2) rl.Color {
+    // Use the oak's opaque art (source bounds [11,52) × [9,64)), not
+    // the padded atlas cell or shadow. Test against the player's body, not tool reach.
+    const root_y = dest.y + 64 * 2;
+    const overlaps_body = root_y > feet.y and dest.y + 9 * 2 < feet.y and
+        dest.x + 11 * 2 < feet.x + 14 and dest.x + 52 * 2 > feet.x - 14;
+    return if (overlaps_body) occluding_oak_tint else .white;
+}
+
 // Quadrants TL, TR, BL, BR; columns convex, horizontal boundary, vertical
 // boundary, concave, solid. Each measured atlas crop is 8x8, drawn at 2x.
 const dirt_quadrants = [4][5][2]f32{
@@ -228,7 +239,7 @@ fn drawChunkDebug(chunk: *const world.Chunk, settings: game_mod.DebugSettings) v
     }
 }
 
-fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.DebugSettings, resources: *const Resources) void {
+fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.DebugSettings, feet: rl.Vector2, frame: player.Frame, resources: *const Resources) void {
     // One visible grass pass keeps texture draws together, below all overlays.
     var grass_cy = vis.cy0;
     while (grass_cy <= vis.cy1) : (grass_cy += 1) {
@@ -322,21 +333,30 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
         }
     }
 
+    // Merge the player into the oak pass by ground depth, across chunk seams.
+    var player_pending = true;
     var tree_cy = sprite_range.cy0;
     while (tree_cy <= sprite_range.cy1) : (tree_cy += 1) {
         for (0..world.CT) |row| {
+            const y: f32 = @floatFromInt((tree_cy * world.CHUNK_TILES + @as(i32, @intCast(row))) * world.TILE_PX);
+            if (player_pending and y + world.TILE_PX > feet.y) {
+                drawPlayer(feet, frame, resources);
+                player_pending = false;
+            }
             var tree_cx = sprite_range.cx0;
             while (tree_cx <= sprite_range.cx1) : (tree_cx += 1) {
                 const chunk = w.get(tree_cx, tree_cy) orelse continue;
                 for (0..world.CT) |col| {
                     if (chunk.tiles[row * world.CT + col] != .tree) continue;
                     const x: f32 = @floatFromInt((tree_cx * world.CHUNK_TILES + @as(i32, @intCast(col))) * world.TILE_PX);
-                    const y: f32 = @floatFromInt((tree_cy * world.CHUNK_TILES + @as(i32, @intCast(row))) * world.TILE_PX);
-                    rl.drawTexturePro(resources.oak, oak_source, oakDest(x, y), .{ .x = 0, .y = 0 }, 0, .white);
+                    const dest = oakDest(x, y);
+                    rl.drawTexturePro(resources.oak, oak_source, dest, .{ .x = 0, .y = 0 }, 0, oakTint(dest, feet));
                 }
             }
         }
     }
+
+    if (player_pending) drawPlayer(feet, frame, resources);
 
     // ponytail: debug overlays may cover canopies.
     var cy = vis.cy0;
@@ -829,8 +849,8 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
     rl.clearBackground(rl.Color.init(24, 24, 28, 255));
 
     rl.beginMode2D(view.transform);
-    drawWorld(&game.world, view.chunks, game.settings.debug, resources);
-    drawPlayer(camera.tileCenter(game.player_pos.x, game.player_pos.y), game.player_animation.frame(), resources);
+    const feet = camera.tileCenter(game.player_pos.x, game.player_pos.y);
+    drawWorld(&game.world, view.chunks, game.settings.debug, feet, game.player_animation.frame(), resources);
     rl.endMode2D();
 
     drawHud(&game.world, view.chunks, &game.camera, game.settings.debug);
@@ -1151,6 +1171,18 @@ test "oak root doubles around the ground tile bottom center" {
         try std.testing.expectEqual(pixel + world.TILE_PX / 2, dest.x + 32 * 2);
         try std.testing.expectEqual(pixel + world.TILE_PX, dest.y + 64 * 2);
     }
+}
+
+test "oak tint fades only foreground art that can cover the player" {
+    const feet = camera.tileCenter(-1, -1);
+    // A canopy rooted across the chunk seam can still cover the player.
+    try std.testing.expectEqual(occluding_oak_tint, oakTint(oakDest(0, 0), feet));
+    try std.testing.expectEqual(occluding_oak_tint, oakTint(oakDest(-32, 32), feet));
+    try std.testing.expectEqual(occluding_oak_tint, oakTint(oakDest(-64, -32), feet));
+    // Behind the feet, beside the body, or only cell padding above the feet.
+    try std.testing.expectEqual(rl.Color.white, oakTint(oakDest(-32, -64), feet));
+    try std.testing.expectEqual(rl.Color.white, oakTint(oakDest(32, 0), feet));
+    try std.testing.expectEqual(rl.Color.white, oakTint(oakDest(-32, 64), feet));
 }
 
 test "sprite anchor ring includes adjacent offscreen canopies and shadows at negative coordinates" {
