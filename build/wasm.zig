@@ -89,6 +89,8 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     const oak_sheet = b.path("assets/Outdoor decoration/Oak_Tree.png");
     const rock_sheet = b.path("assets/Outdoor decoration/Outdoor_Decor_Free.png");
     const water_sheet = b.path("assets/Tiles/Water_Tile.png");
+    const player_sheet = b.path("assets/Player/Player.png");
+    const player_action_sheet = b.path("assets/Player/Player_Actions.png");
     const preload_paths: []const rlz.emsdk.ResourceFile = &.{
         .{
             .src_path = grass_sheet,
@@ -109,6 +111,14 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         .{
             .src_path = water_sheet,
             .virtual_path = "/assets/Tiles/Water_Tile.png",
+        },
+        .{
+            .src_path = player_sheet,
+            .virtual_path = "/assets/Player/Player.png",
+        },
+        .{
+            .src_path = player_action_sheet,
+            .virtual_path = "/assets/Player/Player_Actions.png",
         },
     };
     const linked = try rlz.emsdk.emccStep(b, &.{}, &.{renderer}, .{
@@ -154,6 +164,8 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         emcc.addFileInput(oak_sheet);
         emcc.addFileInput(rock_sheet);
         emcc.addFileInput(water_sheet);
+        emcc.addFileInput(player_sheet);
+        emcc.addFileInput(player_action_sheet);
     }
     const browser_fixture = b.step("browser-fixture", "Build and install the isolated browser fixture application");
     browser_fixture.dependOn(&install_fixture.step);

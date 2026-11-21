@@ -128,7 +128,7 @@ class GraphIsolationTests(unittest.TestCase):
         self.assertNotIn("macos-preflight.py", wasm_source)
         self.assertNotIn("macos_deployment_target", wasm_source)
 
-    def test_both_browser_links_preload_only_grass_dirt_oak_rock_water_sheets_and_track_their_contents(self):
+    def test_both_browser_links_preload_game_sheets_and_track_their_contents(self):
         source = (ROOT / "build" / "wasm.zig").read_text(encoding="utf-8")
         for sheet, path in (
             ("grass_sheet", "assets/Tiles/Grass_Middle.png"),
@@ -136,6 +136,8 @@ class GraphIsolationTests(unittest.TestCase):
             ("oak_sheet", "assets/Outdoor decoration/Oak_Tree.png"),
             ("rock_sheet", "assets/Outdoor decoration/Outdoor_Decor_Free.png"),
             ("water_sheet", "assets/Tiles/Water_Tile.png"),
+            ("player_sheet", "assets/Player/Player.png"),
+            ("player_action_sheet", "assets/Player/Player_Actions.png"),
         ):
             with self.subTest(sheet=sheet):
                 self.assertIn(f'const {sheet} = b.path("{path}");', source)
@@ -143,11 +145,11 @@ class GraphIsolationTests(unittest.TestCase):
                 self.assertIn(f'.virtual_path = "/{path}",', source)
                 self.assertIn(f"emcc.addFileInput({sheet});", source)
         self.assertEqual(source.count(".preload_paths = preload_paths,"), 2)
-        self.assertEqual(source.count(".src_path ="), 5)
-        self.assertEqual(source.count(".virtual_path ="), 5)
+        self.assertEqual(source.count(".src_path ="), 7)
+        self.assertEqual(source.count(".virtual_path ="), 7)
         self.assertIn("for ([_]*std.Build.Step{ linked, fixture_linked })", source)
         self.assertIn(".cast(std.Build.Step.Run)", source)
-        self.assertEqual(source.count("emcc.addFileInput("), 5)
+        self.assertEqual(source.count("emcc.addFileInput("), 7)
 
     def test_explicit_wasm_platform_and_target_select_the_complete_browser_graph(self):
         result = configure("-Dplatform=wasm", "-Dtarget=wasm32-emscripten")

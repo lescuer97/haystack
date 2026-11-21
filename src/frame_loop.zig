@@ -114,8 +114,7 @@ pub const Driver = struct {
         self.viewport_h = height;
     }
 
-    /// No time-based animations currently exist. If added, advance them ONCE
-    /// here using tick.dt_seconds, not once per drained input record.
+    /// Advance animation time only on the reconciliation sample, not on queued edges.
     pub fn advance(self: *Driver, seconds: f64, game: *game_mod.GameState, model: ?*onboarding.Onboarding, sink: ?EffectSink, privacy_blocked: *bool) !bool {
         const now = clockNanoseconds(seconds) orelse return false;
         if (!self.schedule.poll(now)) return false;
@@ -123,19 +122,20 @@ pub const Driver = struct {
         while (self.queue.pop()) |value| {
             var sample = value;
             defer sample.scrub();
-            try self.consume(sample, game, model, sink, privacy_blocked);
+            try self.consume(sample, 0, game, model, sink, privacy_blocked);
         }
         // Includes a dropped release, but NEVER a dropped edge/text/delta.
-        try self.consume(self.queue.latest, game, model, sink, privacy_blocked);
+        try self.consume(self.queue.latest, tick.dt_seconds, game, model, sink, privacy_blocked);
         try self.prepare(game, self.queue.latest.frame.viewport_w, self.queue.latest.frame.viewport_h);
         self.routing = Routing.get(game, model);
         return true;
     }
 
-    fn consume(self: *Driver, sample: input.RawSample, game: *game_mod.GameState, model: ?*onboarding.Onboarding, sink: ?EffectSink, privacy_blocked: *bool) !void {
+    fn consume(self: *Driver, sample: input.RawSample, dt: f32, game: *game_mod.GameState, model: ?*onboarding.Onboarding, sink: ?EffectSink, privacy_blocked: *bool) !void {
         if (model) |m| privacy_blocked.* = privacy_blocked.* or m.isBlocking();
         const modal = game.menu.opened or (if (model) |m| m.isBlocking() else false);
         var frame = self.repeat.route(sample, modal);
+        frame.dt = dt;
         defer std.crypto.secureZero(u21, &frame.characters);
         const effect = try routeFrame(game, model, frame);
         if (model) |m| {

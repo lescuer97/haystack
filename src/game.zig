@@ -1,7 +1,7 @@
 //! Persistent game state and the rules that apply one frame of input to it.
 //!
 //! `GameState` owns everything that survives a frame: the world cache, the
-//! camera, and settings. Nothing here polls hardware. `main` collects a
+//! camera, player animation, and settings. Nothing here polls hardware. `main` collects a
 //! `FrameInput` and hands it in, so the same update logic can be driven by a
 //! test, a replay, or a future network source without a window.
 
@@ -12,6 +12,7 @@ const camera = @import("camera.zig");
 const input = @import("input.zig");
 const world = @import("world.zig");
 const menu = @import("menu.zig");
+const player = @import("player.zig");
 const settings_mod = @import("settings.zig");
 
 pub const DebugSettings = settings_mod.DebugSettings;
@@ -20,6 +21,7 @@ pub const Settings = settings_mod.Settings;
 pub const GameState = struct {
     world: world.World,
     camera: camera.Camera,
+    player_animation: player.Animation = .{},
     menu: menu.Menu,
     settings: Settings,
 
@@ -76,6 +78,7 @@ pub const GameState = struct {
         }
 
         try self.camera.applyInput(frame);
+        self.player_animation.update(frame.dt, frame.held_dx, frame.held_dy, frame.action);
 
         if (frame.toggle_grid) self.settings.debug.tile_grid = !self.settings.debug.tile_grid;
         if (frame.toggle_borders) self.settings.debug.chunk_borders = !self.settings.debug.chunk_borders;
@@ -137,6 +140,25 @@ test "supplied input moves the camera by tiles, drag wins, and toggles flip" {
     try game_state.update(.{ .toggle_grid = true, .toggle_borders = true });
     try std.testing.expectEqual(!grid_before, game_state.settings.debug.tile_grid);
     try std.testing.expectEqual(!borders_before, game_state.settings.debug.chunk_borders);
+}
+
+test "player walks between tile steps and the menu consumes action input" {
+    var game_state = try GameState.init(std.testing.allocator, 1000, 640);
+    defer game_state.deinit();
+
+    try game_state.update(.{ .right = true, .held_dx = 1 });
+    try game_state.update(.{ .held_dx = 1, .dt = 0.11 });
+    try std.testing.expectEqual(@as(i32, 1), game_state.camera.tile_x);
+    try std.testing.expectEqual(@as(i32, 32), game_state.player_animation.frame().x);
+
+    const before = game_state.player_animation.frame();
+    try game_state.update(.{ .escape_clicked = true, .action = .sword });
+    try game_state.update(.{ .action = .axe, .dt = 0.25 });
+    try game_state.update(.{ .escape_clicked = true, .action = .hoe });
+    try std.testing.expectEqualDeep(before, game_state.player_animation.frame());
+
+    try game_state.update(.{ .action = .water });
+    try std.testing.expectEqual(player.Sheet.tools, game_state.player_animation.frame().sheet);
 }
 
 test "settings default to nested debug defaults" {

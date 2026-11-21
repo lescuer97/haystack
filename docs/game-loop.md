@@ -6,9 +6,33 @@ guide in `menu.md`.
 
 The demo is a chunk-streaming viewer: the camera pans over an endless,
 deterministically generated tile world, and only the chunks near the view are
-kept in memory. It does not simulate characters or talk to a server yet.
+kept in memory. The player sprite follows the camera target; it does not yet
+have separate movement, collision, or server state.
 `Esc` toggles the demonstration menu; see `menu.md` for its controls and
 extension points.
+
+## Player sprites
+
+WASD, arrows, and controller directions select the walk animation; releasing
+movement returns to idle facing the last direction. Mouse drag still pans the
+view. Press `Space` for the sword swing, `1` for pickaxe, `2` for axe, `3` for
+hoe, `4` for watering can, or `5` to preview the collapse. These play once and
+do not affect terrain, health, or inventory.
+
+The local asset pack supplies both files in `assets/Player/`. Rows below are
+zero-based; each source rectangle starts at `(column × cell size, row × cell
+size)`. Left-facing frames mirror the right-facing ones.
+
+| File | Cell | Animation | Rows (down / right / up) | Columns |
+|---|---|---|---|---|
+| `Player.png` (192×320) | 32×32 | Idle | 0 / 1 / 2 | 0–5 |
+| | | Walk | 3 / 4 / 5 | 0–5 |
+| | | Sword | 6 / 7 / 8 | 0–3 |
+| | | Collapse | 9 (side only) | 0–3 |
+| `Player_Actions.png` (96×576) | 48×48 | Pickaxe | 1 / 0 / 2 | 0–1 |
+| | | Axe | 4 / 3 / 5 | 0–1 |
+| | | Hoe | 7 / 6 / 8 | 0–1 |
+| | | Water | 9 / 11 / 10 | 0–1 |
 
 ## Where things live
 
@@ -17,14 +41,15 @@ extension points.
 | `src/main.zig` | allocator, window, the explicit per-frame loop or browser callback, teardown, screenshot hook | yes |
 | `src/input.zig` | raw device polling, bounded text, and a device-free tick-count direction repeater | yes |
 | `src/frame_loop.zig` | shared schedule adapter, ordered bounded queue, modal routing, immediate effects, cached view/viewport | no device polling |
-| `src/game.zig` | `GameState` owns the world, camera, menu, and debug settings; applies input | indirectly |
+| `src/game.zig` | `GameState` owns the world, camera, player animation, menu, and debug settings; applies input | indirectly |
+| `src/player.zig` | sprite-sheet frame coordinates and playback timing | **no** |
 | `src/menu.zig` | menu page/item data, pure layout, bounded text fields, and runtime menu state | **no** |
 | `src/onboarding.zig` | platform-neutral onboarding model, modal input, effects, and layout | **no** |
 | `src/onboarding_native.zig` | native wallet startup and completion adapter | **no** |
 | `src/camera.zig` | camera movement, world→screen transform, visible chunk range, bounds checks | yes |
 | `shared/world.zig` | tile/chunk types and deterministic terrain generation, shared with the standalone server | **no** |
 | `src/world.zig` | client resident cache, drawable bounds, streaming, stats, and unused private-yield primitive | **no** |
-| `src/rendering.zig` | draws world, marker, HUD, minimap, menu, and optional onboarding overlay from read-only state | yes |
+| `src/rendering.zig` | draws world, player, HUD, minimap, menu, and optional onboarding overlay from read-only state | yes |
 
 `world.zig` and `menu.zig` are intentionally Raylib-free. That keeps them
 headless-testable. The standalone [server](server.md) already uses shared terrain

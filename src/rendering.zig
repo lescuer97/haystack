@@ -1,4 +1,4 @@
-//! Read-only rendering of the world, camera marker, HUD, minimap, and menu.
+//! Read-only rendering of the world, player, HUD, minimap, and menu.
 //!
 //! Every function here borrows `GameState` and a calculated `View` as `const`.
 //! Nothing in this file polls input, moves the camera, streams chunks, or
@@ -13,6 +13,7 @@ const camera = @import("camera.zig");
 const game_mod = @import("game.zig");
 const menu = @import("menu.zig");
 const onboarding = @import("onboarding.zig");
+const player = @import("player.zig");
 const world = @import("world.zig");
 const terrain = @import("shared").world;
 
@@ -143,6 +144,8 @@ pub const Resources = struct {
     oak: rl.Texture2D,
     decor: rl.Texture2D,
     water: rl.Texture2D,
+    player_sheet: rl.Texture2D,
+    player_actions: rl.Texture2D,
 
     pub fn init(allocator: std.mem.Allocator) !Resources {
         const grass = try loadAtlas(allocator, grass_asset, grass_sheet_width, grass_sheet_height);
@@ -153,12 +156,18 @@ pub const Resources = struct {
         errdefer rl.unloadTexture(oak);
         const decor = try loadAtlas(allocator, decor_asset, decor_sheet_width, decor_sheet_height);
         errdefer rl.unloadTexture(decor);
+        const water = try loadAtlas(allocator, water_asset, water_sheet_width, water_sheet_height);
+        errdefer rl.unloadTexture(water);
+        const player_sheet = try loadAtlas(allocator, "assets/Player/Player.png", 192, 320);
+        errdefer rl.unloadTexture(player_sheet);
         return .{
             .grass = grass,
             .dirt = dirt,
             .oak = oak,
             .decor = decor,
-            .water = try loadAtlas(allocator, water_asset, water_sheet_width, water_sheet_height),
+            .water = water,
+            .player_sheet = player_sheet,
+            .player_actions = try loadAtlas(allocator, "assets/Player/Player_Actions.png", 96, 576),
         };
     }
 
@@ -168,6 +177,8 @@ pub const Resources = struct {
         rl.unloadTexture(self.oak);
         rl.unloadTexture(self.decor);
         rl.unloadTexture(self.water);
+        rl.unloadTexture(self.player_sheet);
+        rl.unloadTexture(self.player_actions);
     }
 };
 
@@ -343,19 +354,23 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
     rl.drawRectangleLinesEx(.{ .x = -5, .y = -5, .width = 10, .height = 10 }, 2.0, .yellow);
 }
 
-/// Yellow X marking the camera target, drawn in world space from the view's
-/// calculated pixel target.
-fn drawCameraMarker(target: rl.Vector2) void {
-    const s: f32 = 14;
-    const yellow = rl.Color.init(255, 220, 0, 255);
-    const x = target.x;
-    const y = target.y;
-
-    // Dark under-stroke so the X stays readable on light grass.
-    rl.drawLineEx(.{ .x = x - s, .y = y - s }, .{ .x = x + s, .y = y + s }, 5, .black);
-    rl.drawLineEx(.{ .x = x - s, .y = y + s }, .{ .x = x + s, .y = y - s }, 5, .black);
-    rl.drawLineEx(.{ .x = x - s, .y = y - s }, .{ .x = x + s, .y = y + s }, 3, yellow);
-    rl.drawLineEx(.{ .x = x - s, .y = y + s }, .{ .x = x + s, .y = y - s }, 3, yellow);
+fn drawPlayer(target: rl.Vector2, frame: player.Frame, resources: *const Resources) void {
+    const texture = switch (frame.sheet) {
+        .character => resources.player_sheet,
+        .tools => resources.player_actions,
+    };
+    const size: f32 = @floatFromInt(frame.size);
+    const scale = 2;
+    const source = rl.Rectangle{
+        .x = @floatFromInt(frame.x),
+        .y = @floatFromInt(frame.y),
+        .width = if (frame.flip_x) -size else size,
+        .height = size,
+    };
+    const dest = rl.Rectangle{ .x = target.x, .y = target.y, .width = size * scale, .height = size * scale };
+    // The larger tool cells add 8 px of padding on each side; both sheets
+    // put the foot/shadow line 8 px below their cell center.
+    rl.drawTexturePro(texture, source, dest, .{ .x = size, .y = size + 8 * scale }, 0, .white);
 }
 
 /// Top-right minimap: loaded chunks (green), visible rect (yellow),
@@ -815,7 +830,7 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
 
     rl.beginMode2D(view.transform);
     drawWorld(&game.world, view.chunks, game.settings.debug, resources);
-    drawCameraMarker(view.transform.target);
+    drawPlayer(view.transform.target, game.player_animation.frame(), resources);
     rl.endMode2D();
 
     drawHud(&game.world, view.chunks, &game.camera, game.settings.debug);

@@ -2,6 +2,7 @@
 //! happen at consumption, never at presentation frequency.
 const std = @import("std");
 const rl = @import("raylib");
+const player = @import("player.zig");
 const stick_deadzone: f32 = 0.25;
 const gamepad: i32 = 0;
 pub const max_frame_characters = 32;
@@ -12,6 +13,10 @@ pub const FrameInput = struct {
     right: bool = false,
     up: bool = false,
     down: bool = false,
+    held_dx: i8 = 0,
+    held_dy: i8 = 0,
+    dt: f32 = 0,
+    action: ?player.Action = null,
     dragging: bool = false,
     drag_x: f32 = 0,
     drag_y: f32 = 0,
@@ -62,7 +67,7 @@ pub const RawSample = struct {
         const f = self.frame;
         return !f.clicked and !f.escape_clicked and !f.confirm and !f.backspace and
             !f.paste_shortcut and !f.toggle_grid and !f.toggle_borders and
-            f.character_count == 0 and f.drag_x == 0 and f.drag_y == 0;
+            f.action == null and f.character_count == 0 and f.drag_x == 0 and f.drag_y == 0;
     }
 };
 
@@ -101,6 +106,13 @@ pub const Reader = struct {
         }
         held.toggle_grid = rl.isKeyPressed(.g);
         held.toggle_borders = rl.isKeyPressed(.b);
+        const bindings = .{
+            .{ .space, .sword }, .{ .one, .pickaxe }, .{ .two, .axe },
+            .{ .three, .hoe },   .{ .four, .water },  .{ .five, .collapse },
+        };
+        inline for (bindings) |binding| {
+            if (held.action == null and rl.isKeyPressed(binding[0])) held.action = binding[1];
+        }
         while (true) {
             const cp = rl.getCharPressed();
             if (cp <= 0) break;
@@ -131,6 +143,7 @@ pub const Repeater = struct {
         out.right = false;
         out.up = false;
         out.down = false;
+        if (modal) out.action = null;
         const nav = sample.navigation;
         const wasd = sample.wasd;
         const dx: i8 = @as(i8, @intFromBool(nav.right or (!modal and wasd.right))) - @as(i8, @intFromBool(nav.left or (!modal and wasd.left)));
@@ -142,6 +155,10 @@ pub const Repeater = struct {
             // A world drag suppresses every later direction in this tick.
             if (sample.frame.dragging and !modal) self.used = true;
             return out;
+        }
+        if (!modal) {
+            out.held_dx = dx;
+            out.held_dy = dy;
         }
         const changed = dx != self.dx or dy != self.dy;
         self.dx = dx;
