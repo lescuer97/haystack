@@ -62,6 +62,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     b.dependOnFileContents(b.path("browser/game-ui.js"));
     b.dependOnFileContents(b.path("browser/game-storage.js"));
     b.dependOnFileContents(b.path("browser/game-onboarding.js"));
+    b.dependOnFileContents(b.path("browser/game-ws.js"));
     const ui_js = b.root.root_dir.handle.readFileAlloc(
         b.graph.io,
         "browser/game-ui.js",
@@ -81,7 +82,8 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         return err;
     };
     const onboarding_js = try b.root.root_dir.handle.readFileAlloc(b.graph.io, "browser/game-onboarding.js", b.allocator, .limited(256 * 1024));
-    const libraries_js = try std.mem.concat(b.allocator, u8, &.{ ui_js, "\n", storage_js, "\n", onboarding_js });
+    const websocket_js = try b.root.root_dir.handle.readFileAlloc(b.graph.io, "browser/game-ws.js", b.allocator, .limited(256 * 1024));
+    const libraries_js = try std.mem.concat(b.allocator, u8, &.{ ui_js, "\n", storage_js, "\n", onboarding_js, "\n", websocket_js });
     const write_files = b.addWriteFiles();
     const combined_library = write_files.add("haystack-game-libraries.js", libraries_js);
     const grass_sheet = b.path("assets/Tiles/Grass_Middle.png");

@@ -11,11 +11,12 @@ The independent [local server](docs/server.md) builds with
 `zig build server -Dgame=false` and has socket-free tests via `test-server`.
 It requires the native Rust/CDK toolchain and initializes a separate headless
 `haystack-server` wallet before listening; operators must back up its seed and DB.
-The server is not part of the default desktop install. For local desktop play,
-run `zig build run-server` in one terminal and `zig build run` in another. After
-wallet onboarding, the desktop client authenticates to `ws://127.0.0.1:9224/`
-and syncs movement. It shows a disconnected screen and retries if the server is
-unavailable. Browser gameplay remains local-only.
+The server is not part of the default client install. For local play, run
+`zig build run-server` in one terminal and either `zig build run` (desktop) or
+`zig build run -Dplatform=wasm` (browser) in another. Both clients authenticate to
+`ws://127.0.0.1:9224/` after wallet onboarding and sync movement. If the server is
+unavailable, they show a disconnected screen and retry. The browser endpoint is
+loopback; it is not a remote deployment or `wss://` configuration.
 
 The browser graph is selected **only** by `-Dplatform=wasm`. A Wasm
 `-Dtarget` alone (including `-Dtarget=wasm32-emscripten`, `wasm64-*` or WASI)

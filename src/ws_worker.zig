@@ -12,13 +12,9 @@ const poll_ms = 20;
 const endpoint = "127.0.0.1";
 const port = 9224;
 
-pub const Status = enum { disabled, connecting, authenticating, ready, retrying, wallet_error, credentials_rejected };
-pub const Snapshot = struct {
-    status: Status = .disabled,
-    session: u64 = 0,
-    confirmed: protocol.Location = shared.movement.spawn,
-    pending: bool = false,
-};
+const sync = @import("ws_sync.zig");
+const Status = sync.Status;
+const Snapshot = sync.Snapshot;
 
 pub const Worker = struct {
     paths: wallet.Paths,

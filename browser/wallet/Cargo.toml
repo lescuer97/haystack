@@ -18,6 +18,8 @@ cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels",
 safer-ffi = { version = "=0.1.13", features = ["proc_macros"] }
 bip39 = { version = "=2.2.2", features = ["rand", "zeroize"] }
 zeroize = "1"
+hkdf = "=0.12.4"
+sha2 = "=0.10.9"
 url = "2"
 uuid = "1"
 serde = { version = "1", features = ["derive"] }

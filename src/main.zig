@@ -36,6 +36,8 @@ const native_wallet = if (builtin.os.tag != .emscripten) @import("wallet.zig") e
 const wallet_ui = @import("wallet_ui.zig");
 const wallet_service = if (builtin.os.tag != .emscripten) @import("wallet_service.zig") else struct {};
 const ws_worker = if (builtin.os.tag != .emscripten) @import("ws_worker.zig") else struct {};
+const browser_ws = @import("browser_ws.zig");
+const ws_sync = @import("ws_sync.zig");
 const Location = @import("shared").protocol.Location;
 
 // `zig build test` collects tests from files referenced by this root module.
@@ -88,6 +90,8 @@ const BrowserContext = struct {
     driver: frame_loop.Driver = .{},
     model: onboarding.Onboarding,
     onboarding_start_failed: bool = false,
+    connection: browser_ws.Worker = .{},
+    network_frame: ws_sync.Frame = .{},
 };
 
 var browser_context: ?*BrowserContext = null;
@@ -110,7 +114,7 @@ extern "c" fn haystack_onboarding_unbind_input() void;
 
 fn clipboardProbe(kind: c_int, x: c_int, y: c_int, ptr: [*]u8, cap: u32) callconv(.c) c_int {
     const ctx = browser_context orelse return 0;
-    if (cap > 4097) return 0;
+    if (cap > 4097 or (!ctx.model.isBlocking() and ctx.connection.state.status != .ready)) return 0;
     if (!ctx.model.isBlocking() and ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Withdraw) {
         const state = &ctx.game_state.menu;
         if (kind == 2) return if (state.focus == .withdrawal_invoice) 16 else 0;
@@ -142,6 +146,7 @@ fn clipboardPaste(ptr: [*c]const u8, len: u32) callconv(.c) void {
     const ctx = browser_context orelse return;
     if (len > 4096 or (len > 0 and ptr == null)) return;
     if (!ctx.model.isBlocking()) {
+        if (ctx.connection.state.status != .ready) return;
         if (ctx.game_state.menu.opened and ctx.game_state.menu.currentPage == .Withdraw and ctx.game_state.menu.focus == .withdrawal_invoice) {
             withdrawal_clipboard_pending = withdrawal_clipboard.set(if (len == 0) "" else ptr[0..len]);
         }
@@ -318,6 +323,12 @@ fn browserFrame() callconv(.c) void {
         wallet_model.request = null;
     }
     privacy_blocked = privacy_blocked or ctx.model.isBlocking();
+    const network = ctx.connection.step(if (ctx.model.isBlocking()) null else browser_onboarding.currentGeneration());
+    const connection_detail = ctx.network_frame.apply(network, &ctx.driver, &ctx.game_state) catch |err| {
+        std.log.err("browser connection reconciliation failed: {s}", .{@errorName(err)});
+        stopBrowser();
+        return;
+    };
     stepFrame(
         &ctx.game_state,
         &ctx.resources,
@@ -326,14 +337,19 @@ fn browserFrame() callconv(.c) void {
         null,
         browser_settings_persister,
         &ctx.model,
-        .{ .dispatch = browserDispatch },
+        .{ .context = ctx, .dispatch = browserDispatch, .commit_movement = browserCommitMovement },
         &privacy_blocked,
-        null,
+        connection_detail,
     ) catch |err| {
         std.log.err("browser frame failed: {s}", .{@errorName(err)});
         stopBrowser();
         return;
     };
+}
+
+fn browserCommitMovement(context: ?*anyopaque, destination: Location) bool {
+    const ctx: *BrowserContext = @ptrCast(@alignCast(context.?));
+    return ctx.connection.submit(ctx.network_frame.session, destination);
 }
 
 fn browserDispatch(_: ?*anyopaque, model: *onboarding.Onboarding, effect: onboarding.Effect) void {
@@ -384,6 +400,7 @@ fn stopBrowser() void {
     withdrawal_clipboard = .{};
     withdrawal_clipboard_pending = false;
 
+    ctx.connection.stop();
     browser_onboarding.close();
     emscripten_cancel_main_loop();
     ctx.model.deinit();
@@ -901,7 +918,7 @@ pub fn main() anyerror!void {
     try connection.start();
     defer connection.stop();
     var effects = NativeEffects{ .allocator = allocator, .native = native, .scan_job = &scan_job, .connection = &connection };
-    var last_status: ws_worker.Status = .disabled;
+    var network_frame: ws_sync.Frame = .{};
     var onboarding_hand_cursor = false;
 
     while (!rl.windowShouldClose()) {
@@ -937,34 +954,8 @@ pub fn main() anyerror!void {
         };
         // Reconcile server output before capturing or consuming new input.
         connection.setEnabled(!model.isBlocking());
-        const network = connection.snapshot();
-        if ((last_status == .ready) != (network.status == .ready)) {
-            driver.invalidateInput();
-            game_state.camera.resetDrag();
-            game_state.player_walking = false;
-        }
-        last_status = network.status;
-        const new_session = network.session != effects.session;
-        if (network.status == .ready and (new_session or
-            (!network.pending and !std.meta.eql(game_state.player_pos, network.confirmed))))
-        {
-            try game_state.camera.setTarget(network.confirmed.x, network.confirmed.y);
-            game_state.camera.resetDrag();
-            game_state.player_pos = network.confirmed;
-            game_state.player_walking = false;
-            driver.invalidateInput();
-            driver.view = null;
-        }
-        effects.session = network.session;
-        driver.movement_blocked = network.pending;
-        const connection_detail: ?[:0]const u8 = switch (network.status) {
-            .disabled, .ready => null,
-            .connecting => "Connecting to the game server...",
-            .authenticating => "Authenticating your wallet...",
-            .retrying => "Server unavailable. Retrying...",
-            .wallet_error => "Could not sign with the wallet. Retrying...",
-            .credentials_rejected => "Server rejected the wallet proof. Retrying...",
-        };
+        const connection_detail = try network_frame.apply(connection.snapshot(), &driver, &game_state);
+        effects.session = network_frame.session;
         // Capture on the last requested frame, inside stepFrame's drawing pass.
         privacy_blocked = privacy_blocked or model.isBlocking();
         try stepFrame(

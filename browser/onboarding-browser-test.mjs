@@ -1,4 +1,5 @@
 // Isolated CDP runner: all wallet data lives in disposable browser contexts.
+import {gameSocketFixture} from './test-support/game-ws-fixture.mjs';
 import {bounded, CdpConnection, discoverEndpoint, launchBrowser, makeProfile, removeProfile, stopBrowser, watchdog} from './cdp-runner.mjs';
 
 const input = new URL(process.argv[2]);
@@ -95,7 +96,7 @@ async function prepareGame(sessionId, flow) {
   await send('Runtime.addBinding', {name:runtimeBinding}, sessionId);
   await send('Page.enable', {}, sessionId);
   await send('Emulation.setDeviceMetricsOverride', {width:1000, height:640, deviceScaleFactor:1, mobile:false}, sessionId);
-  await send('Page.addScriptToEvaluateOnNewDocument', {source:gameInstrumentation}, sessionId);
+  await send('Page.addScriptToEvaluateOnNewDocument', {source:gameSocketFixture + '\n' + gameInstrumentation}, sessionId);
   await send('Page.bringToFront', {}, sessionId);
 }
 
@@ -220,6 +221,7 @@ async function runGame(flow) {
     await settleTicks();
   }
   async function expectGameplay(transition) {
+    await expect(`${flow}: game socket authenticates after ${transition}`, 'window.gameSocketChecks?.ready === true');
     await settleTicks();
     const baseline = (await evaluate(gridSetting)).value;
     await pressGridKey();
@@ -235,6 +237,7 @@ async function runGame(flow) {
     await expect('game consumes startup and creates backup', 'window.gameOnboardingChecks.operations.includes("create") && window.gameOnboardingChecks.events.includes("backup")');
     await click(514); // Continue, without the backup checkbox
     await expect('game gates unconfirmed backup', '!window.gameOnboardingChecks.operations.includes("complete_backup")');
+    await expect('game never connects during backup', 'gameSocketChecks.connections === 0');
     await click(344); // Copy: a stub, never the system clipboard
     await expect('game consumes backup and supports trusted copy', 'window.gameOnboardingChecks.copies === 1');
     await reload();
@@ -245,6 +248,30 @@ async function runGame(flow) {
     await click(514); // Continue
     await expect('game completes confirmed backup', 'window.gameOnboardingChecks.operations.includes("complete_backup") && window.gameOnboardingChecks.events.includes("complete_success")');
     await expectGameplay('completion');
+    const moveRight = async () => {
+      await evaluate('document.getElementById("canvas").focus()');
+      await send('Input.dispatchKeyEvent', {type:'rawKeyDown', key:'ArrowRight', code:'ArrowRight', windowsVirtualKeyCode:39}, sessionId);
+      await frames();
+      await send('Input.dispatchKeyEvent', {type:'keyUp', key:'ArrowRight', code:'ArrowRight', windowsVirtualKeyCode:39}, sessionId);
+      await settleTicks();
+    };
+    await moveRight();
+    await expect('committed movement reaches game socket', 'gameSocketChecks.moves.some(([x,y]) => x === 1 && y === 0)');
+    const moves = await evaluate('gameSocketChecks.moves.length');
+    await evaluate('gameSocketChecks.disconnect(); true');
+    await settleTicks();
+    await moveRight();
+    await expect('disconnected gameplay sends no moves', `gameSocketChecks.moves.length === ${moves}`);
+    await evaluate('gameSocketChecks.online = true');
+    await expect('reconnect authenticates with the same key', 'gameSocketChecks.ready && gameSocketChecks.keys.length === 2 && gameSocketChecks.keys[0] === gameSocketChecks.keys[1]');
+    await settleTicks();
+    await moveRight();
+    await expect('reconnect starts at spawn', `gameSocketChecks.moves[${moves}]?.join() === '1,0'`);
+    const beforeReject = await evaluate('gameSocketChecks.rejectNext = true; gameSocketChecks.moves.length');
+    await moveRight();
+    await expect('fixture rejects the second step', `gameSocketChecks.moves[${beforeReject}]?.join() === '2,0'`);
+    await moveRight();
+    await expect('rejected step rolls back before the next move', `gameSocketChecks.moves[${beforeReject + 1}]?.join() === '2,0'`);
     await click(344);
     await expect('game dismisses backup controls', 'window.gameOnboardingChecks.copies === 1');
     await reload();

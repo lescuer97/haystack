@@ -473,23 +473,7 @@ impl BrowserOnboarding {
     /// Called only AFTER a Ready request has returned and released its temporary
     /// user lock. The lifetime onboarding lock remains owned by this service.
     pub async fn open_ready_wallet(&mut self) -> Result<crate::BrowserWallet, JsValue> {
-        if self.lock.is_none() {
-            return Err(unavailable());
-        }
-        let raw = Zeroizing::new(snapshot().await.map_err(|_| unavailable())?);
-        let audited = audit(&raw, &self.mint).map_err(|_| unavailable())?;
-        if !matches!(audited.view, View::Ready) {
-            return Err(unavailable());
-        }
-        let snapshot: Snapshot = serde_json::from_str(&raw).map_err(|_| unavailable())?;
-        let user = snapshot
-            .wallets
-            .into_iter()
-            .find(|w| w.name == USER_WALLET_NAME)
-            .ok_or_else(unavailable)?;
-        let phrase = Zeroizing::new(user.mnemonic.ok_or_else(unavailable)?);
-        let (_, seed) = browser_db::parse_mnemonic(&phrase).map_err(|_| unavailable())?;
-        let seed = Zeroizing::new(seed);
+        let seed = self.ready_seed().await?;
         let mint = wallet::parse_mint_url(&self.mint).map_err(|_| unavailable())?;
         let tasks = tokio::task::LocalSet::new();
         let (inner, reports) = tasks
@@ -506,9 +490,35 @@ impl BrowserOnboarding {
             tasks,
         })
     }
+
+    /// The browser game gets only an opaque signer, never the seed or key.
+    pub async fn open_game_signer(&mut self) -> Result<crate::game_auth::GameSigner, JsValue> {
+        let seed = self.ready_seed().await?;
+        crate::game_auth::GameSigner::derive(&seed).ok_or_else(unavailable)
+    }
 }
 
 impl BrowserOnboarding {
+    async fn ready_seed(&self) -> Result<Zeroizing<[u8; 64]>, JsValue> {
+        if self.lock.is_none() {
+            return Err(unavailable());
+        }
+        let raw = Zeroizing::new(snapshot().await.map_err(|_| unavailable())?);
+        let audited = audit(&raw, &self.mint).map_err(|_| unavailable())?;
+        if !matches!(audited.view, View::Ready) {
+            return Err(unavailable());
+        }
+        let snapshot: Snapshot = serde_json::from_str(&raw).map_err(|_| unavailable())?;
+        let user = snapshot
+            .wallets
+            .into_iter()
+            .find(|w| w.name == USER_WALLET_NAME)
+            .ok_or_else(unavailable)?;
+        let phrase = Zeroizing::new(user.mnemonic.ok_or_else(unavailable)?);
+        let (normalized, seed) = browser_db::parse_mnemonic(&phrase).map_err(|_| unavailable())?;
+        let _normalized = Zeroizing::new(normalized);
+        Ok(Zeroizing::new(seed))
+    }
     /// The caller holds the user wallet lock and the scan has fully quiesced.
     async fn finish_scan(&self, expected_id: &str, outcome: Result<(u64, u64, u64), ()>) -> String {
         let failed_event = || {

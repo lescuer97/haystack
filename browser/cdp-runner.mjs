@@ -16,7 +16,7 @@ const devtoolsEndpoint = /DevTools listening on (ws:\/\/[^\s]+)/;
 
 // Keep heavy temporary profiles off tmpfs when the shared scratch exists.
 export function disposableRoot() {
-  return existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir();
+  return process.env.HAYSTACK_BROWSER_TEST_TMPDIR || (existsSync('/tmp/opencode') ? '/tmp/opencode' : tmpdir());
 }
 
 export async function makeProfile(prefix) {

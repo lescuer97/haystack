@@ -7,6 +7,7 @@ mod api;
 mod browser_db;
 mod browser_onboarding;
 mod browser_platform;
+mod game_auth;
 mod mint_policy;
 #[path = "../../../vendor/cdk-wallet-ffi/src/spilman.rs"]
 mod spilman;

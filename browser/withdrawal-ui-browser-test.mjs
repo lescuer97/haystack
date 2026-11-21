@@ -1,5 +1,6 @@
 // Real renderer/input/CDK functional regression. No screenshots or public wallets.
 import {bounded, CdpConnection, discoverEndpoint, launchBrowser, makeProfile, removeProfile, stopBrowser, watchdog} from './cdp-runner.mjs';
+import {gameSocketFixture} from './test-support/game-ws-fixture.mjs';
 const origin = new URL(process.argv[2]);
 if (origin.protocol !== 'http:' || origin.hostname !== '127.0.0.1' || !origin.port) throw new Error('Local fixture required');
 const profile = await makeProfile('haystack-withdrawal-ui-');
@@ -97,7 +98,10 @@ const instrumentation = `(() => {
     };
   }});
 })();`;
-async function openWallet() { await settleTicks(); await key('Escape','Escape',27); await row('Main',0); }
+async function openWallet() {
+  await expect('game socket authenticated', 'window.gameSocketChecks?.ready === true');
+  await settleTicks(); await key('Escape','Escape',27); await row('Main',0);
+}
 async function openWithdraw() { await row('Wallet',2); }
 async function paste(text) {
   const delivered = await evaluate('checks.pasteDelivered');
@@ -127,7 +131,7 @@ async function run() {
   await expect('isolated fixture origin',`location.origin===${JSON.stringify(origin.origin)}`);
   // A fresh random wallet via the production onboarding service, never a saved user seed.
   await evaluate(`(async()=>{const m=await import('/wallet/cdk_wallet_browser.js');await m.default();const s=await m.start_onboarding(m.onboarding_mint());try{await s.request('inspect','{}');await s.request('create','{}');const r=JSON.parse(await s.request('complete_backup','{}'));if(r.event!=='complete_success')throw 0}finally{await s.close();s.free()}return true})()`);
-  await send('Page.addScriptToEvaluateOnNewDocument',{source:instrumentation});
+  await send('Page.addScriptToEvaluateOnNewDocument',{source:gameSocketFixture + '\n' + instrumentation});
   await send('Page.navigate',{url:new URL('/renderer/index.html',origin).href});
   await expect('Ready real renderer wallet','window.checks?.snapshot?.sats==="0" && checks.events.includes("ready")');
   await evaluate('document.getElementById("canvas").focus()');

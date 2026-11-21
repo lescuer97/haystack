@@ -1,4 +1,5 @@
 // Functional wallet/input/FFI regression, never a public mint or a user profile.
+import {gameSocketFixture} from './test-support/game-ws-fixture.mjs';
 import {bounded, CdpConnection, discoverEndpoint, launchBrowser, makeProfile, removeProfile, stopBrowser, watchdog} from './cdp-runner.mjs';
 const origin = new URL(process.argv[2]);
 if (origin.protocol !== 'http:' || origin.hostname !== '127.0.0.1' || !origin.port) throw new Error('Local fake mint required');
@@ -121,6 +122,7 @@ const instrumentation = `(() => {
   }});
 })();`;
 async function openWallet() {
+  await expect('game socket authenticated', 'window.gameSocketChecks?.ready === true');
   await settleTicks(); // Consume ready/reload replies before opening the menu.
   await escape(); await enter(); // Main -> Wallet
 }
@@ -142,7 +144,7 @@ async function run() {
   await send('Emulation.setDeviceMetricsOverride',{width:1000,height:640,deviceScaleFactor:1,mobile:false});
   await expect('isolated fixture origin',`location.origin===${JSON.stringify(origin.origin)}`);
   await evaluate(`(async()=>{const m=await import('/wallet/cdk_wallet_browser.js');await m.default();await m.provision_wallet('abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about','haystack-user');return true;})()`);
-  await send('Page.addScriptToEvaluateOnNewDocument',{source:instrumentation});
+  await send('Page.addScriptToEvaluateOnNewDocument',{source:gameSocketFixture + '\n' + instrumentation});
   await send('Page.navigate',{url:new URL('/renderer/index.html',origin).href});
   await expect('Ready opens Rust-owned wallet after onboarding lock release','walletUiChecks.events.includes("ready") && !!walletUiChecks.snapshot && walletUiChecks.active===0');
   await evaluate('document.getElementById("canvas").focus()');

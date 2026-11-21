@@ -6,8 +6,8 @@ const input = new URL(process.argv[2]);
 if (input.protocol !== 'http:' || input.hostname !== '127.0.0.1' || !input.port) throw new Error('Expected local fake mint URL');
 const runner = fileURLToPath(new URL('./onboarding-browser-test.mjs', import.meta.url));
 const failures = {
-  'drop-ready': 'gameplay after ready reload changes persisted grid',
-  'drop-complete': 'gameplay after completion changes persisted grid',
+  'drop-ready': 'game socket authenticates after ready reload',
+  'drop-complete': 'game socket authenticates after completion',
   'backup-error': 'no uncaught runtime errors across reload',
   'backup-rejection': 'no uncaught runtime errors across reload',
 };
