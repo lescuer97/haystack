@@ -25,7 +25,7 @@ pub const MenuPage = enum { Main, Debug, Wallet, Deposit, Invoice, History, With
 
 /// Local menu actions. None of these touch a wallet, payment, or network layer;
 /// they only change menu-local UI state.
-pub const Action = enum { close_menu, toggle_grid, toggle_borders, toggle_minimap, toggle_hud, balance, preset21, preset42, preset100, preset1000, deposit, previous, next, copy_invoice, review_withdrawal, confirm_withdrawal, cancel_withdrawal, review_again, paste_withdrawal, clear_withdrawal };
+pub const Action = enum { close_menu, toggle_grid, toggle_borders, toggle_debug_minimap, toggle_hud, balance, preset21, preset42, preset100, preset1000, deposit, previous, next, copy_invoice, review_withdrawal, confirm_withdrawal, cancel_withdrawal, review_again, paste_withdrawal, clear_withdrawal };
 
 /// Editable fields. A field is a data key; its runtime value lives in `Menu`.
 pub const InputField = enum { deposit_sats, withdrawal_invoice };
@@ -122,7 +122,7 @@ const main_items = [_]MenuItem{
 const debug_items = [_]MenuItem{
     .{ .action = .toggle_grid },
     .{ .action = .toggle_borders },
-    .{ .action = .toggle_minimap },
+    .{ .action = .toggle_debug_minimap },
     .{ .action = .toggle_hud },
     .{ .navigate = .Main },
 };
@@ -192,7 +192,7 @@ pub fn itemLabel(item: MenuItem) [:0]const u8 {
             .close_menu => "Resume",
             .toggle_grid => "Tile grid",
             .toggle_borders => "Chunk borders",
-            .toggle_minimap => "Chunk minimap",
+            .toggle_debug_minimap => "Show debug minimap",
             .toggle_hud => "Debug HUD",
             .balance => "Balance (sat)",
             .preset21 => "21 sat",
@@ -570,7 +570,7 @@ pub const Menu = struct {
             },
             .action => |action| switch (action) {
                 .close_menu => self.close(),
-                .toggle_grid, .toggle_borders, .toggle_minimap, .toggle_hud => self.debug_toggle = action,
+                .toggle_grid, .toggle_borders, .toggle_debug_minimap, .toggle_hud => self.debug_toggle = action,
                 .balance => {},
                 .preset21, .preset42, .preset100, .preset1000 => {
                     self.deposit_sats.clear();

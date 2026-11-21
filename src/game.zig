@@ -29,7 +29,7 @@ pub const GameState = struct {
     player_walking: bool = false,
     menu: menu.Menu,
     settings: Settings,
-    show_minimap: bool = true,
+    show_debug_minimap: bool = false,
     show_debug_hud: bool = true,
 
     /// Build the persistent state and size the world cache for the initial
@@ -50,7 +50,8 @@ pub const GameState = struct {
     ) !GameState {
         const cam = camera.Camera{ .tile_x = movement.spawn.x, .tile_y = movement.spawn.y };
         const initial_view = try camera.calculate(cam, initial_vw, initial_vh);
-        const initial_ring = initial_view.chunks.expanded(world.PREFETCH_MARGIN_CHUNKS);
+        const initial_ring = world.residencyRange(initial_view.chunks, if (initial_view.minimap) |map| map.chunks else null);
+        try world.validateChunkRange(initial_ring, 0);
         const initial_capacity = @max(
             world.MIN_PREHEATED_CHUNKS,
             @as(usize, @intCast(initial_ring.count())),
@@ -85,7 +86,7 @@ pub const GameState = struct {
                 switch (action) {
                     .toggle_grid => self.settings.debug.tile_grid = !self.settings.debug.tile_grid,
                     .toggle_borders => self.settings.debug.chunk_borders = !self.settings.debug.chunk_borders,
-                    .toggle_minimap => self.show_minimap = !self.show_minimap,
+                    .toggle_debug_minimap => self.show_debug_minimap = !self.show_debug_minimap,
                     .toggle_hud => self.show_debug_hud = !self.show_debug_hud,
                     else => unreachable,
                 }
@@ -129,9 +130,9 @@ pub const GameState = struct {
     /// Load visible chunks first, then prefetch; keep whatever is available on
     /// allocation failure and retry next frame. A coordinate error is a program
     /// invariant, so it propagates instead of being retried.
-    pub fn streamChunks(self: *GameState, view: world.ChunkRange) world.StreamError!void {
+    pub fn streamChunks(self: *GameState, view: camera.View) world.StreamError!void {
         const was_under_pressure = self.world.underMemoryPressure();
-        self.world.stream(view) catch |err| switch (err) {
+        self.world.streamWithMinimap(view.chunks, if (view.minimap) |map| map.chunks else null) catch |err| switch (err) {
             error.OutOfMemory => {
                 // Log once per pressure episode rather than flooding at 120 Hz.
                 if (!was_under_pressure) {
@@ -147,6 +148,24 @@ pub const GameState = struct {
 };
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+test "streaming covers the fixed minimap while panning across chunk boundaries" {
+    var game_state = try GameState.init(std.testing.allocator, 1600, 400);
+    defer game_state.deinit();
+    for ([_]i32{ -17, -16, -1, 0, 15, 16 }) |x| {
+        game_state.camera.tile_x = x;
+        const view = try camera.calculate(game_state.camera, 1600, 400);
+        const map = view.minimap.?.chunks;
+        const prefetch = view.chunks.expanded(world.PREFETCH_MARGIN_CHUNKS);
+        try std.testing.expect(map.cy0 < prefetch.cy0 and map.cy1 > prefetch.cy1);
+        try game_state.streamChunks(view);
+        var cy = map.cy0;
+        while (cy <= map.cy1) : (cy += 1) {
+            var cx = map.cx0;
+            while (cx <= map.cx1) : (cx += 1) try std.testing.expect(game_state.world.get(cx, cy) != null);
+        }
+    }
+}
 
 test "camera follows accepted player steps but drag only pans the view" {
     var game_state = try GameState.init(std.testing.allocator, 1000, 640);
@@ -371,7 +390,8 @@ test "debug menu toggles overlays independently by keyboard and pointer" {
     defer game_state.deinit();
 
     const initial = game_state.settings.debug;
-    try std.testing.expect(!game_state.show_minimap and !game_state.show_debug_hud);
+    const initial_minimap = game_state.show_debug_minimap;
+    const initial_hud = game_state.show_debug_hud;
     try game_state.update(.{ .escape_clicked = true });
     try game_state.update(.{ .down = true, .confirm = true });
     try std.testing.expectEqual(menu.MenuPage.Debug, game_state.menu.currentPage);
@@ -382,14 +402,17 @@ test "debug menu toggles overlays independently by keyboard and pointer" {
     try std.testing.expectEqual(!initial.chunk_borders, game_state.settings.debug.chunk_borders);
 
     try game_state.update(.{ .down = true, .confirm = true });
-    try std.testing.expect(game_state.show_minimap and !game_state.show_debug_hud);
+    try std.testing.expectEqual(!initial_minimap, game_state.show_debug_minimap);
+    try std.testing.expectEqual(initial_hud, game_state.show_debug_hud);
     const hud = game_state.menu.layoutFor(1000, 640).items[3];
     try game_state.update(.{ .clicked = true, .pointer_x = hud.centerX(), .pointer_y = hud.centerY() });
-    try std.testing.expect(game_state.show_minimap and game_state.show_debug_hud);
+    try std.testing.expectEqual(!initial_minimap, game_state.show_debug_minimap);
+    try std.testing.expectEqual(!initial_hud, game_state.show_debug_hud);
     try game_state.update(.{ .confirm = true });
     try game_state.update(.{ .escape_clicked = true });
     try std.testing.expect(!game_state.menu.opened);
-    try std.testing.expect(game_state.show_minimap and !game_state.show_debug_hud);
+    try std.testing.expectEqual(!initial_minimap, game_state.show_debug_minimap);
+    try std.testing.expectEqual(initial_hud, game_state.show_debug_hud);
 }
 
 test "the same direction field drives the camera or the menu by mode" {

@@ -167,20 +167,87 @@ pub const View = struct {
     transform: rl.Camera2D,
     /// Chunks intersecting the window, including prefetch validation.
     chunks: world.ChunkRange,
+    tiles: TileRange,
+    minimap: ?MinimapView,
+};
+
+pub const MinimapView = struct {
+    size_px: f32,
+    radius_tiles: i32,
+    chunks: world.ChunkRange,
+};
+
+fn minimapView(cam: Camera, vw: f32, vh: f32) ?MinimapView {
+    const size = @floor(@min(192, vw / 3, vh / 3));
+    if (size < 32) return null;
+    // Cover the longer viewport axis plus room for partial chunks and prefetch.
+    const extra_tiles = (world.PREFETCH_MARGIN_CHUNKS + 1) * world.CHUNK_TILES;
+    const radius: i32 = @as(i32, @intFromFloat(@ceil(@max(vw, vh) / (2 * world.TILE_PX)))) + extra_tiles;
+    return .{
+        .size_px = size,
+        .radius_tiles = radius,
+        .chunks = .{
+            .cx0 = @max(world.MIN_DRAWABLE_CHUNK, @divFloor(cam.tile_x - radius, world.CHUNK_TILES)),
+            .cy0 = @max(world.MIN_DRAWABLE_CHUNK, @divFloor(cam.tile_y - radius, world.CHUNK_TILES)),
+            .cx1 = @min(world.MAX_DRAWABLE_CHUNK, @divFloor(cam.tile_x + radius, world.CHUNK_TILES)),
+            .cy1 = @min(world.MAX_DRAWABLE_CHUNK, @divFloor(cam.tile_y + radius, world.CHUNK_TILES)),
+        },
+    };
+}
+
+/// Half-open tile bounds: a tile touching only the far edge is not visible.
+pub const TileRange = struct {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+
+    pub fn expanded(self: TileRange, padding: i32) TileRange {
+        return .{ .x0 = self.x0 - padding, .y0 = self.y0 - padding, .x1 = self.x1 + padding, .y1 = self.y1 + padding };
+    }
+};
+
+const PixelEdges = struct {
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+
+    fn chunks(self: PixelEdges) world.CoordinateError!world.ChunkRange {
+        const range = world.ChunkRange{
+            .cx0 = @divFloor(self.x0, world.CHUNK_PX),
+            .cy0 = @divFloor(self.y0, world.CHUNK_PX),
+            .cx1 = @divFloor(self.x1, world.CHUNK_PX),
+            .cy1 = @divFloor(self.y1, world.CHUNK_PX),
+        };
+        try world.validateChunkRange(range, world.PREFETCH_MARGIN_CHUNKS);
+        return range;
+    }
+
+    fn tiles(self: PixelEdges) TileRange {
+        return .{
+            .x0 = @divFloor(self.x0, world.TILE_PX),
+            .y0 = @divFloor(self.y0, world.TILE_PX),
+            .x1 = @divCeil(self.x1, world.TILE_PX),
+            .y1 = @divCeil(self.y1, world.TILE_PX),
+        };
+    }
 };
 
 pub fn calculate(cam: Camera, vw: f32, vh: f32) world.CoordinateError!View {
     const transform = cam.raylib(vw, vh);
-    return .{
-        .transform = transform,
-        .chunks = try visibleRange(transform, vw, vh),
-    };
+    const edges = try visibleEdges(transform, vw, vh);
+    return .{ .transform = transform, .chunks = try edges.chunks(), .tiles = edges.tiles(), .minimap = minimapView(cam, vw, vh) };
 }
 
 /// Chunks intersecting the camera view. Returns
 /// `error.CoordinateOutOfBounds` before any f32→i32 conversion that would
 /// trap or before a chunk range whose prefetch ring cannot be represented.
 pub fn visibleRange(cam: rl.Camera2D, vw: f32, vh: f32) world.CoordinateError!world.ChunkRange {
+    return (try visibleEdges(cam, vw, vh)).chunks();
+}
+
+fn visibleEdges(cam: rl.Camera2D, vw: f32, vh: f32) world.CoordinateError!PixelEdges {
     // The camera target is converted to i32 by the visible-range math, so
     // reject non-finite / out-of-i32 targets even before transforming.
     if (!pixelInI32Bounds(cam.target.x) or !pixelInI32Bounds(cam.target.y))
@@ -197,22 +264,7 @@ pub fn visibleRange(cam: rl.Camera2D, vw: f32, vh: f32) world.CoordinateError!wo
         !pixelInI32Bounds(br_x) or !pixelInI32Bounds(br_y))
         return error.CoordinateOutOfBounds;
 
-    const tx0 = @divFloor(@as(i32, @intFromFloat(tl_x)), world.TILE_PX);
-    const ty0 = @divFloor(@as(i32, @intFromFloat(tl_y)), world.TILE_PX);
-    const tx1 = @divFloor(@as(i32, @intFromFloat(br_x)), world.TILE_PX);
-    const ty1 = @divFloor(@as(i32, @intFromFloat(br_y)), world.TILE_PX);
-
-    const range = world.ChunkRange{
-        .cx0 = @divFloor(tx0, world.CHUNK_TILES),
-        .cy0 = @divFloor(ty0, world.CHUNK_TILES),
-        .cx1 = @divFloor(tx1, world.CHUNK_TILES),
-        .cy1 = @divFloor(ty1, world.CHUNK_TILES),
-    };
-
-    // The prefetch ring is loaded and generated too, so it must stay within
-    // the drawable chunk extent; this also makes `expanded()` safe.
-    try world.validateChunkRange(range, world.PREFETCH_MARGIN_CHUNKS);
-    return range;
+    return .{ .x0 = @intFromFloat(tl_x), .y0 = @intFromFloat(tl_y), .x1 = @intFromFloat(br_x), .y1 = @intFromFloat(br_y) };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -274,6 +326,12 @@ test "visibleRange validates transformed corners, not just the target" {
     try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(2000000000, 0, 1000000000, 0), 1000000000, 0));
     // Mirror: target and far corner fit, but the near corner is below i32 min.
     try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(-2000000000, 0, 1000000000, 0), 1000000000, 0));
+}
+
+test "visible tile range keeps partial tiles but excludes exact far edges" {
+    const cam = Camera{ .tile_x = -1, .tile_y = 0 };
+    try std.testing.expectEqual(TileRange{ .x0 = -1, .y0 = 0, .x1 = 0, .y1 = 1 }, (try calculate(cam, 32, 32)).tiles);
+    try std.testing.expectEqual(TileRange{ .x0 = -2, .y0 = -1, .x1 = 1, .y1 = 2 }, (try calculate(cam, 33, 33)).tiles);
 }
 
 test "visibleRange accepts ordinary and negative views" {

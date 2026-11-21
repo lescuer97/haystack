@@ -108,7 +108,7 @@ pub const Driver = struct {
 
     pub fn prepare(self: *Driver, game: *game_mod.GameState, width: f32, height: f32) !void {
         const view = try camera.calculate(game.camera, width, height);
-        try game.streamChunks(view.chunks);
+        try game.streamChunks(view);
         self.view = view;
         self.viewport_w = width;
         self.viewport_h = height;

@@ -108,16 +108,19 @@ Why this order:
 3. **View third.** The camera may have moved in step 2, so the view is
    calculated once after the batch. The loop caches derived view and viewport
    together until the next tick; resize layout can lag by up to 50 ms.
-4. **Stream fourth.** `streamChunks` is the other mutation site, but it only
-   changes *which chunks are resident*. Generated world content is unchanged.
+4. **Stream fourth.** `streamChunks` loads visible chunks first, then fills the
+   prefetch ring and the extra chunks needed to cover the fixed minimap. If the
+   full requested range is already cached, streaming skips the scan. Moving the
+   range preserves overlapping chunks and generates only missing ones.
 5. **Render last.** Rendering receives `*const GameState`, a `View`, the
    viewport size, and an optional read-only onboarding model. It cannot move the camera or collect input, and its functions
    take read-only pointers, so the compiler helps prevent accidental mutation.
-   Open **Debug Settings** from the pause menu to toggle the tile grid, chunk
-   borders, chunk minimap, and debug HUD. The minimap and HUD start hidden and
-   their visibility lasts for the current session. When the menu is open, it is
-   drawn over the world and any enabled overlays. A blocking onboarding overlay
-   is drawn last.
+   The terrain minimap colors the tiles within its fixed, camera-centered area,
+   with a marker at the player's tile when it is in range. Open **Debug
+   Settings** from the pause menu to toggle the separate chunk-diagnostics
+   minimap, debug HUD, tile grid, and chunk borders. The debug minimap and HUD
+   toggles last for the session. The menu is drawn over the world and overlays;
+   a blocking onboarding overlay is drawn last.
 
 Screenshot mode (`HAYSTACK_SHOT=/path.png`) runs a few frames, then captures
 **inside the drawing pass before `endDrawing` presents**, so the rendered world

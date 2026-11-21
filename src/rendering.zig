@@ -150,6 +150,8 @@ fn loadAtlas(allocator: std.mem.Allocator, comptime asset: []const u8, width: i3
 
 /// Window-owned GPU resources, separate from persistent game/world state.
 pub const Resources = struct {
+    allocator: std.mem.Allocator,
+    minimap: MinimapCache = .{},
     grass: rl.Texture2D,
     dirt: rl.Texture2D,
     oak: rl.Texture2D,
@@ -172,6 +174,7 @@ pub const Resources = struct {
         const player_sheet = try loadAtlas(allocator, "assets/Player/Player.png", 192, 320);
         errdefer rl.unloadTexture(player_sheet);
         return .{
+            .allocator = allocator,
             .grass = grass,
             .dirt = dirt,
             .oak = oak,
@@ -182,7 +185,13 @@ pub const Resources = struct {
         };
     }
 
+    pub fn prepareMinimap(self: *Resources, w: *const world.World, map: ?camera.MinimapView) void {
+        if (map) |view| self.minimap.prepare(self.allocator, w, view.chunks);
+    }
+
     pub fn deinit(self: *const Resources) void {
+        if (self.minimap.texture) |texture| rl.unloadTexture(texture);
+        self.allocator.free(self.minimap.pixels.allocatedSlice());
         rl.unloadTexture(self.grass);
         rl.unloadTexture(self.dirt);
         rl.unloadTexture(self.oak);
@@ -239,19 +248,59 @@ fn drawChunkDebug(chunk: *const world.Chunk, settings: game_mod.DebugSettings) v
     }
 }
 
-fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.DebugSettings, feet: rl.Vector2, frame: player.Frame, resources: *const Resources) void {
+const TileSpan = struct { start: usize, end: usize };
+
+fn tileSpan(min: i32, max: i32, chunk: i32) TileSpan {
+    const base = chunk * world.CHUNK_TILES;
+    const start = std.math.clamp(min - base, 0, world.CHUNK_TILES);
+    return .{ .start = @intCast(start), .end = @intCast(std.math.clamp(max - base, start, world.CHUNK_TILES)) };
+}
+
+const ChunkTiles = struct {
+    chunk: *const world.Chunk,
+    columns: TileSpan,
+    row_end: usize,
+    row: usize,
+    col: usize,
+
+    const Item = struct { tile: world.Tile, tx: i32, ty: i32 };
+
+    fn init(chunk: *const world.Chunk, bounds: camera.TileRange) ChunkTiles {
+        const columns = tileSpan(bounds.x0, bounds.x1, chunk.cx);
+        const rows = tileSpan(bounds.y0, bounds.y1, chunk.cy);
+        return .{ .chunk = chunk, .columns = columns, .row_end = rows.end, .row = rows.start, .col = columns.start };
+    }
+
+    inline fn next(self: *ChunkTiles) ?Item {
+        if (self.row >= self.row_end or self.col >= self.columns.end) return null;
+        const item = Item{
+            .tile = self.chunk.tiles[self.row * world.CT + self.col],
+            .tx = self.chunk.cx * world.CHUNK_TILES + @as(i32, @intCast(self.col)),
+            .ty = self.chunk.cy * world.CHUNK_TILES + @as(i32, @intCast(self.row)),
+        };
+        self.col += 1;
+        if (self.col == self.columns.end) {
+            self.row += 1;
+            self.col = self.columns.start;
+        }
+        return item;
+    }
+};
+
+fn drawWorld(w: *const world.World, view: camera.View, settings: game_mod.DebugSettings, feet: rl.Vector2, frame: player.Frame, resources: *const Resources) void {
+    const vis = view.chunks;
+    const ground = view.tiles;
     // One visible grass pass keeps texture draws together, below all overlays.
     var grass_cy = vis.cy0;
     while (grass_cy <= vis.cy1) : (grass_cy += 1) {
         var grass_cx = vis.cx0;
         while (grass_cx <= vis.cx1) : (grass_cx += 1) {
             const chunk = w.get(grass_cx, grass_cy) orelse continue;
-            for (chunk.tiles, 0..) |tile, i| {
-                if (!isGrassGround(tile)) continue;
-                const tx = chunk.cx * world.CHUNK_TILES + @as(i32, @intCast(i % world.CT));
-                const ty = chunk.cy * world.CHUNK_TILES + @as(i32, @intCast(i / world.CT));
-                const x: f32 = @floatFromInt(tx * world.TILE_PX);
-                const y: f32 = @floatFromInt(ty * world.TILE_PX);
+            var tiles = ChunkTiles.init(chunk, ground);
+            while (tiles.next()) |entry| {
+                if (!isGrassGround(entry.tile)) continue;
+                const x: f32 = @floatFromInt(entry.tx * world.TILE_PX);
+                const y: f32 = @floatFromInt(entry.ty * world.TILE_PX);
                 rl.drawTexturePro(resources.grass, grass_source, .{
                     .x = x,
                     .y = y,
@@ -271,13 +320,12 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
             var cx = vis.cx0;
             while (cx <= vis.cx1) : (cx += 1) {
                 const chunk = w.get(cx, cy) orelse continue;
-                for (chunk.tiles, 0..) |tile, i| {
-                    if (tile != kind) continue;
-                    const tx = chunk.cx * world.CHUNK_TILES + @as(i32, @intCast(i % world.CT));
-                    const ty = chunk.cy * world.CHUNK_TILES + @as(i32, @intCast(i / world.CT));
-                    const x: f32 = @floatFromInt(tx * world.TILE_PX);
-                    const y: f32 = @floatFromInt(ty * world.TILE_PX);
-                    const neighbors = terrainNeighbors(w, tx, ty, kind);
+                var tiles = ChunkTiles.init(chunk, ground);
+                while (tiles.next()) |entry| {
+                    if (entry.tile != kind) continue;
+                    const x: f32 = @floatFromInt(entry.tx * world.TILE_PX);
+                    const y: f32 = @floatFromInt(entry.ty * world.TILE_PX);
+                    const neighbors = terrainNeighbors(w, entry.tx, entry.ty, kind);
                     if (std.mem.allEqual(bool, &neighbors, true)) {
                         rl.drawTexturePro(texture, source, .{
                             .x = x,
@@ -301,12 +349,11 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
         var clump_cx = vis.cx0;
         while (clump_cx <= vis.cx1) : (clump_cx += 1) {
             const chunk = w.get(clump_cx, clump_cy) orelse continue;
-            for (chunk.tiles, 0..) |tile, i| {
-                if (tile != .grass) continue;
-                const tx = chunk.cx * world.CHUNK_TILES + @as(i32, @intCast(i % world.CT));
-                const ty = chunk.cy * world.CHUNK_TILES + @as(i32, @intCast(i / world.CT));
-                const x: f32 = @floatFromInt(tx * world.TILE_PX);
-                const y: f32 = @floatFromInt(ty * world.TILE_PX);
+            var tiles = ChunkTiles.init(chunk, ground);
+            while (tiles.next()) |entry| {
+                if (entry.tile != .grass) continue;
+                const x: f32 = @floatFromInt(entry.tx * world.TILE_PX);
+                const y: f32 = @floatFromInt(entry.ty * world.TILE_PX);
                 rl.drawTexturePro(resources.decor, grass_clump_source, .{
                     .x = x,
                     .y = y,
@@ -317,17 +364,21 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
         }
     }
 
-    // Shadows and canopies reach beyond their anchor chunk. Resident reads only.
+    // Rock shadows extend 8 px past their tile; oak sprites reach up to 96 px
+    // from their anchor. Both can reach the screen from an adjacent chunk.
+    const rock_tiles = ground.expanded(1);
+    const oak_tiles = ground.expanded(3);
     const sprite_range = vis.expanded(1);
     var rock_cy = sprite_range.cy0;
     while (rock_cy <= sprite_range.cy1) : (rock_cy += 1) {
         var rock_cx = sprite_range.cx0;
         while (rock_cx <= sprite_range.cx1) : (rock_cx += 1) {
             const chunk = w.get(rock_cx, rock_cy) orelse continue;
-            for (chunk.tiles, 0..) |tile, i| {
-                if (tile != .rock) continue;
-                const x: f32 = @floatFromInt((rock_cx * world.CHUNK_TILES + @as(i32, @intCast(i % world.CT))) * world.TILE_PX);
-                const y: f32 = @floatFromInt((rock_cy * world.CHUNK_TILES + @as(i32, @intCast(i / world.CT))) * world.TILE_PX);
+            var tiles = ChunkTiles.init(chunk, rock_tiles);
+            while (tiles.next()) |entry| {
+                if (entry.tile != .rock) continue;
+                const x: f32 = @floatFromInt(entry.tx * world.TILE_PX);
+                const y: f32 = @floatFromInt(entry.ty * world.TILE_PX);
                 rl.drawTexturePro(resources.decor, rock_source, rockDest(x, y), .{ .x = 0, .y = 0 }, 0, .white);
             }
         }
@@ -337,7 +388,8 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
     var player_pending = true;
     var tree_cy = sprite_range.cy0;
     while (tree_cy <= sprite_range.cy1) : (tree_cy += 1) {
-        for (0..world.CT) |row| {
+        const rows = tileSpan(oak_tiles.y0, oak_tiles.y1, tree_cy);
+        for (rows.start..rows.end) |row| {
             const y: f32 = @floatFromInt((tree_cy * world.CHUNK_TILES + @as(i32, @intCast(row))) * world.TILE_PX);
             if (player_pending and y + world.TILE_PX > feet.y) {
                 drawPlayer(feet, frame, resources);
@@ -345,8 +397,10 @@ fn drawWorld(w: *const world.World, vis: world.ChunkRange, settings: game_mod.De
             }
             var tree_cx = sprite_range.cx0;
             while (tree_cx <= sprite_range.cx1) : (tree_cx += 1) {
+                const cols = tileSpan(oak_tiles.x0, oak_tiles.x1, tree_cx);
+                if (cols.start == cols.end) continue;
                 const chunk = w.get(tree_cx, tree_cy) orelse continue;
-                for (0..world.CT) |col| {
+                for (cols.start..cols.end) |col| {
                     if (chunk.tiles[row * world.CT + col] != .tree) continue;
                     const x: f32 = @floatFromInt((tree_cx * world.CHUNK_TILES + @as(i32, @intCast(col))) * world.TILE_PX);
                     const dest = oakDest(x, y);
@@ -397,22 +451,187 @@ fn drawPlayer(target: rl.Vector2, frame: player.Frame, resources: *const Resourc
     rl.drawTexturePro(texture, source, dest, .{ .x = size, .y = size + 8 * scale }, 0, .white);
 }
 
-/// Top-right minimap: loaded chunks (green), visible rect (yellow),
-/// camera chunk (red dot). Makes the prefetch ring visible at a glance.
-fn drawMinimap(w: *const world.World, vis: world.ChunkRange, cam: *const camera.Camera, viewport_w: f32) void {
-    const panel_w: i32 = 180;
-    const panel_h: i32 = 140;
-    const x0 = @as(i32, @intFromFloat(viewport_w)) - panel_w - 12;
-    const y0 = 12;
+const MinimapLayout = struct {
+    chunks: world.ChunkRange,
+    bounds: rl.Rectangle,
+    tile_size: f32,
+    camera_x: i32,
+    camera_y: i32,
 
-    rl.drawRectangle(x0, y0, panel_w, panel_h, hud_bg);
-    rl.drawRectangleLines(x0, y0, panel_w, panel_h, .dark_gray);
+    fn tileOrigin(self: MinimapLayout, x: i32, y: i32) rl.Vector2 {
+        return .{
+            .x = self.bounds.x + self.bounds.width / 2 + (@as(f32, @floatFromInt(x - self.camera_x)) - 0.5) * self.tile_size,
+            .y = self.bounds.y + self.bounds.height / 2 + (@as(f32, @floatFromInt(y - self.camera_y)) - 0.5) * self.tile_size,
+        };
+    }
+
+    fn playerCenter(self: MinimapLayout, x: i32, y: i32) ?rl.Vector2 {
+        if (!self.chunks.contains(@divFloor(x, world.CHUNK_TILES), @divFloor(y, world.CHUNK_TILES))) return null;
+        const origin = self.tileOrigin(x, y);
+        const center = rl.Vector2{ .x = origin.x + self.tile_size / 2, .y = origin.y + self.tile_size / 2 };
+        if (!rl.checkCollisionPointRec(center, self.bounds)) return null;
+        return center;
+    }
+};
+
+fn minimapLayout(map: camera.MinimapView, cam: camera.Camera, viewport_w: f32) MinimapLayout {
+    const size = map.size_px;
+    return .{
+        .chunks = map.chunks,
+        .tile_size = size / @as(f32, @floatFromInt(2 * map.radius_tiles + 1)),
+        .camera_x = cam.tile_x,
+        .camera_y = cam.tile_y,
+        .bounds = .{ .x = @floor(viewport_w) - 12 - size, .y = 12, .width = size, .height = size },
+    };
+}
+
+fn minimapColor(tile: world.Tile) rl.Color {
+    // Representative opaque colors sampled from the terrain and sprite crops.
+    return switch (tile) {
+        .grass => rl.Color.init(62, 137, 72, 255),
+        .dirt => rl.Color.init(228, 166, 114, 255),
+        .water => rl.Color.init(0, 149, 233, 255),
+        .tree => rl.Color.init(90, 197, 79, 255),
+        .rock => rl.Color.init(142, 154, 180, 255),
+    };
+}
+
+const MinimapStamp = struct {
+    chunks: world.ChunkRange,
+    generated: u64,
+    unloaded: u64,
+
+    fn get(w: *const world.World, chunks: world.ChunkRange) MinimapStamp {
+        return .{ .chunks = chunks, .generated = w.generated, .unloaded = w.unloaded };
+    }
+};
+
+const MinimapCache = struct {
+    stamp: ?MinimapStamp = null,
+    pixels: std.ArrayList(rl.Color) = .empty,
+    texture: ?rl.Texture2D = null,
+
+    fn prepare(self: *MinimapCache, allocator: std.mem.Allocator, w: *const world.World, chunks: world.ChunkRange) void {
+        const stamp = MinimapStamp.get(w, chunks);
+        if (self.stamp) |old| {
+            if (std.meta.eql(old, stamp)) return;
+        }
+        self.stamp = null;
+        const width = chunks.cols() * world.CHUNK_TILES;
+        const height = chunks.rows() * world.CHUNK_TILES;
+        const len = std.math.mul(usize, @intCast(width), @intCast(height)) catch return;
+        self.pixels.resize(allocator, len) catch return;
+        paintMinimap(self.pixels.items, @intCast(width), w, chunks);
+
+        if (self.texture) |texture| {
+            if (texture.width == width and texture.height == height) {
+                rl.updateTexture(texture, self.pixels.items.ptr);
+                self.stamp = stamp;
+                return;
+            }
+            rl.unloadTexture(texture);
+            self.texture = null;
+        }
+        const texture = rl.loadTextureFromImage(.{
+            .data = self.pixels.items.ptr,
+            .width = width,
+            .height = height,
+            .mipmaps = 1,
+            .format = .uncompressed_r8g8b8a8,
+        }) catch return;
+        rl.setTextureFilter(texture, .point);
+        self.texture = texture;
+        self.stamp = stamp;
+    }
+};
+
+fn paintMinimap(pixels: []rl.Color, width: usize, w: *const world.World, chunks: world.ChunkRange) void {
+    @memset(pixels, menu_panel_bg);
+    var cy = chunks.cy0;
+    while (cy <= chunks.cy1) : (cy += 1) {
+        var cx = chunks.cx0;
+        while (cx <= chunks.cx1) : (cx += 1) {
+            const chunk = w.get(cx, cy) orelse continue;
+            const x: usize = @as(usize, @intCast(cx - chunks.cx0)) * world.CT;
+            const y: usize = @as(usize, @intCast(cy - chunks.cy0)) * world.CT;
+            for (0..world.CT) |row| {
+                const offset = (y + row) * width + x;
+                for (pixels[offset..][0..world.CT], chunk.tiles[row * world.CT ..][0..world.CT]) |*pixel, tile| {
+                    pixel.* = minimapColor(tile);
+                }
+            }
+        }
+    }
+}
+
+fn drawTerrainMinimap(game: *const game_mod.GameState, vis: world.ChunkRange, layout: MinimapLayout, cache: *const MinimapCache) void {
+    rl.drawRectangleRec(layout.bounds, menu_panel_bg);
+    rl.beginScissorMode(@intFromFloat(layout.bounds.x), @intFromFloat(layout.bounds.y), @intFromFloat(layout.bounds.width), @intFromFloat(layout.bounds.height));
+    defer {
+        rl.endScissorMode();
+        rl.drawRectangleLinesEx(layout.bounds, 1, menu_panel_border);
+    }
+    if (cache.stamp != null) if (cache.texture) |texture| {
+        const width: f32 = @floatFromInt(texture.width);
+        const height: f32 = @floatFromInt(texture.height);
+        const first = layout.tileOrigin(layout.chunks.cx0 * world.CHUNK_TILES, layout.chunks.cy0 * world.CHUNK_TILES);
+        rl.drawTexturePro(texture, .{ .x = 0, .y = 0, .width = width, .height = height }, .{
+            .x = first.x,
+            .y = first.y,
+            .width = width * layout.tile_size,
+            .height = height * layout.tile_size,
+        }, .{ .x = 0, .y = 0 }, 0, .white);
+
+        const seam = rl.Color.init(0, 0, 0, 48);
+        var cx = layout.chunks.cx0 + 1;
+        while (cx <= layout.chunks.cx1) : (cx += 1) {
+            const x = layout.tileOrigin(cx * world.CHUNK_TILES, 0).x;
+            rl.drawRectangleRec(.{ .x = x, .y = layout.bounds.y, .width = 1, .height = layout.bounds.height }, seam);
+        }
+        var cy = layout.chunks.cy0 + 1;
+        while (cy <= layout.chunks.cy1) : (cy += 1) {
+            const y = layout.tileOrigin(0, cy * world.CHUNK_TILES).y;
+            rl.drawRectangleRec(.{ .x = layout.bounds.x, .y = y, .width = layout.bounds.width, .height = 1 }, seam);
+        }
+        const visible = layout.tileOrigin(vis.cx0 * world.CHUNK_TILES, vis.cy0 * world.CHUNK_TILES);
+        const chunk_size = layout.tile_size * world.CHUNK_TILES;
+        rl.drawRectangleLinesEx(.{
+            .x = visible.x,
+            .y = visible.y,
+            .width = @as(f32, @floatFromInt(vis.cols())) * chunk_size,
+            .height = @as(f32, @floatFromInt(vis.rows())) * chunk_size,
+        }, 1, rl.Color.init(255, 255, 255, 48));
+    };
+    if (layout.playerCenter(game.player_pos.x, game.player_pos.y)) |center| {
+        rl.drawCircleV(center, 4, .black);
+        rl.drawCircleV(center, 2.5, .white);
+    }
+}
+
+fn debugMinimapBounds(terrain_bounds: rl.Rectangle, viewport_h: f32) ?rl.Rectangle {
+    const y = @ceil(terrain_bounds.y + terrain_bounds.height + 12);
+    const height = @min(140, viewport_h - y - 12);
+    if (terrain_bounds.width < 32 or height < 32) return null;
+    return .{ .x = terrain_bounds.x, .y = y, .width = terrain_bounds.width, .height = height };
+}
+
+/// Loaded chunks (green), visible rect (yellow), and camera chunk (red dot).
+fn drawDebugMinimap(w: *const world.World, vis: world.ChunkRange, cam: *const camera.Camera, bounds: rl.Rectangle) void {
+    const x0: i32 = @intFromFloat(@ceil(bounds.x));
+    const y0: i32 = @intFromFloat(bounds.y);
+    const panel_w: i32 = @intFromFloat(@floor(bounds.x + bounds.width) - @ceil(bounds.x));
+    const panel_h: i32 = @intFromFloat(bounds.height);
+
+    rl.drawRectangleRec(bounds, hud_bg);
+    rl.drawRectangleLinesEx(bounds, 1, .dark_gray);
+    rl.beginScissorMode(x0 + 1, y0 + 1, panel_w - 2, panel_h - 2);
+    defer rl.endScissorMode();
 
     const cell: i32 = 4;
     const cam_cx = cam.chunkX();
     const cam_cy = cam.chunkY();
-    const center_x = x0 + panel_w / 2;
-    const center_y = y0 + panel_h / 2;
+    const center_x = x0 + @divTrunc(panel_w, 2);
+    const center_y = y0 + @divTrunc(panel_h, 2);
 
     var it = w.residents();
     while (it.next()) |c| {
@@ -659,7 +878,7 @@ fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, game: *const game_mod.Game
     const debug_enabled: ?bool = if (item == .action) switch (item.action) {
         .toggle_grid => game.settings.debug.tile_grid,
         .toggle_borders => game.settings.debug.chunk_borders,
-        .toggle_minimap => game.show_minimap,
+        .toggle_debug_minimap => game.show_debug_minimap,
         .toggle_hud => game.show_debug_hud,
         else => null,
     } else null;
@@ -869,11 +1088,19 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
 
     rl.beginMode2D(view.transform);
     const feet = camera.tileCenter(game.player_pos.x, game.player_pos.y);
-    drawWorld(&game.world, view.chunks, game.settings.debug, feet, game.player_animation.frame(), resources);
+    drawWorld(&game.world, view, game.settings.debug, feet, game.player_animation.frame(), resources);
     rl.endMode2D();
 
     if (game.show_debug_hud) drawHud(&game.world, view.chunks, &game.camera, game.settings.debug);
-    if (game.show_minimap) drawMinimap(&game.world, view.chunks, &game.camera, viewport_w);
+    if (view.minimap) |map| {
+        const layout = minimapLayout(map, game.camera, viewport_w);
+        drawTerrainMinimap(game, view.chunks, layout, &resources.minimap);
+        if (game.show_debug_minimap) {
+            if (debugMinimapBounds(layout.bounds, viewport_h)) |bounds| {
+                drawDebugMinimap(&game.world, view.chunks, &game.camera, bounds);
+            }
+        }
+    }
 
     if (game.menu.opened) {
         drawMenu(game, viewport_w, viewport_h);
@@ -996,6 +1223,105 @@ fn drawOnboarding(model: *const onboarding.Onboarding, vw: f32, vh: f32) void {
             rl.endScissorMode();
         } else drawOnboardingButton(control.rect, control.label, std.meta.eql(model.selected, @as(?onboarding.Action, control.action)), control.enabled, size);
     }
+}
+
+test "minimap texture pixels follow chunk coordinates and refresh when missing terrain loads" {
+    const allocator = std.testing.allocator;
+    var w = try world.World.init(allocator, world.MIN_PREHEATED_CHUNKS);
+    defer w.deinit();
+    const vis = world.ChunkRange{ .cx0 = 0, .cy0 = 0, .cx1 = 0, .cy1 = 0 };
+    const map = world.ChunkRange{ .cx0 = -3, .cy0 = -1, .cx1 = -2, .cy1 = -1 };
+    try w.stream(vis);
+    const before = MinimapStamp.get(&w, map);
+    const width = 2 * world.CT;
+    var pixels: [width * world.CT]rl.Color = undefined;
+    paintMinimap(&pixels, width, &w, map);
+    const resident = w.get(-2, -1).?;
+    for (0..world.CT) |row| {
+        for (0..world.CT) |col| {
+            try std.testing.expectEqual(menu_panel_bg, pixels[row * width + col]);
+            try std.testing.expectEqual(minimapColor(resident.tiles[row * world.CT + col]), pixels[row * width + world.CT + col]);
+        }
+    }
+    try w.streamWithMinimap(vis, map);
+    const after = MinimapStamp.get(&w, map);
+    try std.testing.expect(!std.meta.eql(before, after));
+    paintMinimap(&pixels, width, &w, map);
+    try std.testing.expectEqual(minimapColor(w.get(-3, -1).?.tiles[0]), pixels[0]);
+    try w.streamWithMinimap(vis, map);
+    try std.testing.expectEqual(after, MinimapStamp.get(&w, map));
+}
+
+test "debug minimap uses the terrain minimap column and fits the remaining height" {
+    const bounds = rl.Rectangle{ .x = 210.5, .y = 12, .width = 77.5, .height = 60.5 };
+    const debug = debugMinimapBounds(bounds, 160).?;
+    try std.testing.expectEqual(bounds.x, debug.x);
+    try std.testing.expectEqual(bounds.width, debug.width);
+    try std.testing.expectEqual(85, debug.y);
+    try std.testing.expectEqual(148, debug.y + debug.height);
+    try std.testing.expect(debugMinimapBounds(bounds, 120) == null);
+}
+
+test "terrain minimap includes prefetched chunks and maps player tiles across zero" {
+    const cam = camera.Camera{};
+    const view = try camera.calculate(cam, 1000, 640);
+    const map = view.minimap.?;
+    const layout = minimapLayout(map, cam, 1000);
+    try std.testing.expect(layout.chunks.contains(-3, -2));
+    try std.testing.expect(layout.chunks.contains(3, 2));
+    try std.testing.expect(!view.chunks.contains(-3, -2));
+    const first = layout.tileOrigin(-map.radius_tiles, -map.radius_tiles);
+    const end = layout.tileOrigin(map.radius_tiles + 1, map.radius_tiles + 1);
+    try std.testing.expectApproxEqAbs(layout.bounds.x, first.x, 0.001);
+    try std.testing.expectApproxEqAbs(layout.bounds.y, first.y, 0.001);
+    try std.testing.expectApproxEqAbs(layout.bounds.x + layout.bounds.width, end.x, 0.001);
+    try std.testing.expectApproxEqAbs(layout.bounds.y + layout.bounds.height, end.y, 0.001);
+    const left = layout.playerCenter(-1, 0).?;
+    const right = layout.playerCenter(0, 0).?;
+    try std.testing.expectApproxEqAbs(layout.tile_size, right.x - left.x, 0.001);
+    try std.testing.expectEqual(left.y, right.y);
+    try std.testing.expect(layout.playerCenter(0, map.radius_tiles) != null);
+    try std.testing.expect(layout.playerCenter(0, map.radius_tiles + 1) == null);
+    try std.testing.expect((try camera.calculate(cam, 64, 64)).minimap == null);
+}
+
+test "minimap frame and tile scale stay stable as visible chunk count changes" {
+    const before = camera.Camera{ .tile_x = 0 };
+    const after = camera.Camera{ .tile_x = 1 };
+    const view_before = try camera.calculate(before, 960, 640);
+    const view_after = try camera.calculate(after, 960, 640);
+    try std.testing.expect(view_before.chunks.cols() != view_after.chunks.cols());
+    const a = minimapLayout(view_before.minimap.?, before, 960);
+    const b = minimapLayout(view_after.minimap.?, after, 960);
+    try std.testing.expectEqual(a.bounds, b.bounds);
+    try std.testing.expectEqual(a.tile_size, b.tile_size);
+    try std.testing.expectEqual(debugMinimapBounds(a.bounds, 640), debugMinimapBounds(b.bounds, 640));
+    try std.testing.expectEqual(a.playerCenter(before.tile_x, 0), b.playerCenter(after.tile_x, 0));
+    try std.testing.expectApproxEqAbs(a.tile_size, a.tileOrigin(0, 0).x - b.tileOrigin(0, 0).x, 0.001);
+}
+
+test "chunk tile iteration skips offscreen rows and columns across negative seams" {
+    var west = world.Chunk{ .cx = -1, .cy = -1, .tiles = @splat(.grass) };
+    west.tiles[15 * world.CT + 15] = .water;
+    const east = world.Chunk{ .cx = 0, .cy = -1, .tiles = @splat(.grass) };
+    const bounds = camera.TileRange{ .x0 = -1, .y0 = -1, .x1 = 2, .y1 = 0 };
+    var left = ChunkTiles.init(&west, bounds);
+    try std.testing.expectEqual(ChunkTiles.Item{ .tile = .water, .tx = -1, .ty = -1 }, left.next().?);
+    try std.testing.expect(left.next() == null);
+    var right = ChunkTiles.init(&east, bounds);
+    try std.testing.expectEqual(ChunkTiles.Item{ .tile = .grass, .tx = 0, .ty = -1 }, right.next().?);
+    try std.testing.expectEqual(ChunkTiles.Item{ .tile = .grass, .tx = 1, .ty = -1 }, right.next().?);
+    try std.testing.expect(right.next() == null);
+}
+
+test "sprite padding keeps anchors in adjacent chunks that can reach the viewport" {
+    const bounds = camera.TileRange{ .x0 = 0, .y0 = 0, .x1 = 16, .y1 = 16 };
+    const oak = bounds.expanded(3);
+    const rock = bounds.expanded(1);
+    try std.testing.expectEqual(TileSpan{ .start = 13, .end = 16 }, tileSpan(oak.x0, oak.x1, -1));
+    try std.testing.expectEqual(TileSpan{ .start = 0, .end = 3 }, tileSpan(oak.y0, oak.y1, 1));
+    try std.testing.expectEqual(TileSpan{ .start = 15, .end = 16 }, tileSpan(rock.y0, rock.y1, -1));
+    try std.testing.expectEqual(TileSpan{ .start = 0, .end = 0 }, tileSpan(bounds.x0, bounds.x1, 1));
 }
 
 test "grass is a whole tile at 2x beneath grass trees and rocks" {

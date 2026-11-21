@@ -439,7 +439,7 @@ const browser_settings_persister: SettingsPersister = .{
 /// (before presentation) so the image is not a post-swap black frame.
 fn stepFrame(
     game_state: *game_mod.GameState,
-    resources: *const rendering.Resources,
+    resources: *rendering.Resources,
     input_reader: *input.Reader,
     driver: *frame_loop.Driver,
     shot_path: ?[:0]const u8,
@@ -470,7 +470,8 @@ fn stepFrame(
 
     if (advanced) driver.skipPast(rl.getTime());
 
-    // 5. render read-only state. The caller owns presentation timing.
+    // 5. Prepare GPU resources, then draw read-only state.
+    resources.prepareMinimap(&game_state.world, driver.view.?.minimap);
     rl.beginDrawing();
     rendering.draw(game_state, driver.view.?, driver.viewport_w, driver.viewport_h, model, resources);
     // Capture after drawing and before `endDrawing` swaps/presents, otherwise
@@ -826,7 +827,7 @@ pub fn main() anyerror!void {
         return error.WindowInitializationFailed;
     }
     defer rl.closeWindow();
-    const resources = try rendering.Resources.init(allocator);
+    var resources = try rendering.Resources.init(allocator);
     defer resources.deinit();
     rl.setTargetFPS(rendering.target_fps);
 

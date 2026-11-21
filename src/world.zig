@@ -45,6 +45,17 @@ pub const Chunk = terrain.Chunk;
 /// An inclusive rectangular range of chunk indices.
 pub const ChunkRange = terrain.ChunkRange;
 
+pub fn residencyRange(vis: ChunkRange, minimap: ?ChunkRange) ChunkRange {
+    const prefetch = vis.expanded(PREFETCH_MARGIN_CHUNKS);
+    const map = minimap orelse return prefetch;
+    return .{
+        .cx0 = @min(prefetch.cx0, map.cx0),
+        .cy0 = @min(prefetch.cy0, map.cy0),
+        .cx1 = @max(prefetch.cx1, map.cx1),
+        .cy1 = @max(prefetch.cy1, map.cy1),
+    };
+}
+
 // ── coordinate validation ────────────────────────────────────────────────────
 
 /// A chunk is drawable only if its full pixel extent fits in an i32:
@@ -182,6 +193,8 @@ pub const World = struct {
     /// Desired residency, not the amount of memory retained by the pool.
     wanted: usize = 0,
     memory_pressure: bool = false,
+    /// Set only when every chunk in this range is resident.
+    completed_range: ?ChunkRange = null,
 
     /// Scratch list of keys to unload; capacity always covers all residents,
     /// so eviction never needs to allocate, even under memory pressure.
@@ -212,7 +225,7 @@ pub const World = struct {
         return (@as(u64, x) << 32) | y;
     }
 
-    /// Bring a chunk into memory, generating it if this is the first time.
+    /// Reuse resident terrain; generate a chunk only on a cache miss.
     fn ensureLoaded(self: *World, cx: i32, cy: i32) std.mem.Allocator.Error!void {
         const key = keyOf(cx, cy);
         if (self.by_key.contains(key)) return;
@@ -223,9 +236,9 @@ pub const World = struct {
         errdefer self.pool.destroy(chunk);
         chunk.cx = cx;
         chunk.cy = cy;
-        generate(chunk);
-
         try self.by_key.put(self.alloc, key, chunk);
+        generate(chunk);
+        self.completed_range = null;
         self.generated += 1;
     }
 
@@ -234,6 +247,7 @@ pub const World = struct {
         // The map stores the item's natural alignment; the pool guarantees
         // the free-list alignment, so re-assert it here.
         self.pool.destroy(@alignCast(entry.value));
+        self.completed_range = null;
         self.unloaded += 1;
     }
 
@@ -279,13 +293,22 @@ pub const World = struct {
     /// Failure leaves a valid, possibly incomplete resident set that can be
     /// retried on the next frame.
     pub fn stream(self: *World, vis: ChunkRange) StreamError!void {
-        // Validate before mutating the world: inverted, extreme, or count-overflow
-        // ranges must not unload/load anything or look like allocation pressure.
-        try validateChunkRange(vis, PREFETCH_MARGIN_CHUNKS);
+        return self.streamWithMinimap(vis, null);
+    }
 
+    pub fn streamWithMinimap(self: *World, vis: ChunkRange, minimap: ?ChunkRange) StreamError!void {
+        // Validate before mutating the world so an invalid range cannot evict chunks.
+        try validateChunkRange(vis, PREFETCH_MARGIN_CHUNKS);
+        if (minimap) |map| try validateChunkRange(map, 0);
+        const ring = residencyRange(vis, minimap);
+        try validateChunkRange(ring, 0);
+        if (self.completed_range) |completed| {
+            if (std.meta.eql(completed, ring)) return;
+        }
+
+        self.completed_range = null;
         self.memory_pressure = false;
         errdefer self.memory_pressure = true;
-        const ring = vis.expanded(PREFETCH_MARGIN_CHUNKS);
         self.wanted = @intCast(ring.count());
 
         // Unload first: afterwards every resident chunk is inside the ring,
@@ -320,6 +343,7 @@ pub const World = struct {
                 if (!vis.contains(cx, cy)) try self.ensureLoaded(cx, cy);
             }
         }
+        self.completed_range = ring;
     }
 };
 
@@ -384,6 +408,29 @@ test "stream keeps visible chunks plus a 2-chunk margin" {
         try std.testing.expect(c.cx >= 2 and c.cx <= 9);
         try std.testing.expect(c.cy >= -2 and c.cy <= 4);
     }
+}
+
+test "minimap streaming reuses cached terrain and generates only entering chunks" {
+    var world = try World.init(std.testing.allocator, MIN_PREHEATED_CHUNKS);
+    defer world.deinit();
+
+    const vis = ChunkRange{ .cx0 = 0, .cy0 = 0, .cx1 = 0, .cy1 = 0 };
+    const map = ChunkRange{ .cx0 = -3, .cy0 = -3, .cx1 = 3, .cy1 = 3 };
+    try world.streamWithMinimap(vis, map);
+    const cached = world.get(0, 0).?;
+    const initial = world.stats();
+    try std.testing.expectEqual(@as(u64, 49), initial.generated);
+
+    // Changing which chunks are visible does not matter if residency is unchanged.
+    const next_vis = ChunkRange{ .cx0 = 1, .cy0 = 0, .cx1 = 1, .cy1 = 0 };
+    try world.streamWithMinimap(next_vis, map);
+    try std.testing.expectEqual(initial, world.stats());
+    try std.testing.expectEqual(cached, world.get(0, 0).?);
+
+    try world.streamWithMinimap(next_vis, .{ .cx0 = -2, .cy0 = -3, .cx1 = 4, .cy1 = 3 });
+    try std.testing.expectEqual(cached, world.get(0, 0).?);
+    try std.testing.expectEqual(initial.generated + 7, world.stats().generated);
+    try std.testing.expectEqual(initial.unloaded + 7, world.stats().unloaded);
 }
 
 test "ring larger than the startup reserve does not thrash" {
@@ -478,13 +525,16 @@ test "prefetch failure preserves visible chunks and recovers on retry" {
     const moved = ChunkRange{ .cx0 = -10, .cy0 = -10, .cx1 = -10, .cy1 = -10 };
     try std.testing.expectError(error.OutOfMemory, world.stream(moved));
     try std.testing.expect(world.get(10, 10) == null);
-    try std.testing.expect(world.get(-10, -10) != null);
+    const cached = world.get(-10, -10).?;
+    const generated = world.stats().generated;
 
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
     try world.stream(moved);
     try std.testing.expect(!world.stats().memory_pressure);
     try std.testing.expectEqual(@as(usize, 25), world.residentCount());
+    try std.testing.expectEqual(cached, world.get(-10, -10).?);
+    try std.testing.expectEqual(generated + 24, world.stats().generated);
 }
 
 test "initialization and streaming clean up every allocation failure" {
