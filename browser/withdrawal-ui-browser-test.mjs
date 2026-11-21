@@ -227,6 +227,12 @@ async function run() {
   await expect('released Pending completes through CDK checks without confirmation',`checks.replies.some(r=>(r.operation===13?r.value?.withdrawal:r.operation===12?r.value:null)?.quote_id===${JSON.stringify(pending.quote_id)}&&(r.operation===13?r.value?.withdrawal:r.value)?.payment_status==='completed') && checks.snapshot?.msats==='957' && !checks.active`);
   if((await counts()).melt_posts!==2)throw new Error('Recovery issued another payment POST');
   await expect('no uncaught renderer error or overlapping wallet request','!checks.errors && !checks.overlap');
+  await key('Escape','Escape',27); // Close History.
+  await key('Escape','Escape',27); // Open Main.
+  await key('ArrowUp','ArrowUp',38); await key('Enter','Enter',13); // Wrap to Resume, not Exit Game.
+  const snapshots = await evaluate('checks.requests.filter(op=>op===1).length');
+  await click(40,608); // The in-game Wallet badge only responds with the menu closed.
+  await expect('browser Main ends in Resume and returns to gameplay', `checks.requests.filter(op=>op===1).length>${snapshots}`);
 }
 const timer=watchdog(240000,'withdrawal UI');
 const work=run();work.catch(()=>{});

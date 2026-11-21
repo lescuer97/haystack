@@ -127,6 +127,10 @@ pub const Driver = struct {
             var sample = value;
             defer sample.scrub();
             try self.consume(sample, 0, game, model, sink, privacy_blocked);
+            if (game.menu.exit_requested) {
+                self.invalidateInput();
+                return true;
+            }
         }
         // Includes a dropped release, but NEVER a dropped edge/text/delta.
         try self.consume(self.queue.latest, tick.dt_seconds, game, model, sink, privacy_blocked);
@@ -150,6 +154,7 @@ pub const Driver = struct {
         const before = game.player_pos;
         const before_camera = game.camera;
         const effect = try routeFrame(game, model, frame);
+        if (game.menu.exit_requested) return;
         if (sink) |s| if (s.commit_movement) |commit| {
             if (!std.meta.eql(before, game.player_pos)) {
                 // A disconnect can race with local validation. Never keep a
@@ -271,6 +276,27 @@ test "120 and 144 presentation frames produce the same twenty updates and ten st
 fn pushFrame(driver: *Driver, frame: input.FrameInput) void {
     var sample = input.RawSample{ .frame = frame };
     driver.queue.push(&sample);
+}
+
+test "desktop exit discards queued input without preparing another view" {
+    if (@import("builtin").os.tag == .emscripten) return error.SkipZigTest;
+    var driver = Driver{};
+    defer driver.deinit();
+    var game = try game_mod.GameState.init(std.testing.allocator, 1000, 640);
+    defer game.deinit();
+    game.menu.open();
+    _ = game.menu.applyInput(.{ .up = true });
+
+    pushFrame(&driver, .{ .confirm = true });
+    var queued = input.FrameInput{ .escape_clicked = true, .character_count = 1 };
+    queued.characters[0] = 'x';
+    pushFrame(&driver, queued);
+
+    var privacy = false;
+    try std.testing.expect(try driver.advance(0, &game, null, null, &privacy));
+    try std.testing.expect(game.menu.exit_requested and game.menu.opened);
+    try std.testing.expect(driver.view == null and driver.queue.len == 0);
+    try std.testing.expectEqual(@as(u21, 0), driver.queue.samples[1].frame.characters[0]);
 }
 
 test "no between-tick updates; initial preparation and viewport remain coherent" {

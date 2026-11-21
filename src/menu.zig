@@ -14,6 +14,7 @@
 //! input rules stay headless-testable.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const input = @import("input.zig");
 const wallet_ui = @import("wallet_ui.zig");
 
@@ -25,7 +26,7 @@ pub const MenuPage = enum { Main, Debug, Wallet, Deposit, Invoice, History, With
 
 /// Local menu actions. None of these touch a wallet, payment, or network layer;
 /// they only change menu-local UI state.
-pub const Action = enum { close_menu, toggle_grid, toggle_borders, toggle_debug_minimap, toggle_hud, balance, preset21, preset42, preset100, preset500k, deposit, previous, next, copy_invoice, review_withdrawal, confirm_withdrawal, cancel_withdrawal, review_again, paste_withdrawal, clear_withdrawal };
+pub const Action = enum { close_menu, exit_game, toggle_grid, toggle_borders, toggle_debug_minimap, toggle_hud, balance, preset21, preset42, preset100, preset500k, deposit, previous, next, copy_invoice, review_withdrawal, confirm_withdrawal, cancel_withdrawal, review_again, paste_withdrawal, clear_withdrawal };
 
 /// Editable fields. A field is a data key; its runtime value lives in `Menu`.
 pub const InputField = enum { deposit_msats, withdrawal_invoice };
@@ -117,7 +118,7 @@ const main_items = [_]MenuItem{
     .{ .navigate = .Wallet },
     .{ .navigate = .Debug },
     .{ .action = .close_menu },
-};
+} ++ (if (builtin.os.tag == .emscripten) [_]MenuItem{} else [_]MenuItem{.{ .action = .exit_game }});
 
 const debug_items = [_]MenuItem{
     .{ .action = .toggle_grid },
@@ -190,6 +191,7 @@ pub fn itemLabel(item: MenuItem) [:0]const u8 {
         },
         .action => |action| switch (action) {
             .close_menu => "Resume",
+            .exit_game => "Exit Game",
             .toggle_grid => "Tile grid",
             .toggle_borders => "Chunk borders",
             .toggle_debug_minimap => "Show debug minimap",
@@ -374,6 +376,7 @@ fn calculateLayoutCount(page: MenuPage, viewport_w: f32, viewport_h: f32, item_c
 pub const Menu = struct {
     wallet: wallet_ui.Model = .{},
     opened: bool = false,
+    exit_requested: bool = false,
     currentPage: MenuPage = .Main,
     focus: ?InputField = null,
     deposit_msats: TextField = .{},
@@ -397,6 +400,8 @@ pub const Menu = struct {
     /// belongs to the menu and must not reach the world: while open, and on the
     /// frame that opens or closes it.
     pub fn applyInput(self: *Menu, frame: input.FrameInput) bool {
+        if (self.exit_requested) return true;
+
         const pointer_moved = frame.pointer_x != self.pointer_x or
             frame.pointer_y != self.pointer_y;
         self.pointer_x = frame.pointer_x;
@@ -456,6 +461,11 @@ pub const Menu = struct {
         self.currentPage = .Main;
         self.focus = null;
         self.selected_index = 0;
+    }
+
+    pub fn openWallet(self: *Menu) void {
+        self.open();
+        self.activate(.{ .navigate = .Wallet });
     }
 
     pub fn close(self: *Menu) void {
@@ -570,6 +580,7 @@ pub const Menu = struct {
             },
             .action => |action| switch (action) {
                 .close_menu => self.close(),
+                .exit_game => self.exit_requested = true,
                 .toggle_grid, .toggle_borders, .toggle_debug_minimap, .toggle_hud => self.debug_toggle = action,
                 .balance => {},
                 .preset21, .preset42, .preset100, .preset500k => {
@@ -877,12 +888,30 @@ test "Main navigates to Wallet and Back returns to Main" {
     try std.testing.expectEqual(MenuPage.Main, menu.currentPage);
 }
 
+test "desktop Exit Game requests shutdown on the first activation" {
+    if (builtin.os.tag == .emscripten) return error.SkipZigTest;
+    var pointer_menu = Menu{};
+    pointer_menu.open();
+    const exit_button = itemCenter(calculateLayout(.Main, 1000, 640), main_items.len - 1);
+    try std.testing.expect(pointer_menu.applyInput(frameFor(exit_button.x, exit_button.y, 1000, 640)));
+    try std.testing.expect(pointer_menu.exit_requested);
+    try std.testing.expect(pointer_menu.applyInput(.{ .escape_clicked = true }));
+    try std.testing.expect(pointer_menu.exit_requested);
+
+    var keyboard_menu = Menu{};
+    keyboard_menu.open();
+    _ = keyboard_menu.applyInput(.{ .up = true });
+    try std.testing.expect(!keyboard_menu.exit_requested);
+    try std.testing.expect(keyboard_menu.applyInput(.{ .confirm = true }));
+    try std.testing.expect(keyboard_menu.exit_requested);
+}
+
 test "Resume closes and preset replaces custom msat" {
     var menu = Menu{};
     _ = menu.applyInput(.{ .escape_clicked = true });
 
     const main_layout = calculateLayout(.Main, 1000, 640);
-    const resume_index = pageItems(.Main).len - 1;
+    const resume_index = 2;
     const resume_point = itemCenter(main_layout, resume_index);
     _ = menu.applyInput(frameFor(resume_point.x, resume_point.y, 1000, 640));
     try std.testing.expect(!menu.opened);
@@ -995,7 +1024,7 @@ test "focus resets on navigation and close" {
 
     // Resume also blurs; reopening starts on Main with nothing focused.
     menu.activate(.{ .navigate = .Main });
-    const resume_point = itemCenter(calculateLayout(.Main, 1000, 640), main_items.len - 1);
+    const resume_point = itemCenter(calculateLayout(.Main, 1000, 640), 2);
     _ = menu.applyInput(frameFor(resume_point.x, resume_point.y, 1000, 640));
     try std.testing.expect(!menu.opened);
     try std.testing.expectEqual(@as(?InputField, null), menu.focus);
@@ -1131,7 +1160,8 @@ test "confirm navigates, runs actions, and focuses a text input" {
     menu.activate(.{ .navigate = .Main });
     try std.testing.expectEqual(MenuPage.Main, menu.currentPage);
     try std.testing.expectEqual(@as(usize, 0), menu.selected_index);
-    _ = menu.applyInput(.{ .up = true }); // Wrap to Resume.
+    _ = menu.applyInput(.{ .down = true });
+    _ = menu.applyInput(.{ .down = true }); // Resume.
     _ = menu.applyInput(.{ .confirm = true });
     try std.testing.expect(!menu.opened);
 }

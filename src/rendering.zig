@@ -14,6 +14,7 @@ const game_mod = @import("game.zig");
 const menu = @import("menu.zig");
 const onboarding = @import("onboarding.zig");
 const player = @import("player.zig");
+const wallet_ui = @import("wallet_ui.zig");
 const world = @import("world.zig");
 const terrain = @import("shared").world;
 
@@ -926,7 +927,7 @@ fn drawMenu(game: *const game_mod.GameState, viewport_w: f32, viewport_h: f32) v
     drawSolidRect(layout.panel, menu_panel_bg);
     rl.drawRectangleLinesEx(toRaylibRect(layout.panel), 2.0, menu_panel_border);
     drawCenteredText(menu.pageTitle(state.currentPage), layout.title, 26, menu_title_color);
-    if (state.currentPage != .Main and state.currentPage != .Debug) drawWalletContent(state, layout.content);
+    if (layout.content.height > 0) drawWalletContent(state, layout.content);
 
     const page_items = state.items();
 
@@ -1079,11 +1080,44 @@ fn drawWrapped(text: []const u8, rect: menu.Rect, size: i32, tail: bool) void {
     }
 }
 
+fn drawToolbar(game: *const game_mod.GameState, vw: f32, vh: f32) void {
+    const layout = game_mod.toolbarLayout(vw, vh) orelse return;
+    const selected = game.selected_tool == .hoe;
+    drawSolidRect(layout.bounds, menu_panel_bg);
+    rl.drawRectangleLinesEx(toRaylibRect(layout.bounds), 1, menu_panel_border);
+    drawSolidRect(layout.hoe, if (selected) menu_item_focus else menu_item_bg);
+    rl.drawRectangleLinesEx(toRaylibRect(layout.hoe), 2, if (selected) menu_accent else menu_panel_border);
+    drawCenteredText("Hoe", layout.hoe, 18, menu_text_color);
+}
+
+fn walletBadgeBalance(wallet: *const wallet_ui.Model) [:0]const u8 {
+    if (wallet.available and wallet.balance.len != 0) return wallet.balance.z();
+    if (!wallet.started or (wallet.pending and wallet.operation == .open)) return "Loading balance...";
+    return "Balance unavailable";
+}
+
+fn drawWalletBadge(state: *const menu.Menu, vw: f32, vh: f32) void {
+    const bounds = game_mod.walletBadgeBounds(vw, vh) orelse return;
+    const wallet = &state.wallet;
+    const hovered = bounds.contains(state.pointer_x, state.pointer_y);
+    drawSolidRect(bounds, if (hovered) menu_item_hover else menu_panel_bg);
+    rl.drawRectangleLinesEx(toRaylibRect(bounds), 1, if (hovered) menu_accent else menu_panel_border);
+
+    const x: i32 = @intFromFloat(bounds.x + 10);
+    const y: i32 = @intFromFloat(bounds.y + 8);
+    rl.drawRectangle(x + 2, y, 13, 3, menu_accent);
+    rl.drawRectangle(x, y + 3, 17, 11, menu_accent);
+    rl.drawRectangle(x + 2, y + 5, 13, 7, menu_item_focus);
+    rl.drawRectangle(x + 11, y + 7, 7, 3, menu_accent);
+    rl.drawText("Wallet", x + 25, y, 16, menu_title_color);
+    rl.drawText(walletBadgeBalance(wallet), x, y + 20, 14, if (wallet.available) menu_text_color else menu_muted);
+}
+
 /// Draw one complete frame using only read-only state and the calculated view.
 /// The caller owns `beginDrawing`/`endDrawing` so presentation and the optional
 /// screenshot stay visible in `main`. The menu is last so its dim backdrop sits
 /// over the HUD and minimap.
-pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32, viewport_h: f32, model: ?*const onboarding.Onboarding, resources: *const Resources) void {
+pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32, viewport_h: f32, model: ?*const onboarding.Onboarding, resources: *const Resources, connected: bool) void {
     rl.clearBackground(rl.Color.init(24, 24, 28, 255));
 
     rl.beginMode2D(view.transform);
@@ -1102,8 +1136,12 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
         }
     }
 
+    const onboarding_blocked = if (model) |m| m.isBlocking() else false;
     if (game.menu.opened) {
         drawMenu(game, viewport_w, viewport_h);
+    } else if (connected and !onboarding_blocked) {
+        drawToolbar(game, viewport_w, viewport_h);
+        drawWalletBadge(&game.menu, viewport_w, viewport_h);
     }
     if (model) |m| if (m.isBlocking()) {
         drawOnboarding(m, viewport_w, viewport_h);
@@ -1236,6 +1274,33 @@ fn drawOnboarding(model: *const onboarding.Onboarding, vw: f32, vh: f32) void {
             rl.endScissorMode();
         } else drawOnboardingButton(control.rect, control.label, std.meta.eql(model.selected, @as(?onboarding.Action, control.action)), control.enabled, size);
     }
+}
+
+test "wallet badge anchors left and clears the hoe toolbar on narrow viewports" {
+    const wide = game_mod.walletBadgeBounds(1000, 640).?;
+    const wide_tools = game_mod.toolbarLayout(1000, 640).?;
+    try std.testing.expectEqual(@as(f32, 8), wide.x);
+    try std.testing.expectEqual(wide_tools.bounds.y, wide.y);
+    try std.testing.expect(wide.x + wide.width < wide_tools.bounds.x);
+
+    const narrow = game_mod.walletBadgeBounds(320, 480).?;
+    const narrow_tools = game_mod.toolbarLayout(320, 480).?;
+    try std.testing.expectEqual(wide.x, narrow.x);
+    try std.testing.expect(narrow.x + narrow.width <= 320);
+    try std.testing.expect(narrow.y + narrow.height < narrow_tools.bounds.y);
+    try std.testing.expect(game_mod.walletBadgeBounds(320, 64) == null);
+}
+
+test "wallet badge distinguishes unknown balance from zero and shows exact msat" {
+    var wallet = wallet_ui.Model{};
+    try std.testing.expectEqualStrings("Loading balance...", walletBadgeBalance(&wallet));
+    wallet.started = true;
+    try std.testing.expectEqualStrings("Balance unavailable", walletBadgeBalance(&wallet));
+    wallet.available = true;
+    _ = wallet.balance.set("0 msat");
+    try std.testing.expectEqualStrings("0 msat", walletBadgeBalance(&wallet));
+    _ = wallet.balance.set("18446744073709551615 msat");
+    try std.testing.expectEqualStrings("18446744073709551615 msat", walletBadgeBalance(&wallet));
 }
 
 test "minimap texture pixels follow chunk coordinates and refresh when missing terrain loads" {

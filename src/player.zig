@@ -1,6 +1,7 @@
 //! Frame coordinates and playback for the Cute Fantasy player sheets.
 const std = @import("std");
 
+pub const Tool = enum { hoe };
 pub const Action = enum { sword, pickaxe, axe, hoe, water, collapse };
 const Facing = enum { down, right, up, left };
 

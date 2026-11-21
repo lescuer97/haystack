@@ -21,12 +21,48 @@ const settings_mod = @import("settings.zig");
 pub const DebugSettings = settings_mod.DebugSettings;
 pub const Settings = settings_mod.Settings;
 
+pub const ToolbarLayout = struct {
+    bounds: menu.Rect,
+    hoe: menu.Rect,
+};
+
+pub fn toolbarLayout(viewport_w: f32, viewport_h: f32) ?ToolbarLayout {
+    const width = 80;
+    const height = 48;
+    const margin = 8;
+    const padding = 6;
+    if (viewport_w < width + 2 * margin or viewport_h < height + 2 * margin) return null;
+
+    const x = (viewport_w - width) / 2;
+    const y = viewport_h - height - margin;
+    return .{
+        .bounds = .{ .x = x, .y = y, .width = width, .height = height },
+        .hoe = .{ .x = x + padding, .y = y + padding, .width = width - 2 * padding, .height = height - 2 * padding },
+    };
+}
+
+pub fn walletBadgeBounds(vw: f32, vh: f32) ?menu.Rect {
+    const margin = 8;
+    const width = 220;
+    const height = 48;
+    if (vw < width + 2 * margin) return null;
+
+    var y = vh - height - margin;
+    if (toolbarLayout(vw, vh)) |toolbar| {
+        if (width + 2 * margin > toolbar.bounds.x) y = toolbar.bounds.y - margin - height;
+    }
+    if (y < margin) return null;
+    return .{ .x = margin, .y = y, .width = width, .height = height };
+}
+
 pub const GameState = struct {
     world: world.World,
     camera: camera.Camera,
     player_pos: Location = movement.spawn,
     player_animation: player.Animation = .{},
     player_walking: bool = false,
+    selected_tool: player.Tool = .hoe,
+    ui_press_held: bool = false,
     menu: menu.Menu,
     settings: Settings,
     show_debug_minimap: bool = false,
@@ -91,14 +127,31 @@ pub const GameState = struct {
                     else => unreachable,
                 }
             }
+            self.ui_press_held = frame.dragging;
             self.camera.resetDrag();
             return;
+        }
+
+        if (!frame.dragging or frame.clicked) self.ui_press_held = false;
+        if (frame.clicked) {
+            if (walletBadgeBounds(frame.viewport_w, frame.viewport_h)) |bounds| {
+                if (bounds.contains(frame.pointer_x, frame.pointer_y)) {
+                    self.menu.openWallet();
+                    self.ui_press_held = frame.dragging;
+                    self.camera.resetDrag();
+                    return;
+                }
+            }
+            if (toolbarLayout(frame.viewport_w, frame.viewport_h)) |layout| {
+                self.ui_press_held = frame.dragging and layout.bounds.contains(frame.pointer_x, frame.pointer_y);
+                if (layout.hoe.contains(frame.pointer_x, frame.pointer_y)) self.selected_tool = .hoe;
+            }
         }
 
         var facing_dx: i8 = 0;
         var facing_dy: i8 = 0;
         if (frame.dragging) {
-            try self.camera.applyInput(frame);
+            if (self.ui_press_held) self.camera.resetDrag() else try self.camera.applyInput(frame);
             self.player_walking = false;
         } else {
             const dx = @as(i8, @intFromBool(frame.right)) - @as(i8, @intFromBool(frame.left));
@@ -148,6 +201,68 @@ pub const GameState = struct {
 };
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+test "wallet badge opens Wallet directly and consumes gameplay input" {
+    for ([_]f32{ 320, 1000 }) |width| {
+        var game = try GameState.init(std.testing.allocator, width, 640);
+        defer game.deinit();
+        const initial_camera = game.camera;
+        const initial_pos = game.player_pos;
+        const bounds = walletBadgeBounds(width, 640).?;
+        var frame = input.FrameInput{
+            .viewport_w = width,
+            .pointer_x = bounds.x + 1,
+            .pointer_y = bounds.y + 1,
+        };
+        try game.update(frame);
+        try std.testing.expect(!game.menu.opened);
+
+        frame.clicked = true;
+        frame.confirm = true;
+        frame.dragging = true;
+        frame.drag_x = world.TILE_PX;
+        frame.action = .hoe;
+        frame.toggle_grid = true;
+        const grid_before = game.settings.debug.tile_grid;
+        try game.update(frame);
+        try std.testing.expect(game.menu.opened and game.menu.currentPage == .Wallet);
+        try std.testing.expect(game.menu.wallet.balance_dirty);
+        try std.testing.expectEqual(@as(usize, 0), game.menu.selected_index);
+        try std.testing.expectEqual(grid_before, game.settings.debug.tile_grid);
+        try std.testing.expectEqual(@as(?player.Action, null), game.player_animation.action);
+        try std.testing.expectEqualDeep(initial_pos, game.player_pos);
+        try std.testing.expectEqualDeep(initial_camera, game.camera);
+
+        try game.update(.{ .escape_clicked = true, .dragging = true });
+        try game.update(.{ .dragging = true, .drag_x = world.TILE_PX });
+        try std.testing.expect(!game.menu.opened);
+        try std.testing.expectEqualDeep(initial_camera, game.camera);
+    }
+}
+
+test "hoe starts selected and a toolbar press does not swing or pan" {
+    var game = try GameState.init(std.testing.allocator, 1000, 640);
+    defer game.deinit();
+    try std.testing.expectEqual(player.Tool.hoe, game.selected_tool);
+    const initial_camera_x = game.camera.tile_x;
+    const layout = toolbarLayout(1000, 640).?;
+    try std.testing.expectEqual(@as(f32, 500), layout.bounds.x + layout.bounds.width / 2);
+    try std.testing.expectEqual(@as(f32, 632), layout.bounds.y + layout.bounds.height);
+
+    try game.update(.{ .clicked = true, .dragging = true, .pointer_x = layout.hoe.x + 1, .pointer_y = layout.hoe.y + 1, .drag_x = world.TILE_PX });
+    try std.testing.expect(game.ui_press_held);
+    try game.update(.{ .dragging = true, .pointer_x = 20, .pointer_y = 20, .drag_x = world.TILE_PX });
+    try std.testing.expectEqual(initial_camera_x, game.camera.tile_x);
+    try std.testing.expectEqual(player.Tool.hoe, game.selected_tool);
+    try std.testing.expectEqual(@as(?player.Action, null), game.player_animation.action);
+
+    try game.update(.{});
+    try game.update(.{ .clicked = true, .dragging = true, .pointer_x = 20, .pointer_y = 20, .drag_x = world.TILE_PX });
+    try std.testing.expectEqual(initial_camera_x - 1, game.camera.tile_x);
+    // A world drag crossing the toolbar is still a world drag.
+    try game.update(.{ .dragging = true, .pointer_x = layout.hoe.x + 1, .pointer_y = layout.hoe.y + 1, .drag_x = world.TILE_PX });
+    try std.testing.expectEqual(initial_camera_x - 2, game.camera.tile_x);
+}
 
 test "streaming covers the fixed minimap while panning across chunk boundaries" {
     var game_state = try GameState.init(std.testing.allocator, 1600, 400);
@@ -354,15 +469,17 @@ test "menu navigation and confirm frames stay modal through Resume" {
     try std.testing.expectEqual(@as(i32, 0), game_state.camera.tile_x);
     try std.testing.expectEqual(grid_before, game_state.settings.debug.tile_grid);
 
-    // Navigating to Resume cannot pan, drag, or toggle. The drag remainder is
+    // Wrap past Exit Game, then navigate to Resume. The drag remainder is
     // discarded so it cannot replay after the menu closes.
+    try game_state.update(.{ .up = true });
     try game_state.update(.{
         .up = true,
         .dragging = true,
         .drag_x = -32,
         .toggle_borders = true,
     });
-    try std.testing.expectEqual(menu.pageItems(.Main).len - 1, game_state.menu.selected_index);
+    const selected = game_state.menu.items()[game_state.menu.selected_index];
+    try std.testing.expect(selected == .action and selected.action == .close_menu);
     try std.testing.expectEqual(@as(i32, 0), game_state.camera.tile_y);
     try std.testing.expectEqual(@as(f64, 0), game_state.camera.drag_remainder_x);
     try std.testing.expectEqual(borders_before, game_state.settings.debug.chunk_borders);

@@ -53,7 +53,10 @@ field that was previously focused; the caret appears only after activation.
 
 Pages and rows:
 
-- **Main**: `Wallet` (navigation), `Resume` (close).
+- **Main**: `Wallet` (navigation), `Debug Settings`, and `Resume` (close the menu).
+  Desktop also offers `Exit Game`, which stops accepting input and runs normal
+  shutdown without a confirmation screen. Shutdown waits for any in-flight
+  wallet work before closing the wallet handle.
 - **Wallet**: selected-mint msat balance, `Deposit`, `Withdraw`,
   `History`, `Back to Main`.
 - **Deposit**: custom positive integer millisats, presets 21000/42000/100000/500000, `Deposit`, `Back`.

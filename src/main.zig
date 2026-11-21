@@ -492,9 +492,6 @@ fn stepFrame(
         driver.skipPast(rl.getTime());
         break :blk false;
     };
-    if (driver.view == null or (connection_detail != null and (vw != driver.viewport_w or vh != driver.viewport_h))) {
-        try driver.prepare(game_state, vw, vh);
-    }
 
     // A save follows an actual toggle only; modal frames and idle frames leave
     // the settings untouched and produce no write.
@@ -504,12 +501,16 @@ fn stepFrame(
         }
     }
 
+    if (builtin.os.tag != .emscripten and game_state.menu.exit_requested) return;
+    if (driver.view == null or (connection_detail != null and (vw != driver.viewport_w or vh != driver.viewport_h))) {
+        try driver.prepare(game_state, vw, vh);
+    }
     if (advanced) driver.skipPast(rl.getTime());
 
     // 5. Prepare GPU resources, then draw read-only state.
     resources.prepareMinimap(&game_state.world, driver.view.?.minimap);
     rl.beginDrawing();
-    rendering.draw(game_state, driver.view.?, driver.viewport_w, driver.viewport_h, model, resources);
+    rendering.draw(game_state, driver.view.?, driver.viewport_w, driver.viewport_h, model, resources, connection_detail == null);
     if (connection_detail) |detail| rendering.drawDisconnected(detail, driver.viewport_w, driver.viewport_h);
     // Capture after drawing and before `endDrawing` swaps/presents, otherwise
     // the framebuffer read is the cleared back buffer (a black screenshot).
@@ -978,6 +979,7 @@ pub fn main() anyerror!void {
             &privacy_blocked,
             connection_detail,
         );
+        if (game_state.menu.exit_requested) break;
 
         if (!started) {
             started = true;
