@@ -876,6 +876,30 @@ fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, game: *const game_mod.Game
     drawSolidRect(rect, fill);
     rl.drawRectangleLinesEx(toRaylibRect(rect), if (focused) 2.0 else 1.0, border);
 
+    if (item == .action and item.action == .toggle_music) {
+        const font_size: i32 = if (rect.height < 32) 14 else 20;
+        const size = @min(rect.height * 0.55, @as(f32, @floatFromInt(font_size)));
+        const label = if (game.music_enabled and game.music_unavailable) "Music (unavailable)" else menu.itemLabel(item);
+        const text_width: f32 = @floatFromInt(rl.measureText(label, font_size));
+        const gap = size * 0.45;
+        const box = menu.Rect{
+            .x = rect.centerX() - (size + gap + text_width) / 2,
+            .y = rect.centerY() - size / 2,
+            .width = size,
+            .height = size,
+        };
+        rl.drawRectangleLinesEx(toRaylibRect(box), 1, menu_text_color);
+        if (game.music_enabled) {
+            const left = rl.Vector2{ .x = box.x + size * 0.2, .y = box.y + size * 0.52 };
+            const middle = rl.Vector2{ .x = box.x + size * 0.43, .y = box.y + size * 0.75 };
+            const right = rl.Vector2{ .x = box.x + size * 0.8, .y = box.y + size * 0.25 };
+            rl.drawLineEx(left, middle, 2, menu_text_color);
+            rl.drawLineEx(middle, right, 2, menu_text_color);
+        }
+        rl.drawText(label, @intFromFloat(box.x + size + gap), @intFromFloat(rect.centerY() - @as(f32, @floatFromInt(font_size)) / 2), font_size, menu_text_color);
+        return;
+    }
+
     const debug_enabled: ?bool = if (item == .action) switch (item.action) {
         .toggle_grid => game.settings.debug.tile_grid,
         .toggle_borders => game.settings.debug.chunk_borders,

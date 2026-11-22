@@ -90,6 +90,18 @@ zig build test-wallet           # native Rust + Zig C-ABI regression suites
 zig build test -Dplatform=wasm   # browser database + fake-mint/Chromium tests
 ```
 
+## Soundtrack
+
+Haystack loops four cozy instrumental tracks from [`assets/music`](assets/music/CREDITS.md).
+Music starts only once the game menu and controls are available: wallet
+onboarding must be complete and the server connection ready. The browser
+fetches the current track on demand and may require you to click or tap the
+game, or press Play, before audio can start.
+
+Use **Settings → Music** to pause or resume playback. If the soundtrack is
+unavailable, turn **Music** off and back on to retry. This choice lasts only
+for the current session; music is enabled by default in each new session.
+
 ## Dependencies
 
 Both Cargo roots (`vendor/cdk-wallet-ffi` for the native C ABI, `browser/wallet`

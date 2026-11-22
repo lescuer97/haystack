@@ -53,10 +53,17 @@ field that was previously focused; the caret appears only after activation.
 
 Pages and rows:
 
-- **Main**: `Wallet` (navigation), `Debug Settings`, and `Resume` (close the menu).
+- **Main**: `Wallet`, `Debug Settings`, `Settings`, and `Resume` (close the menu).
   Desktop also offers `Exit Game`, which stops accepting input and runs normal
   shutdown without a confirmation screen. Shutdown waits for any in-flight
   wallet work before closing the wallet handle.
+- **Settings**: `Music` checkbox and `Back to Main`. The choice is session-only
+  and defaults to enabled. Playback starts only once wallet onboarding is
+  complete and the server connection is ready, when the game menu and controls
+  become available. The browser fetches the current track on demand and may
+  require a click, tap, or Play activation before audio can start. Unchecking
+  pauses playback; checking resumes it. If the soundtrack is unavailable,
+  uncheck and recheck `Music` to retry.
 - **Wallet**: selected-mint msat balance, `Deposit`, `Withdraw`,
   `History`, `Back to Main`.
 - **Deposit**: custom positive integer millisats, presets 21000/42000/100000/500000, `Deposit`, `Back`.

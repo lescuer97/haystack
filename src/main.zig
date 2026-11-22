@@ -23,6 +23,7 @@ const input = @import("input.zig");
 const frame_loop = @import("frame_loop.zig");
 const routeFrame = frame_loop.routeFrame;
 const rendering = @import("rendering.zig");
+const Soundtrack = @import("soundtrack.zig").Soundtrack;
 const world = @import("world.zig");
 const browser_storage = @import("browser_storage.zig");
 const config = @import("config.zig");
@@ -50,6 +51,7 @@ comptime {
     _ = @import("menu.zig");
     _ = @import("world.zig");
     _ = @import("rendering.zig");
+    _ = @import("soundtrack.zig");
     _ = @import("settings.zig");
     _ = @import("paths.zig");
     _ = @import("storage_fs.zig");
@@ -86,6 +88,7 @@ comptime {
 const BrowserContext = struct {
     game_state: game_mod.GameState,
     resources: rendering.Resources,
+    soundtrack: Soundtrack,
     input_reader: input.Reader,
     driver: frame_loop.Driver = .{},
     model: onboarding.Onboarding,
@@ -263,8 +266,10 @@ fn startBrowser(settings: game_mod.Settings) !void {
         ),
         .input_reader = .{},
         .model = onboarding.Onboarding.init(allocator),
+        .soundtrack = Soundtrack.init(allocator),
     };
     errdefer ctx.game_state.deinit();
+    errdefer ctx.soundtrack.deinit();
     errdefer ctx.model.deinit();
 
     browser_context = ctx;
@@ -350,6 +355,7 @@ fn browserFrame() callconv(.c) void {
         stopBrowser();
         return;
     };
+    ctx.game_state.music_unavailable = ctx.soundtrack.update(ctx.game_state.music_enabled, !ctx.model.isBlocking() and connection_detail == null);
 }
 
 fn browserCommitMovement(context: ?*anyopaque, destination: Location) bool {
@@ -409,6 +415,7 @@ fn stopBrowser() void {
     browser_onboarding.close();
     browser_storage.close();
     emscripten_cancel_main_loop();
+    ctx.soundtrack.deinit();
     ctx.model.deinit();
     ctx.driver.deinit();
     ctx.game_state.deinit();
@@ -876,6 +883,8 @@ pub fn main() anyerror!void {
     defer rl.closeWindow();
     var resources = try rendering.Resources.init(allocator);
     defer resources.deinit();
+    var soundtrack = Soundtrack.init(allocator);
+    defer soundtrack.deinit();
     rl.setTargetFPS(rendering.target_fps);
 
     // Escape toggles the menu, so it must not also be Raylib's quit key.
@@ -980,6 +989,7 @@ pub fn main() anyerror!void {
             connection_detail,
         );
         if (game_state.menu.exit_requested) break;
+        game_state.music_unavailable = soundtrack.update(game_state.music_enabled, !model.isBlocking() and connection_detail == null);
 
         if (!started) {
             started = true;

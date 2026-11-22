@@ -66,9 +66,8 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     b.getInstallStep().dependOn(&installed.step);
     const installed_raylib = b.addInstallArtifact(raylib_artifact, .{ .dest_dir = .{ .override = .{ .custom = "desktop/lib" } }, .h_dir = .disabled });
     b.getInstallStep().dependOn(&installed_raylib.step);
-    // Ship the game's visual assets next to the installed desktop executable
-    // at zig-out/desktop/bin/assets/. The directory is a checkout-level,
-    // gitignored asset source; a clean clone must populate it before install.
+    // Ship assets next to the installed executable. Music is tracked; a clean
+    // clone still needs to populate the gitignored visual assets.
     b.installDirectory(.{
         .source_dir = b.path("assets"),
         .install_dir = .{ .custom = "desktop/bin" },

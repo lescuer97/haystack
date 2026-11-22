@@ -86,6 +86,8 @@
         "browser/game-storage-test.mjs",
         "browser/game-onboarding.js",
         "browser/game-ws.js",
+        "browser/game-music.js",
+        "browser/game-music-test.mjs",
         "browser/game-onboarding-test.mjs",
         "browser/cdp-runner.mjs",
         "browser/cdp-runner-test.mjs",

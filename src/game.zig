@@ -65,6 +65,8 @@ pub const GameState = struct {
     ui_press_held: bool = false,
     menu: menu.Menu,
     settings: Settings,
+    music_enabled: bool = true,
+    music_unavailable: bool = false,
     show_debug_minimap: bool = false,
     show_debug_hud: bool = true,
 
@@ -117,9 +119,10 @@ pub const GameState = struct {
     /// closes.
     pub fn update(self: *GameState, frame: input.FrameInput) world.CoordinateError!void {
         if (self.menu.applyInput(frame)) {
-            if (self.menu.debug_toggle) |action| {
-                self.menu.debug_toggle = null;
+            if (self.menu.option_toggle) |action| {
+                self.menu.option_toggle = null;
                 switch (action) {
+                    .toggle_music => self.music_enabled = !self.music_enabled,
                     .toggle_grid => self.settings.debug.tile_grid = !self.settings.debug.tile_grid,
                     .toggle_borders => self.settings.debug.chunk_borders = !self.settings.debug.chunk_borders,
                     .toggle_debug_minimap => self.show_debug_minimap = !self.show_debug_minimap,
@@ -363,6 +366,29 @@ test "blocked steps leave player and panned camera in place without walking" {
     try std.testing.expectEqualDeep(Location{ .x = 19, .y = 1 }, game_state.player_pos);
     try std.testing.expectEqual(@as(i32, 19), game_state.camera.tile_x);
     try std.testing.expectEqual(@as(i32, 1), game_state.camera.tile_y);
+}
+
+test "Settings music checkbox toggles and keeps its value when the menu closes" {
+    var game = try GameState.init(std.testing.allocator, 1000, 640);
+    defer game.deinit();
+    try std.testing.expect(game.music_enabled);
+
+    try game.update(.{ .escape_clicked = true });
+    try game.update(.{ .down = true });
+    try game.update(.{ .down = true });
+    try game.update(.{ .confirm = true });
+    try std.testing.expectEqual(menu.MenuPage.Settings, game.menu.currentPage);
+    try game.update(.{ .confirm = true });
+    try std.testing.expect(!game.music_enabled);
+    try game.update(.{ .escape_clicked = true });
+    try std.testing.expect(!game.music_enabled);
+
+    try game.update(.{ .escape_clicked = true });
+    const settings_row = menu.calculateLayout(.Main, 1000, 640).items[2];
+    try game.update(.{ .clicked = true, .pointer_x = settings_row.centerX(), .pointer_y = settings_row.centerY() });
+    const music_row = menu.calculateLayout(.Settings, 1000, 640).items[0];
+    try game.update(.{ .clicked = true, .pointer_x = music_row.centerX(), .pointer_y = music_row.centerY() });
+    try std.testing.expect(game.music_enabled);
 }
 
 test "settings default to nested debug defaults" {

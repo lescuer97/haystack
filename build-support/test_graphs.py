@@ -151,6 +151,12 @@ class GraphIsolationTests(unittest.TestCase):
         self.assertIn(".cast(std.Build.Step.Run)", source)
         self.assertEqual(source.count("emcc.addFileInput("), 7)
 
+    def test_browser_installs_playlist_tracks_outside_preload(self):
+        source = (ROOT / "build" / "wasm.zig").read_text(encoding="utf-8")
+        self.assertIn('@import("../src/soundtrack_tracks.zig").paths', source)
+        for target in ("wasm", "wasm-test"):
+            self.assertIn(f'b.addInstallFile(b.path(path), b.fmt("{target}/renderer/{{s}}"', source)
+
     def test_explicit_wasm_platform_and_target_select_the_complete_browser_graph(self):
         result = configure("-Dplatform=wasm", "-Dtarget=wasm32-emscripten")
         self.assertEqual(result.returncode, 0, result.stderr)

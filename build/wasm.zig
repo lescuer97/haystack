@@ -63,6 +63,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     b.dependOnFileContents(b.path("browser/game-storage.js"));
     b.dependOnFileContents(b.path("browser/game-onboarding.js"));
     b.dependOnFileContents(b.path("browser/game-ws.js"));
+    b.dependOnFileContents(b.path("browser/game-music.js"));
     const ui_js = b.root.root_dir.handle.readFileAlloc(
         b.graph.io,
         "browser/game-ui.js",
@@ -83,7 +84,8 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     };
     const onboarding_js = try b.root.root_dir.handle.readFileAlloc(b.graph.io, "browser/game-onboarding.js", b.allocator, .limited(256 * 1024));
     const websocket_js = try b.root.root_dir.handle.readFileAlloc(b.graph.io, "browser/game-ws.js", b.allocator, .limited(256 * 1024));
-    const libraries_js = try std.mem.concat(b.allocator, u8, &.{ ui_js, "\n", storage_js, "\n", onboarding_js, "\n", websocket_js });
+    const music_js = try b.root.root_dir.handle.readFileAlloc(b.graph.io, "browser/game-music.js", b.allocator, .limited(256 * 1024));
+    const libraries_js = try std.mem.concat(b.allocator, u8, &.{ ui_js, "\n", storage_js, "\n", onboarding_js, "\n", websocket_js, "\n", music_js });
     const write_files = b.addWriteFiles();
     const combined_library = write_files.add("haystack-game-libraries.js", libraries_js);
     const grass_sheet = b.path("assets/Tiles/Grass_Middle.png");
@@ -123,6 +125,7 @@ pub fn build(b: *std.Build, options: common.Options) !void {
             .virtual_path = "/assets/Player/Player_Actions.png",
         },
     };
+
     const linked = try rlz.emsdk.emccStep(b, &.{}, &.{renderer}, .{
         .optimize = options.optimize,
         .flags = flags,
@@ -134,7 +137,8 @@ pub fn build(b: *std.Build, options: common.Options) !void {
         .preload_paths = preload_paths,
     });
     b.getInstallStep().dependOn(linked);
-    b.step("renderer", "Build the browser renderer without the wallet").dependOn(linked);
+    const renderer_step = b.step("renderer", "Build the browser renderer without the wallet");
+    renderer_step.dependOn(linked);
     // Give the fixture link its own cache output even though it uses the same
     // renderer and JS libraries as production.
     var fixture_flags = rlz.emsdk.emccDefaultFlags(b.allocator, .{ .optimize = options.optimize, .asyncify = false, .fsanitize = false });
@@ -173,6 +177,13 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     browser_fixture.dependOn(&install_fixture.step);
     browser_fixture.dependOn(fixture_linked);
     browser_fixture.dependOn(&b.addInstallFile(b.path("browser/index.html"), "wasm-test/index.html").step);
+    // Serve tracks separately so enabling music fetches only the current track.
+    for (@import("../src/soundtrack_tracks.zig").paths) |path| {
+        const installed = b.addInstallFile(b.path(path), b.fmt("wasm/renderer/{s}", .{path}));
+        renderer_step.dependOn(&installed.step);
+        b.getInstallStep().dependOn(&installed.step);
+        browser_fixture.dependOn(&b.addInstallFile(b.path(path), b.fmt("wasm-test/renderer/{s}", .{path})).step);
+    }
     // The normal installed application is runtime-only: the root redirect, the
     // renderer (shell, JS and Wasm installed by `linked`) and the wallet module.
     // Wallet regression JS, the test fixture and deterministic vectors are
@@ -208,7 +219,10 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     const cdp_runner_tests = b.addSystemCommand(&.{ "node", "browser/cdp-runner-test.mjs" });
     cdp_runner_tests.setCwd(b.path("."));
     cdp_runner_tests.setName("run browser CDP runner helper tests in Node");
+    const music_bridge_tests = b.addSystemCommand(&.{ "node", "--test", "browser/game-music-test.mjs" });
+    music_bridge_tests.setCwd(b.path("."));
     const storage_step = b.step("test-storage", "Run the Node-only browser bridge and storage tests (no Chromium)");
+    storage_step.dependOn(&music_bridge_tests.step);
     storage_step.dependOn(&storage_tests.step);
     storage_step.dependOn(&wallet_storage_tests.step);
     storage_step.dependOn(&fake_indexeddb_tests.step);

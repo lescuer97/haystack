@@ -3,7 +3,8 @@ zig-pkg
 /zig-out-release/
 .zig-cache
 :memory*
-/assets/
+/assets/*
+/assets/music/
 /haystack.sqlite3-wal
 /haystack.sqlite3-shm
 
