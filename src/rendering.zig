@@ -11,6 +11,7 @@ const rl = @import("raylib");
 
 const camera = @import("camera.zig");
 const game_mod = @import("game.zig");
+const cut_feedback = @import("cut_feedback.zig");
 const menu = @import("menu.zig");
 const onboarding = @import("onboarding.zig");
 const player = @import("player.zig");
@@ -43,6 +44,12 @@ const decor_sheet_width = 112;
 const decor_sheet_height = 192;
 const rock_source = rl.Rectangle{ .x = 32, .y = 32, .width = 16, .height = 16 };
 const grass_clump_source = rl.Rectangle{ .x = 96, .y = 16, .width = 16, .height = 16 };
+const cut_grass_source = rl.Rectangle{ .x = 16, .y = 16, .width = 16, .height = 16 };
+
+fn grassClumpSource(tile: world.Tile, is_cut: bool) ?rl.Rectangle {
+    if (tile != .grass) return null;
+    return if (is_cut) cut_grass_source else grass_clump_source;
+}
 
 fn rockDest(x: f32, y: f32) rl.Rectangle {
     // Source baseline (8,12) meets the ground tile bottom; shadow extends below.
@@ -315,7 +322,39 @@ fn containsTile(bounds: camera.TileRange, x: i32, y: i32) bool {
     return x >= bounds.x0 and x < bounds.x1 and y >= bounds.y0 and y < bounds.y1;
 }
 
-fn drawWorld(w: *const world.World, view: camera.View, cam: camera.Camera, settings: game_mod.DebugSettings, player_pos: shared.protocol.Location, frame: player.Frame, resources: *const Resources) void {
+fn drawCutBursts(feedback: *const cut_feedback.Feedback, tiles: camera.TileRange, cam: camera.Camera) void {
+    const bursts = feedback.activeBursts();
+    if (bursts.len == 0) return;
+    const visible = tiles.expanded(2);
+    const clippings = [_]struct { vx: f32, vy: f32, spin: f32 }{
+        .{ .vx = -54, .vy = -62, .spin = -105 },
+        .{ .vx = -36, .vy = -92, .spin = 145 },
+        .{ .vx = -19, .vy = -69, .spin = 240 },
+        .{ .vx = 6, .vy = -95, .spin = -145 },
+        .{ .vx = 23, .vy = -78, .spin = 155 },
+        .{ .vx = 39, .vy = -89, .spin = -190 },
+        .{ .vx = 57, .vy = -64, .spin = 95 },
+    };
+    const greens = [_]rl.Color{ .init(82, 142, 53, 255), .init(144, 192, 76, 255), .init(188, 214, 103, 255) };
+    for (bursts) |burst| {
+        if (!containsTile(visible, burst.tile.x, burst.tile.y)) continue;
+        const center = camera.relativeTileCenter(burst.tile.x, burst.tile.y, cam.tile_x, cam.tile_y);
+        const age = burst.age;
+        const alpha: u8 = @intFromFloat(255 * (1 - age / cut_feedback.burst_seconds));
+        for (clippings, 0..) |clipping, i| {
+            var tint = greens[i % greens.len];
+            tint.a = alpha;
+            rl.drawRectanglePro(.{
+                .x = center.x + clipping.vx * (age + 0.07),
+                .y = center.y + clipping.vy * age + 175 * age * age,
+                .width = 2,
+                .height = 4,
+            }, .{ .x = 1, .y = 2 }, clipping.spin * (age + 0.16), tint);
+        }
+    }
+}
+
+fn drawWorld(w: *const world.World, view: camera.View, cam: camera.Camera, settings: game_mod.DebugSettings, player_pos: shared.protocol.Location, frame: player.Frame, resources: *const Resources, feedback: *const cut_feedback.Feedback) void {
     const vis = view.chunks;
     const ground = view.tiles;
     // One visible grass pass keeps texture draws together, below all overlays.
@@ -371,7 +410,7 @@ fn drawWorld(w: *const world.World, view: camera.View, cam: camera.Camera, setti
         }
     }
 
-    // Contained tall grass clumps share the decor atlas; finish before rock shadows.
+    // Tall and cut grass clumps share the decor atlas; finish before rock shadows.
     var clump_cy = vis.cy0;
     while (clump_cy <= vis.cy1) : (clump_cy += 1) {
         var clump_cx = vis.cx0;
@@ -379,10 +418,10 @@ fn drawWorld(w: *const world.World, view: camera.View, cam: camera.Camera, setti
             const chunk = w.get(clump_cx, clump_cy) orelse continue;
             var tiles = ChunkTiles.init(chunk, ground);
             while (tiles.next()) |entry| {
-                if (entry.tile != .grass or chunk.isCut(entry.index)) continue;
+                const source = grassClumpSource(entry.tile, chunk.isCut(entry.index)) orelse continue;
                 const x = localPixel(entry.tx, cam.tile_x);
                 const y = localPixel(entry.ty, cam.tile_y);
-                rl.drawTexturePro(resources.decor, grass_clump_source, .{
+                rl.drawTexturePro(resources.decor, source, .{
                     .x = x,
                     .y = y,
                     .width = world.TILE_PX,
@@ -391,6 +430,8 @@ fn drawWorld(w: *const world.World, view: camera.View, cam: camera.Camera, setti
             }
         }
     }
+
+    drawCutBursts(feedback, ground, cam);
 
     // Rock shadows extend 8 px past their tile; oak sprites reach up to 96 px
     // from their anchor. Both can reach the screen from an adjacent chunk.
@@ -1190,7 +1231,7 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
     rl.clearBackground(rl.Color.init(24, 24, 28, 255));
 
     rl.beginMode2D(view.transform);
-    drawWorld(&game.world, view, game.camera, game.settings.debug, game.player_pos, game.player_animation.frame(), resources);
+    drawWorld(&game.world, view, game.camera, game.settings.debug, game.player_pos, game.player_animation.frame(), resources, &game.cut_feedback);
     rl.endMode2D();
 
     if (game.show_debug_hud) drawHud(&game.world, view.chunks, &game.camera, game.settings.debug);
@@ -1586,6 +1627,15 @@ test "tall grass source is bounded by the decor atlas and fills a tile at 2x" {
     try std.testing.expect(grass_clump_source.y >= 0 and grass_clump_source.y + grass_clump_source.height <= decor_sheet_height);
     try std.testing.expectEqual(@as(f32, world.TILE_PX), grass_clump_source.width * 2);
     try std.testing.expectEqual(@as(f32, world.TILE_PX), grass_clump_source.height * 2);
+}
+
+test "only cut grass uses the persistent cut clump atlas cell" {
+    try std.testing.expectEqual(grass_clump_source, grassClumpSource(.grass, false).?);
+    const cut = grassClumpSource(.grass, true).?;
+    try std.testing.expectEqual(rl.Rectangle{ .x = 16, .y = 16, .width = 16, .height = 16 }, cut);
+    try std.testing.expect(cut.x + cut.width <= decor_sheet_width and cut.y + cut.height <= decor_sheet_height);
+    try std.testing.expectEqual(null, grassClumpSource(.tree, true));
+    try std.testing.expectEqual(null, grassClumpSource(.dirt, true));
 }
 
 test "all 256 dirt and water neighbor patterns share bounded shore quadrants at 2x" {

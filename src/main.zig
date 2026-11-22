@@ -344,6 +344,7 @@ fn browserFrame() callconv(.c) void {
     stepFrame(
         &ctx.game_state,
         &ctx.resources,
+        &ctx.soundtrack,
         &ctx.input_reader,
         &ctx.driver,
         null,
@@ -480,6 +481,7 @@ const browser_settings_persister: SettingsPersister = .{
 fn stepFrame(
     game_state: *game_mod.GameState,
     resources: *rendering.Resources,
+    soundtrack: *Soundtrack,
     input_reader: *input.Reader,
     driver: *frame_loop.Driver,
     shot_path: ?[:0]const u8,
@@ -517,6 +519,9 @@ fn stepFrame(
         try driver.prepare(game_state, vw, vh);
     }
     if (advanced) driver.skipPast(rl.getTime());
+
+    // Feedback advances on presentation frames, independently of input ticks.
+    soundtrack.playCutCues(game_state.cut_feedback.update(rl.getFrameTime()));
 
     // 5. Prepare GPU resources, then draw read-only state.
     resources.prepareMinimap(&game_state.world, driver.view.?.minimap);
@@ -989,6 +994,7 @@ pub fn main() anyerror!void {
         try stepFrame(
             &game_state,
             &resources,
+            &soundtrack,
             &input_reader,
             &driver,
             if (shot_frames == 0) shot_path else null,

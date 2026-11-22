@@ -60,6 +60,7 @@ pub const GameState = struct {
     camera: camera.Camera,
     player_pos: Location = movement.spawn,
     player_animation: player.Animation = .{},
+    cut_feedback: @import("cut_feedback.zig").Feedback = .{},
     player_walking: bool = false,
     selected_tool: player.Tool = .hoe,
     ui_press_held: bool = false,

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rl = @import("raylib");
 const tracks = @import("soundtrack_tracks.zig").paths;
+const CutCues = @import("cut_feedback.zig").Cues;
 
 const Status = enum { active, ended, failed };
 
@@ -54,6 +55,10 @@ fn Player(comptime Backend: type) type {
             return true;
         }
 
+        pub fn playCutCues(self: *Self, cues: CutCues) void {
+            self.backend.playCutCues(cues);
+        }
+
         pub fn deinit(self: *Self) void {
             self.backend.deinit();
         }
@@ -63,6 +68,8 @@ fn Player(comptime Backend: type) type {
 const Desktop = struct {
     allocator: std.mem.Allocator,
     stream: ?rl.Music = null,
+    snip: CueSound = .{},
+    fail: CueSound = .{},
 
     fn init(allocator: std.mem.Allocator) Desktop {
         return .{ .allocator = allocator };
@@ -98,9 +105,41 @@ const Desktop = struct {
         self.stream = null;
     }
 
+    fn playCutCues(self: *Desktop, cues: CutCues) void {
+        if (!cues.snip and !cues.fail) return;
+        if (!rl.isAudioDeviceReady()) rl.initAudioDevice();
+        if (!rl.isAudioDeviceReady()) return;
+        if (cues.snip) self.snip.play(@embedFile("cut_audio_assets/snip.wav"), 0.8);
+        if (cues.fail) self.fail.play(@embedFile("cut_audio_assets/fail.wav"), 0.25);
+    }
+
     fn deinit(self: *Desktop) void {
         self.closeTrack();
+        self.snip.unload();
+        self.fail.unload();
         if (rl.isAudioDeviceReady()) rl.closeAudioDevice();
+    }
+};
+
+const CueSound = struct {
+    sound: ?rl.Sound = null,
+    attempted: bool = false,
+
+    fn play(self: *CueSound, wav: []const u8, volume: f32) void {
+        if (!self.attempted) {
+            self.attempted = true;
+            const wave = rl.loadWaveFromMemory(".wav", wav) catch return;
+            defer rl.unloadWave(wave);
+            const sound = rl.loadSoundFromWave(wave);
+            if (!rl.isSoundValid(sound)) return;
+            rl.setSoundVolume(sound, volume);
+            self.sound = sound;
+        }
+        if (self.sound) |sound| rl.playSound(sound);
+    }
+
+    fn unload(self: *CueSound) void {
+        if (self.sound) |sound| rl.unloadSound(sound);
     }
 };
 
@@ -134,6 +173,9 @@ const Browser = struct {
     fn closeTrack(_: *Browser) void {
         haystack_music_close();
     }
+
+    // No WebAudio integration yet; visuals and refill notice still run.
+    fn playCutCues(_: *Browser, _: CutCues) void {}
 
     fn deinit(self: *Browser) void {
         self.closeTrack();
