@@ -2,56 +2,36 @@
 //! temporary view calculated from it.
 //!
 //! Persistent camera state is ours (`Camera`). `rl.Camera2D` is only a
-//! world→screen matrix derived each tick. The loop caches it and the visible
+//! camera-local→screen matrix derived each tick. The loop caches it and the visible
 //! chunk range with the viewport; neither belongs to persistent GameState.
 
 const std = @import("std");
 const rl = @import("raylib");
+const protocol = @import("shared").protocol;
 
 const input = @import("input.zig");
 const world = @import("world.zig");
 
-// ── coordinate validation ────────────────────────────────────────────────────
+const min_tile: i64 = std.math.minInt(i32);
+const max_tile: i64 = std.math.maxInt(i32);
+const end_tile = max_tile + 1;
+const half_tile_px = world.TILE_PX / 2;
 
-/// Every world pixel and view corner we convert must fit in an i32. The
-/// positive edge is exclusive: the largest f32 below 2^31 is 2147483520, but
-/// `@as(f32, @floatFromInt(maxInt(i32)))` rounds to 2147483648, so a naive f32
-/// comparison would accept a value that `@intFromFloat` rejects. Compare
-/// widened in f64 instead. NaN and infinities are rejected by this range check.
-const MIN_WORLD_PX: f64 = -2147483648.0;
-const MAX_WORLD_PX_EXCLUSIVE: f64 = 2147483648.0;
-
-fn pixelInI32Bounds(v: f32) bool {
-    const wide: f64 = @as(f64, v);
-    return wide >= MIN_WORLD_PX and wide < MAX_WORLD_PX_EXCLUSIVE;
+/// Camera-local pixel edge for an absolute tile coordinate. Subtract before
+/// converting to f32 so adjacent tiles remain distinct near the camera.
+pub fn relativePixel(tile: i64, origin: i32) i64 {
+    return (tile - origin) * world.TILE_PX;
 }
 
-// ── camera state ─────────────────────────────────────────────────────────────
-
-/// True when a drag step (already in whole tiles) can be converted to `i32`.
-/// NaN fails both comparisons; infinities fail the range.
-fn deltaFitsI32(v: f64) bool {
-    const min: f64 = @floatFromInt(std.math.minInt(i32));
-    const max: f64 = @floatFromInt(std.math.maxInt(i32));
-    return v >= min and v <= max;
-}
-
-/// True when the tile's center pixel (`tile * TILE_PX + TILE_PX/2`) fits the
-/// i32 world-pixel contract. Both pixel bounds align with tile edges.
-fn tileCenterFitsI32(tile: i64) bool {
-    return tile >= @divFloor(std.math.minInt(i32), world.TILE_PX) and
-        tile <= @divFloor(std.math.maxInt(i32), world.TILE_PX);
-}
-
-pub fn tileCenter(x: i32, y: i32) rl.Vector2 {
+pub fn relativeTileCenter(tile_x: i32, tile_y: i32, origin_x: i32, origin_y: i32) rl.Vector2 {
     return .{
-        .x = @floatFromInt(@as(i64, x) * world.TILE_PX + world.TILE_PX / 2),
-        .y = @floatFromInt(@as(i64, y) * world.TILE_PX + world.TILE_PX / 2),
+        .x = @floatFromInt(relativePixel(tile_x, origin_x) + half_tile_px),
+        .y = @floatFromInt(relativePixel(tile_y, origin_y) + half_tile_px),
     };
 }
 
 pub const Camera = struct {
-    /// View target in whole world tiles, not pixels.
+    /// Absolute tile at the view target, and origin of the local pixel transform.
     tile_x: i32 = 0,
     tile_y: i32 = 0,
 
@@ -67,8 +47,8 @@ pub const Camera = struct {
     /// whole `TILE_PX` steps, and a large drag can move several tiles. Both
     /// axes are validated and committed together or not at all.
     pub fn applyInput(self: *Camera, frame: input.FrameInput) world.CoordinateError!void {
-        var dx: i32 = 0;
-        var dy: i32 = 0;
+        var dx: i64 = 0;
+        var dy: i64 = 0;
 
         var remainder_x = self.drag_remainder_x;
         var remainder_y = self.drag_remainder_y;
@@ -90,7 +70,9 @@ pub const Camera = struct {
             const tile_px: f64 = @floatFromInt(world.TILE_PX);
             const step_x = @trunc(remainder_x / tile_px);
             const step_y = @trunc(remainder_y / tile_px);
-            if (!deltaFitsI32(step_x) or !deltaFitsI32(step_y))
+            // Even a legal move can cross more than maxInt(i32) tiles.
+            const max_step: f64 = @floatFromInt(max_tile - min_tile);
+            if (@abs(step_x) > max_step or @abs(step_y) > max_step)
                 return error.CoordinateOutOfBounds;
 
             dx = @intFromFloat(step_x);
@@ -118,7 +100,8 @@ pub const Camera = struct {
     }
 
     pub fn setTarget(self: *Camera, x: i64, y: i64) world.CoordinateError!void {
-        if (!tileCenterFitsI32(x) or !tileCenterFitsI32(y)) return error.CoordinateOutOfBounds;
+        if (x < min_tile or x > max_tile or y < min_tile or y > max_tile)
+            return error.CoordinateOutOfBounds;
         self.tile_x = @intCast(x);
         self.tile_y = @intCast(y);
     }
@@ -131,19 +114,12 @@ pub const Camera = struct {
         self.drag_remainder_y = 0;
     }
 
-    /// Build the Raylib transform for this camera and window size. The target
-    /// is the tile's center pixel (`tile * TILE_PX + TILE_PX/2`), widened to
-    /// i64 before the f32 conversion.
-    ///
-    /// ponytail: tile coordinates are exact, but the Raylib target is f32, so
-    /// adjacent tile steps far from the origin can round to the same pixel. The
-    /// upgrade, if that becomes visible, is origin rebasing (render relative to
-    /// a nearby chunk while keeping absolute tile coordinates authoritative);
-    /// it is not implemented.
-    pub fn raylib(self: Camera, vw: f32, vh: f32) rl.Camera2D {
+    /// Draw positions relative to `tile_x/y`. The local origin tile starts at
+    /// (0, 0); its center is the target at every absolute camera position.
+    pub fn raylib(_: Camera, vw: f32, vh: f32) rl.Camera2D {
         return .{
             .offset = .{ .x = vw / 2, .y = vh / 2 },
-            .target = tileCenter(self.tile_x, self.tile_y),
+            .target = .{ .x = half_tile_px, .y = half_tile_px },
             .rotation = 0,
             .zoom = 1,
         };
@@ -163,9 +139,9 @@ pub const Camera = struct {
 /// A calculated frame view. Not persistent state: rebuild it from the camera
 /// and window size every frame.
 pub const View = struct {
-    /// World→screen transform handed to `beginMode2D`.
+    /// Camera-local→screen transform handed to `beginMode2D`.
     transform: rl.Camera2D,
-    /// Chunks intersecting the window, including prefetch validation.
+    /// Absolute chunks intersecting the visible tiles.
     chunks: world.ChunkRange,
     tiles: TileRange,
     minimap: ?MinimapView,
@@ -182,185 +158,172 @@ fn minimapView(cam: Camera, vw: f32, vh: f32) ?MinimapView {
     if (size < 32) return null;
     // Cover the longer viewport axis plus room for partial chunks and prefetch.
     const extra_tiles = (world.PREFETCH_MARGIN_CHUNKS + 1) * world.CHUNK_TILES;
-    const radius: i32 = @as(i32, @intFromFloat(@ceil(@max(vw, vh) / (2 * world.TILE_PX)))) + extra_tiles;
-    return .{
-        .size_px = size,
-        .radius_tiles = radius,
-        .chunks = .{
-            .cx0 = @max(world.MIN_DRAWABLE_CHUNK, @divFloor(cam.tile_x - radius, world.CHUNK_TILES)),
-            .cy0 = @max(world.MIN_DRAWABLE_CHUNK, @divFloor(cam.tile_y - radius, world.CHUNK_TILES)),
-            .cx1 = @min(world.MAX_DRAWABLE_CHUNK, @divFloor(cam.tile_x + radius, world.CHUNK_TILES)),
-            .cy1 = @min(world.MAX_DRAWABLE_CHUNK, @divFloor(cam.tile_y + radius, world.CHUNK_TILES)),
-        },
+    const radius_tiles = @ceil(@as(f64, @max(vw, vh)) / (2 * world.TILE_PX)) + extra_tiles;
+    // Oversized maps will fail residency validation. Bound the conversion first.
+    const radius: i32 = @intFromFloat(@min(radius_tiles, max_tile));
+    const center = TileRange{
+        .x0 = cam.tile_x,
+        .y0 = cam.tile_y,
+        .x1 = @as(i64, cam.tile_x) + 1,
+        .y1 = @as(i64, cam.tile_y) + 1,
     };
+    return .{ .size_px = size, .radius_tiles = radius, .chunks = center.expanded(radius).chunks() };
 }
 
-/// Half-open tile bounds: a tile touching only the far edge is not visible.
+/// Absolute, half-open tile bounds. The final tile ends at maxInt(i32) + 1.
 pub const TileRange = struct {
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
 
     pub fn expanded(self: TileRange, padding: i32) TileRange {
-        return .{ .x0 = self.x0 - padding, .y0 = self.y0 - padding, .x1 = self.x1 + padding, .y1 = self.y1 + padding };
-    }
-};
-
-const PixelEdges = struct {
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
-
-    fn chunks(self: PixelEdges) world.CoordinateError!world.ChunkRange {
-        const range = world.ChunkRange{
-            .cx0 = @divFloor(self.x0, world.CHUNK_PX),
-            .cy0 = @divFloor(self.y0, world.CHUNK_PX),
-            .cx1 = @divFloor(self.x1, world.CHUNK_PX),
-            .cy1 = @divFloor(self.y1, world.CHUNK_PX),
-        };
-        try world.validateChunkRange(range, world.PREFETCH_MARGIN_CHUNKS);
-        return range;
-    }
-
-    fn tiles(self: PixelEdges) TileRange {
+        std.debug.assert(padding >= 0);
         return .{
-            .x0 = @divFloor(self.x0, world.TILE_PX),
-            .y0 = @divFloor(self.y0, world.TILE_PX),
-            .x1 = @divCeil(self.x1, world.TILE_PX),
-            .y1 = @divCeil(self.y1, world.TILE_PX),
+            .x0 = @max(min_tile, self.x0 - padding),
+            .y0 = @max(min_tile, self.y0 - padding),
+            .x1 = @min(end_tile, self.x1 + padding),
+            .y1 = @min(end_tile, self.y1 + padding),
+        };
+    }
+
+    fn chunks(self: TileRange) world.ChunkRange {
+        return .{
+            .cx0 = @intCast(@divFloor(self.x0, world.CHUNK_TILES)),
+            .cy0 = @intCast(@divFloor(self.y0, world.CHUNK_TILES)),
+            .cx1 = @intCast(@divFloor(self.x1 - 1, world.CHUNK_TILES)),
+            .cy1 = @intCast(@divFloor(self.y1 - 1, world.CHUNK_TILES)),
         };
     }
 };
 
 pub fn calculate(cam: Camera, vw: f32, vh: f32) world.CoordinateError!View {
-    const transform = cam.raylib(vw, vh);
-    const edges = try visibleEdges(transform, vw, vh);
-    return .{ .transform = transform, .chunks = try edges.chunks(), .tiles = edges.tiles(), .minimap = minimapView(cam, vw, vh) };
+    const tiles = try visibleTiles(cam, vw, vh);
+    const chunks = tiles.chunks();
+    const minimap = minimapView(cam, vw, vh);
+    try world.validateChunkRange(world.residencyRange(chunks, if (minimap) |map| map.chunks else null), 0);
+    return .{ .transform = cam.raylib(vw, vh), .chunks = chunks, .tiles = tiles, .minimap = minimap };
 }
 
-/// Chunks intersecting the camera view. Returns
-/// `error.CoordinateOutOfBounds` before any f32→i32 conversion that would
-/// trap or before a chunk range whose prefetch ring cannot be represented.
-pub fn visibleRange(cam: rl.Camera2D, vw: f32, vh: f32) world.CoordinateError!world.ChunkRange {
-    return (try visibleEdges(cam, vw, vh)).chunks();
+/// Absolute chunks intersecting the view, with a streamable clipped prefetch ring.
+pub fn visibleRange(cam: Camera, vw: f32, vh: f32) world.CoordinateError!world.ChunkRange {
+    const chunks = (try visibleTiles(cam, vw, vh)).chunks();
+    try world.validateChunkRange(chunks, world.PREFETCH_MARGIN_CHUNKS);
+    return chunks;
 }
 
-fn visibleEdges(cam: rl.Camera2D, vw: f32, vh: f32) world.CoordinateError!PixelEdges {
-    // The camera target is converted to i32 by the visible-range math, so
-    // reject non-finite / out-of-i32 targets even before transforming.
-    if (!pixelInI32Bounds(cam.target.x) or !pixelInI32Bounds(cam.target.y))
-        return error.CoordinateOutOfBounds;
+fn validViewport(vw: f32, vh: f32) bool {
+    return std.math.isFinite(vw) and std.math.isFinite(vh) and vw >= 0 and vh >= 0;
+}
 
-    const tl = rl.getScreenToWorld2D(.{ .x = 0, .y = 0 }, cam);
-    const br = rl.getScreenToWorld2D(.{ .x = vw, .y = vh }, cam);
+// Inverse of the unrotated zoom-1 Camera.raylib transform, in local tiles.
+fn localTileAt(pixel: f32, extent: f32) f64 {
+    return (@as(f64, pixel) + (half_tile_px - @as(f64, extent) / 2)) / world.TILE_PX;
+}
 
-    const tl_x = @floor(tl.x);
-    const tl_y = @floor(tl.y);
-    const br_x = @ceil(br.x);
-    const br_y = @ceil(br.y);
-    if (!pixelInI32Bounds(tl_x) or !pixelInI32Bounds(tl_y) or
-        !pixelInI32Bounds(br_x) or !pixelInI32Bounds(br_y))
-        return error.CoordinateOutOfBounds;
+fn clampedTile(origin: i32, offset: f64) i64 {
+    const tile = @as(f64, @floatFromInt(origin)) + offset;
+    return @intFromFloat(std.math.clamp(tile, @as(f64, @floatFromInt(min_tile)), @as(f64, @floatFromInt(end_tile))));
+}
 
-    return .{ .x0 = @intFromFloat(tl_x), .y0 = @intFromFloat(tl_y), .x1 = @intFromFloat(br_x), .y1 = @intFromFloat(br_y) };
+fn visibleTiles(cam: Camera, vw: f32, vh: f32) world.CoordinateError!TileRange {
+    if (!validViewport(vw, vh)) return error.CoordinateOutOfBounds;
+    return .{
+        .x0 = clampedTile(cam.tile_x, @floor(localTileAt(0, vw))),
+        .y0 = clampedTile(cam.tile_y, @floor(localTileAt(0, vh))),
+        .x1 = clampedTile(cam.tile_x, @ceil(localTileAt(vw, vw))),
+        .y1 = clampedTile(cam.tile_y, @ceil(localTileAt(vh, vh))),
+    };
+}
+
+/// Convert a screen point into an absolute tile. Points outside the tile world
+/// or with non-finite coordinates have no tile.
+pub fn screenToTile(cam: Camera, vw: f32, vh: f32, point: rl.Vector2) ?protocol.Location {
+    if (!validViewport(vw, vh)) return null;
+    const x = @as(f64, @floatFromInt(cam.tile_x)) + @floor(localTileAt(point.x, vw));
+    const y = @as(f64, @floatFromInt(cam.tile_y)) + @floor(localTileAt(point.y, vh));
+    if (!(x >= min_tile and x < end_tile and y >= min_tile and y < end_tile)) return null;
+    return .{ .x = @intFromFloat(x), .y = @intFromFloat(y) };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
-// A camera shaped like `Camera.raylib`, so tests exercise the same transform as
-// the frame loop without initializing a raylib window.
-fn testCamera(x: f32, y: f32, vw: f32, vh: f32) rl.Camera2D {
-    return .{
-        .offset = .{ .x = vw / 2, .y = vh / 2 },
-        .target = .{ .x = x, .y = y },
-        .rotation = 0,
-        .zoom = 1,
-    };
-}
-
-test "pixel bounds reject non-finite and f32 rounding at the i32 edges" {
-    // NaN fails both comparisons; infinities fail the half-open range.
-    try std.testing.expect(!pixelInI32Bounds(std.math.nan(f32)));
-    try std.testing.expect(!pixelInI32Bounds(std.math.inf(f32)));
-    try std.testing.expect(!pixelInI32Bounds(-std.math.inf(f32)));
-
-    // Largest f32 below 2^31 is representable and converts to i32.
-    try std.testing.expect(pixelInI32Bounds(2147483520));
-    // 2^31 exactly is not: this is the rounding trap that a naive f32
-    // comparison against `@floatFromInt(maxInt(i32))` would accept.
-    try std.testing.expect(!pixelInI32Bounds(2147483648));
-    // i32 min is valid and exactly representable; the next f32 below is not.
-    try std.testing.expect(pixelInI32Bounds(-2147483648));
-    try std.testing.expect(!pixelInI32Bounds(-2147483904));
-}
-
-test "visibleRange rejects non-finite camera targets on both axes" {
-    const invalid = [_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) };
-    for (invalid) |value| {
-        try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(value, 0, 1000, 640), 1000, 640));
-        try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(0, value, 1000, 640), 1000, 640));
-    }
-}
-
-test "visibleRange rejects the reproduced i32 overflow boundaries" {
-    // These are the values from the Debug reproduction. 2147483008 fits in
-    // i32 and its transformed corner (2147483520) still fits, but the chunk it
-    // maps to has a full +CHUNK_PX extent past i32; 2147483648 already rounds
-    // past the i32 conversion.
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(2147483008, 0, 1000, 640), 1000, 640));
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(-2147483008, 0, 1000, 640), 1000, 640));
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(2147483648, 0, 1000, 640), 1000, 640));
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(-2147483648, 0, 1000, 640), 1000, 640));
-
-    // Same boundaries on Y, independently.
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(0, 2147483008, 1000, 640), 1000, 640));
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(0, -2147483008, 1000, 640), 1000, 640));
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(0, 2147483648, 1000, 640), 1000, 640));
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(0, -2147483648, 1000, 640), 1000, 640));
-}
-
-test "visibleRange validates transformed corners, not just the target" {
-    // Target and top-left corner fit i32, but the far corner does not.
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(2000000000, 0, 1000000000, 0), 1000000000, 0));
-    // Mirror: target and far corner fit, but the near corner is below i32 min.
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(-2000000000, 0, 1000000000, 0), 1000000000, 0));
-}
-
-test "visible tile range keeps partial tiles but excludes exact far edges" {
+test "visible tiles and chunks exclude exact far edges" {
     const cam = Camera{ .tile_x = -1, .tile_y = 0 };
-    try std.testing.expectEqual(TileRange{ .x0 = -1, .y0 = 0, .x1 = 0, .y1 = 1 }, (try calculate(cam, 32, 32)).tiles);
+    const exact = try calculate(cam, 32, 32);
+    try std.testing.expectEqual(TileRange{ .x0 = -1, .y0 = 0, .x1 = 0, .y1 = 1 }, exact.tiles);
+    try std.testing.expectEqual(world.ChunkRange{ .cx0 = -1, .cy0 = 0, .cx1 = -1, .cy1 = 0 }, exact.chunks);
     try std.testing.expectEqual(TileRange{ .x0 = -2, .y0 = -1, .x1 = 1, .y1 = 2 }, (try calculate(cam, 33, 33)).tiles);
 }
 
-test "visibleRange accepts ordinary and negative views" {
-    const origin = try visibleRange(testCamera(0, 0, 1000, 640), 1000, 640);
-    try std.testing.expectEqual(world.ChunkRange{ .cx0 = -1, .cy0 = -1, .cx1 = 0, .cy1 = 0 }, origin);
-
-    // -10000 +/- 400 px and -20000 +/- 300 px, floor-divided per tile/chunk.
-    const negative = try visibleRange(testCamera(-10000, -20000, 800, 600), 800, 600);
+test "visible range accepts ordinary and negative views" {
+    const origin = try visibleRange(.{}, 1000, 640);
+    try std.testing.expectEqual(world.ChunkRange{ .cx0 = -1, .cy0 = -1, .cx1 = 1, .cy1 = 0 }, origin);
+    const negative = try visibleRange(.{ .tile_x = -313, .tile_y = -625 }, 800, 600);
     try std.testing.expectEqual(world.ChunkRange{ .cx0 = -21, .cy0 = -40, .cx1 = -19, .cy1 = -39 }, negative);
 }
 
-test "visibleRange accepts the furthest prefetch-safe chunk edges" {
-    // Visible chunk 4194300 leaves exactly the 2-chunk margin up to 4194302.
-    const max_cam: f32 = @floatFromInt(4194300 * world.CHUNK_PX);
-    const max_view = try visibleRange(testCamera(max_cam, 0, 0, 0), 0, 0);
-    try std.testing.expectEqual(@as(i32, 4194300), max_view.cx0);
-    try std.testing.expectEqual(@as(i32, 4194300), max_view.cx1);
+test "views and minimaps clip at both tile-world corners" {
+    var cam: Camera = .{};
+    try cam.setTarget(min_tile, max_tile);
+    const view = try calculate(cam, 1000, 640);
+    try std.testing.expectEqual(TileRange{ .x0 = min_tile, .y0 = max_tile - 10, .x1 = min_tile + 17, .y1 = end_tile }, view.tiles);
+    try std.testing.expectEqual(world.ChunkRange{
+        .cx0 = protocol.min_chunk,
+        .cy0 = protocol.max_chunk,
+        .cx1 = protocol.min_chunk + 1,
+        .cy1 = protocol.max_chunk,
+    }, view.chunks);
+    const map = view.minimap.?;
+    try std.testing.expectEqual(@as(i32, 64), map.radius_tiles);
+    try std.testing.expectEqual(world.ChunkRange{
+        .cx0 = protocol.min_chunk,
+        .cy0 = protocol.max_chunk - 4,
+        .cx1 = protocol.min_chunk + 4,
+        .cy1 = protocol.max_chunk,
+    }, map.chunks);
 
-    const too_far_pos: f32 = @floatFromInt(4194301 * world.CHUNK_PX);
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(too_far_pos, 0, 0, 0), 0, 0));
+    try cam.setTarget(max_tile, min_tile);
+    const odd = try calculate(cam, 999, 639);
+    try std.testing.expectEqual(end_tile, odd.tiles.x1);
+    try std.testing.expectEqual(min_tile, odd.tiles.y0);
+    try std.testing.expectEqual(protocol.max_chunk, odd.minimap.?.chunks.cx1);
+    try std.testing.expectEqual(protocol.min_chunk, odd.minimap.?.chunks.cy0);
+    const padded = odd.tiles.expanded(3);
+    try std.testing.expectEqual(end_tile, padded.x1);
+    try std.testing.expectEqual(min_tile, padded.y0);
+}
 
-    // Mirror on the negative side.
-    const min_cam: f32 = @floatFromInt(-4194302 * world.CHUNK_PX);
-    const min_view = try visibleRange(testCamera(0, min_cam, 0, 0), 0, 0);
-    try std.testing.expectEqual(@as(i32, -4194302), min_view.cy0);
-    try std.testing.expectEqual(@as(i32, -4194302), min_view.cy1);
+test "view validation rejects invalid dimensions and unstreamable ranges" {
+    for ([_]f32{ -1, std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32) }) |value| {
+        try std.testing.expectError(error.CoordinateOutOfBounds, calculate(.{}, value, 640));
+        try std.testing.expectError(error.CoordinateOutOfBounds, calculate(.{}, 1000, value));
+    }
+    const huge = std.math.floatMax(f32);
+    const cam: Camera = .{ .tile_x = @intCast(min_tile), .tile_y = @intCast(max_tile) };
+    try std.testing.expectEqual(TileRange{ .x0 = min_tile, .y0 = min_tile, .x1 = end_tile, .y1 = end_tile }, try visibleTiles(cam, huge, huge));
+    try std.testing.expectError(error.CoordinateOutOfBounds, calculate(cam, huge, huge));
+    // The visible strip fits on its own, but its square minimap does not.
+    const wide = 100_000_000;
+    _ = try visibleRange(cam, wide, 100);
+    try std.testing.expectError(error.CoordinateOutOfBounds, calculate(cam, wide, 100));
+}
 
-    const too_far_neg: f32 = @floatFromInt(-4194303 * world.CHUNK_PX);
-    try std.testing.expectError(error.CoordinateOutOfBounds, visibleRange(testCamera(0, too_far_neg, 0, 0), 0, 0));
+test "screen picking floors negative offsets and rejects positions beyond the world" {
+    const ordinary: Camera = .{ .tile_x = -17, .tile_y = -16 };
+    try std.testing.expectEqual(protocol.Location{ .x = -18, .y = -17 }, screenToTile(ordinary, 801, 601, .{ .x = 384, .y = 284 }).?);
+    try std.testing.expectEqual(protocol.Location{ .x = -17, .y = -16 }, screenToTile(ordinary, 801, 601, .{ .x = 384.5, .y = 284.5 }).?);
+
+    const corner: Camera = .{ .tile_x = @intCast(min_tile), .tile_y = @intCast(max_tile) };
+    try std.testing.expectEqual(protocol.Location{ .x = @intCast(min_tile), .y = @intCast(max_tile) }, screenToTile(corner, 1000, 640, .{ .x = 484, .y = 335.99 }).?);
+    try std.testing.expectEqual(protocol.Location{ .x = @intCast(min_tile + 1), .y = @intCast(max_tile - 1) }, screenToTile(corner, 1000, 640, .{ .x = 516, .y = 303.99 }).?);
+    for ([_]rl.Vector2{
+        .{ .x = 483.99, .y = 320 },
+        .{ .x = 500, .y = 336 },
+        .{ .x = std.math.nan(f32), .y = 320 },
+        .{ .x = 500, .y = std.math.floatMax(f32) },
+    }) |point| try std.testing.expect(screenToTile(corner, 1000, 640, point) == null);
+    try std.testing.expect(screenToTile(corner, 1000, std.math.inf(f32), .{ .x = 500, .y = 320 }) == null);
 }
 
 test "direction requests move one tile and cancel opposites" {
@@ -375,10 +338,10 @@ test "direction requests move one tile and cancel opposites" {
     try std.testing.expectEqual(@as(i32, 1), cam.tile_x);
     try std.testing.expectEqual(@as(i32, 0), cam.tile_y);
 
-    // One tile right moves the target by exactly TILE_PX.
+    // The local target is unchanged; the previous tile is now one tile left.
     const stepped = cam.raylib(800, 600);
-    try std.testing.expectEqual(@as(f32, 48), stepped.target.x);
-    try std.testing.expectEqual(@as(f32, 16), stepped.target.y);
+    try std.testing.expectEqual(start.target, stepped.target);
+    try std.testing.expectEqual(@as(i64, -world.TILE_PX), relativePixel(0, cam.tile_x));
 
     try cam.applyInput(.{ .up = true });
     try std.testing.expectEqual(@as(i32, 1), cam.tile_x);
@@ -430,15 +393,10 @@ test "tile steps cross negative chunk boundaries with floor division" {
     try std.testing.expectEqual(@as(i32, -1), cam.chunkX());
     try std.testing.expectEqual(@as(i32, -1), cam.chunkY());
 
-    // Regression: the real Camera → View path targets the tile center, not the
-    // pixel-only test helper above.
     cam.tile_x = -17;
     cam.tile_y = -33;
     const view = try calculate(cam, 0, 0);
-    const expected_x: f32 = @floatFromInt(-17 * world.TILE_PX + world.TILE_PX / 2);
-    const expected_y: f32 = @floatFromInt(-33 * world.TILE_PX + world.TILE_PX / 2);
-    try std.testing.expectEqual(expected_x, view.transform.target.x);
-    try std.testing.expectEqual(expected_y, view.transform.target.y);
+    try std.testing.expectEqual(rl.Vector2{ .x = 16, .y = 16 }, view.transform.target);
     try std.testing.expectEqual(
         world.ChunkRange{ .cx0 = -2, .cy0 = -3, .cx1 = -2, .cy1 = -3 },
         view.chunks,
@@ -497,19 +455,32 @@ test "drag resets between gestures and wins over the keyboard" {
     try std.testing.expectEqual(@as(i32, 0), override.tile_y);
 }
 
-test "tile coordinates stay exact for large one-tile steps" {
-    // 2^25 tiles is 2^30 px, where an f32 can no longer represent every 32 px
-    // step. The authoritative tile coordinate still advances exactly.
-    const big: i32 = 1 << 25;
-    var cam = Camera{ .tile_x = big, .tile_y = -big };
+test "one-tile steps and draw positions stay exact at both extremes" {
+    var cam: Camera = .{ .tile_x = @intCast(max_tile), .tile_y = @intCast(min_tile) };
+    const target = cam.raylib(800, 600).target;
+    try std.testing.expectEqual(rl.Vector2{ .x = 16, .y = 16 }, target);
+    try std.testing.expectEqual(target, relativeTileCenter(cam.tile_x, cam.tile_y, cam.tile_x, cam.tile_y));
+    try std.testing.expectEqual(@as(i64, world.TILE_PX), relativePixel(end_tile, cam.tile_x));
+    try std.testing.expectEqual(@as(i64, 1 << 37), relativePixel(end_tile, cam.tile_y));
 
-    try cam.applyInput(.{ .right = true, .down = true });
-    try std.testing.expectEqual(big + 1, cam.tile_x);
-    try std.testing.expectEqual(-big + 1, cam.tile_y);
+    try cam.applyInput(.{ .left = true, .down = true });
+    try std.testing.expectEqual(@as(i32, @intCast(max_tile - 1)), cam.tile_x);
+    try std.testing.expectEqual(@as(i32, @intCast(min_tile + 1)), cam.tile_y);
+    try std.testing.expectEqual(rl.Vector2{ .x = 48, .y = -16 }, relativeTileCenter(@intCast(max_tile), @intCast(min_tile), cam.tile_x, cam.tile_y));
 
-    try cam.applyInput(.{ .left = true, .up = true });
-    try std.testing.expectEqual(big, cam.tile_x);
-    try std.testing.expectEqual(-big, cam.tile_y);
+    try cam.applyInput(.{ .right = true, .up = true });
+    try std.testing.expectEqual(@as(i32, @intCast(max_tile)), cam.tile_x);
+    try std.testing.expectEqual(@as(i32, @intCast(min_tile)), cam.tile_y);
+}
+
+test "drag can cross more than an i32 delta without overflowing" {
+    var cam: Camera = .{ .tile_x = @intCast(min_tile), .tile_y = @intCast(max_tile) };
+    const pixels: f32 = @floatFromInt(end_tile * world.TILE_PX);
+    try cam.applyInput(.{ .dragging = true, .drag_x = -pixels, .drag_y = pixels });
+    try std.testing.expectEqual(@as(i32, 0), cam.tile_x);
+    try std.testing.expectEqual(@as(i32, -1), cam.tile_y);
+    try std.testing.expectEqual(@as(f64, 0), cam.drag_remainder_x);
+    try std.testing.expectEqual(@as(f64, 0), cam.drag_remainder_y);
 }
 
 test "invalid or unrepresentable movement is rejected without partial mutation" {
@@ -525,7 +496,7 @@ test "invalid or unrepresentable movement is rejected without partial mutation" 
     try std.testing.expectError(error.CoordinateOutOfBounds, cam.applyInput(.{ .dragging = true, .drag_x = std.math.nan(f32) }));
     try std.testing.expectError(error.CoordinateOutOfBounds, cam.applyInput(.{ .dragging = true, .drag_y = std.math.inf(f32) }));
 
-    // Finite, but far more tiles than an i32 delta can hold.
+    // Finite, but far more than the width of the tile world.
     try std.testing.expectError(error.CoordinateOutOfBounds, cam.applyInput(.{
         .dragging = true,
         .drag_x = -std.math.floatMax(f32),
@@ -538,13 +509,11 @@ test "invalid or unrepresentable movement is rejected without partial mutation" 
     try std.testing.expectEqual(initial.drag_remainder_y, cam.drag_remainder_y);
 
     // One axis overflowing rejects the whole move: y must not advance.
-    var edge = Camera{ .tile_x = 67108863, .tile_y = 0 };
+    const bounds = Camera{ .tile_x = @intCast(max_tile), .tile_y = @intCast(min_tile), .drag_remainder_x = 1 };
+    var edge = bounds;
     try std.testing.expectError(error.CoordinateOutOfBounds, edge.applyInput(.{ .right = true, .down = true }));
-    try std.testing.expectEqual(@as(i32, 67108863), edge.tile_x);
-    try std.testing.expectEqual(@as(i32, 0), edge.tile_y);
-
-    // i32 min tile center is exactly representable; one past it is not.
-    var low = Camera{ .tile_x = -67108864, .tile_y = 0 };
-    try std.testing.expectError(error.CoordinateOutOfBounds, low.applyInput(.{ .left = true }));
-    try std.testing.expectEqual(@as(i32, -67108864), low.tile_x);
+    try std.testing.expectError(error.CoordinateOutOfBounds, edge.applyInput(.{ .dragging = true, .drag_x = 32, .drag_y = 32 }));
+    try std.testing.expectError(error.CoordinateOutOfBounds, edge.setTarget(end_tile, 0));
+    try std.testing.expectError(error.CoordinateOutOfBounds, edge.setTarget(0, min_tile - 1));
+    try std.testing.expectEqual(bounds, edge);
 }

@@ -98,8 +98,8 @@ pub fn sampleTile(seed: [32]u8, x: i32, y: i32) Tile {
     return .grass;
 }
 pub fn generate(chunk: *Chunk) void {
-    // Precondition: the whole chunk fits i32 tile coordinates. The client
-    // validates its stricter drawable range; the server samples absolute tiles.
+    // Precondition: the whole chunk fits i32 tile coordinates. Client streaming
+    // clips to this range; the server samples absolute tiles.
     for (0..CT) |ly| {
         for (0..CT) |lx| {
             const x = chunk.cx * CHUNK_TILES + @as(i32, @intCast(lx));

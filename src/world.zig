@@ -12,7 +12,9 @@
 //! memory.
 
 const std = @import("std");
-const terrain = @import("shared").world;
+const shared = @import("shared");
+const terrain = shared.world;
+const protocol = shared.protocol;
 
 // ── world constants ──────────────────────────────────────────────────────────
 
@@ -36,17 +38,37 @@ pub const MIN_PREHEATED_CHUNKS: usize = 64;
 
 // ── tiles / chunks ───────────────────────────────────────────────────────────
 
-/// Generated terrain. Gameplay state (cut, tilled, ownership, …) is not stored
-/// here; the standalone server persists absolute cut state separately.
 pub const Tile = terrain.Tile;
 
-pub const Chunk = terrain.Chunk;
+pub const Chunk = struct {
+    cx: i32 = 0,
+    cy: i32 = 0,
+    tiles: [CT * CT]Tile = undefined,
+    // Null means unsynced; a zero bitmap is an authoritative result too.
+    cuts: ?[protocol.chunk_bytes]u8 = null,
+
+    pub fn isCut(self: *const Chunk, index: usize) bool {
+        const bits = if (self.cuts) |*value| value else return false;
+        return bits[index / 8] & (@as(u8, 1) << @as(u3, @intCast(index % 8))) != 0;
+    }
+};
 
 /// An inclusive rectangular range of chunk indices.
 pub const ChunkRange = terrain.ChunkRange;
 
+/// Expand a valid chunk range without prefetching outside the tile world.
+pub fn expandChunkRange(range: ChunkRange, margin: i32) ChunkRange {
+    std.debug.assert(margin >= 0);
+    return .{
+        .cx0 = @intCast(@max(protocol.min_chunk, @as(i64, range.cx0) - margin)),
+        .cy0 = @intCast(@max(protocol.min_chunk, @as(i64, range.cy0) - margin)),
+        .cx1 = @intCast(@min(protocol.max_chunk, @as(i64, range.cx1) + margin)),
+        .cy1 = @intCast(@min(protocol.max_chunk, @as(i64, range.cy1) + margin)),
+    };
+}
+
 pub fn residencyRange(vis: ChunkRange, minimap: ?ChunkRange) ChunkRange {
-    const prefetch = vis.expanded(PREFETCH_MARGIN_CHUNKS);
+    const prefetch = expandChunkRange(vis, PREFETCH_MARGIN_CHUNKS);
     const map = minimap orelse return prefetch;
     return .{
         .cx0 = @min(prefetch.cx0, map.cx0),
@@ -58,33 +80,21 @@ pub fn residencyRange(vis: ChunkRange, minimap: ?ChunkRange) ChunkRange {
 
 // ── coordinate validation ────────────────────────────────────────────────────
 
-/// A chunk is drawable only if its full pixel extent fits in an i32:
-/// `cx * CHUNK_PX` and `cx * CHUNK_PX + CHUNK_PX`. For 512 px chunks this
-/// gives the inclusive range [-4194304, 4194302].
-pub const MIN_DRAWABLE_CHUNK: i32 = @divFloor(std.math.minInt(i32), CHUNK_PX);
-pub const MAX_DRAWABLE_CHUNK: i32 = @divFloor(std.math.maxInt(i32) - CHUNK_PX, CHUNK_PX);
-
-/// Raised before an unsafe world-pixel, chunk, or count conversion.
 pub const CoordinateError = error{CoordinateOutOfBounds};
 
-/// Validate a visible/streamed chunk range together with its prefetch margin.
-/// Arithmetic is widened to i64 so validation itself can never overflow.
+/// Validate absolute chunk bounds and the size of their clipped prefetch ring.
 pub fn validateChunkRange(range: ChunkRange, margin: i32) CoordinateError!void {
-    if (range.cx0 > range.cx1 or range.cy0 > range.cy1) return error.CoordinateOutOfBounds;
+    if (margin < 0 or range.cx0 > range.cx1 or range.cy0 > range.cy1 or
+        range.cx0 < protocol.min_chunk or range.cy0 < protocol.min_chunk or
+        range.cx1 > protocol.max_chunk or range.cy1 > protocol.max_chunk)
+        return error.CoordinateOutOfBounds;
 
-    const x0 = @as(i64, range.cx0) - @as(i64, margin);
-    const y0 = @as(i64, range.cy0) - @as(i64, margin);
-    const x1 = @as(i64, range.cx1) + @as(i64, margin);
-    const y1 = @as(i64, range.cy1) + @as(i64, margin);
-
-    if (x0 < MIN_DRAWABLE_CHUNK or x1 > MAX_DRAWABLE_CHUNK) return error.CoordinateOutOfBounds;
-    if (y0 < MIN_DRAWABLE_CHUNK or y1 > MAX_DRAWABLE_CHUNK) return error.CoordinateOutOfBounds;
-
-    // `ChunkRange.count()` is i32 and feeds the desired residency count;
-    // reject a ring whose dimensions cannot be represented before it is used.
-    const cols = x1 - x0 + 1;
-    const rows = y1 - y0 + 1;
-    if (cols * rows > std.math.maxInt(i32)) return error.CoordinateOutOfBounds;
+    const expanded = expandChunkRange(range, margin);
+    const count = @as(i64, expanded.cols()) * expanded.rows();
+    // A u32 hash table must round its bucket count up for spare capacity.
+    // Also reject ranges whose chunk bytes cannot fit on 32-bit targets.
+    const max_resident_chunks = @min(1 << 30, std.math.maxInt(usize) / @sizeOf(Chunk));
+    if (count > max_resident_chunks) return error.CoordinateOutOfBounds;
 }
 
 // Deterministic terrain generation lives in shared/world.zig.
@@ -141,8 +151,6 @@ pub fn privateYield(private_seed: [32]u8, x: i32, y: i32) u64 {
     return std.mem.readInt(u64, &out, .little);
 }
 
-const generate = terrain.generate;
-
 // ── resident storage and streaming ───────────────────────────────────────────
 
 /// Standard-library pool of fixed-size chunks: O(1) create/destroy,
@@ -189,6 +197,7 @@ pub const World = struct {
 
     generated: u64 = 0,
     unloaded: u64 = 0,
+    cut_revision: u64 = 0,
 
     /// Desired residency, not the amount of memory retained by the pool.
     wanted: usize = 0,
@@ -234,10 +243,10 @@ pub const World = struct {
         try self.doomed.ensureTotalCapacity(self.alloc, @as(usize, self.by_key.count()) + 1);
         const chunk = try self.pool.create(self.alloc);
         errdefer self.pool.destroy(chunk);
-        chunk.cx = cx;
-        chunk.cy = cy;
+        var base: terrain.Chunk = .{ .cx = cx, .cy = cy };
+        terrain.generate(&base);
+        chunk.* = .{ .cx = cx, .cy = cy, .tiles = base.tiles };
         try self.by_key.put(self.alloc, key, chunk);
-        generate(chunk);
         self.completed_range = null;
         self.generated += 1;
     }
@@ -255,6 +264,55 @@ pub const World = struct {
     /// they can be regenerated deterministically when needed.
     pub fn get(self: *const World, cx: i32, cy: i32) ?*const Chunk {
         return self.by_key.get(keyOf(cx, cy));
+    }
+
+    pub fn invalidateCuts(self: *World) void {
+        var it = self.by_key.valueIterator();
+        while (it.next()) |slot| slot.*.cuts = null;
+        self.cut_revision +%= 1;
+    }
+
+    pub fn applyCuts(self: *World, snapshot: *const protocol.Snapshot) void {
+        const area = snapshot.area;
+        const cols: usize = @intCast(area.cols());
+        var changed = false;
+        for (snapshot.chunks[0..snapshot.count], 0..) |bits, i| {
+            const cx = area.cx0 + @as(i32, @intCast(i % cols));
+            const cy = area.cy0 + @as(i32, @intCast(i / cols));
+            // Panning can evict a requested chunk while its reply is in flight.
+            const chunk = self.by_key.get(keyOf(cx, cy)) orelse continue;
+            const previous: [protocol.chunk_bytes]u8 = chunk.cuts orelse @splat(0);
+            if (!std.mem.eql(u8, &previous, &bits)) changed = true;
+            chunk.cuts = bits;
+        }
+        if (changed) self.cut_revision +%= 1;
+    }
+
+    /// The first missing resident starts a rectangle of only unsynced chunks.
+    pub fn nextCutArea(self: *const World, range: ChunkRange, limit: i32) ?ChunkRange {
+        std.debug.assert(limit > 0 and limit <= protocol.max_area_chunks);
+        var cy = range.cy0;
+        while (cy <= range.cy1) : (cy += 1) {
+            var cx = range.cx0;
+            while (cx <= range.cx1) : (cx += 1) {
+                if (!self.needsCuts(cx, cy)) continue;
+                var end_x = cx;
+                while (end_x < @min(range.cx1, cx + limit - 1) and self.needsCuts(end_x + 1, cy)) end_x += 1;
+                const rows = @divTrunc(limit, end_x - cx + 1);
+                var end_y = cy;
+                extend: while (end_y < @min(range.cy1, cy + rows - 1)) : (end_y += 1) {
+                    var x = cx;
+                    while (x <= end_x) : (x += 1) if (!self.needsCuts(x, end_y + 1)) break :extend;
+                }
+                return .{ .cx0 = cx, .cy0 = cy, .cx1 = end_x, .cy1 = end_y };
+            }
+        }
+        return null;
+    }
+
+    fn needsCuts(self: *const World, cx: i32, cy: i32) bool {
+        const chunk = self.get(cx, cy) orelse return false;
+        return chunk.cuts == null;
     }
 
     /// Number of chunks currently in memory.
@@ -352,6 +410,38 @@ pub const World = struct {
 pub const StreamError = std.mem.Allocator.Error || CoordinateError;
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+test "cut batches are bounded, use chunk addresses, and expire with residency" {
+    const t = std.testing;
+    var w = try World.init(t.allocator, MIN_PREHEATED_CHUNKS);
+    defer w.deinit();
+    const visible: ChunkRange = .{ .cx0 = -10, .cy0 = -4, .cx1 = 5, .cy1 = 4 };
+    try w.stream(visible);
+    const first = w.nextCutArea(visible, protocol.max_area_chunks).?;
+    const geometry = try protocol.areaGeometry(first);
+    try t.expectEqual(@as(u16, 64), geometry.count);
+    var reply: protocol.Snapshot = .{ .area = first, .count = geometry.count };
+    const cx = first.cx0 + 3;
+    const cy = first.cy0 + 1;
+    const base = w.get(cx, cy).?.tiles;
+    reply.chunks[geometry.cols + 3][2] = 0b00000100;
+    w.applyCuts(&reply);
+    try t.expectEqualDeep(base, w.get(cx, cy).?.tiles);
+    try t.expect(w.get(cx, cy).?.isCut(18));
+    try t.expect(!w.get(cx, cy).?.isCut(17));
+    try t.expect(!w.get(cx - 1, cy).?.isCut(18));
+    try t.expect(w.get(cx - 1, cy).?.cuts != null);
+    const next = w.nextCutArea(visible, protocol.max_area_chunks).?;
+    try t.expectEqual(first.cy1 + 1, next.cy0);
+
+    const far: ChunkRange = .{ .cx0 = 30, .cy0 = 40, .cx1 = 30, .cy1 = 40 };
+    try w.stream(far);
+    w.applyCuts(&reply); // An old reply cannot resurrect evicted terrain.
+    try t.expect(w.get(cx, cy) == null);
+    try w.stream(visible);
+    try t.expect(w.get(cx, cy).?.cuts == null);
+    try t.expectEqual(first, w.nextCutArea(visible, protocol.max_area_chunks).?);
+}
 
 test "terrain survives eviction regeneration and reversed load order" {
     var first = try World.init(std.testing.allocator, 4);
@@ -550,19 +640,28 @@ test "initialization and streaming clean up every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
 }
 
-test "chunk extent validation covers the +CHUNK_PX edge" {
-    // Positive: chunk 4194302 is the last chunk whose full extent fits i32
-    // (it ends at 2147483136; the next chunk would end at 2^31).
-    try validateChunkRange(.{ .cx0 = 4194302, .cy0 = 0, .cx1 = 4194302, .cy1 = 0 }, 0);
-    try std.testing.expectError(error.CoordinateOutOfBounds, validateChunkRange(.{ .cx0 = 4194303, .cy0 = 0, .cx1 = 4194303, .cy1 = 0 }, 0));
+test "streaming clips prefetch and loads absolute terrain at opposite world edges" {
+    const t = std.testing;
+    var w = try World.init(t.allocator, MIN_PREHEATED_CHUNKS);
+    defer w.deinit();
+    const low = protocol.min_chunk;
+    const high = protocol.max_chunk;
+    const first: ChunkRange = .{ .cx0 = low, .cy0 = high, .cx1 = low, .cy1 = high };
+    const second: ChunkRange = .{ .cx0 = high, .cy0 = low, .cx1 = high, .cy1 = low };
+    const map: ChunkRange = .{ .cx0 = high - 3, .cy0 = low, .cx1 = high, .cy1 = low + 3 };
 
-    // Negative: origin == minInt(i32) exactly for chunk -4194304.
-    try validateChunkRange(.{ .cx0 = -4194304, .cy0 = 0, .cx1 = -4194304, .cy1 = 0 }, 0);
-    try std.testing.expectError(error.CoordinateOutOfBounds, validateChunkRange(.{ .cx0 = -4194305, .cy0 = 0, .cx1 = -4194305, .cy1 = 0 }, 0));
+    try t.expectEqual(ChunkRange{ .cx0 = low, .cy0 = high - 2, .cx1 = low + 2, .cy1 = high }, residencyRange(first, null));
+    try w.stream(first);
+    try t.expectEqual(@as(usize, 9), w.residentCount());
+    try t.expect(w.get(low - 1, high) == null and w.get(low, high + 1) == null);
+    try t.expectEqual(terrain.sampleTile(terrain.public_seed, std.math.minInt(i32), std.math.maxInt(i32)), w.get(low, high).?.tiles[(CT - 1) * CT]);
 
-    // The prefetch ring must also fit, so an edge chunk needs two chunks slack.
-    try std.testing.expectError(error.CoordinateOutOfBounds, validateChunkRange(.{ .cx0 = 4194302, .cy0 = 0, .cx1 = 4194302, .cy1 = 0 }, PREFETCH_MARGIN_CHUNKS));
-    try std.testing.expectError(error.CoordinateOutOfBounds, validateChunkRange(.{ .cx0 = -4194304, .cy0 = 0, .cx1 = -4194304, .cy1 = 0 }, PREFETCH_MARGIN_CHUNKS));
+    try t.expectEqual(map, residencyRange(second, map));
+    try w.streamWithMinimap(second, map);
+    try t.expectEqual(@as(usize, 16), w.residentCount());
+    try t.expect(w.get(low, high) == null and w.get(high - 3, low + 3) != null);
+    try t.expect(w.get(high + 1, low) == null and w.get(high, low - 1) == null);
+    try t.expectEqual(terrain.sampleTile(terrain.public_seed, std.math.maxInt(i32), std.math.minInt(i32)), w.get(high, low).?.tiles[CT - 1]);
 }
 
 test "stream rejects malformed and oversized ranges before mutating the world" {
@@ -573,13 +672,18 @@ test "stream rejects malformed and oversized ranges before mutating the world" {
     try std.testing.expectError(error.CoordinateOutOfBounds, world.stream(.{ .cx0 = 1, .cy0 = 0, .cx1 = 0, .cy1 = 0 }));
     try std.testing.expectError(error.CoordinateOutOfBounds, world.stream(.{ .cx0 = 0, .cy0 = 1, .cx1 = 0, .cy1 = 0 }));
 
-    // Extreme chunk indices fail before generation or eviction.
-    try std.testing.expectError(error.CoordinateOutOfBounds, world.stream(.{ .cx0 = 4194302, .cy0 = 0, .cx1 = 4194302, .cy1 = 0 }));
-    try std.testing.expectError(error.CoordinateOutOfBounds, world.stream(.{ .cx0 = 0, .cy0 = -4194304, .cx1 = 0, .cy1 = -4194304 }));
+    // Indices beyond the world fail before generation or eviction.
+    const high = protocol.max_chunk;
+    const low = protocol.min_chunk;
+    try std.testing.expectError(error.CoordinateOutOfBounds, world.stream(.{ .cx0 = high + 1, .cy0 = 0, .cx1 = high + 1, .cy1 = 0 }));
+    try std.testing.expectError(error.CoordinateOutOfBounds, world.stream(.{ .cx0 = 0, .cy0 = low - 1, .cx1 = 0, .cy1 = low - 1 }));
 
-    // Individually drawable bounds, but the prefetch ring count exceeds i32.
-    const wide = ChunkRange{ .cx0 = -4194302, .cy0 = -2, .cx1 = 4194300, .cy1 = 255 };
-    try std.testing.expectError(error.CoordinateOutOfBounds, world.stream(wide));
+    // Valid individual bounds do not guarantee a manageable residency count.
+    const all = ChunkRange{ .cx0 = low, .cy0 = low, .cx1 = high, .cy1 = high };
+    try std.testing.expectError(error.CoordinateOutOfBounds, world.stream(all));
+    const first: ChunkRange = .{ .cx0 = low, .cy0 = low, .cx1 = low, .cy1 = low };
+    const map: ChunkRange = .{ .cx0 = high, .cy0 = high, .cx1 = high, .cy1 = high };
+    try std.testing.expectError(error.CoordinateOutOfBounds, world.streamWithMinimap(first, map));
 
     try std.testing.expectEqual(@as(usize, 0), world.residentCount());
     var stats = world.stats();

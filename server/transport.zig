@@ -135,7 +135,7 @@ pub const Handler = struct {
     fn sendAuthReply(self: *Handler, outcome: p.AuthOutcome) !void {
         const io = self.app.registry.io;
         try checkDeadline(io, self.deadline);
-        var reply: [9]u8 = undefined;
+        var reply: [15]u8 = undefined;
         try self.conn.writeMessage(try wire.encodeAuth(&reply, .{ .reply = outcome }), .binary);
         try checkDeadline(io, self.deadline);
     }
@@ -152,6 +152,7 @@ pub const Handler = struct {
     }
     pub fn clientMessage(self: *Handler, data: []const u8, tpe: ws.Opcode) !void {
         if (!self.authenticated) {
+            std.debug.assert(self.session == null);
             const io = self.app.registry.io;
             try checkDeadline(io, self.deadline);
             const message = (if (data.len > p.max_gameplay_request_bytes)
@@ -165,13 +166,16 @@ pub const Handler = struct {
             const key = auth.verifyAuth(proof.pubkey, self.nonce, proof.signature) catch
                 return self.rejectAuth(.invalid_credentials);
             try checkDeadline(io, self.deadline);
-            self.session = self.app.registry.claimBefore(key, self.deadline) catch |err| switch (err) {
-                error.DeadlineExpired => return err,
-                error.DuplicatePubkey, error.SessionCapacity, error.GenerationExhausted => return self.rejectAuth(.unavailable),
+            self.session = (if (self.app.persistence) |storage|
+                storage.claim(key, self.deadline)
+            else
+                self.app.registry.claimBefore(key, self.deadline)) catch |err| switch (err) {
+                error.DeadlineExpired, error.Canceled => return err,
+                else => return self.rejectAuth(.unavailable),
             };
             errdefer self.close();
-            try self.sendAuthReply(.{ .ok = {} });
-            self.authenticated = true;
+            const location = self.app.registry.get(self.session.?).?.location.?;
+            try self.sendAuthReply(.{ .ok = location });
             return;
         }
         const req = wire.decodeMessage(data, tpe == .binary) catch |err|
@@ -180,17 +184,37 @@ pub const Handler = struct {
 
         const dispatch = self.dispatch orelse return error.MissingTickDispatcher;
         const box = self.mailbox.?;
-        dispatch.publish(box, self.session.?, req) catch |err| switch (err) {
+        const storage = self.app.persistence;
+        var replay = try self.app.retainedCut(req);
+        var pins: @import("persistence.zig").Pins = .{};
+        if (storage) |store| {
+            if (replay == null) pins = store.prepare(req) catch |err| blk: {
+                if (err == error.Canceled) return err;
+                // Another connection may have admitted this ID while prepare ran.
+                replay = try self.app.retainedCut(req);
+                if (replay != null) break :blk .{};
+                var reply: [p.max_response_bytes]u8 = undefined;
+                return self.conn.writeMessage(application.encodeCommonFailure(&reply, req, .server_busy), .binary);
+            };
+        }
+        defer if (storage) |store| store.release(&pins);
+        dispatch.publishPrepared(box, self.session.?, req, replay) catch |err| switch (err) {
             error.NotGameplayRequest => unreachable,
             error.RequestPending, error.ServerStopping, error.GenerationExhausted => {
                 // A rejected publish owns no generation and must not touch the box.
+                if (storage) |store| store.release(&pins);
                 var reply: [p.max_response_bytes]u8 = undefined;
                 try self.conn.writeMessage(application.encodeCommonFailure(&reply, req, .server_busy), .binary);
                 if (err != error.RequestPending) return err;
                 return;
             },
         };
-        try self.finishReply();
+        try self.finishPreparedReply(&pins);
+    }
+    /// Called only after proof/ACK work has joined successfully.
+    pub fn completeAuthentication(self: *Handler) !void {
+        try self.app.registry.confirmBefore(self.session.?, self.deadline);
+        self.authenticated = true;
     }
     fn rejectChannel(self: *Handler, req: p.Request) !void {
         // Open proof bytes borrow the receive buffer until the next WebSocket read.
@@ -204,9 +228,14 @@ pub const Handler = struct {
         try self.conn.writeMessage(bytes, .binary);
     }
     pub fn finishReply(self: *Handler) !void {
+        var pins = @import("persistence.zig").Pins{};
+        return self.finishPreparedReply(&pins);
+    }
+    fn finishPreparedReply(self: *Handler, pins: *@import("persistence.zig").Pins) !void {
         const box = self.mailbox.?;
         defer self.dispatch.?.cleanup(box);
         try box.completion.wait(self.app.registry.io);
+        if (self.app.persistence) |storage| storage.release(pins);
         try self.conn.writeMessage(box.reply[0..box.len], .binary);
         if (box.close_after_reply) return error.StaleSession;
     }
@@ -273,6 +302,7 @@ pub const Server = struct {
         var group: std.Io.Group = .init;
         defer group.cancel(self.io); // joins before app/slots can be freed
         try group.concurrent(self.io, tickTask, .{ self, app });
+        if (app.persistence) |storage| try group.concurrent(self.io, @import("persistence.zig").Persistence.saveLoop, .{storage});
         while (true) {
             const stream = listener.accept(self.io) catch |err| switch (acceptAction(err)) {
                 .retry => continue,
@@ -373,7 +403,7 @@ const Connection = struct {
         self.websocket = try self.request.respondWebSocket(.{ .key = &self.slot.key });
         self.websocket.input = &self.guard.interface;
         try self.handler.sendChallenge(); // flushes HTTP101 and challenge together
-        while (!self.handler.authenticated) {
+        while (self.handler.session == null) {
             const message = try self.websocket.readSmallMessage();
             try checkDeadline(self.io, self.handler.deadline);
             if (message.opcode == .ping) {
@@ -459,7 +489,7 @@ fn serveConnection(server: *Server, slot: *Slot, app: *App) !void {
     // Separate absolute auth window: preparation and HTTP time do not consume it.
     connection.handler.deadline = freshDeadline(io);
     try race(io, connection.handler.deadline, Connection.authenticate, .{&connection});
-    try checkDeadline(io, connection.handler.deadline);
+    try connection.handler.completeAuthentication();
     while (true) {
         const message = try connection.websocket.readSmallMessage();
         if (message.opcode == .ping) {

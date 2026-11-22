@@ -12,6 +12,8 @@ const Handler = @import("transport.zig").Handler;
 const Fixture = @import("fixture.zig").Fixture;
 const sessions = @import("sessions.zig");
 const ticks = @import("tick_mailbox.zig");
+const GameDb = @import("game_db.zig").GameDb;
+const Persistence = @import("persistence.zig").Persistence;
 const upgrade_headers = "Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n";
 const many_headers = blk: {
     var bytes: [29 * 6]u8 = undefined;
@@ -128,7 +130,7 @@ test "frame guard zero limits and partial forwarding preserve exact bytes and bo
 }
 
 const protocol_error_frame = "\x82\x04\xff\x00\x00\x7e";
-const auth_ack_frame = "\x82\x07\xf2\x03\x00\x03\x00\x00\x7e";
+const auth_ack_frame = "\x82\x0f\xf2\x0b\x00\x03\x08\x00\x00\x00\x00\x00\x00\x00\x00\x00\x7e";
 const test_pubkey_hex = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 const test_signature_hex = "49eacfb328fa4897cd34d70e114b33f3f1964f0a0d36ecf0ef5719488358b61eabd2b684bff67111333304d960ff5a1dc83d9aa3a632c4b27e329fc4e47acf20";
 
@@ -204,9 +206,13 @@ test "fixed buffer authentication challenge proof ACK claims and failure cleanup
     var guard = transport.FrameInput.init(&frame_reader, &frame_buffer);
     websocket.input = &guard.interface;
     try handleNextFrame(&handler);
+    try std.testing.expect(!handler.authenticated);
+    try handler.completeAuthentication();
     try std.testing.expect(handler.authenticated);
     try std.testing.expectEqualDeep(key, fixture.application.registry.get(handler.session.?).?.pubkey);
-    try std.testing.expectEqualSlices(u8, auth_ack_frame, output.buffered()[ack_start..]);
+    const ack = output.buffered()[ack_start..];
+    try std.testing.expectEqualSlices(u8, auth_ack_frame, ack);
+    try std.testing.expectEqualDeep(p.AuthOutcome{ .ok = spawn }, (try wire.decodeAuth(ack[2..], true, .reply)).reply);
     const session = handler.session.?;
     for ([_][]const u8{ &proof, challenge_frame[2..], auth_ack_frame[2..], "\x00" }, [_]ws.Opcode{ .binary, .binary, .binary, .text }) |data, opcode| {
         const start = output.buffered().len;
@@ -257,6 +263,76 @@ test "fixed buffer authentication challenge proof ACK claims and failure cleanup
     try std.testing.expect(auth_deadline.compare(.gt, handler.deadline));
     try transport.checkDeadline(std.testing.io, auth_deadline);
 }
+test "durable auth ACK stays provisional until the outer deadline check passes" {
+    const t = std.testing;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.application;
+    var db = try GameDb.open(":memory:");
+    defer db.close();
+    var persistence = try Persistence.init(t.io, t.allocator, &db, &app.context.state, app.registry);
+    defer persistence.deinit(t.allocator);
+    app.persistence = &persistence;
+
+    var input = std.Io.Reader.fixed("");
+    var bytes: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&bytes);
+    var websocket = ws{ .input = &input, .output = &output, .key = "" };
+    var handler = try Handler.init(&websocket, app);
+    defer handler.close();
+    handler.nonce = @splat(7);
+    var key: sessions.Pubkey = undefined;
+    _ = try std.fmt.hexToBytes(&key, test_pubkey_hex);
+    var signature: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&signature, test_signature_hex);
+    var proof_bytes: [107]u8 = undefined;
+    const proof = try wire.encodeAuth(&proof_bytes, .{ .proof = .{ .pubkey = key, .signature = signature } });
+
+    handler.deadline = transport.freshDeadline(t.io);
+    try handler.clientMessage(proof, .binary);
+    try t.expect(!handler.authenticated and handler.session != null);
+    try t.expect((try wire.decodeAuth(output.buffered()[2..], true, .reply)).reply == .ok);
+    var pending: [1]sessions.UserSnapshot = undefined;
+    try t.expectEqual(@as(usize, 0), app.registry.snapshotUsers(&pending));
+    const Confirm = struct {
+        fn run(h: *Handler, result: *anyerror!void) void {
+            result.* = h.completeAuthentication();
+        }
+    };
+    var result: anyerror!void = undefined;
+    const worker = start: {
+        app.registry.mutex.lockUncancelable(t.io);
+        errdefer app.registry.mutex.unlock(t.io);
+        handler.deadline = .fromNow(t.io, .{ .raw = .fromMilliseconds(500), .clock = .awake });
+        break :start try std.Thread.spawn(.{}, Confirm.run, .{ &handler, &result });
+    };
+    {
+        defer worker.join();
+        defer app.registry.mutex.unlock(t.io);
+        // Observe confirmation waiting for the mutex before letting the deadline expire.
+        while (app.registry.mutex.state.load(.acquire) != .contended) {
+            try transport.checkDeadline(t.io, handler.deadline);
+            try std.Io.sleep(t.io, .fromMilliseconds(1), .awake);
+        }
+        try transport.checkDeadline(t.io, handler.deadline);
+        try handler.deadline.wait(t.io);
+    }
+    try t.expectError(error.DeadlineExpired, result);
+    try t.expect(!handler.authenticated);
+    try t.expectEqual(@as(usize, 0), app.registry.snapshotUsers(&pending));
+    handler.close();
+    try persistence.flush();
+    try t.expect((try db.loadUser(key)) == null);
+
+    output.end = 0;
+    handler.deadline = transport.freshDeadline(t.io);
+    try handler.clientMessage(proof, .binary);
+    try handler.completeAuthentication();
+    try t.expect(handler.authenticated);
+    try persistence.flush();
+    try t.expect((try db.loadUser(key)) != null);
+}
+
 fn stateCount(f: *Fixture) usize {
     const state = &f.application.context.state;
     return state.chunk_count + state.replay_count;
@@ -445,6 +521,7 @@ test "Spilman messages require authentication and reject without touching tick o
     output.end = 0;
     try handleNextFrame(&handler);
     try std.testing.expectEqualSlices(u8, auth_ack_frame, output.buffered());
+    try handler.completeAuthentication();
     const session = handler.session.?;
     output.end = 0;
     try handleNextFrame(&handler);
@@ -463,30 +540,86 @@ test "Spilman messages require authentication and reject without touching tick o
     try std.testing.expectEqualDeep(spawn, fixture.application.registry.get(session).?.location.?);
 
     // A normal gameplay request on the same connection still reaches the tick.
-    const Tick = struct {
-        fn run(d: *ticks.Dispatcher, app: *transport.App, s: *[1]transport.Slot) void {
-            defer d.stop(s);
-            const deadline = transport.freshDeadline(d.io);
-            while (true) {
-                transport.checkDeadline(d.io, deadline) catch return;
-                var batch = d.beginBatch(s, 0);
-                if (d.claimNext(s, &batch, 0)) |work| {
-                    d.execute(app, &s[0].mailbox, work);
-                    return;
-                }
-                std.Io.sleep(d.io, .fromMilliseconds(1), .awake) catch return;
-            }
-        }
-    };
     dispatch.stopping = false;
     var group: std.Io.Group = .init;
     defer group.cancel(std.testing.io);
-    try group.concurrent(std.testing.io, Tick.run, .{ &dispatch, &fixture.application, &slots });
+    try group.concurrent(std.testing.io, runOneTickRequest, .{ &dispatch, &fixture.application, &slots });
     output.end = 0;
     try handleNextFrame(&handler);
     var snapshot: p.Snapshot = undefined;
     try std.testing.expectEqualDeep(p.Outcome(.update_location){ .ok = {} }, try wire.decodeReply(output.buffered()[2..], .update_location, location.request_id, &snapshot));
     try std.testing.expectEqualDeep(location.payload, fixture.application.registry.get(session).?.location.?);
+}
+
+fn runOneTickRequest(dispatch: *ticks.Dispatcher, app: *transport.App, slots: *[1]transport.Slot) void {
+    defer dispatch.stop(slots);
+    const deadline = transport.freshDeadline(dispatch.io);
+    while (true) {
+        transport.checkDeadline(dispatch.io, deadline) catch return;
+        var batch = dispatch.beginBatch(slots, 0);
+        if (dispatch.claimNext(slots, &batch, 0)) |work| {
+            dispatch.execute(app, &slots[0].mailbox, work);
+            return;
+        }
+        std.Io.sleep(dispatch.io, .fromMilliseconds(1), .awake) catch return;
+    }
+}
+
+test "retained cut replay and conflict reach the tick when chunk preparation would fail" {
+    const t = std.testing;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.application;
+    const state = &app.context.state;
+    var db = try GameDb.open(":memory:");
+    defer db.close();
+    var persistence = try Persistence.init(t.io, t.allocator, &db, state, app.registry);
+    defer persistence.deinit(t.allocator);
+    app.persistence = &persistence;
+
+    const cut: p.RequestFor(.cut) = .{ .request_id = @splat(0x42), .payload = .{ .x = 0, .y = 0 } };
+    const original: p.Request = .{ .request_id = cut.request_id, .operation = .{ .cut = cut.payload } };
+    var pins = try persistence.prepare(original);
+    defer persistence.release(&pins);
+    const outcome = try state.cut(cut);
+    try t.expect(outcome == .ok);
+    persistence.release(&pins);
+    try persistence.flush();
+
+    // Replace the saved chunk with pinned rows so neither requested chunk can be loaded.
+    const capacity = @import("world_state.zig").WorldState.cache_capacity;
+    for (1..capacity + 1) |cx| try t.expect(state.installPinned(.{ .cx = @intCast(cx), .cy = 0 }, @splat(0), &.{}));
+    try t.expectError(error.ChunkCacheBusy, persistence.prepare(original));
+    const conflict: p.Cut = .{ .x = -16, .y = 0 };
+    try t.expectError(error.ChunkCacheBusy, persistence.prepare(.{ .request_id = cut.request_id, .operation = .{ .cut = conflict } }));
+
+    var input = std.Io.Reader.fixed("");
+    var bytes: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&bytes);
+    var websocket = ws{ .input = &input, .output = &output, .key = "" };
+    var dispatch: ticks.Dispatcher = .{ .io = t.io };
+    var slots: [1]transport.Slot = @splat(.{});
+    var handler = try Handler.init(&websocket, app);
+    handler.session = try app.registry.claim(@splat(9));
+    handler.authenticated = true;
+    handler.dispatch = &dispatch;
+    handler.mailbox = &slots[0].mailbox;
+    defer handler.close();
+
+    for ([_]p.Cut{ cut.payload, conflict }, [_]p.Outcome(.cut){ outcome, .{ .failed = .request_id_conflict } }) |tile, expected| {
+        dispatch.stopping = false;
+        output.end = 0;
+        var group: std.Io.Group = .init;
+        defer group.cancel(t.io);
+        try group.concurrent(t.io, runOneTickRequest, .{ &dispatch, app, &slots });
+        var request_bytes: [p.max_request_bytes]u8 = undefined;
+        const request = try wire.encodeRequest(&request_bytes, .cut, .{ .request_id = cut.request_id, .payload = tile });
+        try handler.clientMessage(request, .binary);
+        var snapshot: p.Snapshot = undefined;
+        try t.expectEqualDeep(expected, try wire.decodeReply(output.buffered()[2..], .cut, cut.request_id, &snapshot));
+    }
+    try t.expectEqual(@as(u64, 2), slots[0].mailbox.generation);
+    try t.expectEqual(@as(usize, 1), state.replay_count);
 }
 
 test "tick admission replies typed busy without taking ownership of a mailbox generation" {
@@ -541,6 +674,56 @@ test "tick admission replies typed busy without taking ownership of a mailbox ge
     try std.testing.expectError(error.ServerStopping, handler.clientMessage(request, .binary));
     try std.testing.expectEqualDeep(busy, try wire.decodeReply(output.buffered()[2..], .update_location, req.request_id, &snapshot));
     try std.testing.expectEqualDeep(spawn, fixture.application.registry.get(session).?.location.?);
+}
+
+test "rejected tick admission releases prepared pins before flushing the busy reply" {
+    const t = std.testing;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.application;
+    const state = &app.context.state;
+    var db = try GameDb.open(":memory:");
+    defer db.close();
+    var persistence = try Persistence.init(t.io, t.allocator, &db, state, app.registry);
+    defer persistence.deinit(t.allocator);
+    app.persistence = &persistence;
+
+    const address = @import("chunk_address.zig").ChunkAddress.fromTile(0, 0);
+    try t.expect(state.installPinned(address, @splat(0), &.{}));
+    state.unpin(address);
+    const PinObserver = struct {
+        pins: *const usize,
+        pins_at_flush: ?usize = null,
+        writer: std.Io.Writer,
+        fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            const self: *@This() = @fieldParentPtr("writer", writer);
+            self.pins_at_flush = self.pins.*;
+        }
+    };
+    var bytes: [128]u8 = undefined;
+    var output = PinObserver{ .pins = &state.cache.?.rows[0].pins, .writer = .{
+        .buffer = &bytes,
+        .vtable = &.{ .drain = std.Io.Writer.fixedDrain, .flush = PinObserver.flush },
+    } };
+    var input = std.Io.Reader.fixed("");
+    var websocket = ws{ .input = &input, .output = &output.writer, .key = "" };
+    var dispatch: ticks.Dispatcher = .{ .io = t.io, .stopping = true };
+    var box: ticks.Mailbox = .{};
+    var handler = try Handler.init(&websocket, app);
+    handler.session = try app.registry.claim(@splat(3));
+    handler.authenticated = true;
+    handler.dispatch = &dispatch;
+    handler.mailbox = &box;
+    defer handler.close();
+
+    const cut: p.RequestFor(.cut) = .{ .request_id = @splat(0x42), .payload = .{ .x = 0, .y = 0 } };
+    var request_bytes: [p.max_request_bytes]u8 = undefined;
+    const request = try wire.encodeRequest(&request_bytes, .cut, cut);
+    try t.expectError(error.ServerStopping, handler.clientMessage(request, .binary));
+    try t.expectEqual(@as(?usize, 0), output.pins_at_flush);
+    var snapshot: p.Snapshot = undefined;
+    try t.expectEqualDeep(p.Outcome(.cut){ .failed = .server_busy }, try wire.decodeReply(output.writer.buffered()[2..], .cut, cut.request_id, &snapshot));
+    try t.expectEqual(@as(u64, 0), box.generation);
 }
 
 test "frozen startup allocator admits updates reads and releases all 64 sessions" {

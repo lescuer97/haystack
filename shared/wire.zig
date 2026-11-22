@@ -492,7 +492,7 @@ pub fn encodeAuth(out: []u8, message: p.AuthMessage) error{BufferTooSmall}![]con
     const n: u16 = switch (message) {
         .challenge => header_bytes + 32,
         .proof => 2 * header_bytes + 33 + 64,
-        .reply => |outcome| header_bytes + @as(u16, if (outcome == .ok) 0 else 2),
+        .reply => |outcome| header_bytes + @as(u16, if (outcome == .ok) 8 else 2),
     };
     var writer = try Writer.init(out, @fromBackingInt(@intCast(@backingInt(std.meta.activeTag(message)))), n);
     switch (message) {
@@ -502,7 +502,7 @@ pub fn encodeAuth(out: []u8, message: p.AuthMessage) error{BufferTooSmall}![]con
             writer.bytes(.signature, &proof.signature);
         },
         .reply => |outcome| switch (outcome) {
-            .ok => writer.bytes(.ok, &.{}),
+            .ok => |pos| writePoint(writer.field(.ok, 8), pos.x, pos.y),
             .failed => |code| put(u16, writer.field(.failed, 2), 0, @backingInt(code)),
         },
     }
@@ -531,8 +531,8 @@ pub fn decodeAuth(data: []const u8, binary: bool, expected: p.AuthKind) DecodeEr
             const outcome = try frame.body.next(fields) orelse return error.MissingRequiredField;
             try frame.body.finish(fields);
             if (outcome.tag == .ok) {
-                if (outcome.bytes.len != 0) return error.InvalidFieldLength;
-                return .{ .reply = .ok };
+                if (outcome.bytes.len != 8) return error.InvalidFieldLength;
+                return .{ .reply = .{ .ok = .{ .x = get(i32, outcome.bytes, 0), .y = get(i32, outcome.bytes, 4) } } };
             }
             if (outcome.bytes.len != 2) return error.InvalidFieldLength;
             const code = std.enums.fromInt(p.AuthFailure, get(u16, outcome.bytes, 0)) orelse return error.InvalidFieldValue;

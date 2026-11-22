@@ -110,8 +110,8 @@ pub const GameState = struct {
 
     /// Apply one frame of already-collected input to persistent state.
     /// Step requests are checked before moving the player and following with the
-    /// camera. A drag pans only the view. A coordinate error propagates without
-    /// applying the toggles.
+    /// camera. A drag pans only the view. Attempts to cross the world edge
+    /// leave the camera or player in place.
     ///
     /// Menu input is modal. While the menu is open, and on the frame that opens
     /// or closes it, neither the camera nor the gameplay hotkeys see the frame.
@@ -154,7 +154,11 @@ pub const GameState = struct {
         var facing_dx: i8 = 0;
         var facing_dy: i8 = 0;
         if (frame.dragging) {
-            if (self.ui_press_held) self.camera.resetDrag() else try self.camera.applyInput(frame);
+            if (self.ui_press_held) {
+                self.camera.resetDrag();
+            } else {
+                self.camera.applyInput(frame) catch self.camera.resetDrag();
+            }
             self.player_walking = false;
         } else {
             const dx = @as(i8, @intFromBool(frame.right)) - @as(i8, @intFromBool(frame.left));
@@ -163,13 +167,15 @@ pub const GameState = struct {
                 facing_dx = dx;
                 facing_dy = dy;
                 var next_camera = self.camera;
-                try next_camera.setTarget(@as(i64, self.player_pos.x) + dx, @as(i64, self.player_pos.y) + dy);
-                const next: Location = .{ .x = next_camera.tile_x, .y = next_camera.tile_y };
-                self.player_walking = movement.canStep(self.player_pos, next);
-                if (self.player_walking) {
-                    self.player_pos = next;
-                    self.camera = next_camera;
-                }
+                self.player_walking = false;
+                if (next_camera.setTarget(@as(i64, self.player_pos.x) + dx, @as(i64, self.player_pos.y) + dy)) |_| {
+                    const next: Location = .{ .x = next_camera.tile_x, .y = next_camera.tile_y };
+                    self.player_walking = movement.canStep(self.player_pos, next);
+                    if (self.player_walking) {
+                        self.player_pos = next;
+                        self.camera = next_camera;
+                    }
+                } else |_| {}
             } else {
                 facing_dx = frame.held_dx;
                 facing_dy = frame.held_dy;
@@ -241,6 +247,23 @@ test "wallet badge opens Wallet directly and consumes gameplay input" {
         try std.testing.expect(!game.menu.opened);
         try std.testing.expectEqualDeep(initial_camera, game.camera);
     }
+}
+
+test "input at the world edge cannot move or pan beyond it" {
+    var game = try GameState.init(std.testing.allocator, 1000, 640);
+    defer game.deinit();
+    const corner: Location = .{ .x = std.math.maxInt(i32), .y = std.math.minInt(i32) };
+    game.player_pos = corner;
+    try game.camera.setTarget(corner.x, corner.y);
+    try game.update(.{ .right = true, .up = true });
+    try std.testing.expectEqual(corner, game.player_pos);
+    try std.testing.expect(!game.player_walking);
+    try game.update(.{ .dragging = true, .drag_x = -world.TILE_PX, .drag_y = world.TILE_PX });
+    try std.testing.expectEqual(corner.x, game.camera.tile_x);
+    try std.testing.expectEqual(corner.y, game.camera.tile_y);
+    try game.update(.{ .dragging = true, .drag_x = world.TILE_PX, .drag_y = -world.TILE_PX });
+    try std.testing.expectEqual(corner.x - 1, game.camera.tile_x);
+    try std.testing.expectEqual(corner.y + 1, game.camera.tile_y);
 }
 
 test "hoe starts selected and a toolbar press does not swing or pan" {

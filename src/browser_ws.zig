@@ -29,7 +29,13 @@ pub const Worker = struct {
     retry_at: f64 = 0,
     backoff: f64 = 0.25,
     serial: u64 = 0,
-    pending: ?struct { id: protocol.Id, pos: protocol.Location } = null,
+    pending: ?sync.PlayRequest = null,
+    move_outbox: ?protocol.Location = null,
+    area: sync.AreaMailbox = .idle,
+
+    // browser/game-ws.js caps incoming frames at 256 bytes. Batch within it.
+    const bridge_frame_bytes = 256;
+    pub const area_limit = @min(protocol.max_area_chunks, (bridge_frame_bytes - protocol.area_response_overhead) / protocol.chunk_bytes);
 
     pub fn step(self: *Worker, generation: ?u32) sync.Snapshot {
         if (self.wallet_generation != generation) {
@@ -48,12 +54,13 @@ pub const Worker = struct {
             self.deadline = now + 10;
             haystack_ws_prepare(next_token, wallet, deliver);
         }
+        if (self.stage == .play and self.pending == null) self.pump(now) catch self.fail(.retrying, now);
         return self.snapshot();
     }
 
     fn snapshot(self: *const Worker) sync.Snapshot {
         var state = self.state;
-        state.pending = self.pending != null;
+        state.pending = self.movePending();
         return state;
     }
 
@@ -79,6 +86,8 @@ pub const Worker = struct {
         self.token = null;
         self.stage = .idle;
         self.pending = null;
+        self.move_outbox = null;
+        self.area = .idle;
         if (token) |id| haystack_ws_close(id);
     }
 
@@ -93,21 +102,38 @@ pub const Worker = struct {
         return haystack_ws_send(self.token orelse return false, payload.ptr, @intCast(payload.len)) == 1;
     }
 
+    fn movePending(self: *const Worker) bool {
+        return self.move_outbox != null or (if (self.pending) |request| request.operation == .move else false);
+    }
+
     pub fn submit(self: *Worker, session: u64, pos: protocol.Location) bool {
-        if (self.stage != .play or self.state.session != session or self.pending != null) return false;
-        self.serial +%= 1;
-        var id: protocol.Id = @splat(0);
-        std.mem.writeInt(u64, id[0..8], self.serial, .little);
-        var out: [protocol.max_gameplay_request_bytes]u8 = undefined;
-        const bytes = wire.encodeRequest(&out, .update_location, .{ .request_id = id, .payload = pos }) catch unreachable;
-        const now = haystack_ws_now();
-        if (!self.send(bytes)) {
-            self.fail(.retrying, now);
-            return false;
-        }
-        self.pending = .{ .id = id, .pos = pos };
-        self.deadline = now + 2.5;
+        if (self.stage != .play or self.state.session != session or self.movePending()) return false;
+        self.move_outbox = pos;
         return true;
+    }
+
+    pub fn requestArea(self: *Worker, session: u64, range: shared.world.ChunkRange) bool {
+        if (self.stage != .play or self.state.session != session) return false;
+        return self.area.request(range);
+    }
+
+    pub fn takeArea(self: *Worker, session: u64, dest: *protocol.Snapshot) ?sync.AreaCompletion {
+        if (self.stage != .play or self.state.session != session) return null;
+        return self.area.take(dest);
+    }
+
+    fn pump(self: *Worker, now: f64) !void {
+        const operation: sync.PlayRequest.Operation = if (self.move_outbox) |move| blk: {
+            self.move_outbox = null;
+            break :blk .{ .move = move };
+        } else if (self.area.start()) |range| .{ .area = range } else return;
+        self.serial +%= 1;
+        var request: sync.PlayRequest = .{ .id = @splat(0), .operation = operation };
+        std.mem.writeInt(u64, request.id[0..8], self.serial, .little);
+        var out: [protocol.max_gameplay_request_bytes]u8 = undefined;
+        if (!self.send(try request.encode(&out))) return error.SendFailed;
+        self.pending = request;
+        self.deadline = now + 2.5;
     }
 
     fn receive(self: *Worker, token: u32, event: Event, bytes: []const u8, now: f64) !void {
@@ -141,20 +167,25 @@ pub const Worker = struct {
                 .auth_reply => {
                     const reply = (try wire.decodeAuth(bytes, true, .reply)).reply;
                     switch (reply) {
-                        .ok => {
+                        .ok => |pos| {
                             self.stage = .play;
                             self.state.status = .ready;
                             self.backoff = 0.25;
                             self.state.session +%= 1;
-                            self.state.confirmed = shared.movement.spawn;
+                            self.state.confirmed = pos;
                         },
                         .failed => |failure| self.fail(if (failure == .invalid_credentials) .credentials_rejected else .retrying, now),
                     }
                 },
                 .play => {
-                    const move = self.pending orelse return error.UnexpectedReply;
+                    const request = self.pending orelse return error.UnexpectedReply;
                     var scratch: protocol.Snapshot = undefined;
-                    if (try wire.decodeReply(bytes, .update_location, move.id, &scratch) == .ok) self.state.confirmed = move.pos;
+                    switch (try request.decode(bytes, &scratch)) {
+                        .move => |pos| if (pos) |confirmed| {
+                            self.state.confirmed = confirmed;
+                        },
+                        .area => |result| self.area.complete(result, &scratch),
+                    }
                     self.pending = null;
                 },
                 else => return error.UnexpectedReply,
@@ -168,9 +199,46 @@ fn deliver(token: u32, kind: c_int, ptr: [*c]const u8, len: u32) callconv(.c) vo
     if (self.token != token) return;
     const now = haystack_ws_now();
     const event = std.enums.fromInt(Event, kind) orelse return;
-    if (len > protocol.max_gameplay_request_bytes or (len != 0 and ptr == null)) {
+    if (len > Worker.bridge_frame_bytes or (len != 0 and ptr == null)) {
         self.fail(.retrying, now);
         return;
     }
     self.receive(token, event, if (len == 0) "" else ptr[0..len], now) catch self.fail(.retrying, now);
+}
+
+test "browser area batches fit the bridge and an in-flight area does not block a queued move" {
+    const t = std.testing;
+    const area: shared.world.ChunkRange = .{ .cx0 = -4, .cy0 = 2, .cx1 = -4 + Worker.area_limit - 1, .cy1 = 2 };
+    const request: sync.PlayRequest = .{ .id = @splat(1), .operation = .{ .area = area } };
+    const reply: protocol.Snapshot = .{ .area = area, .count = Worker.area_limit };
+    var out: [protocol.max_response_bytes]u8 = undefined;
+    const bytes = try wire.encodeReply(&out, .read_area, .{ .request_id = request.id, .payload = area }, .{ .ok = &reply });
+    try t.expect(bytes.len <= Worker.bridge_frame_bytes);
+    try t.expect(bytes.len + protocol.chunk_bytes > Worker.bridge_frame_bytes);
+
+    var worker: Worker = .{ .stage = .play, .state = .{ .status = .ready, .session = 8 } };
+    try t.expect(!worker.requestArea(7, area));
+    try t.expect(worker.requestArea(8, area));
+    try t.expect(!worker.requestArea(8, area));
+    var dest: protocol.Snapshot = undefined;
+    try t.expect(worker.takeArea(8, &dest) == null);
+    try t.expectEqual(area, worker.area.start().?);
+    try t.expect(worker.area.start() == null);
+    try t.expect(worker.takeArea(8, &dest) == null);
+    worker.pending = request;
+    try t.expect(!worker.snapshot().pending);
+    try t.expect(worker.submit(8, .{ .x = 1, .y = 0 }));
+    try t.expect(worker.snapshot().pending);
+    worker.area.complete(.snapshot, &reply);
+    try t.expect(!worker.requestArea(8, area));
+    try t.expect(worker.takeArea(7, &dest) == null);
+    try t.expectEqual(sync.AreaCompletion.snapshot, worker.takeArea(8, &dest).?);
+    try t.expectEqualDeep(reply, dest);
+    try t.expect(worker.requestArea(8, area));
+    try t.expectEqual(area, worker.area.start().?);
+    worker.area.complete(.server_busy, &dest);
+    try t.expectEqual(sync.AreaCompletion.server_busy, worker.takeArea(8, &dest).?);
+    try t.expectEqualDeep(reply, dest);
+    try t.expect(worker.takeArea(8, &dest) == null);
+    try t.expect(worker.requestArea(8, area));
 }

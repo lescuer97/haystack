@@ -1,9 +1,10 @@
 # Local binary server
 
-Zig 0.17.0; built-in `std.http.Server.WebSocket`, fixed-capacity RAM world state,
-and a persistent native CDK wallet. Native server builds require the pinned
-Rust/CDK toolchain (`zig build setup -Dgame=false`; use `-Doffline` with warmed
-tools/Cargo caches). The native CDK target policy applies: native Linux
+Zig 0.17.0; built-in `std.http.Server.WebSocket`, SQLite-backed gameplay with a
+bounded RAM cache, and a separate persistent native CDK wallet. The server and
+its tests use the SQLite build already bundled with the native CDK wallet, not
+system SQLite. Native server builds require the pinned Rust/CDK toolchain
+(`zig build setup -Dgame=false`; use `-Doffline` with warmed tools/Cargo caches). The native CDK target policy applies: native Linux
 x86_64/aarch64 or Apple Silicon macOS. Server-only builds do not initialize Raylib;
 installation remains opt-in.
 
@@ -14,13 +15,11 @@ zig build run-server -Dgame=false -- 4194304 65536
 # executable arguments: [ws-bytes [app-bytes]]
 ```
 
-Endpoint: **ws://127.0.0.1:9224/**. Cuts and request replay history reset on
-every restart. No world database is opened, converted, deleted or used; existing
-world files are left untouched. There is no world SQL dependency, schema,
-table usage, persistence, or benchmark build step. Wallet SQLite remains intact.
-Gameplay requests target a global 20 Hz tick; wallet startup and authentication
-remain independent of ticks. No gameplay network client, rewards, private gameplay,
-regrowth or inventory are included. Terrain generator v2 adds water; its region checksum is
+Endpoint: **ws://127.0.0.1:9224/**. Saved cuts and player locations survive
+restart; request replay history does not. Gameplay requests target a global 20 Hz
+tick; wallet startup, authentication and SQLite I/O remain outside the tick.
+Rewards, private gameplay, regrowth and inventory are not implemented.
+Terrain generator v2 adds water; its region checksum is
 `0x2beaf359deeea5bb` (see [world.md](world.md)).
 
 Connections must prove signing-key ownership. This is not an access allowlist:
@@ -61,10 +60,10 @@ override. Before opening or creating the wallet, startup fetches the mint’s li
 verified, the server logs the failure and exits without starting the listener.
 Opening does not eagerly add a mint, poll or scan for restoration.
 
-Main owns the wallet; App borrows it. WebSocket task cancellation/join and App
-cleanup precede wallet close; the root lock is released last. CDK/Rust's runtime,
-SQLite and allocations are **outside the two reserved server budgets below**.
-Restart retains the wallet identity, but never the world cuts or replay history.
+Main owns the wallet and gameplay database; the application borrows them through
+its wallet and persistence references. Both are closed after task shutdown and
+application cleanup; the root lock is released last. CDK/Rust and SQLite memory
+are **outside the two reserved server budgets below**.
 
 ## Authentication and ephemeral connection sessions
 
@@ -84,10 +83,11 @@ verification, session claim and reply transmission. Auth uses the same
 |---|---|---|---:|
 | Server challenge | `0xf0` | `0x10`: fresh OS-secure random nonce (32 bytes) | 39 |
 | Client proof | `0xf1` | `0x11`: compressed secp256k1 public key (33 bytes); `0x12`: signature (64 bytes) | 107 |
-| Server auth reply | `0xf2` | Empty `ok` (`0x03`), or `failed` (`0x04`) with a u16 code | 7 or 9 |
+| Server auth reply | `0xf2` | `ok` (`0x03`): x:i32, y:i32 (8 bytes, little-endian tile coordinates); or `failed` (`0x04`) with a u16 code | 15 or 9 |
 
-Auth failure codes are `1` (`invalid_credentials`, key or signature verification
-failed) and `2` (`unavailable`, session claim rejected). A typed failure reply is
+The former empty auth `ok` is not accepted. Auth failure codes are `1`
+(`invalid_credentials`, key or signature verification failed) and `2`
+(`unavailable`, player load or session claim failed). A typed failure reply is
 followed by disconnect.
 
 The signature is **BIP340 Schnorr** over the 32-byte digest
@@ -119,10 +119,9 @@ deadlines and admission remain server-only.
 Authentication protocol, hashing, frame handling and admission are Zig. BIP340
 verification calls Bitcoin Core **libsecp256k1 v0.8.0** directly through translated
 upstream C headers, using its immutable shared static context (no context allocation).
-There are no new Rust crypto/wallet exports, key registration or persistence.
-This proves possession of the supplied key, **not wallet provenance**.
-Selecting/deriving a client wallet signing key and client networking/signing
-integration are outside this server change.
+This proves possession of the supplied key, **not wallet provenance**. The
+canonical public key identifies the stored player; auth nonces and proofs are not
+persisted.
 
 The native-server-only lazy Zig dependency is the official release archive:
 `https://github.com/bitcoin-core/secp256k1/releases/download/v0.8.0/libsecp256k1-0.8.0.tar.gz`.
@@ -135,12 +134,17 @@ blocks 43, teeth 6). No system installation, CMake, Cargo source path, Rust ABI 
 handwritten crypto is used. The browser/Wasm graph never requests this dependency.
 Warm Zig dependencies before using offline builds.
 
-Sessions are internal RAM only, with immutable connection identity and a packed
-8-byte `Location{x:i32,y:i32}` in **tile** coordinates. Each session starts at
-the shared walkable spawn `(0,0)`. A location update may stay put or move one
-tile onto grass or dirt. A diagonal also needs both side tiles clear. Rejected
-moves return `invalid_request` without changing position or closing a live
-session. An acknowledgement means RAM acceptance, not durability. Location
+Connection sessions are ephemeral, but player positions are saved by canonical
+public key. Login restores the latest pending RAM position if present, otherwise
+the stored position. A first login chooses a random grass/dirt tile with a
+walkable cardinal neighbor in the 9×9 chunk region centered on the origin, with
+`(0,0)` as fallback. The auth ACK carries this starting or restored position; a
+new player becomes eligible for saving only after authentication succeeds.
+
+A location update may stay put or move one tile onto grass or dirt. A diagonal
+also needs both side tiles clear. Rejected moves return `invalid_request` without
+changing position or closing a live session. Acknowledgement means RAM acceptance,
+not durability. Location
 updates are not replay-cached and do not enforce movement cadence or consult
 cuts or other characters. Cut/read connections must first complete authentication.
 There is no listing, client query, subscription, broadcast or location history.
@@ -154,9 +158,8 @@ Release builds suppress these debug logs.
 
 Normal/error/shutdown cleanup and failed-upgrade cleanup after admission release
 the session. Generation-checked handles protect reused connection records from
-stale cleanup/update. Reconnect after close starts at the spawn.
-An undetected authenticated old socket may temporarily block reconnect: no
-post-authentication heartbeat/idle deadline is added. Registry locking never spans
+stale cleanup/update. An undetected authenticated old socket may temporarily
+block reconnect: no post-authentication heartbeat or idle deadline is added. Registry locking never spans
 world or socket operations. Cut replay history is global across sessions, not
 owned by the connection and not cleared on disconnect.
 
@@ -240,8 +243,17 @@ output storage before modifying either buffer.
 `wire.Pending` has eight fixed entries and matches typed replies by operation
 and request ID. It reports a validated late or unknown reply separately from a
 matched reply, and a generic protocol error does not consume any pending entry.
-No gameplay network client or gameplay popover is implemented; a future client
-owns logging, deadlines, and displaying protocol errors.
+
+### Native and browser chunk streaming
+
+Both clients restore the player and camera from the auth ACK and request cut
+bitmaps with `read_area`. The restored viewport is synchronized first, followed
+by the resident area (including minimap coverage). The native client can batch
+up to 64 chunks; the browser batches up to five to fit its 256-byte receive
+bridge. Clients generate the base terrain locally and apply authoritative cut
+bits to resident chunks for world and minimap rendering. Reconnect invalidates
+old bitmaps and refetches them around the restored position. This is pull-based
+streaming, not a server push or live subscription.
 
 ## Spilman channel messages
 
@@ -277,39 +289,73 @@ closing the connection. It does not issue live quotes, verify or redeem funding,
 accept payments, or settle channels; those require a channel service and durable
 state, not just the startup wallet. Malformed messages receive `PROTOCOL_ERROR`.
 
-## Rules and bounded volatile state
+## Gameplay SQLite, cache and saves
 
-Only generated grass/tree can be cut, preserving terrain with `cut:true` for this
-process lifetime. Dirt/rock/water reject; another ID for a cut tile gets `already_cut`.
-All sixteen opaque ID bytes bind the cut coordinates `(x,y)`, including zero IDs.
-Matching IDs replay the original typed terminal success or game error; an original
-success does not become `already_cut`. Changed valid bindings conflict before mutation.
-Only cut operations enter replay history: reads, location updates, malformed
-requests, and capacity/admission failures do not consume IDs.
+The separate gameplay database is `game.sqlite` in the server data root, next
+to the `wallet/` directory: `~/.local/share/haystack-server/game.sqlite` by
+default on Linux (`$XDG_DATA_HOME/haystack-server/game.sqlite` with an override),
+or `~/Library/Application Support/haystack-server/game.sqlite` on macOS.
 
-`WorldState` is inline in the single App context. It has **512 chunk entries**
-(`cx`, `cy`, 32-byte bitmap) and **512 cut replay entries** (complete ID,
-coordinates, original result). Entries are append-only, searched linearly over
-populated counts, never evicted, and require no post-startup allocator. Untouched
-chunks are implicit all-zero bitmaps. Reads consume neither capacity.
+| Table | Contents |
+|---|---|
+| `game_meta` | Single row (`id = 1`) with the 32-byte public seed and generator version. |
+| `game_chunks` | `(cx, cy)` primary key in chunk coordinates and a 32-byte cut bitmap (`bits`). |
+| `game_users` | Canonical 33-byte `pubkey` primary key, signed 32-bit tile coordinates `x, y`, and a nullable 32-byte `channel_id` (no live channel service). |
 
-Every new terminal cut result, including `not_cuttable` and `already_cut`, needs
-one replay slot. A successful cut in a new chunk additionally needs a chunk slot.
-All capacity checks happen before any bitmap, entry or count mutation. Exhaustion
-returns `server_busy` without consuming the ID or changing the world. Existing
-replays, ID conflicts and reads still work when full. A full replay store rejects
-new cuts even in existing chunks. **Store-full busy lasts until restart**, which
-clears both cuts and replay history; there is no resize or administrative reset.
-Increasing the application byte budget does **not** increase these capacities.
-Results are published before response encoding/write; if delivery is uncertain,
-resend the same ID during this process lifetime. Nothing survives restart.
+Startup creates the schema for a new database. For an existing database, it
+checks that SQLite opened it for writing, then validates the seed, generator
+version, integrity, and stored gameplay rows. A read-only database, mismatch,
+or invalid data fails startup rather than resetting the world. The older
+renderer-limited player table is migrated in one transaction to allow the full
+signed `i32` tile range, preserving all player fields. The wire format is
+unchanged.
+
+**No chunk rows are cached at startup or login.** On demand, connection tasks
+load missing cut/read chunks from SQLite, using an all-zero bitmap for an absent
+row, and pin them through tick execution. Cache hits need no disk I/O.
+
+The server shares one cache across all connections: **5,184 base entries plus
+512 overflow entries**. At or above base capacity, a miss first tries to evict
+an unpinned, clean entry with no save in flight. The victim is farthest from its
+nearest active player by squared distance in chunk coordinates (first eligible
+entry if no players are active). If no entry can be evicted, the miss uses an
+available overflow slot or returns `server_busy` at the hard limit. Dirty rows
+cannot be evicted before saving. Releasing pins or successfully saving dirty
+rows lets background tasks drain overflow back toward the base capacity. The
+limits are independent of the application byte budget.
+
+The save task runs on a fixed five-second schedule, skipping elapsed deadlines
+rather than overlapping writes. It snapshots dirty chunk bitmaps and player
+records and upserts them in one SQLite transaction per nonempty pass. Only
+records that still match what was committed are marked clean. Changes not yet
+committed remain dirty for a later pass. If rollback fails, the next flush tries to reopen
+the existing database. A cut or movement ACK is RAM acceptance, not a disk commit.
+`SIGINT` and `SIGTERM` stop accepts and cancel
+and join the connection, tick and save tasks, letting claimed tick work finish.
+The server then attempts a final flush before closing the database; it logs and
+returns a final save failure. An abrupt exit can lose uncommitted changes.
+
+### Cut rules and replay
+
+Only generated grass/tree can be cut; cuts preserve the base terrain and set
+its cut bit. Dirt/rock/water reject; another ID for a cut tile gets `already_cut`.
+All 16 opaque ID bytes (including zero) bind the cut coordinates. A retained ID
+replays its original success or terminal game error; different coordinates
+return `request_id_conflict` before mutation. Reads, location updates, malformed
+requests and capacity/admission failures do not consume IDs.
+
+The global RAM replay history keeps **512 terminal cut results**. A new result
+at capacity evicts the oldest admitted result; hits and conflicts do not refresh
+age. Retry an uncertain cut with the same ID while it is still retained. Once
+evicted, or after restart, that ID is evaluated against current world state and
+may return `already_cut` instead of the original success.
 
 ## Reserved memory and admission
 
-After readiness, managed application and WebSocket requests use startup-reserved
-memory with **no upstream system-heap fallback**. This does not bound total RSS
-or exclude OS/kernel allocations, thread resources/stacks or mappings.
-Initialization/shutdown may use the process allocator. Budgets do not guarantee latency.
+The WebSocket slots and application layout use startup-reserved memory with
+**no upstream system-heap fallback**. The gameplay cache, bounded 1,024-player
+record array and save scratch are separately allocated at startup. These budgets
+do not bound total RSS or latency, and exclude SQLite and OS/runtime resources.
 
 | Budget | Default bytes | Reservation and checks |
 |---|---:|---|
@@ -335,9 +381,9 @@ One exclusively leased context owns world state and scratch response/snapshot;
 the tick copies its encoded reply into the slot **before releasing the lease**,
 and only then may the connection write to its socket. Location updates use the
 session registry rather than this lease, but are dispatched on the same tick.
-A cut/read without an available context gets `server_busy` **before mutation**.
-Context contention is transient; unlike store-full busy it can resolve when the
-current lease releases. The sole production tick owner normally avoids contention.
+A cut/read without an available context or cache lock gets `server_busy`
+**before mutation**. Cache preparation can also return `server_busy` on storage
+failure or cache saturation. Socket writes hold neither the lease nor chunk pins.
 At connection capacity an accepted socket is immediately closed without launching
 a task or promising HTTP503. HTTP limits: 5 seconds, 8192 bytes, 32 headers.
 `server/ws_config.zig` holds the fixed production/test limits.
@@ -361,9 +407,9 @@ write-timeout policy.
 
 ## Tick handoff and cancellation
 
-One task in the existing listener group starts before accepts; failure to start
-it fails listening. It uses the shared 20 Hz schedule and absolute monotonic
-`awake` deadlines (50 ms), with an immediate initial batch. At each due batch it
+The tick and periodic save tasks start in the listener group before accepts;
+failure to start either fails listening. The tick uses the shared 20 Hz schedule
+and absolute monotonic `awake` deadlines (50 ms), with an immediate initial batch. At each due batch it
 snapshots up to 64 queued `(slot, request generation)` records under one mailbox
 mutex, in round-robin order. Later arrivals, including a new request from a slot
 already served, wait for the next tick. All decoded cut/read/location requests
@@ -374,10 +420,10 @@ Each batch has a soft 50 ms work budget from its actual start, checked between
 requests. Unclaimed work stays queued, and the cursor advances past the last
 serviced/examined slot so a costly prefix cannot starve the tail. Bounded world
 actions finish once claimed, even if that overruns the target. Missed boundaries
-are discarded after work; no catch-up batches, tick IDs, synchronization protocol,
-prediction or interpolation are introduced. This is a scheduling target, not a
-hard real-time latency guarantee. The existing RAM capacities and replay rules
-remain unchanged; there is no tick work on wallet/auth or SQL state.
+are discarded after work; there are no catch-up batches or tick IDs on the wire.
+This is a scheduling target, not a hard real-time latency guarantee. The tick
+works on in-memory state; connection tasks handle
+SQLite loads before publication, and the saver handles writes separately.
 
 Mailbox states are idle, queued, executing and ready. A connection owns its slot
 through completion and the end of its socket write. Queued cancellation removes
@@ -396,27 +442,45 @@ only on the next publication after all prior waits returned. Request generations
 persist across slot reuse and reject exhaustion rather than wrapping, so cutoff
 records cannot execute a replacement request.
 
+## Chunk read benchmark
+
+```sh
+zig build bench-chunk-reads -Dgame=false -Doffline -Doptimize=ReleaseSafe
+```
+
+The benchmark seeds a temporary SQLite file with 16,384 edited chunks and
+reports p50, p95, p99, and maximum latency in nanoseconds for 1-, 16-, and
+64-chunk requests. Each case uses 256 samples. `sqlite_miss` requests start with
+those chunks absent from the server cache; `ram_hit` immediately repeats the same
+request. `prepare` measures the lookup, any SQLite reads, and cache pinning;
+`total` also includes assembling the bitmap snapshot and releasing the pins.
+
+This measures one connection with no tick wait, socket I/O, background writes,
+or cache eviction. SQLite and OS page caches are not cleared, so a server cache
+miss does not necessarily mean a physical disk read. The benchmark does not
+open the wallet or touch the live game database.
+
 ## Verification
 
 ```sh
 zig build server test-server -Dgame=false -Doffline --summary all
 zig build server test-server -Dgame=false -Doffline -Doptimize=ReleaseSafe --summary all
+zig build test-game-db -Dgame=false -Doffline
 python3 -B -m unittest discover -s build-support -p 'test_*.py'
 git diff --check
 ```
 
-`test-server` covers shared wire encoding/validation, pure rules, volatile state
-and replay tests, snapshots/extremes, capacity atomicity, fresh startup, budget
+`test-server` covers shared wire encoding/validation, rules, SQLite storage,
+cache and replay eviction, snapshots/extremes, capacity atomicity, startup, budget
 failures, cross-thread exclusive leasing, frozen allocator checks, session tests,
 buddy reclamation/concurrent churn, fixed-buffer transport tests, and real CDK
 wallet tests in isolated temporary storage. It never opens sockets. Wallet tests
 retain seed hashes/inodes across reopen, borrowed ownership, locking and failure
 preservation checks. Authentication tests retain message goldens, positive/negative
 signature fixtures, parity/domain/nonce/single-hash binding, malformed keys and
-signatures, admission/deadline/ownership checks. Socket integration tests remain
-deferred until the client exists; no socket harness is added. Tick tests exercise
-production snapshot/claim/execute/cleanup methods with explicit clock inputs,
-cutoff/generation reuse, all three operations, soft-budget fairness, full-store
-and busy behavior, owned replies after context reuse, event-reset lifecycle,
+signatures, admission/deadline/ownership checks. Tick tests exercise production
+snapshot/claim/execute/cleanup methods with explicit clock inputs, cutoff and
+generation reuse, all three operations, soft-budget fairness, FIFO replay and
+busy behavior, owned replies after context reuse, event-reset lifecycle,
 queued/executing cancellation and group join. The real tick task's absolute wait
 and cancellation are also checked without listening or opening sockets.

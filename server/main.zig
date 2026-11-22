@@ -4,6 +4,9 @@ const memory = @import("memory.zig");
 const app = @import("app.zig");
 const native = @import("native_storage");
 const wallet_storage = @import("wallet.zig");
+const GameDb = @import("game_db.zig").GameDb;
+const Persistence = @import("persistence.zig").Persistence;
+const Shutdown = @import("shutdown.zig").Shutdown;
 const startup_log = std.log.scoped(.server_startup);
 
 const Options = struct {
@@ -43,6 +46,16 @@ pub fn main(init: std.process.Init) !void {
     defer wallet.close() catch {};
     startup_log.info("wallet opened", .{});
 
+    const data_dir = std.fs.path.dirname(locations.wallet_dir) orelse return error.InvalidPath;
+    const game_path = try std.fs.path.joinZ(init.gpa, &.{ data_dir, "game.sqlite" });
+    defer init.gpa.free(game_path);
+    var db = GameDb.open(game_path) catch |err| {
+        startup_log.err("cannot open game database at {s}: {s}", .{ game_path, @errorName(err) });
+        return err;
+    };
+    defer db.close();
+    startup_log.info("game database opened", .{});
+
     // Reserve independent WebSocket and application memory regions.
     const websocket_alignment: std.mem.Alignment = .fromByteUnits(options.websocket_budget);
     const websocket_ptr = init.gpa.rawAlloc(options.websocket_budget, websocket_alignment, @returnAddress()) orelse return error.OutOfMemory;
@@ -55,6 +68,9 @@ pub fn main(init: std.process.Init) !void {
     var application = try app.App.init(init.io, application_buffer);
     application.wallet = &wallet;
     defer application.deinit();
+    var persistence = try Persistence.init(init.io, init.gpa, &db, &application.context.state, application.registry);
+    defer persistence.deinit(init.gpa);
+    application.persistence = &persistence;
     startup_log.info("application ready", .{});
 
     // Transport initialization reserves slots; listen performs the bind.
@@ -65,8 +81,29 @@ pub fn main(init: std.process.Init) !void {
     defer server.deinit();
     startup_log.info("transport ready", .{});
 
+    var shutdown = try Shutdown.install();
+    defer shutdown.restore();
     startup_log.info("starting listener", .{});
-    try server.listen(&application);
+    const listen_result = listenUntilShutdown(init.io, &server, &application, &shutdown);
+    // The listener and all of its connection, tick and saver tasks have joined.
+    persistence.flush() catch |err| {
+        startup_log.err("final game save failed: {s}", .{@errorName(err)});
+        return err;
+    };
+    try listen_result;
+}
+
+fn listenUntilShutdown(io: std.Io, server: *transport.Server, application: *app.App, shutdown: *Shutdown) !void {
+    const Result = union(enum) { listener: anyerror!void, signal: std.Io.Cancelable!void };
+    var results: [2]Result = undefined;
+    var select = std.Io.Select(Result).init(io, &results);
+    defer select.cancelDiscard();
+    try select.concurrent(.listener, transport.Server.listen, .{ server, application });
+    try select.concurrent(.signal, Shutdown.wait, .{ shutdown, io });
+    return switch (try select.await()) {
+        .listener => |result| result,
+        .signal => |result| result,
+    };
 }
 
 test "startup options defaults" {

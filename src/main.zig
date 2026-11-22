@@ -46,6 +46,8 @@ const Location = @import("shared").protocol.Location;
 comptime {
     _ = @import("input.zig");
     _ = @import("frame_loop.zig");
+    _ = @import("ws_sync.zig");
+    _ = @import("browser_ws.zig");
     _ = @import("camera.zig");
     _ = @import("game.zig");
     _ = @import("menu.zig");
@@ -334,7 +336,7 @@ fn browserFrame() callconv(.c) void {
     }
     privacy_blocked = privacy_blocked or ctx.model.isBlocking();
     const network = ctx.connection.step(if (ctx.model.isBlocking()) null else browser_onboarding.currentGeneration());
-    const connection_detail = ctx.network_frame.apply(network, &ctx.driver, &ctx.game_state) catch |err| {
+    const presentation = ctx.network_frame.apply(network, &ctx.connection, &ctx.driver, &ctx.game_state) catch |err| {
         std.log.err("browser connection reconciliation failed: {s}", .{@errorName(err)});
         stopBrowser();
         return;
@@ -349,13 +351,14 @@ fn browserFrame() callconv(.c) void {
         &ctx.model,
         .{ .context = ctx, .dispatch = browserDispatch, .commit_movement = browserCommitMovement },
         &privacy_blocked,
-        connection_detail,
+        presentation,
     ) catch |err| {
         std.log.err("browser frame failed: {s}", .{@errorName(err)});
         stopBrowser();
         return;
     };
-    ctx.game_state.music_unavailable = ctx.soundtrack.update(ctx.game_state.music_enabled, !ctx.model.isBlocking() and connection_detail == null);
+    ctx.network_frame.requestAreas(&ctx.connection, &ctx.driver, &ctx.game_state.world);
+    ctx.game_state.music_unavailable = ctx.soundtrack.update(ctx.game_state.music_enabled, !ctx.model.isBlocking() and !presentation.blocksInput());
 }
 
 fn browserCommitMovement(context: ?*anyopaque, destination: Location) bool {
@@ -484,14 +487,15 @@ fn stepFrame(
     model: ?*onboarding.Onboarding,
     sink: ?frame_loop.EffectSink,
     privacy_blocked: *bool,
-    connection_detail: ?[:0]const u8,
+    presentation: ws_sync.Presentation,
 ) !void {
     const vw: f32 = @floatFromInt(rl.getScreenWidth());
     const vh: f32 = @floatFromInt(rl.getScreenHeight());
 
     driver.observeRouting(game_state, model);
     const settings_before = game_state.settings;
-    const advanced = if (connection_detail == null) blk: {
+    const blocked = presentation.blocksInput();
+    const advanced = if (!blocked) blk: {
         var sample = input_reader.read();
         driver.queue.push(&sample);
         break :blk try driver.advance(rl.getTime(), game_state, model, sink, privacy_blocked);
@@ -509,7 +513,7 @@ fn stepFrame(
     }
 
     if (builtin.os.tag != .emscripten and game_state.menu.exit_requested) return;
-    if (driver.view == null or (connection_detail != null and (vw != driver.viewport_w or vh != driver.viewport_h))) {
+    if (driver.view == null or (blocked and (vw != driver.viewport_w or vh != driver.viewport_h))) {
         try driver.prepare(game_state, vw, vh);
     }
     if (advanced) driver.skipPast(rl.getTime());
@@ -517,8 +521,14 @@ fn stepFrame(
     // 5. Prepare GPU resources, then draw read-only state.
     resources.prepareMinimap(&game_state.world, driver.view.?.minimap);
     rl.beginDrawing();
-    rendering.draw(game_state, driver.view.?, driver.viewport_w, driver.viewport_h, model, resources, connection_detail == null);
-    if (connection_detail) |detail| rendering.drawDisconnected(detail, driver.viewport_w, driver.viewport_h);
+    rendering.draw(game_state, driver.view.?, driver.viewport_w, driver.viewport_h, model, resources, !blocked);
+    switch (presentation) {
+        .playing => {},
+        .loading_visible => if (!game_state.menu.opened and !(if (model) |m| m.isBlocking() else false)) {
+            rendering.drawWorldSync(driver.viewport_w);
+        },
+        .disconnected => |detail| rendering.drawDisconnected(detail, driver.viewport_w, driver.viewport_h),
+    }
     // Capture after drawing and before `endDrawing` swaps/presents, otherwise
     // the framebuffer read is the cleared back buffer (a black screenshot).
     // The 2D overlay (HUD/minimap) is still batched at this point;
@@ -972,7 +982,7 @@ pub fn main() anyerror!void {
         };
         // Reconcile server output before capturing or consuming new input.
         connection.setEnabled(!model.isBlocking());
-        const connection_detail = try network_frame.apply(connection.snapshot(), &driver, &game_state);
+        const presentation = try network_frame.apply(connection.snapshot(), &connection, &driver, &game_state);
         effects.session = network_frame.session;
         // Capture on the last requested frame, inside stepFrame's drawing pass.
         privacy_blocked = privacy_blocked or model.isBlocking();
@@ -986,10 +996,11 @@ pub fn main() anyerror!void {
             &model,
             .{ .context = &effects, .dispatch = NativeEffects.dispatch, .after_input = NativeEffects.afterInput, .commit_movement = NativeEffects.commitMovement },
             &privacy_blocked,
-            connection_detail,
+            presentation,
         );
         if (game_state.menu.exit_requested) break;
-        game_state.music_unavailable = soundtrack.update(game_state.music_enabled, !model.isBlocking() and connection_detail == null);
+        network_frame.requestAreas(&connection, &driver, &game_state.world);
+        game_state.music_unavailable = soundtrack.update(game_state.music_enabled, !model.isBlocking() and !presentation.blocksInput());
 
         if (!started) {
             started = true;

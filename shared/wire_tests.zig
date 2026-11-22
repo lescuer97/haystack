@@ -115,7 +115,8 @@ test "wire water state preserves appended terrain ordinal" {
 test "wire golden auth messages and every strict prefix" {
     try checkAuth(.{ .challenge = @splat(0x7e) }, "\xf0\x23\x00\x10\x20\x00" ++ repeat("\x7e", 32) ++ "\x7e");
     try checkAuth(.{ .proof = .{ .pubkey = "\x02".* ++ repeat("\x7e", 32), .signature = repeat("\x7e\x5a", 32) } }, proof_frame);
-    try checkAuth(.{ .reply = .ok }, "\xf2\x03\x00\x03\x00\x00\x7e");
+    try checkAuth(.{ .reply = .{ .ok = .{ .x = -2, .y = 0x12345678 } } }, "\xf2\x0b\x00\x03\x08\x00\xfe\xff\xff\xff\x78\x56\x34\x12\x7e");
+    try t.expectError(error.InvalidFieldLength, wire.decodeAuth("\xf2\x03\x00\x03\x00\x00\x7e", true, .reply));
     try checkAuth(.{ .reply = .{ .failed = .invalid_credentials } }, "\xf2\x05\x00\x04\x02\x00\x01\x00\x7e");
     try checkAuth(.{ .reply = .{ .failed = .unavailable } }, "\xf2\x05\x00\x04\x02\x00\x02\x00\x7e");
 }

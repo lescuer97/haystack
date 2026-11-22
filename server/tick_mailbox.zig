@@ -11,6 +11,7 @@ pub const Mailbox = struct {
     generation: u64 = 0,
     request: p.Request = undefined,
     session: sessions.Handle = undefined,
+    cut_replay: ?p.Outcome(.cut) = null,
     abandoned: bool = false,
     close_after_reply: bool = false,
     reply: [p.max_response_bytes]u8 = undefined,
@@ -18,7 +19,7 @@ pub const Mailbox = struct {
     completion: std.Io.Event = .unset,
 };
 pub const Record = struct { index: usize, generation: u64 };
-pub const Work = struct { record: Record, request: p.Request, session: sessions.Handle };
+pub const Work = struct { record: Record, request: p.Request, session: sessions.Handle, cut_replay: ?p.Outcome(.cut) };
 pub const Batch = struct {
     records: [64]Record = undefined,
     len: usize = 0,
@@ -33,6 +34,12 @@ pub const Dispatcher = struct {
     stopping: bool = false,
 
     pub fn publish(self: *Dispatcher, box: *Mailbox, session: sessions.Handle, request: p.Request) !void {
+        return self.publishPrepared(box, session, request, null);
+    }
+
+    /// A copied replay is a reply-only job, even if the replay entry is later evicted.
+    pub fn publishPrepared(self: *Dispatcher, box: *Mailbox, session: sessions.Handle, request: p.Request, cut_replay: ?p.Outcome(.cut)) !void {
+        std.debug.assert(cut_replay == null or request.operation == .cut);
         // Channel opens may borrow the WebSocket receive buffer.
         if (p.isChannel(std.meta.activeTag(request.operation))) return error.NotGameplayRequest;
         self.mutex.lockUncancelable(self.io);
@@ -45,6 +52,7 @@ pub const Dispatcher = struct {
         box.generation += 1;
         box.request = request;
         box.session = session;
+        box.cut_replay = cut_replay;
         box.abandoned = false;
         box.close_after_reply = false;
         box.state = .queued;
@@ -78,7 +86,7 @@ pub const Dispatcher = struct {
             const box = &slots[record.index].mailbox;
             if (box.state != .queued or box.generation != record.generation) continue;
             box.state = .executing;
-            return .{ .record = record, .request = box.request, .session = box.session };
+            return .{ .record = record, .request = box.request, .session = box.session, .cut_replay = box.cut_replay };
         }
         return null;
     }
@@ -91,6 +99,9 @@ pub const Dispatcher = struct {
         if (session == null) {
             close = true;
             box.len = application.encodeCommonFailure(&box.reply, work.request, .invalid_request).len;
+        } else if (work.cut_replay) |outcome| {
+            const req: p.RequestFor(.cut) = .{ .request_id = work.request.request_id, .payload = work.request.operation.cut };
+            box.len = (shared.wire.encodeReply(&box.reply, .cut, req, outcome) catch unreachable).len;
         } else switch (work.request.operation) {
             .update_location => |payload| {
                 const req: p.RequestFor(.update_location) = .{ .request_id = work.request.request_id, .payload = payload };

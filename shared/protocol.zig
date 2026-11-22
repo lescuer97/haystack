@@ -1,4 +1,5 @@
 //! Typed message contract; serialization lives in wire.zig.
+const std = @import("std");
 const world = @import("world.zig");
 pub const max_area_chunks = 64;
 pub const max_gameplay_request_bytes = 256;
@@ -8,8 +9,9 @@ pub const max_request_bytes = 1024;
 pub const max_channel_proof_bytes = max_request_bytes - (4 + 3 + @sizeOf(Id) + 3 + 32 + 3);
 pub const snapshot_metadata_bytes = 16 + 4 + 32 + 2;
 pub const chunk_bytes = 32;
-// Envelope, request ID TLV, outcome TLV, and maximum snapshot value.
-pub const max_response_bytes = 4 + 3 + @sizeOf(Id) + 3 + snapshot_metadata_bytes + max_area_chunks * chunk_bytes;
+// Envelope, request ID TLV, outcome TLV header, and fixed snapshot metadata.
+pub const area_response_overhead = 4 + 3 + @sizeOf(Id) + 3 + snapshot_metadata_bytes;
+pub const max_response_bytes = area_response_overhead + max_area_chunks * chunk_bytes;
 pub const Id = [16]u8;
 pub const min_chunk: i32 = -134217728;
 pub const max_chunk: i32 = 134217727;
@@ -26,7 +28,6 @@ pub fn areaGeometry(area: world.ChunkRange) error{ InvalidArea, OutOfBounds, Are
     return .{ .cols = @intCast(cols), .rows = @intCast(rows), .count = @intCast(count) };
 }
 test "area geometry checks order, coordinate bounds, and the 64 chunk limit" {
-    const std = @import("std");
     try std.testing.expectEqual(AreaGeometry{ .cols = 8, .rows = 8, .count = 64 }, try areaGeometry(.{ .cx0 = min_chunk, .cy0 = max_chunk - 7, .cx1 = min_chunk + 7, .cy1 = max_chunk }));
     try std.testing.expectError(error.AreaTooLarge, areaGeometry(.{ .cx0 = 0, .cy0 = 0, .cx1 = 64, .cy1 = 0 }));
     try std.testing.expectError(error.InvalidArea, areaGeometry(.{ .cx0 = 1, .cy0 = 0, .cx1 = 0, .cy1 = 0 }));
@@ -34,11 +35,13 @@ test "area geometry checks order, coordinate bounds, and the 64 chunk limit" {
 }
 
 pub const Cut = struct { x: i32, y: i32 };
+/// World tile coordinates; each axis spans the full signed i32 range.
 pub const Location = packed struct(u64) { x: i32, y: i32 };
+
 pub const AuthKind = enum(u8) { challenge = 0xf0, proof = 0xf1, reply = 0xf2 };
 pub const AuthProof = struct { pubkey: [33]u8, signature: [64]u8 };
 pub const AuthFailure = enum(u16) { invalid_credentials = 1, unavailable = 2 };
-pub const AuthOutcome = union(enum) { ok: void, failed: AuthFailure };
+pub const AuthOutcome = union(enum) { ok: Location, failed: AuthFailure };
 pub const AuthMessage = union(AuthKind) { challenge: [32]u8, proof: AuthProof, reply: AuthOutcome };
 
 pub const tool = enum(u8) { axe = 0, hoe = 1, pickaxe = 2 };
@@ -108,6 +111,8 @@ pub const ChannelCloseFailure = enum(u16) { invalid_request = 1, server_busy = 1
 pub const Snapshot = struct {
     area: world.ChunkRange,
     count: u16,
+    // Chunks are row-major within area. Within each chunk, bit y * CT + x
+    // is stored least-significant-bit first at that tile's local address.
     chunks: [max_area_chunks][chunk_bytes]u8 = @splat(@splat(0)),
 };
 

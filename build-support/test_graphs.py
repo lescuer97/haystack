@@ -33,7 +33,7 @@ class GraphIsolationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         step_help = result.stdout.split("Steps:\n", 1)[1].split("\nProject-Specific Options:", 1)[0]
         steps = {line.split()[0] for line in step_help.splitlines() if line.split()}
-        for step in ("server", "run-server", "test-server", "setup"):
+        for step in ("server", "run-server", "test-server", "bench-chunk-reads", "setup"):
             self.assertIn(step, steps)
         for step in ("desktop", "run", "test", "wallet", "header-check", "test-wallet",
                      "test-spilman", "browser", "renderer", "test-mint", "test-build", "test-package",
@@ -70,7 +70,7 @@ class GraphIsolationTests(unittest.TestCase):
                 self.assertIn("-Dplatform=wasm and -Dgame=true", result.stderr)
 
     def test_wasm_does_not_expose_native_server_steps(self):
-        for step in ("server", "run-server", "test-server", "build-bench-server", "bench-server"):
+        for step in ("server", "run-server", "test-server", "bench-chunk-reads", "build-bench-server", "bench-server"):
             self.assertNotRegex(self.wasm, rf"(?m)^  {step}\s")
 
     def test_wasm_server_only_is_explicitly_rejected(self):

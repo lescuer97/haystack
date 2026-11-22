@@ -15,6 +15,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
         .imports = &.{.{ .name = "shared", .module = shared }},
     });
     server_mod.addImport("native_storage", storage);
+    // The native wallet archive supplies SQLite for both CDK and the game database.
     native.link(server_mod);
     secp.link(server_mod);
     server_mod.link_libc = true;
@@ -25,6 +26,11 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
     const run_server = b.addRunArtifact(server);
     run_server.addPassthruArgs();
     b.step("run-server", "Run the local server").dependOn(&run_server.step);
+    const bench_mod = b.createModule(.{ .root_source_file = b.path("server/chunk_read_bench.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "shared", .module = shared }} });
+    native.link(bench_mod);
+    const bench = b.addExecutable(.{ .name = "haystack_chunk_read_bench", .root_module = bench_mod });
+    bench.step.dependOn(&native.rust.step);
+    b.step("bench-chunk-reads", "Benchmark on-demand SQLite and cached RAM chunk reads").dependOn(&b.addRunArtifact(bench).step);
     const unit_mod = b.createModule(.{ .root_source_file = b.path("server/tests.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "shared", .module = shared }} });
     unit_mod.addImport("native_storage", storage);
     unit_mod.addAnonymousImport("spilman_vectors.json", .{ .root_source_file = b.path("src/testdata/spilman_vectors.json") });
@@ -39,9 +45,20 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
     server_test_step.dependOn(&unit_tests.step);
     server_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = storage })).step);
     server_test_step.dependOn(&shared_tests.step);
+    const game_db_mod = b.createModule(.{ .root_source_file = b.path("server/game_db.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "shared", .module = shared }} });
+    // Keep the focused test separate, but use the same SQLite provider as production.
+    native.link(game_db_mod);
+    const game_db_binary = b.addTest(.{ .root_module = game_db_mod });
+    game_db_binary.step.dependOn(&native.rust.step);
+    const game_db_tests = b.addRunArtifact(game_db_binary);
+    b.step("test-game-db", "Run the gameplay SQLite storage tests").dependOn(&game_db_tests.step);
+    server_test_step.dependOn(&game_db_tests.step);
     const ws_memory_mod = b.createModule(.{ .root_source_file = b.path("server/ws_memory_tests.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ws_memory_mod.addImport("shared", shared);
     ws_memory_mod.addImport("native_storage", storage);
+    native.link(ws_memory_mod);
     secp.link(ws_memory_mod);
-    server_test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = ws_memory_mod, .filters = &.{"bounded-memory application"} })).step);
+    const ws_memory_binary = b.addTest(.{ .root_module = ws_memory_mod, .filters = &.{"bounded-memory application"} });
+    ws_memory_binary.step.dependOn(&native.rust.step);
+    server_test_step.dependOn(&b.addRunArtifact(ws_memory_binary).step);
 }

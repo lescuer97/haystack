@@ -317,38 +317,80 @@ test "stopping wakes queued work; ready cancellation and slot reuse retain monot
     try t.expectError(error.ServerStopping, dispatcher.publish(box, session, read));
 }
 
-test "full replay store still permits reads and replay while new cuts stay busy through tick handoff" {
+test "full replay history evicts the oldest admission through tick handoff" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
     const app = &fixture.application;
     const session = try app.registry.claim(@splat(8));
-    const request = @import("world_state.zig").request;
-    for (0..512) |id| _ = try app.context.state.cut(request(id, 0, 0));
-    const original = app.context.state;
+    const world_state = @import("world_state.zig");
+    const capacity = world_state.WorldState.capacity;
+    const state = &app.context.state;
+    const first = try state.cut(world_state.request(0, 0, 0));
+    try t.expect(first == .ok);
+    for (1..capacity) |id| _ = try state.cut(world_state.request(id, 0, 0));
+    var expected: p.Snapshot = undefined;
+    try state.readArea(read.operation.read_area, &expected);
+
     var dispatcher = ticks.Dispatcher{ .io = t.io };
     var slots: [1]TestSlot = @splat(.{});
     const box = &slots[0].mailbox;
-    for ([_]p.Request{ cutRequest(512, 0, 0), read, cutRequest(0, 0, 0) }, 0..) |req, index| {
+    const cases = [_]struct { req: p.Request, cut: ?p.Outcome(.cut) }{
+        .{ .req = cutRequest(0, 0, 0), .cut = first },
+        .{ .req = cutRequest(capacity, 0, 0), .cut = .{ .failed = .{ .already_cut = first.ok } } },
+        .{ .req = read, .cut = null },
+        .{ .req = cutRequest(1, 1, 0), .cut = .{ .failed = .request_id_conflict } },
+        .{ .req = cutRequest(0, 0, 0), .cut = .{ .failed = .{ .already_cut = first.ok } } },
+    };
+    for (cases) |case| {
+        const req = case.req;
         try dispatcher.publish(box, session, req);
         var batch = dispatcher.beginBatch(&slots, 0);
         dispatcher.execute(app, box, dispatcher.claimNext(&slots, &batch, 0).?);
         var snapshot: p.Snapshot = undefined;
-        switch (index) {
-            0 => try t.expect((try reply(box, .cut, req.request_id, &snapshot)).failed == .server_busy),
-            1 => {
-                var expected: p.Snapshot = undefined;
-                try original.readArea(read.operation.read_area, &expected);
-                try t.expectEqualDeep(expected, (try reply(box, .read_area, req.request_id, &snapshot)).ok.*);
-            },
-            2 => try t.expectEqualDeep(original.replays[0].result, try reply(box, .cut, req.request_id, &snapshot)),
-            else => unreachable,
+        if (case.cut) |outcome| {
+            try t.expectEqualDeep(outcome, try reply(box, .cut, req.request_id, &snapshot));
+        } else {
+            try t.expectEqualDeep(expected, (try reply(box, .read_area, req.request_id, &snapshot)).ok.*);
         }
         try t.expect(!box.close_after_reply);
         dispatcher.cleanup(box);
     }
-    try t.expectEqual(original.chunk_count, app.context.state.chunk_count);
-    try t.expectEqual(original.replay_count, app.context.state.replay_count);
-    try t.expectEqualDeep(original.replays, app.context.state.replays);
-    for (original.chunks[0..original.chunk_count], app.context.state.chunks[0..original.chunk_count]) |before, after|
-        try t.expectEqualDeep(before, after);
+    try t.expectEqual(capacity, state.replay_count);
+    try t.expect(state.replayCut(world_state.request(1, 0, 0)) == null);
+}
+
+test "prepared cut replay survives ring eviction and still validates the session" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.application;
+    const session = try app.registry.claim(@splat(9));
+    const world_state = @import("world_state.zig");
+    const state = &app.context.state;
+    const req = world_state.request(0, 0, 0);
+    const first = try state.cut(req);
+    try t.expect(first == .ok);
+    for (1..world_state.WorldState.capacity) |id| _ = try state.cut(world_state.request(id, 0, 0));
+    const replay = state.replayCut(req).?;
+
+    var dispatcher = ticks.Dispatcher{ .io = t.io };
+    var slots: [1]TestSlot = @splat(.{});
+    const box = &slots[0].mailbox;
+    const request = cutRequest(0, 0, 0);
+    try dispatcher.publishPrepared(box, session, request, replay);
+    _ = try state.cut(world_state.request(world_state.WorldState.capacity, 0, 0));
+    try t.expect(state.replayCut(req) == null);
+    var batch = dispatcher.beginBatch(&slots, 0);
+    dispatcher.execute(app, box, dispatcher.claimNext(&slots, &batch, 0).?);
+    var snapshot: p.Snapshot = undefined;
+    try t.expectEqualDeep(first, try reply(box, .cut, req.request_id, &snapshot));
+    try t.expect(state.replayCut(req) == null);
+    dispatcher.cleanup(box);
+
+    try dispatcher.publishPrepared(box, session, request, replay);
+    app.registry.release(session);
+    batch = dispatcher.beginBatch(&slots, 0);
+    dispatcher.execute(app, box, dispatcher.claimNext(&slots, &batch, 0).?);
+    try t.expect((try reply(box, .cut, req.request_id, &snapshot)).failed == .invalid_request);
+    try t.expect(box.close_after_reply);
+    dispatcher.cleanup(box);
 }

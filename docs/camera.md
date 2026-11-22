@@ -27,27 +27,20 @@ implemented.
 
 ## 2. The transform
 
-Raylib maps world pixels to screen pixels as:
+The camera keeps its absolute world tile as the frame's origin. For each axis,
+the renderer widens the tile coordinate, subtracts that origin, and only then
+converts the local offset to pixels:
 
 ```
-screen = (world - target) * zoom + offset
+local_px = (i64(world_tile) - camera_tile) * TILE_PX
+screen = (local_px - target) * zoom + offset
 ```
 
-With `offset = screen_center` and `target = camera position`, the camera target
-is always drawn in the middle of the window.
-
-Three coordinate spaces, in order:
-
-```
-world tile (x,y)    world px (x*32 + 16, y*32 + 16)   screen px (sx, sy)
-    i32                     f32                       f32
-        ─── × TILE_PX ───►        ─── Camera2D ───►
-```
-
-Everything inside `beginMode2D` is drawn in **world px**. Everything outside is
-**screen px**. Our camera stores tile coordinates (`i32`); `Camera.raylib`
-widens `tile * TILE_PX + TILE_PX/2` to `i64` before converting the target to
-`f32` pixels. The target is the tile's center pixel.
+Raylib's target is the center of the local origin tile `(16,16)` and its offset
+is the screen center. Everything inside `beginMode2D` is drawn in
+**camera-relative pixels**; everything outside uses **screen pixels**. Chunk
+addresses, player positions, and terrain lookups stay absolute. A tile three
+tiles away stays exactly 96 pixels away even near the limits of the world.
 
 ---
 
@@ -64,13 +57,10 @@ pub const Camera = struct {
         // Drag wins; one tile per emitted direction request. See behaviour below.
     }
 
-    pub fn raylib(self: Camera, vw: f32, vh: f32) rl.Camera2D {
+    pub fn raylib(_: Camera, vw: f32, vh: f32) rl.Camera2D {
         return .{
             .offset = .{ .x = vw / 2, .y = vh / 2 },
-            .target = .{
-                .x = @floatFromInt(@as(i64, self.tile_x) * world.TILE_PX + world.TILE_PX / 2),
-                .y = @floatFromInt(@as(i64, self.tile_y) * world.TILE_PX + world.TILE_PX / 2),
-            },
+            .target = .{ .x = world.TILE_PX / 2, .y = world.TILE_PX / 2 },
             .rotation = 0,
             .zoom = 1,
         };
@@ -105,9 +95,9 @@ Facts about the current behaviour:
   or neutral record resets repeat; world dragging suppresses directions that tick.
 - There is no movement speed or fractional camera position: movement is
   discrete. Presentation `dt` is never used to pace held steps. Both axes are
-  validated and committed together. Non-finite drags and moves whose tile-center
-  pixel cannot fit the `i32` world-pixel contract return
-  `error.CoordinateOutOfBounds` without changing state.
+  validated and committed together. Non-finite drags and moves that would leave
+  the signed `i32` tile world are rejected without changing the camera. Gameplay
+  treats such input as a blocked step or pan, not a fatal frame error.
 - `input.zig` supplies the `FrameInput`; camera movement never polls devices.
 
 The camera recenters when the player makes an accepted step; it stays where it
@@ -134,60 +124,39 @@ returns a temporary `View`:
 ```zig
 pub const View = struct {
     transform: rl.Camera2D,
-    chunks: world.ChunkRange,
+    chunks: world.ChunkRange, // absolute, inclusive
+    tiles: TileRange, // absolute, half-open i64 bounds
+    minimap: ?MinimapView,
 };
 
 pub fn calculate(cam: Camera, vw: f32, vh: f32) world.CoordinateError!View
 ```
 
-Inside `visibleRange`:
+The camera converts viewport edges to local tile offsets using the inverse of
+its unrotated, zoom-1 transform. It then adds the absolute camera tile and clips
+the result to the world. Floor the near edge and ceil the far edge to get
+half-open tile bounds; a tile touching only the far edge is not visible.
 
-```zig
-const tl = rl.getScreenToWorld2D(.{ .x = 0, .y = 0 }, rc);
-const br = rl.getScreenToWorld2D(.{ .x = vw, .y = vh }, rc);
-
-const tx0 = @divFloor(@as(i32, @intFromFloat(@floor(tl.x))), world.TILE_PX);
-const ty0 = @divFloor(@as(i32, @intFromFloat(@floor(tl.y))), world.TILE_PX);
-const tx1 = @divFloor(@as(i32, @intFromFloat(@ceil(br.x))), world.TILE_PX);
-const ty1 = @divFloor(@as(i32, @intFromFloat(@ceil(br.y))), world.TILE_PX);
-
-const range = world.ChunkRange{
-    .cx0 = @divFloor(tx0, world.CHUNK_TILES),
-    .cy0 = @divFloor(ty0, world.CHUNK_TILES),
-    .cx1 = @divFloor(tx1, world.CHUNK_TILES),
-    .cy1 = @divFloor(ty1, world.CHUNK_TILES),
-};
-try world.validateChunkRange(range, world.PREFETCH_MARGIN_CHUNKS);
-```
-
-Notes:
-
-- The demo loads a **2-chunk prefetch ring** around the visible range, not a
-  one-tile slack border. `World.stream` unloads outside that ring, then loads
-  visible chunks first and the rest of the ring second.
-- `getScreenToWorld2D` is used instead of hand-rolled math, so this keeps
-  working if zoom is added later.
-- Validation happens before any world mutation, including the full prefetch
-  ring and its count.
+- The demo loads a **2-chunk prefetch ring** around the visible range and clips
+  it at the world edge. `World.stream` unloads outside the residency range and
+  loads visible chunks first.
+- The minimap uses an absolute tile window around the camera and clips the
+  chunks it needs at the same boundary.
+- Validation of the viewport and residency range happens before streaming
+  changes the cache.
 - The view is derived once per tick and cached with the viewport in the loop,
   not in `GameState`. Rendering stays native 120 FPS/browser rAF, with no
   interpolation. The minimap and menu use the same cached viewport.
 
 ---
 
-## 5. Mouse → tile (**planned**)
+## 5. Mouse → tile
 
-Not implemented; this is for future targeting, hover highlight, and the hoe
-preview:
-
-```zig
-const m = rl.getScreenToWorld2D(rl.getMousePosition(), rc);
-const tx = @divFloor(@as(i32, @intFromFloat(m.x)), world.TILE_PX);
-const ty = @divFloor(@as(i32, @intFromFloat(m.y)), world.TILE_PX);
-```
-
-Use `@divFloor` — truncating division breaks on negative coordinates. Today the
-mouse only pans the camera, so there is no world-space cursor yet.
+`camera.screenToTile` uses the same inverse transform as visibility: floor the
+local tile offset, then add the absolute camera origin. It returns `null` for
+points beyond the world edge or non-finite coordinates. The helper is tested,
+but gameplay input still uses the mouse to pan and interact with UI; it does not
+select world tiles yet.
 
 ---
 
@@ -214,15 +183,14 @@ iteration. The renderer neither reads input nor mutates the camera or world.
 
 1. **Draw UI outside `beginMode2D`.** Otherwise the HUD and minimap would pan
    with the world.
-2. **`getMousePosition()` is screen space.** Convert with
-   `getScreenToWorld2D` before comparing to world coords.
+2. **`getMousePosition()` is screen space.** Use `camera.screenToTile` if an
+   interaction needs an absolute world tile.
 3. **Move in whole tiles and use integer zoom** or 32 px tiles shimmer. The
-   camera target is always `tile * TILE_PX + TILE_PX/2`; there is no fractional
-   pixel position to snap.
+   client currently uses zoom 1 and targets the local tile's center.
 4. **Culling still needs the world rect.** The camera does not cull for you; it
    only gives you the rect cheaply.
-5. **Chunks are drawn at world coordinates** (`cx * CHUNK_PX`), never in
-   chunk-local coordinates, while `beginMode2D` is active.
+5. **Chunks are drawn relative to the camera**, not the global world origin.
+   Use `camera.relativePixel` before converting the result to `f32`.
 6. **Camera state is ours, not Raylib's.** Never read `target` back out of
    `rl.Camera2D` to make gameplay decisions.
 7. **Rendering is read-only.** It borrows `*const GameState`; do not add input
@@ -232,41 +200,10 @@ iteration. The renderer neither reads input nor mutates the camera or world.
 
 ## 8. Coordinate bounds (implemented)
 
-World pixels and the transformed viewport corners must stay representable as
-`i32`, and a chunk must stay drawable once its full `CHUNK_PX` extent is added:
-
-```
-world px:    -2147483648 .. 2147483647        (exclusive upper bound 2^31)
-chunk index: -4194304 .. 4194302               (512 px chunks)
-chunk px:     cx * CHUNK_PX  and  cx * CHUNK_PX + CHUNK_PX
-```
-
-Pixel validation lives in `src/camera.zig`; chunk-extent validation lives in
-`src/world.zig`. Validate `f32` coordinates in `f64` with a **half-open** upper
-bound. The largest `f32` below `2^31` is `2147483520`;
-`@as(f32, @floatFromInt(maxInt(i32)))` rounds to `2147483648`, so an `f32`
-comparison would accept a value that `@intFromFloat` rejects. NaN and ±Infinity
-fail the same check.
-
-`Camera.applyInput` validates a candidate move before committing either axis:
-the drag step is checked in `f64` before conversion, and the resulting tile
-coordinate is checked in `i64` so `tile * TILE_PX + TILE_PX/2` cannot overflow. A
-move whose tile-center pixel falls outside the `i32` range returns
-`error.CoordinateOutOfBounds` atomically.
-
-Tile coordinates stay exact within the supported world-pixel bounds, but the
-Raylib transform is `f32`. Far from the origin, adjacent 32 px steps can round
-to the same rendered pixel. That is the existing `f32` ceiling, not a tile-
-movement bug. Origin rebasing (render relative to a nearby chunk while keeping
-absolute tile coordinates authoritative) is the upgrade if it becomes visible;
-it is not implemented.
-
-The chunk check includes the prefetch ring: the visible range plus
-`PREFETCH_MARGIN_CHUNKS` must fit the drawable chunk extent. This keeps
-`range.expanded()`, chunk generation (`cx * CHUNK_TILES`), and rendering
-(`cx * CHUNK_PX + CHUNK_PX`) overflow-free.
-
-Violations return `error.CoordinateOutOfBounds` before any conversion,
-streaming mutation, or draw. The error is **not** allocation pressure: only
-`error.OutOfMemory` may be retried, while coordinate errors propagate out of the
-frame loop rather than clamping or wrapping the camera silently.
+Tiles span the full signed `i32` range (`-2147483648` to `2147483647`) on each
+axis. The 16-tile chunks span `-134217728` to `134217727`, matching the protocol.
+`TileRange` uses `i64` endpoints so the exclusive upper bound `2147483648` is
+representable. The viewport, minimap, and prefetch clip at these boundaries;
+they do not wrap to the opposite edge. The renderer never needs an absolute
+pixel coordinate. `src/world.zig` still validates the size of a requested
+residency range before allocating or streaming.
