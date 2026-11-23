@@ -43,6 +43,7 @@ const Field = enum(u8) {
     channel_params = 0x25,
     channel_capacity_msat = 0x26,
     channel_balance_msat = 0x27,
+    tool_channels = 0x28,
 };
 
 pub const protocol_error = [4]u8{ @backingInt(Tag.protocol_error), 0, 0, bye };
@@ -234,8 +235,12 @@ fn readPayment(reader: *Reader, fields: []const Field) DecodeError!p.SpillmanCha
 
 /// A channel-open proof and params must not overlap the bytes written to `out`.
 pub fn encodeRequest(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind)) (EncodeBufferError || error{ InvalidProofLength, InvalidParamsLength })![]const u8 {
+    const tool_bytes: u16 = switch (kind) {
+        .cut, .channel_open => if (req.payload.tool == .hoe) 0 else header_bytes + 1,
+        else => 0,
+    };
     const payload_bytes: u16 = switch (kind) {
-        .cut => header_bytes + 8 + @as(u16, if (req.payload.payment != null) payment_tlv_bytes else 0),
+        .cut => header_bytes + 8 + @as(u16, if (req.payload.payment != null) payment_tlv_bytes else 0) + tool_bytes,
         .update_location => header_bytes + 8,
         .read_area => header_bytes + 16,
         .channel_requirements => header_bytes + 1,
@@ -245,7 +250,7 @@ pub fn encodeRequest(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind)) 
             if (proof_len == 0 or proof_len > p.max_channel_proof_bytes) return error.InvalidProofLength;
             const params_len = req.payload.params.len;
             if (params_len == 0 or params_len > p.max_channel_params_bytes) return error.InvalidParamsLength;
-            break :blk @intCast(3 * header_bytes + 32 + proof_len + params_len);
+            break :blk @intCast(3 * header_bytes + 32 + proof_len + params_len + tool_bytes);
         },
     };
     const body_len = header_bytes + @sizeOf(p.Id) + payload_bytes;
@@ -258,6 +263,7 @@ pub fn encodeRequest(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind)) 
         .cut => {
             writePoint(writer.field(.payload, 8), req.payload.x, req.payload.y);
             if (req.payload.payment) |payment| writePayment(&writer, payment);
+            if (tool_bytes != 0) writer.field(.tool, 1)[0] = @backingInt(req.payload.tool);
         },
         .update_location => writePoint(writer.field(.payload, 8), req.payload.x, req.payload.y),
         .read_area => writeArea(writer.field(.payload, 16), req.payload),
@@ -265,11 +271,20 @@ pub fn encodeRequest(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind)) 
         .channel_close, .channel_status => writer.bytes(.channel_id, &req.payload.id),
         .channel_open => {
             writer.bytes(.channel_id, &req.payload.id);
+            if (tool_bytes != 0) writer.field(.tool, 1)[0] = @backingInt(req.payload.tool);
             writer.bytes(.funding_proof, req.payload.proof);
             writer.bytes(.channel_params, req.payload.params);
         },
     }
     return writer.finish();
+}
+
+fn readTool(reader: *Reader, fields: []const Field) DecodeError!p.tool {
+    return std.enums.fromInt(p.tool, (try reader.exact(fields, .tool, 1))[0]) orelse error.InvalidFieldValue;
+}
+
+fn nextIs(reader: Reader, field: Field) bool {
+    return reader.remaining.len != 0 and reader.remaining[0] == @backingInt(field);
 }
 
 /// Decoded channel-open proof and params borrow `data` until that buffer is reused.
@@ -280,10 +295,10 @@ pub fn decodeMessage(data: []const u8, binary: bool) DecodeError!p.Request {
     };
     var frame = try open(data, binary, cap);
     const fields: []const Field = switch (frame.tag) {
-        .cut => &.{ .id, .payload, .channel_id, .amount, .payment_signature },
+        .cut => &.{ .id, .payload, .channel_id, .amount, .payment_signature, .tool },
         .read_area, .update_location => &.{ .id, .payload },
         .channel_requirements => &.{ .id, .tool },
-        .channel_open => &.{ .id, .channel_id, .funding_proof, .channel_params },
+        .channel_open => &.{ .id, .channel_id, .tool, .funding_proof, .channel_params },
         .channel_close, .channel_status => &.{ .id, .channel_id },
         else => return error.UnexpectedMessageType,
     };
@@ -291,10 +306,12 @@ pub fn decodeMessage(data: []const u8, binary: bool) DecodeError!p.Request {
     const operation: @FieldType(p.Request, "operation") = switch (frame.tag) {
         .cut => blk: {
             const point = try frame.body.exact(fields, .payload, 8);
+            const payment = if (frame.body.remaining.len == 0 or nextIs(frame.body, .tool)) null else try readPayment(&frame.body, fields);
             break :blk .{ .cut = .{
                 .x = get(i32, point, 0),
                 .y = get(i32, point, 4),
-                .payment = if (frame.body.remaining.len == 0) null else try readPayment(&frame.body, fields),
+                .payment = payment,
+                .tool = if (nextIs(frame.body, .tool)) try readTool(&frame.body, fields) else .hoe,
             } };
         },
         .update_location => blk: {
@@ -303,17 +320,18 @@ pub fn decodeMessage(data: []const u8, binary: bool) DecodeError!p.Request {
         },
         .read_area => .{ .read_area = readArea(try frame.body.exact(fields, .payload, 16)) },
         .channel_requirements => .{ .channel_requirements = .{
-            .tool = std.enums.fromInt(p.tool, (try frame.body.exact(fields, .tool, 1))[0]) orelse return error.InvalidFieldValue,
+            .tool = try readTool(&frame.body, fields),
         } },
         .channel_open => blk: {
             const channel_id = (try frame.body.exact(fields, .channel_id, 32)).*;
+            const tool = if (nextIs(frame.body, .tool)) try readTool(&frame.body, fields) else .hoe;
             const proof = try frame.body.next(fields) orelse return error.MissingRequiredField;
             if (proof.tag != .funding_proof) return error.OutOfOrderField;
             if (proof.bytes.len == 0 or proof.bytes.len > p.max_channel_proof_bytes) return error.InvalidFieldLength;
             const params = try frame.body.next(fields) orelse return error.MissingRequiredField;
             if (params.tag != .channel_params) return error.OutOfOrderField;
             if (params.bytes.len == 0 or params.bytes.len > p.max_channel_params_bytes) return error.InvalidFieldLength;
-            break :blk .{ .channel_open = .{ .id = channel_id, .proof = proof.bytes, .params = params.bytes } };
+            break :blk .{ .channel_open = .{ .id = channel_id, .proof = proof.bytes, .params = params.bytes, .tool = tool } };
         },
         .channel_close => .{ .channel_close = .{ .id = (try frame.body.exact(fields, .channel_id, 32)).* } },
         .channel_status => .{ .channel_status = .{ .id = (try frame.body.exact(fields, .channel_id, 32)).* } },
@@ -494,7 +512,8 @@ fn decodeOutcome(body: *Reader, comptime kind: p.Kind, snapshot: *p.Snapshot, da
 }
 
 const auth_channel_reply_body_bytes = 4 * header_bytes + 8 + 32 + 2 * @sizeOf(u64);
-pub const max_auth_reply_bytes = envelope_bytes + auth_channel_reply_body_bytes;
+const tool_channel_bytes = 1 + 32 + 2 * @sizeOf(u64);
+pub const max_auth_reply_bytes = envelope_bytes + 2 * header_bytes + 8 + p.tools.len * tool_channel_bytes;
 
 pub fn encodeAuth(out: []u8, message: p.AuthMessage) error{ BufferTooSmall, InvalidChannelBalance }![]const u8 {
     const n: u16 = switch (message) {
@@ -502,6 +521,14 @@ pub fn encodeAuth(out: []u8, message: p.AuthMessage) error{ BufferTooSmall, Inva
         .proof => 2 * header_bytes + 33 + 64,
         .reply => |outcome| switch (outcome) {
             .ok => header_bytes + 8,
+            .ok_with_tool_channels => |success| blk: {
+                var bytes: u16 = 0;
+                for (success.channels) |entry| if (entry) |channel| {
+                    if (channel.balance_msat > channel.capacity_msat) return error.InvalidChannelBalance;
+                    bytes += tool_channel_bytes;
+                };
+                break :blk 2 * header_bytes + 8 + bytes;
+            },
             .ok_with_hoe_channel => |success| if (success.hoe_channel_balance_msat > success.hoe_channel_capacity_msat)
                 return error.InvalidChannelBalance
             else
@@ -518,6 +545,17 @@ pub fn encodeAuth(out: []u8, message: p.AuthMessage) error{ BufferTooSmall, Inva
         },
         .reply => |outcome| switch (outcome) {
             .ok => |pos| writePoint(writer.field(.ok, 8), pos.x, pos.y),
+            .ok_with_tool_channels => |success| {
+                writePoint(writer.field(.ok, 8), success.location.x, success.location.y);
+                var entries = writer.field(.tool_channels, n - 2 * header_bytes - 8);
+                for (success.channels, 0..) |entry, i| if (entry) |channel| {
+                    entries[0] = @intCast(i);
+                    @memcpy(entries[1..33], &channel.id);
+                    put(u64, entries, 33, channel.capacity_msat);
+                    put(u64, entries, 41, channel.balance_msat);
+                    entries = entries[tool_channel_bytes..];
+                };
+            },
             .ok_with_hoe_channel => |success| {
                 writePoint(writer.field(.ok, 8), success.location.x, success.location.y);
                 writer.bytes(.channel_id, &success.hoe_channel_id);
@@ -548,16 +586,35 @@ pub fn decodeAuth(data: []const u8, binary: bool, expected: p.AuthKind) DecodeEr
             return .{ .proof = .{ .pubkey = key.*, .signature = signature.* } };
         },
         .reply => {
-            const fields = &.{ .ok, .failed, .channel_id, .channel_capacity_msat, .channel_balance_msat };
+            const fields = &.{ .ok, .failed, .channel_id, .channel_capacity_msat, .channel_balance_msat, .tool_channels };
             const outcome = try frame.body.next(&.{ .ok, .failed }) orelse return error.MissingRequiredField;
             if (outcome.tag == .ok) {
-                const optional_channel = try frame.body.next(fields);
+                const is_tool_group = nextIs(frame.body, .tool_channels);
+                const optional_channel = if (is_tool_group) null else try frame.body.next(fields);
                 if (optional_channel) |channel| {
                     if (channel.tag != .channel_id) return error.ConflictingOutcome;
                     if (channel.bytes.len != 32) return error.InvalidFieldLength;
                 }
                 if (outcome.bytes.len != 8) return error.InvalidFieldLength;
                 const pos: p.Location = .{ .x = get(i32, outcome.bytes, 0), .y = get(i32, outcome.bytes, 4) };
+                if (is_tool_group) {
+                    const encoded = (try frame.body.next(fields)).?.bytes;
+                    if (encoded.len % tool_channel_bytes != 0) return error.InvalidFieldLength;
+                    var channels: p.ToolChannels = @splat(null);
+                    var min_index: usize = 0;
+                    var entries = encoded;
+                    while (entries.len != 0) : (entries = entries[tool_channel_bytes..]) {
+                        const index = entries[0];
+                        if (index >= channels.len or index < min_index) return error.InvalidFieldValue;
+                        const capacity = get(u64, entries, 33);
+                        const balance = get(u64, entries, 41);
+                        if (balance > capacity) return error.InvalidFieldValue;
+                        channels[index] = .{ .id = entries[1..33].*, .capacity_msat = capacity, .balance_msat = balance };
+                        min_index = @as(usize, index) + 1;
+                    }
+                    try frame.body.finish(fields);
+                    return .{ .reply = .{ .ok_with_tool_channels = .{ .location = pos, .channels = channels } } };
+                }
                 const channel = optional_channel orelse return .{ .reply = .{ .ok = pos } };
                 const capacity = get(u64, try frame.body.exact(fields, .channel_capacity_msat, 8), 0);
                 const balance = get(u64, try frame.body.exact(fields, .channel_balance_msat, 8), 0);

@@ -367,15 +367,24 @@ impl BrowserWallet {
         self.startup.clone()
     }
 
-    /// Separate gameplay API; the renderer queues it with ordinary wallet operations.
+    /// Legacy gameplay API for the hoe journal.
     pub async fn hoe_request(&mut self, operation: &str, arguments: &str) -> Result<String, JsValue> {
+        self.tool_request("hoe", operation, arguments).await
+    }
+
+    /// Gameplay API; the renderer queues it with ordinary wallet operations.
+    pub async fn tool_request(&mut self, tool: &str, operation: &str, arguments: &str) -> Result<String, JsValue> {
         if arguments.len() > 128 * 1024 {
-            return Err(js_error("hoe arguments exceed maximum size"));
+            return Err(js_error("tool arguments exceed maximum size"));
         }
+        let tool = match hoe::Tool::parse(tool) {
+            Ok(tool) => tool,
+            Err(err) => return Ok(failure(err).to_string()),
+        };
         let args = Args::new(arguments)?;
         let wallet = self.inner.as_mut().ok_or_else(|| js_error("wallet is closed"))?;
         self.tasks.run_until(async {
-            let value = match hoe::request(wallet, operation, &args).await {
+            let value = match hoe::request(wallet, tool, operation, &args).await {
                 Ok(mut value) => {
                     value["status"] = json!(0);
                     value

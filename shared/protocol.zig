@@ -6,7 +6,7 @@ pub const hoe_refill_cuts: u64 = 10;
 pub const hoe_capacity_msat = hoe_price_msat * hoe_refill_cuts;
 
 pub fn validHoeCapacity(capacity_msat: u64) bool {
-    return capacity_msat != 0 and capacity_msat <= hoe_capacity_msat and capacity_msat % hoe_price_msat == 0;
+    return tool.hoe.validCapacity(capacity_msat);
 }
 
 pub const max_area_chunks = 64;
@@ -14,8 +14,8 @@ pub const max_gameplay_request_bytes = 256;
 pub const max_request_bytes = 8192;
 pub const max_channel_proof_bytes = 3072;
 pub const max_channel_params_bytes = 4096;
-// Envelope, four TLV headers, and the request ID, channel ID, proof and params values.
-pub const max_channel_open_with_params_bytes = 4 + 4 * 3 + @sizeOf(Id) + 32 + max_channel_proof_bytes + max_channel_params_bytes;
+// Envelope, five TLV headers, and the request ID, channel ID, tool, proof and params values.
+pub const max_channel_open_with_params_bytes = 4 + 5 * 3 + @sizeOf(Id) + 32 + 1 + max_channel_proof_bytes + max_channel_params_bytes;
 pub const snapshot_metadata_bytes = 16 + 4 + 32 + 2;
 pub const chunk_bytes = 32;
 // Envelope, request ID TLV, outcome TLV header, and fixed snapshot metadata.
@@ -53,6 +53,7 @@ pub const Cut = struct {
     x: i32,
     y: i32,
     payment: ?SpillmanChannelPayment = null,
+    tool: tool = .hoe,
 };
 /// World tile coordinates; each axis spans the full signed i32 range.
 pub const Location = packed struct(u64) { x: i32, y: i32 };
@@ -63,6 +64,10 @@ pub const AuthFailure = enum(u16) { invalid_credentials = 1, unavailable = 2 };
 pub const AuthOutcome = union(enum) {
     ok: Location,
     failed: AuthFailure,
+    ok_with_tool_channels: struct {
+        location: Location,
+        channels: ToolChannels,
+    },
     ok_with_hoe_channel: struct {
         location: Location,
         hoe_channel_id: [32]u8,
@@ -73,7 +78,40 @@ pub const AuthOutcome = union(enum) {
 };
 pub const AuthMessage = union(AuthKind) { challenge: [32]u8, proof: AuthProof, reply: AuthOutcome };
 
-pub const tool = enum(u8) { axe = 0, hoe = 1, pickaxe = 2 };
+pub const ToolChannel = struct {
+    id: [32]u8,
+    capacity_msat: u64,
+    balance_msat: u64,
+};
+pub const ToolChannels = [tools.len]?ToolChannel;
+
+pub const tool = enum(u8) {
+    axe = 0,
+    hoe = 1,
+    pickaxe = 2,
+
+    pub fn priceMsat(self: tool) u64 {
+        return switch (self) {
+            .axe => 2,
+            .hoe => hoe_price_msat,
+            .pickaxe => 10,
+        };
+    }
+
+    pub fn validCapacity(self: tool, capacity_msat: u64) bool {
+        const price = self.priceMsat();
+        return capacity_msat != 0 and capacity_msat <= price * hoe_refill_cuts and capacity_msat % price == 0;
+    }
+
+    pub fn terrain(self: tool) world.Tile {
+        return switch (self) {
+            .axe => .tree,
+            .hoe => .grass,
+            .pickaxe => .rock,
+        };
+    }
+};
+pub const tools = std.enums.values(tool);
 
 // Client spillman requests
 pub const SpillmanChannelRequirementsReq = struct { tool: tool };
@@ -93,6 +131,7 @@ pub const SpillmanChannelOpen = struct {
     id: [32]u8,
     proof: []const u8,
     params: []const u8,
+    tool: tool = .hoe,
 };
 
 pub const Kind = enum { cut, read_area, update_location, channel_requirements, channel_open, channel_close, channel_status };

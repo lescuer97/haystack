@@ -18,14 +18,9 @@ pub const endpoint_url = "ws://" ++ authority ++ "/";
 const sync = @import("ws_sync.zig");
 const Status = sync.Status;
 const Snapshot = sync.Snapshot;
-pub const HoeChannel = struct {
-    id: [32]u8,
-    capacity_msats: u64,
-    balance_msats: u64,
-    player: [33]u8,
-};
-const Restored = struct { location: protocol.Location, hoe_channel: ?HoeChannel = null, player: ?[33]u8 = null };
-pub const HoeLogin = struct { player: [33]u8, channel: ?HoeChannel };
+pub const HoeChannel = sync.ToolChannel;
+pub const HoeLogin = sync.ToolLogin;
+const Restored = sync.AuthRestore;
 
 pub const ChannelStatusOutcome = union(enum) {
     ok: struct {
@@ -124,7 +119,7 @@ pub const Worker = struct {
     enabled: bool = false,
     generation: u64 = 0,
     state: Snapshot = .{},
-    auth_hoe_channel: ?HoeChannel = null,
+    auth_tool_channels: sync.ToolChannels = @splat(null),
     auth_player: ?[33]u8 = null,
     outbox: ?protocol.Location = null,
     area: sync.AreaMailbox = .idle,
@@ -144,7 +139,7 @@ pub const Worker = struct {
     pub fn stop(self: *Worker) void {
         self.mutex.lockUncancelable(self.io);
         self.stopping = true;
-        self.auth_hoe_channel = null;
+        self.auth_tool_channels = @splat(null);
         self.auth_player = null;
         self.channel = .idle;
         self.cut = .idle;
@@ -173,7 +168,7 @@ pub const Worker = struct {
     fn resetConnectionLocked(self: *Worker) void {
         self.generation +%= 1;
         self.state.status = if (self.enabled) .connecting else .disabled;
-        self.auth_hoe_channel = null;
+        self.auth_tool_channels = @splat(null);
         self.auth_player = null;
         self.state.pending = false;
         self.outbox = null;
@@ -191,18 +186,23 @@ pub const Worker = struct {
 
     /// The identity and optional channel come from the same authenticated login.
     pub fn hoeLogin(self: *Worker, session: u64) ?HoeLogin {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (!self.readyLocked(session)) return null;
-        return .{ .player = self.auth_player orelse return null, .channel = self.auth_hoe_channel };
+        return self.toolLogin(session, .hoe);
     }
 
-    /// Login snapshot, not a live balance. Never returned for a stale session.
     pub fn hoeChannel(self: *Worker, session: u64) ?HoeChannel {
+        return self.toolChannel(session, .hoe);
+    }
+
+    pub fn toolLogin(self: *Worker, session: u64, tool: protocol.tool) ?HoeLogin {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (!self.readyLocked(session)) return null;
-        return self.auth_hoe_channel;
+        return .{ .player = self.auth_player orelse return null, .channel = self.auth_tool_channels[@backingInt(tool)] };
+    }
+
+    /// Channel from login with any acknowledged payments applied. Scoped to this session.
+    pub fn toolChannel(self: *Worker, session: u64, tool: protocol.tool) ?HoeChannel {
+        return (self.toolLogin(session, tool) orelse return null).channel;
     }
 
     pub fn submit(self: *Worker, session: u64, destination: protocol.Location) bool {
@@ -337,6 +337,22 @@ pub const Worker = struct {
         defer self.mutex.unlock(self.io);
         if (!self.activeLocked(generation) or !self.readyLocked(request.session)) return;
         if (self.cut != .waiting or !std.mem.eql(u8, &self.cut.waiting, &id)) return;
+        // Keep the login balance usable when the player switches away and back.
+        const tile = request.command.payload;
+        if (outcome == .ok and outcome.ok.cut and outcome.ok.terrain == tile.tool.terrain() and
+            outcome.ok.x == tile.x and outcome.ok.y == tile.y)
+        {
+            if (tile.payment) |payment| {
+                if (self.auth_tool_channels[@backingInt(tile.tool)]) |*channel| {
+                    if (std.mem.eql(u8, &channel.id, &payment.id) and
+                        payment.amount <= channel.capacity_msats and payment.amount >= channel.balance_msats and
+                        payment.amount - channel.balance_msats == tile.tool.priceMsat())
+                    {
+                        channel.balance_msats = payment.amount;
+                    }
+                }
+            }
+        }
         self.cut = .{ .received = .{ .id = id, .outcome = outcome } };
     }
 
@@ -367,7 +383,7 @@ pub const Worker = struct {
         self.channel = .idle;
         self.cut = .idle;
         self.settled_count = 0;
-        self.auth_hoe_channel = if (restored) |success| success.hoe_channel else null;
+        self.auth_tool_channels = if (restored) |success| success.channels else @splat(null);
         self.auth_player = if (restored) |success| success.player else null;
         if (restored) |success| {
             self.state.session +%= 1;
@@ -445,22 +461,9 @@ pub const Worker = struct {
         var out: [protocol.max_request_bytes]u8 = undefined;
         try send(&client, &out, try wire.encodeAuth(&out, .{ .proof = .{ .pubkey = proof.pubkey, .signature = proof.signature } }));
         const reply = (try self.auth(io, generation, &client, auth_until, .reply)).reply;
-        const restored: Restored = switch (reply) {
-            .ok => |pos| .{ .location = pos, .player = proof.pubkey },
-            .ok_with_hoe_channel => |success| .{
-                .location = success.location,
-                .player = proof.pubkey,
-                .hoe_channel = .{
-                    .id = success.hoe_channel_id,
-                    .capacity_msats = success.hoe_channel_capacity_msat,
-                    .balance_msats = success.hoe_channel_balance_msat,
-                    .player = proof.pubkey,
-                },
-            },
-            .failed => |failure| return switch (failure) {
-                .invalid_credentials => error.CredentialsRejected,
-                .unavailable => error.SessionUnavailable,
-            },
+        const restored = Restored.fromReply(reply, proof.pubkey) orelse return switch (reply.failed) {
+            .invalid_credentials => error.CredentialsRejected,
+            .unavailable => error.SessionUnavailable,
         };
         retry_ms.* = 250;
         self.status(generation, .ready, restored);
@@ -607,7 +610,7 @@ test "movement mailbox waits for auth and holds only one move per session" {
     try t.expect(!worker.submit(0, pos));
     const restored: protocol.Location = .{ .x = -38, .y = 211 };
     const channel: HoeChannel = .{ .id = @splat(0x42), .capacity_msats = 100, .balance_msats = 15, .player = @splat(7) };
-    worker.status(1, .ready, .{ .location = restored, .hoe_channel = channel });
+    worker.status(1, .ready, .{ .location = restored, .channels = .{ null, channel, null }, .player = channel.player });
     try t.expectEqual(channel, worker.hoeChannel(worker.snapshot().session).?);
     try t.expect(worker.hoeChannel(0) == null);
     try t.expect(worker.submit(1, pos));
@@ -627,7 +630,7 @@ test "movement mailbox waits for auth and holds only one move per session" {
     try t.expect(!worker.submit(1, pos));
     try t.expect(worker.submit(2, pos));
     worker.setEnabled(false);
-    worker.status(1, .ready, .{ .location = restored, .hoe_channel = channel });
+    worker.status(1, .ready, .{ .location = restored, .channels = .{ null, channel, null }, .player = channel.player });
     try t.expect(worker.hoeChannel(2) == null);
     try t.expectEqual(Status.disabled, worker.snapshot().status);
     try t.expect(!worker.snapshot().pending);
@@ -658,7 +661,7 @@ test "channel open queues owned bytes without changing movement or area mailboxe
     var params = expected_params;
     const open: protocol.RequestFor(.channel_open) = .{
         .request_id = @splat(1),
-        .payload = .{ .id = @splat(2), .proof = &proof, .params = &params },
+        .payload = .{ .id = @splat(2), .proof = &proof, .params = &params, .tool = .pickaxe },
     };
 
     worker.setEnabled(true);
@@ -680,6 +683,7 @@ test "channel open queues owned bytes without changing movement or area mailboxe
     const decoded = try wire.decodeMessage(out[0..request.len], true);
     try t.expectEqual(open.request_id, decoded.request_id);
     try t.expectEqual(open.payload.id, decoded.operation.channel_open.id);
+    try t.expectEqual(open.payload.tool, decoded.operation.channel_open.tool);
     try t.expectEqual(protocol.max_channel_open_with_params_bytes, request.len);
     try t.expectEqualSlices(u8, &expected_proof, decoded.operation.channel_open.proof);
     try t.expectEqualSlices(u8, &expected_params, decoded.operation.channel_open.params);
@@ -881,6 +885,33 @@ test "signed cut queues alongside play and channel and yields only a matched rep
     try t.expectEqual(area, worker.takeOperation(1, &out).?.play.area);
 }
 
+test "acknowledged cut advances only the matching tool balance before rebinding" {
+    const t = std.testing;
+    const player: [33]u8 = @splat(3);
+    const hoe: HoeChannel = .{ .id = @splat(2), .capacity_msats = 15, .balance_msats = 5, .player = player };
+    const axe: HoeChannel = .{ .id = @splat(4), .capacity_msats = 4, .balance_msats = 0, .player = player };
+    var worker: Worker = .{ .io = t.io, .paths = undefined };
+    worker.setEnabled(true);
+    worker.status(1, .ready, .{ .location = shared.movement.spawn, .player = player, .channels = .{ axe, hoe, null } });
+
+    var command = test_cut;
+    command.payload.payment.?.amount = 10;
+    const tile: protocol.State = .{ .x = command.payload.x, .y = command.payload.y, .terrain = .grass, .cut = true };
+    var out: [protocol.max_request_bytes]u8 = undefined;
+    var scratch: protocol.Snapshot = undefined;
+    for ([_]protocol.Outcome(.cut){ .{ .failed = .{ .already_cut = tile } }, .{ .ok = tile } }, 0..) |outcome, i| {
+        command.request_id[0] = @intCast(i);
+        try t.expect(worker.submitCut(1, command));
+        const request = worker.takeOperation(1, &out).?.cut;
+        const reply = try wire.encodeReply(&out, .cut, command, outcome);
+        try worker.finishCut(1, request, reply, &scratch);
+        try t.expectEqualDeep(outcome, worker.takeCut(1, command.request_id).?);
+        try t.expectEqual(if (i == 0) @as(u64, 5) else 10, worker.toolLogin(1, .hoe).?.channel.?.balance_msats);
+        try t.expectEqual(axe, worker.toolChannel(1, .axe).?);
+        try t.expect(worker.toolChannel(1, .pickaxe) == null);
+    }
+}
+
 test "signed cut is not replayed and stale completions cannot replace the current result" {
     const t = std.testing;
     var worker: Worker = .{ .io = t.io, .paths = undefined };
@@ -922,4 +953,21 @@ test "signed cut is not replayed and stale completions cannot replace the curren
     worker.stop();
     try t.expect(worker.takeCut(3, id) == null);
     try t.expect(!worker.submitCut(3, test_cut));
+}
+
+test "login restores each tool independently and invalidates every slot on reconnect" {
+    const t = std.testing;
+    var worker: Worker = .{ .io = t.io, .paths = undefined };
+    const player: [33]u8 = @splat(2);
+    const axe: protocol.ToolChannel = .{ .id = @splat(3), .capacity_msat = 20, .balance_msat = 2 };
+    const pickaxe: protocol.ToolChannel = .{ .id = @splat(4), .capacity_msat = 100, .balance_msat = 50 };
+    const ack: protocol.AuthOutcome = .{ .ok_with_tool_channels = .{ .location = shared.movement.spawn, .channels = .{ axe, null, pickaxe } } };
+    worker.setEnabled(true);
+    worker.status(1, .ready, Restored.fromReply(ack, player));
+    try t.expectEqual(axe.id, worker.toolChannel(1, .axe).?.id);
+    try t.expectEqual(pickaxe.balance_msat, worker.toolChannel(1, .pickaxe).?.balance_msats);
+    try t.expectEqual(player, worker.toolLogin(1, .pickaxe).?.player);
+    try t.expect(worker.hoeChannel(1) == null);
+    worker.refreshAuth(1);
+    for (protocol.tools) |tool| try t.expect(worker.toolLogin(1, tool) == null);
 }

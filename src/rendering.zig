@@ -445,7 +445,7 @@ fn drawWorld(w: *const world.World, view: camera.View, cam: camera.Camera, setti
             const chunk = w.get(rock_cx, rock_cy) orelse continue;
             var tiles = ChunkTiles.init(chunk, rock_tiles);
             while (tiles.next()) |entry| {
-                if (entry.tile != .rock) continue;
+                if (entry.tile != .rock or chunk.isCut(entry.index)) continue;
                 const x = localPixel(entry.tx, cam.tile_x);
                 const y = localPixel(entry.ty, cam.tile_y);
                 rl.drawTexturePro(resources.decor, rock_source, rockDest(x, y), .{ .x = 0, .y = 0 }, 0, .white);
@@ -641,8 +641,8 @@ fn paintMinimap(pixels: []rl.Color, width: usize, w: *const world.World, chunks:
                 for (pixels[offset..][0..world.CT], 0..) |*pixel, col| {
                     const index = row * world.CT + col;
                     const tile = chunk.tiles[index];
-                    pixel.* = if ((tile == .grass or tile == .tree) and chunk.isCut(index))
-                        rl.Color.init(74, 119, 66, 255) // Bare grass, without the clump or canopy.
+                    pixel.* = if (isGrassGround(tile) and chunk.isCut(index))
+                        rl.Color.init(74, 119, 66, 255) // Cleared ground.
                     else
                         minimapColor(tile);
                 }
@@ -897,15 +897,23 @@ fn drawSolidRect(rect: menu.Rect, color: rl.Color) void {
 }
 
 pub fn drawHoeStatus(view: game_mod.HoeView, funding: game_mod.HoeFundingUi.Controller, vw: f32, vh: f32, debit_limit: u64) void {
+    drawToolStatus(.hoe, view, funding, vw, vh, debit_limit);
+}
+
+pub fn drawToolStatus(tool: player.Tool, view: game_mod.HoeView, funding: game_mod.HoeFundingUi.Controller, vw: f32, vh: f32, debit_limit: u64) void {
     if (view.status == .hidden) return;
     const status: [:0]const u8 = if (funding.status) |state| state.text() else switch (view.status) {
         .hidden => unreachable,
-        .unavailable => "No cuts loaded",
-        .checking => "Checking hoe channel...",
-        .ready => "Click nearby grass to cut",
-        .pending => "Cut pending...",
-        .recovery => "Hoe recovery required",
-        .empty => "Out of cuts",
+        .unavailable => "No uses loaded",
+        .checking => "Checking channel...",
+        .ready => switch (tool) {
+            .pickaxe => "Click to clear nearby rock",
+            .axe => "Click to clear nearby tree",
+            .hoe => "Click nearby grass to cut",
+        },
+        .pending => "Action pending...",
+        .recovery => "Recovery required",
+        .empty => "Out of uses",
         .settling => "Settling previous refill...",
         .settled => "Ready to refill",
     };
@@ -915,9 +923,11 @@ pub fn drawHoeStatus(view: game_mod.HoeView, funding: game_mod.HoeFundingUi.Cont
     const text_width = panel.width - (if (show_button) @as(f32, 142) else 0);
     var buf: [64]u8 = undefined;
     const count = if (view.offer) |offer|
-        std.mem.printSentinel(&buf, "Load {d} cuts", .{offer.cuts}, 0) catch unreachable
+        std.mem.printSentinel(&buf, "{s}: load {d}", .{ tool.label(), offer.cuts }, 0) catch unreachable
+    else if (view.cuts_left) |left|
+        std.mem.printSentinel(&buf, "{s}: {d} left", .{ tool.label(), left }, 0) catch unreachable
     else
-        game_mod.HoeFundingUi.cutsText(view.cuts_left, &buf);
+        std.mem.printSentinel(&buf, "{s}: unknown", .{tool.label()}, 0) catch unreachable;
     drawCenteredText(count, .{ .x = panel.x, .y = panel.y + 6, .width = text_width, .height = 16 }, 16, .ray_white);
     drawCenteredText(status, .{ .x = panel.x, .y = panel.y + 27, .width = text_width, .height = 12 }, 12, .ray_white);
     if (!show_button) return;
@@ -926,7 +936,7 @@ pub fn drawHoeStatus(view: game_mod.HoeView, funding: game_mod.HoeFundingUi.Cont
     rl.drawRectangleRec(rect, .dark_gray);
     rl.drawRectangleLinesEx(rect, 1, .gray);
     if (view.close_first) {
-        drawCenteredText("Close empty hoe", button, 14, .ray_white);
+        drawCenteredText("Close channel", button, 14, .ray_white);
         return;
     }
     if (view.recovery_action) |action| {
@@ -936,7 +946,7 @@ pub fn drawHoeStatus(view: game_mod.HoeView, funding: game_mod.HoeFundingUi.Cont
         }, button, 14, .ray_white);
         return;
     }
-    const label: [:0]const u8 = if (view.offer) |offer| (if (offer.resume_funding) "Resume refill" else "Refill hoe") else if (debit_limit == 0) "Get refill quote" else "Refill hoe";
+    const label: [:0]const u8 = if (view.offer) |offer| (if (offer.resume_funding) "Resume refill" else "Refill") else if (debit_limit == 0) "Get refill quote" else "Refill";
     if (view.offer == null and debit_limit == 0) {
         drawCenteredText(label, button, 14, .ray_white);
         return;
@@ -1295,12 +1305,16 @@ fn drawWrapped(text: []const u8, rect: menu.Rect, size: i32, tail: bool) void {
 
 fn drawToolbar(game: *const game_mod.GameState, vw: f32, vh: f32) void {
     const layout = game_mod.toolbarLayout(vw, vh) orelse return;
-    const selected = game.selected_tool == .hoe;
     drawSolidRect(layout.bounds, menu_panel_bg);
     rl.drawRectangleLinesEx(toRaylibRect(layout.bounds), 1, menu_panel_border);
-    drawSolidRect(layout.hoe, if (selected) menu_item_focus else menu_item_bg);
-    rl.drawRectangleLinesEx(toRaylibRect(layout.hoe), 2, if (selected) menu_accent else menu_panel_border);
-    drawCenteredText("Hoe", layout.hoe, 18, menu_text_color);
+    for (layout.slots, player.Tool.slots, 1..) |slot, tool, key| {
+        const selected = game.selected_tool == tool;
+        drawSolidRect(slot, if (selected) menu_item_focus else menu_item_bg);
+        rl.drawRectangleLinesEx(toRaylibRect(slot), 2, if (selected) menu_accent else menu_panel_border);
+        var buf: [16]u8 = undefined;
+        const label = std.mem.printSentinel(&buf, "{d} {s}", .{ key, tool.label() }, 0) catch unreachable;
+        drawCenteredText(label, slot, 16, menu_text_color);
+    }
 }
 
 fn walletBadgeBalance(wallet: *const wallet_ui.Model) [:0]const u8 {
@@ -1327,7 +1341,7 @@ fn drawWalletBadge(state: *const menu.Menu, vw: f32, vh: f32) void {
 }
 
 fn drawRefillNotice(viewport_w: f32, viewport_h: f32) void {
-    const message = "Hoe empty";
+    const message = "Tool empty";
     const width: f32 = @floatFromInt(rl.measureText(message, 16) + 24);
     const height = 26;
     const toolbar = game_mod.toolbarLayout(viewport_w, viewport_h) orelse return;
@@ -1513,7 +1527,7 @@ fn drawOnboarding(model: *const onboarding.Onboarding, vw: f32, vh: f32) void {
     }
 }
 
-test "wallet badge anchors left and clears the hoe toolbar on narrow viewports" {
+test "wallet badge anchors left and clears the toolbar on narrow viewports" {
     const wide = game_mod.walletBadgeBounds(1000, 640).?;
     const wide_tools = game_mod.toolbarLayout(1000, 640).?;
     try std.testing.expectEqual(@as(f32, 8), wide.x);
@@ -1643,7 +1657,7 @@ test "minimap keeps tile scale and stops at protocol edges" {
     }
 }
 
-test "minimap preserves cut grass and trees until a refreshed snapshot changes them" {
+test "minimap preserves cleared grass, trees, and rocks until a refreshed snapshot changes them" {
     var w = try world.World.init(std.testing.allocator, 1);
     defer w.deinit();
     const area: world.ChunkRange = .{ .cx0 = -1, .cy0 = 0, .cx1 = -1, .cy1 = 0 };
@@ -1653,11 +1667,11 @@ test "minimap preserves cut grass and trees until a refreshed snapshot changes t
     while (it.next()) |slot| {
         const chunk = slot.*;
         if (chunk.cx != -1 or chunk.cy != 0) continue;
-        chunk.tiles[0..3].* = .{ .grass, .tree, .tree };
+        chunk.tiles[0..5].* = .{ .grass, .tree, .tree, .rock, .rock };
     }
     const before = MinimapStamp.get(&w, area);
     var snapshot: @import("shared").protocol.Snapshot = .{ .area = area, .count = 1 };
-    snapshot.chunks[0][0] = 0b00000011;
+    snapshot.chunks[0][0] = 0b00001011;
     w.applyCuts(&snapshot);
     try std.testing.expect(!std.meta.eql(before, MinimapStamp.get(&w, area)));
     var pixels: [world.CT * world.CT]rl.Color = undefined;
@@ -1665,6 +1679,8 @@ test "minimap preserves cut grass and trees until a refreshed snapshot changes t
     try std.testing.expectEqual(pixels[0], pixels[1]);
     try std.testing.expect(!std.meta.eql(minimapColor(.grass), pixels[0]));
     try std.testing.expectEqual(minimapColor(.tree), pixels[2]);
+    try std.testing.expectEqual(pixels[0], pixels[3]);
+    try std.testing.expectEqual(minimapColor(.rock), pixels[4]);
     const cut = MinimapStamp.get(&w, area);
     w.invalidateCuts();
     try std.testing.expectEqual(cut, MinimapStamp.get(&w, area));
@@ -1672,6 +1688,7 @@ test "minimap preserves cut grass and trees until a refreshed snapshot changes t
     paintMinimap(&pixels, world.CT, &w, area);
     try std.testing.expectEqual(cut_pixel, pixels[0]);
     try std.testing.expectEqual(cut_pixel, pixels[1]);
+    try std.testing.expectEqual(cut_pixel, pixels[3]);
 
     w.applyCuts(&snapshot);
     try std.testing.expectEqual(cut, MinimapStamp.get(&w, area));
@@ -1681,6 +1698,7 @@ test "minimap preserves cut grass and trees until a refreshed snapshot changes t
     paintMinimap(&pixels, world.CT, &w, area);
     try std.testing.expectEqual(minimapColor(.grass), pixels[0]);
     try std.testing.expectEqual(minimapColor(.tree), pixels[1]);
+    try std.testing.expectEqual(minimapColor(.rock), pixels[3]);
 }
 
 test "chunk tile iteration skips offscreen rows and columns across negative seams" {

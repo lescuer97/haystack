@@ -6,6 +6,50 @@ const frame_loop = @import("frame_loop.zig");
 const world = @import("world.zig");
 const protocol = shared.protocol;
 
+pub const ToolChannel = struct {
+    id: [32]u8,
+    capacity_msats: u64,
+    balance_msats: u64,
+    player: [33]u8,
+};
+pub const ToolLogin = struct { player: [33]u8, channel: ?ToolChannel };
+pub const ToolChannels = [protocol.tools.len]?ToolChannel;
+
+pub const AuthRestore = struct {
+    location: protocol.Location,
+    channels: ToolChannels = @splat(null),
+    player: ?[33]u8 = null,
+
+    pub fn fromReply(reply: protocol.AuthOutcome, player: [33]u8) ?AuthRestore {
+        var channels: ToolChannels = @splat(null);
+        const location = switch (reply) {
+            .failed => return null,
+            .ok => |location| location,
+            .ok_with_hoe_channel => |success| blk: {
+                channels[@backingInt(protocol.tool.hoe)] = .{
+                    .id = success.hoe_channel_id,
+                    .capacity_msats = success.hoe_channel_capacity_msat,
+                    .balance_msats = success.hoe_channel_balance_msat,
+                    .player = player,
+                };
+                break :blk success.location;
+            },
+            .ok_with_tool_channels => |success| blk: {
+                for (success.channels, &channels) |entry, *out| if (entry) |channel| {
+                    out.* = .{
+                        .id = channel.id,
+                        .capacity_msats = channel.capacity_msat,
+                        .balance_msats = channel.balance_msat,
+                        .player = player,
+                    };
+                };
+                break :blk success.location;
+            },
+        };
+        return .{ .location = location, .channels = channels, .player = player };
+    }
+};
+
 pub const AreaCompletion = enum { snapshot, server_busy };
 
 /// One bounded exchange per connection. The native worker guards this with

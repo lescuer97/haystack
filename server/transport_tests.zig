@@ -475,7 +475,7 @@ test "Spilman messages require authentication and reject without touching tick o
     const modern_open_id: p.Id = @splat(0x25);
     const modern = try wire.encodeRequest(&request_storage, .channel_open, .{
         .request_id = modern_open_id,
-        .payload = .{ .id = @splat(3), .proof = &@as([p.max_channel_proof_bytes]u8, @splat('p')), .params = &@as([p.max_channel_params_bytes]u8, @splat('a')) },
+        .payload = .{ .id = @splat(3), .proof = &@as([p.max_channel_proof_bytes]u8, @splat('p')), .params = &@as([p.max_channel_params_bytes]u8, @splat('a')), .tool = .pickaxe },
     });
     try std.testing.expectEqual(config.max_payload, modern.len);
     try writeClientFrame(&frames, modern);
@@ -527,6 +527,23 @@ test "Spilman messages require authentication and reject without touching tick o
     try std.testing.expect(slot.mailbox.state == .idle);
     try std.testing.expectEqual(before, stateCount(&fixture));
     try std.testing.expectEqualDeep(spawn, fixture.application.registry.get(session).?.location.?);
+
+    var harvest_snapshot: p.Snapshot = undefined;
+    for ([_]p.tool{ .axe, .pickaxe }) |tool| {
+        var x: i32 = -128;
+        while (shared.world.sampleTile(shared.world.public_seed, x, 0) != tool.terrain()) : (x += 1) {
+            if (x == 127) return error.NoHarvestTile;
+        }
+        // Neither the explicit tool nor the legacy hoe encoding may clear this tile for free.
+        for ([_]p.tool{ tool, .hoe }) |selected| {
+            output.end = 0;
+            const cut: p.RequestFor(.cut) = .{ .request_id = @splat(44), .payload = .{ .x = x, .y = 0, .tool = selected } };
+            try handler.clientMessage(try wire.encodeRequest(&request_storage, .cut, cut), .binary);
+            const result = try wire.decodeReply(output.buffered()[2..], .cut, cut.request_id, &harvest_snapshot);
+            try std.testing.expect(result == .failed and result.failed == .invalid_request);
+            try std.testing.expectEqual(@as(u64, 0), slot.mailbox.generation);
+        }
+    }
 
     // A normal gameplay request on the same connection still reaches the tick.
     dispatch.stopping = false;
@@ -582,7 +599,7 @@ test "headless wallet exposes owned spendable and depleted channels and quotes u
     const now: u64 = @intCast(std.Io.Clock.real.now(t.io).toSeconds());
     const before = stateCount(&fixture);
     var input = std.Io.Reader.fixed("");
-    var bytes: [128]u8 = undefined;
+    var bytes: [256]u8 = undefined;
     var output = std.Io.Writer.fixed(&bytes);
     var socket = ws{ .input = &input, .output = &output, .key = "" };
 
@@ -770,12 +787,10 @@ test "headless wallet exposes owned spendable and depleted channels and quotes u
             try handler.clientMessage(request, .binary);
             const quote_after: u64 = @intCast(std.Io.Clock.real.now(t.io).toSeconds());
             const outcome = try wire.decodeReply(output.buffered()[2..], .channel_requirements, req_id, &snapshot);
-            if (tool == .hoe) {
-                try t.expect(outcome == .ok);
-                try t.expectEqual(wallet.receiverPubkey(week).?, outcome.ok.pubkey);
-                try t.expectEqual(p.hoe_price_msat, outcome.ok.amount); // Price per cut, not channel capacity.
-                try t.expect(outcome.ok.refundTime >= quote_before + week and outcome.ok.refundTime <= quote_after + week);
-            } else try t.expectEqual(p.ChannelRequirementsFailure.unavailable, outcome.failed);
+            try t.expect(outcome == .ok);
+            try t.expectEqual(wallet.receiverPubkey(week).?, outcome.ok.pubkey);
+            try t.expectEqual(tool.priceMsat(), outcome.ok.amount);
+            try t.expect(outcome.ok.refundTime >= quote_before + week and outcome.ok.refundTime <= quote_after + week);
         }
 
         try expectOpen(&handler, &output, .{ .id = active, .proof = "[]", .params = active_open.params }, .{ .failed = .invalid_proof });
@@ -860,6 +875,60 @@ test "headless wallet exposes owned spendable and depleted channels and quotes u
             try t.expectEqualDeep(@as(?p.Location, east), app.registry.get(handle).?.location);
             try t.expectEqual(@as(?ChannelId, orphan), app.registry.get(handle).?.hoe_channel_id);
             try t.expectEqualDeep(@import("game_db.zig").User{ .location = east, .hoe_channel_id = orphan }, (try db.loadUser(key)).?);
+        }
+    }
+    {
+        var handler = try Handler.init(&socket, app);
+        defer handler.close();
+        handler.nonce = @splat(7);
+        handler.deadline = transport.freshDeadline(t.io);
+        output.end = 0;
+        try handler.clientMessage(proof, .binary);
+        try handler.completeAuthentication();
+        // The already-funded hoe channel cannot be reused for either tool.
+        for ([_]p.tool{ .axe, .pickaxe }) |tool| {
+            var reuse = active_open;
+            reuse.tool = tool;
+            try expectOpen(&handler, &output, reuse, .{ .failed = .invalid_proof });
+            const id: ChannelId = @splat(@backingInt(tool) + 20);
+            const capacity = tool.priceMsat() * 2;
+            const params = try std.json.Stringify.valueAlloc(a, .{ .capacity = capacity, .expiry_timestamp = now + 3600, .sender_pubkey = test_pubkey_hex }, .{});
+            const insert = try channel_sql.prepare("INSERT INTO receiver_channels (id,owner,price_msat) VALUES (?1,?2,?3)");
+            defer insert.finalize();
+            try insert.bindBlob(1, &id);
+            try insert.bindBlob(2, &key);
+            try insert.bindUInt(3, tool.priceMsat());
+            try insert.finish();
+            const fund = try channel_sql.prepare(
+                \\INSERT INTO spilman_channels (channel_id,funding_json,balance,state)
+                \\VALUES(lower(hex(?1)),json_object('params_json',CAST(?2 AS TEXT),'keyset_info_json','{}','funding_proofs_json',CAST(?3 AS TEXT)),0,'Open')
+            );
+            defer fund.finalize();
+            try fund.bindBlob(1, &id);
+            try fund.bindBlob(2, params);
+            try fund.bindBlob(3, open_proofs);
+            try fund.finish();
+            try expectOpen(&handler, &output, .{ .id = id, .proof = open_proofs, .params = params, .tool = tool }, .{ .ok = {} });
+            try t.expectEqual(id, (try db.loadUser(key)).?.channelId(tool).?);
+        }
+    }
+    {
+        var handler = try Handler.init(&socket, app);
+        defer handler.close();
+        handler.nonce = @splat(7);
+        handler.deadline = transport.freshDeadline(t.io);
+        output.end = 0;
+        try handler.clientMessage(proof, .binary);
+        try handler.completeAuthentication();
+        const ack = output.buffered();
+        try t.expectEqual(@as(u8, 126), ack[1]);
+        const restored = (try wire.decodeAuth(ack[4..], true, .reply)).reply.ok_with_tool_channels;
+        try t.expectEqualDeep(east, restored.location);
+        try t.expectEqual(orphan, restored.channels[@backingInt(p.tool.hoe)].?.id);
+        for ([_]p.tool{ .axe, .pickaxe }) |tool| {
+            const id: ChannelId = @splat(@backingInt(tool) + 20);
+            try t.expectEqualDeep(p.ToolChannel{ .id = id, .capacity_msat = tool.priceMsat() * 2, .balance_msat = 0 }, restored.channels[@backingInt(tool)].?);
+            try t.expectEqual(id, app.registry.toolChannel(handler.session.?, tool).?.id);
         }
     }
     const channels = wallet.tryAcquire() orelse return error.TestWalletBusy;

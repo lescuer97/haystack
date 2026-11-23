@@ -10,7 +10,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {bounded, CdpConnection, discoverEndpoint, launchBrowser, makeProfile, removeProfile, stopBrowser} from './cdp-runner.mjs';
 
-const modes = ['--smoke-only', '--renderer-only', '--funding-recovery', '--funding-change-recovery', '--funding-resume', '--renderer-funding-resume'];
+const modes = ['--smoke-only', '--renderer-only', '--funding-recovery', '--funding-change-recovery', '--funding-resume', '--renderer-funding-resume', '--tools'];
 const args = process.argv.slice(2).filter(arg => !modes.includes(arg));
 const selected = process.argv.slice(2).filter(arg => modes.includes(arg));
 if (args.length !== 3 || selected.length > 1) throw new Error(`Usage: paid-hoe-browser-test.mjs MINT_EXE SERVER_EXE WASM_TEST_DIR [${modes.join(' | ')}]`);
@@ -21,6 +21,12 @@ const changeRecovery = mode === '--funding-change-recovery';
 const fundingRecovery = mode === '--funding-recovery' || changeRecovery;
 const rendererResume = mode === '--renderer-funding-resume';
 const fundingResume = mode === '--funding-resume' || rendererResume;
+// Sampled from shared/world.zig's sampleTile(public_seed, x, y), terrain v2.
+const toolsFixture = mode === '--tools' ? {
+  start:[80, 11],
+  axe:{name:'axe', tag:0, price:'2', terrain:3, tile:[80, 10]},
+  pickaxe:{name:'pickaxe', tag:2, price:'10', terrain:2, tile:[80, 12]},
+} : null;
 const [mintExe, serverExe, assets] = args.map(arg => resolve(arg));
 const mintOrigin = 'http://127.0.0.1:18787'; // Matches the native fixture build option.
 const gamePort = 9224; // Fixed by server/ws_config.zig.
@@ -88,7 +94,7 @@ async function load(reload = false, url = origin) {
 // Runs entirely in the Chromium page: only the production Wasm wallet sees
 // the seed, and no proof/signature bytes are returned to Node. This small test
 // peer implements the TLV subset in shared/wire.zig.
-async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, resumeOffer}) {
+async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, resumeOffer, tools, toolChannels}) {
   const check = (condition, step) => {
     if (!condition) {
       window.paidHoeStep = step;
@@ -153,6 +159,12 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     view(out).setBigUint64(0, BigInt(value), true);
     return out;
   };
+  const point = (x, y) => {
+    const out = new Uint8Array(8);
+    view(out).setInt32(0, x, true);
+    view(out).setInt32(4, y, true);
+    return out;
+  };
   const tlv = (tag, value) => [tag, value.length & 255, value.length >> 8, ...value];
   function sendFrame(tag, fields) {
     const body = fields.flatMap(([field, value]) => tlv(field, value));
@@ -176,7 +188,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
   }
   const inbox = [];
   let socket, service, wallet, signer;
-  let closingChannel;
+  const closingChannels = new Set();
   const failureCode = value => value && value.length >= 2 ? view(value).getUint16(0, true) : null;
   async function next(tag) {
     const deadline = performance.now() + 8000;
@@ -191,7 +203,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       if (frame.tag === 0xa6) {
         // The unsolicited notice can arrive before the close reply. Only status proves settlement.
         const id = frame.fields.get(0x20);
-        check(id?.length === 32 && hex(id) === closingChannel, 'settlement notice identifies the closing channel');
+        check(id?.length === 32 && closingChannels.has(hex(id)), 'settlement notice identifies the closing channel');
         continue;
       }
       message = frame;
@@ -251,11 +263,11 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       return {revision:saved.revision, proofs:Object.values(JSON.parse(saved.data).proofs)};
     } finally { db.close(); }
   }
-  async function status(capacity, accepted, expectedPhase = 0) {
+  async function status(capacity, accepted, expectedPhase = 0, id = channel) {
     step('native channel status');
     const deadline = performance.now() + 8000;
     do {
-      const response = await request(0x25, 0xa5, [[0x20, unhex(channel)]]);
+      const response = await request(0x25, 0xa5, [[0x20, unhex(id)]]);
       const failure = response.get(4);
       if (!(failure?.length === 2 && failureCode(failure) === 12)) {
         const value = response.get(3);
@@ -273,9 +285,12 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
   }
   async function areaCut(x, y) {
     step('native area snapshot');
-    const value = (await request(2, 0x82, [[2, new Uint8Array(16)]])).get(3);
-    check(value?.length === 86 && view(value).getUint16(52, true) === 1, 'one native chunk snapshot');
-    const index = y * 16 + x; // Both fixture grass tiles are in chunk (0,0).
+    const cx = Math.floor(x / 16), cy = Math.floor(y / 16);
+    const chunk = bytes(...point(cx, cy), ...point(cx, cy));
+    const value = (await request(2, 0x82, [[2, chunk]])).get(3);
+    check(value?.length === 86 && hex(value.subarray(0, 16)) === hex(chunk) &&
+      view(value).getUint16(52, true) === 1, 'native snapshot covers the requested chunk');
+    const index = (y - cy * 16) * 16 + x - cx * 16;
     return Boolean(value[54 + (index >> 3)] & (1 << (index & 7)));
   }
   const walletBalance = async mint => (await walletCall('wallet_screen', [mint])).msats;
@@ -295,11 +310,11 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     check(invoice?.confirmed === true && invoice.state === 'ISSUED', 'deposit issued');
     check(await walletBalance(mint) === total, 'deposit spendable in IndexedDB');
   }
-  const requirements = async () => {
-    step('fetch real hoe requirements');
-    const terms = (await request(0x21, 0xa1, [[0x23, bytes(1)]])).get(3);
-    check(terms?.length === 49 && u64(terms, 33) === '5' && Number(u64(terms, 41)) > Date.now() / 1000,
-      'native server offers a 5-msat cut with a future refund');
+  const requirements = async ({name, tag, price} = {name:'hoe', tag:1, price:'5'}) => {
+    step(`fetch real ${name} requirements`);
+    const terms = (await request(0x21, 0xa1, [[0x23, bytes(tag)]])).get(3);
+    check(terms?.length === 49 && u64(terms, 33) === price && Number(u64(terms, 41)) > Date.now() / 1000,
+      `native server offers a ${price}-msat ${name} cut with a future refund`);
     return terms;
   };
   async function fund(mint, player, terms, capacity) {
@@ -331,31 +346,151 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     channel = funding.channel_id;
     await openAndBind(mint, funding, capacity);
   }
-  async function openAndBind(mint, funding, capacity, balance = '0') {
-    check(funding.channel_id === channel, 'opening payload matches the wallet channel ID');
+  async function openAndBind(mint, funding, capacity, balance = '0', tool) {
+    const id = tool ? funding.channel_id : channel;
+    if (!tool) check(funding.channel_id === id, 'opening payload matches the wallet channel ID');
     check(funding.capacity_msats === capacity && await walletBalance(mint) === balance, 'wallet debits exactly the funded capacity');
-    step('admit funded channel on the native server');
-    const opened = await request(0x24, 0xa2, [[0x20, unhex(channel)], [0x24, text(funding.funding_proofs_json)], [0x25, text(funding.params_json)]]);
+    step(`admit funded ${tool?.name ?? 'hoe'} channel on the native server`);
+    const opened = await request(0x24, 0xa2, [[0x20, unhex(id)], ...(tool ? [[0x23, bytes(tool.tag)]] : []),
+      [0x24, text(funding.funding_proofs_json)], [0x25, text(funding.params_json)]]);
     check(opened.get(3)?.length === 0, 'native server accepted real mint funding proofs');
-    const admitted = await status(capacity, '0');
-    const bound = await hoe('bind', scope, channel, admitted.capacity, admitted.accepted);
+    const admitted = await status(capacity, '0', 0, id);
+    const bound = tool ? await toolCall(tool, 'bind', scope, id, admitted.capacity, admitted.accepted)
+      : await hoe('bind', scope, id, admitted.capacity, admitted.accepted);
     check(bound.balance_msats === '0', 'wallet binds new channel at zero accepted');
   }
+  const sendCut = (id, tile, channelId, amount, payment, tool) => request(1, 0x81,
+    [[2, tile], [0x20, unhex(channelId)], [0x21, encodeU64(amount)], [0x22, unhex(payment.signature)],
+      ...(tool ? [[0x23, bytes(tool.tag)]] : [])], id);
   async function cut(x, y, amount, duplicate = false) {
     const id = random(16);
     const payment = await hoe('prepare_cut', scope, channel, hex(id));
     check(payment.balance_msats === amount, 'wallet signs the next cumulative 5-msat increment');
-    const tile = new Uint8Array(8);
-    view(tile).setInt32(0, x, true);
-    view(tile).setInt32(4, y, true);
+    const tile = point(x, y);
     step(duplicate ? 'submit paid duplicate cut' : 'submit signed paid cut');
-    const reply = await request(1, 0x81, [[2, tile], [0x20, unhex(channel)], [0x21, encodeU64(amount)], [0x22, unhex(payment.signature)]], id);
+    const reply = await sendCut(id, tile, channel, amount, payment);
     const failure = reply.get(4);
     if (duplicate) check(failure?.length === 12 && failureCode(failure) === 10, 'native server rejects already-cut tile');
     const state = duplicate ? failure.subarray(2) : reply.get(3);
     check(state?.length === 10 && hex(state.subarray(0, 8)) === hex(tile) && state[8] === 0 && state[9] === 1,
       'native cut result identifies the correct cut grass tile');
     return hex(id);
+  }
+  async function toolCall(tool, op, ...args) {
+    step(`wallet ${tool.name} ${op}`);
+    const result = JSON.parse(await wallet.tool_request(tool.name, op, JSON.stringify(args)));
+    if (result?.status !== 0) walletFailure(result);
+    return result;
+  }
+  async function toolsFlow(mint, player, auth) {
+    const {axe, pickaxe, start} = tools;
+    const at = tile => hex(auth.get(3)) === hex(point(...tile));
+    async function fundTool(tool) {
+      await deposit(mint, tool.price, tool.price);
+      const terms = await requirements(tool);
+      const args = [scope, hex(terms.subarray(0, 33)), u64(terms, 33), u64(terms, 41), hex(player)];
+      const swapUrl = `${mint}/v1/swap`;
+      const beforeQuote = performance.getEntriesByName(swapUrl).length;
+      const quote = await toolCall(tool, 'quote', ...args);
+      check(quote.price_msats === tool.price && quote.capacity_msats === tool.price &&
+        quote.max_debit_msats === tool.price && quote.cuts === '1', `quote offers exactly one ${tool.name} use without fees`);
+      check(await walletBalance(mint) === tool.price && performance.getEntriesByName(swapUrl).length === beforeQuote,
+        `${tool.name} quote neither swaps nor debits before consent`);
+      const funding = await toolCall(tool, 'fund', quote.quote_id, ...args);
+      check(/^[0-9a-f]{64}$/.test(funding.channel_id), `${tool.name} funding returns a channel ID`);
+      await openAndBind(mint, funding, tool.price, '0', tool);
+      return funding.channel_id;
+    }
+    async function harvest(target, tool, payer, expectedFailure) {
+      const channelId = toolChannels[payer.name];
+      const id = random(16);
+      const payment = await toolCall(payer, 'prepare_cut', scope, channelId, hex(id));
+      check(payment.balance_msats === payer.price, `wallet signs exactly one ${payer.name} increment`);
+      const tile = point(...target.tile);
+      step(`submit ${tool.name} cut on ${target.name} terrain using ${payer.name} channel`);
+      const reply = await sendCut(id, tile, channelId, payer.price, payment, tool);
+      const charged = expectedFailure === undefined;
+      if (charged) {
+        const state = reply.get(3);
+        check(state?.length === 10 && hex(state.subarray(0, 8)) === hex(tile) && state[8] === target.terrain && state[9] === 1,
+          `${target.name} cut identifies the expected tile and preserves its base terrain`);
+      } else {
+        const failure = reply.get(4);
+        check(!reply.has(3) && failure?.length === 2 && failureCode(failure) === expectedFailure,
+          `native server rejects ${tool === payer ? 'wrong tool for terrain' : 'wrong channel for tool'}`);
+      }
+      const resolved = await toolCall(payer, 'resolve_cut', scope, channelId, hex(id), charged ? 'charged' : 'not_charged');
+      check(resolved.balance_msats === (charged ? payer.price : '0'), `${payer.name} wallet accepted balance matches the outcome`);
+    }
+    async function move(tile, allowed) {
+      step(`move to (${tile.join(',')}) expecting ${allowed ? 'success' : 'blocked terrain'}`);
+      const reply = await request(3, 0x83, [[2, point(...tile)]]);
+      const failure = reply.get(4);
+      check(allowed ? reply.get(3)?.length === 0 : !reply.has(3) && failure?.length === 2 && failureCode(failure) === 1,
+        'native movement agrees with harvest state');
+    }
+    const toolStatus = (tool, depleted) => status(tool.price, depleted ? tool.price : '0', depleted ? 1 : 0, toolChannels[tool.name]);
+    async function checkBoth(axeDepleted, pickaxeDepleted) {
+      for (const [tool, depleted] of [[axe, axeDepleted], [pickaxe, pickaxeDepleted]]) {
+        const saved = await toolCall(tool, 'inspect', scope);
+        check(saved.admitted && saved.channel_id === toolChannels[tool.name] && saved.capacity_msats === tool.price &&
+          saved.balance_msats === (depleted ? tool.price : '0'), `${tool.name} local binding and balance are independent`);
+        await toolStatus(tool, depleted);
+        check(await areaCut(...tool.tile) === depleted, `${tool.name} tile bitmap matches the expected harvest state`);
+      }
+    }
+    const entries = auth.get(0x28);
+    if (phase === 'tools') {
+      check(at(start) && !entries && !auth.has(0x20), 'fresh tools player is at fixture start with no channels');
+      const axeChannel = await fundTool(axe);
+      // The wallet shares a whole-second setup watermark across tools to keep
+      // deterministic funding outputs distinct. Never retry a funding call.
+      const nextSetup = (Math.floor(Date.now() / 1000) + 1) * 1000;
+      while (Date.now() < nextSetup) await pause(nextSetup - Date.now());
+      toolChannels = {axe:axeChannel, pickaxe:await fundTool(pickaxe)};
+      check(toolChannels.axe !== toolChannels.pickaxe, 'the tools have distinct funded channel IDs');
+      await move(axe.tile, false);
+      await harvest(axe, pickaxe, pickaxe, 9); // Valid pickaxe payment, wrong terrain.
+      await harvest(axe, axe, pickaxe, 1); // Right terrain and tool, wrong channel.
+      await checkBoth(false, false);
+      await harvest(axe, axe, axe);
+      await checkBoth(true, false);
+      await move(axe.tile, true);
+      return toolChannels; // Public IDs only.
+    }
+    check(at(axe.tile), 're-authentication confirms movement onto the harvested tree');
+    check(!auth.has(0x20) && entries?.length === 98, 're-authentication reports exactly two tool channels');
+    for (const [index, tool] of [axe, pickaxe].entries()) {
+      const entry = entries.subarray(index * 49, (index + 1) * 49);
+      check(entry[0] === tool.tag && hex(entry.subarray(1, 33)) === toolChannels[tool.name] &&
+        u64(entry, 33) === tool.price && u64(entry, 41) === (tool === axe ? axe.price : '0'),
+        `native auth restores the ${tool.name} channel at its own balance`);
+    }
+    await checkBoth(true, false);
+    await move(start, true);
+    await move(pickaxe.tile, false);
+    await harvest(pickaxe, pickaxe, pickaxe);
+    await checkBoth(true, true);
+    await move(pickaxe.tile, true);
+    for (const tool of [axe, pickaxe]) {
+      const id = toolChannels[tool.name];
+      step(`close the depleted ${tool.name} channel`);
+      closingChannels.add(id);
+      const closed = await request(0x23, 0xa3, [[0x20, unhex(id)]]);
+      const failed = closed.get(4);
+      check(closed.get(3)?.length === 0 || (failed?.length === 2 && failureCode(failed) === 25),
+        `${tool.name} close succeeded or entered settlement`);
+      const settled = await status(tool.price, tool.price, 3, id);
+      await toolCall(tool, 'finalize', scope, id, settled.capacity, settled.accepted, '');
+      check((await toolCall(tool, 'inspect', scope)).channel_id === null, `${tool.name} settlement releases only its funding slot`);
+      if (tool === axe) {
+        await toolStatus(pickaxe, true);
+        check((await toolCall(pickaxe, 'inspect', scope)).channel_id === toolChannels.pickaxe,
+          'axe settlement leaves the pickaxe journal untouched');
+      }
+    }
+    check(await walletBalance(mint) === '0', 'harvests, reconnect and depleted settlements do not debit ordinary wallet proofs');
+    return true;
   }
   try {
     step('initialize production browser wallet');
@@ -364,6 +499,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     const mint = module.onboarding_mint();
     check(mint === location.origin, 'local mint Wasm fixture');
     check(smoke || typeof module.BrowserWallet.prototype.hoe_request === 'function', 'paid-hoe Wasm bindings (rebuild browser-fixture)');
+    if (tools) check(typeof module.BrowserWallet.prototype.tool_request === 'function', 'paid-tool Wasm bindings (rebuild browser-fixture)');
     if (phase === 'bootstrap') {
       // Public BIP-39 test vector; isolated IndexedDB and fake funds only.
       await module.provision_wallet('abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about', 'haystack-user');
@@ -383,7 +519,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
         const spendable = proofs.filter(proof => proof.state === 'UNSPENT');
         check(spendable.length === 1 && String(spendable[0].proof.amount) === '64' && await walletBalance(mint) === '64',
           'fixture leaves exactly one spendable 64-msat proof after setting aside the smaller denominations');
-      } else {
+      } else if (!tools) {
         await deposit(mint, '10', '10');
       }
     }
@@ -411,6 +547,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     const auth = await next(0xf2);
     check(auth.get(3)?.length === 8, 'native auth accepted');
     if (phase === 'bootstrap') return true;
+    if (tools) return await toolsFlow(mint, player, auth);
     check(auth.get(3).every(byte => byte === 0), 'native auth uses fixture position (0,0)');
     if (phase === 'funding-inspect') {
       check(!auth.has(0x20), 'interrupted funding never opened a native channel');
@@ -541,7 +678,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     check(await areaCut(1, 0), 'depleting cut is visible in the world');
 
     step('close the depleted channel');
-    closingChannel = channel;
+    closingChannels.add(channel);
     const closed = await request(0x23, 0xa3, [[0x20, unhex(channel)]]);
     const closeFailure = closed.get(4);
     check(closed.get(3)?.length === 0 || (closeFailure?.length === 2 && failureCode(closeFailure) === 25),
@@ -565,6 +702,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
 function observeRendererHoe(savedOperation) {
   const replies = window.rendererHoeReplies = {};
   const requests = window.rendererHoeRequests = {};
+  const toolInspects = window.rendererToolInspects = {};
   let bridge;
   Object.defineProperty(window, 'haystackOnboarding', {
     configurable: true,
@@ -572,21 +710,24 @@ function observeRendererHoe(savedOperation) {
     set(value) {
       bridge = value;
       const pending = new Map();
-      const request = bridge.hoeRequest;
+      const request = bridge.toolRequest;
       const deliver = bridge.deliverResponse;
-      bridge.hoeRequest = function(generation, serial, op) {
-        requests[op] = (requests[op] ?? 0) + 1;
-        pending.set(`${generation}:${serial}`, op);
+      bridge.toolRequest = function(generation, serial, tool, op) {
+        if (tool === 1) requests[op] = (requests[op] ?? 0) + 1;
+        pending.set(`${generation}:${serial}`, {tool, op});
         return request.apply(this, arguments);
       };
       bridge.deliverResponse = function(callback, generation, serial, text, startup, limit) {
         if (limit === 65536) {
           const key = `${generation}:${serial}`;
-          const op = pending.get(key);
+          const request = pending.get(key);
           pending.delete(key);
-          if (op) {
+          if (request) {
+            const {tool, op} = request;
             let data;
             try { data = JSON.parse(text); } catch (_) {}
+            if (op === 1 && data?.status === 0) toolInspects[tool] = (toolInspects[tool] ?? 0) + 1;
+            if (tool !== 1) return deliver.apply(this, arguments);
             replies[op] = {
               ok: data?.status === 0,
               twoCutQuote: (op === 2 || op === 9) && data?.cuts === '2' && data.capacity_msats === '10' && data.max_debit_msats === '10',
@@ -677,6 +818,21 @@ async function rendererFlow(areaReady, savedOperation = null) {
     return {x, y, width, height};
   })()`), {x:0, y:0, width, height});
   await settle();
+
+  if (!savedOperation) {
+    // The hotbar's slots are centered at -90, 0, +90 from viewport center.
+    // A slot click and then number keys must load the selected tool's own journal.
+    await click(width / 2, height - 32);
+    await expect('clicking the Axe slot inspects the axe journal', 'rendererToolInspects[0] === 1');
+    for (const number of [1, 3]) {
+      const event = {key:String(number), code:`Digit${number}`, windowsVirtualKeyCode:48 + number};
+      await send('Input.dispatchKeyEvent', {type:'keyDown', ...event});
+      await settle();
+      await send('Input.dispatchKeyEvent', {type:'keyUp', ...event});
+      await expect(`number key ${number} selects its tool`, number === 1 ? 'rendererToolInspects[2] === 1' : 'rendererToolInspects[1] === 2');
+    }
+    assert.equal(cuts, 0, 'switching hotbar slots does not harvest');
+  }
 
   // src/game.zig: the refill button is centered 84 px right of the viewport
   // center and 88 px above the bottom, both before and after the quote.
@@ -818,7 +974,7 @@ async function run() {
 
   stage = 'bootstrap wallet and native player';
   await load();
-  const flow = options => evaluate(`(${pageFlow})(${JSON.stringify({changeRecovery, ...options})})`);
+  const flow = options => evaluate(`(${pageFlow})(${JSON.stringify({changeRecovery, tools:toolsFixture, ...options})})`);
   assert.equal(await flow({phase:'bootstrap', smoke}), true);
   if (changeRecovery) {
     assert.equal(swaps, 0, 'fixture setup sets aside exact denominations without swapping');
@@ -829,12 +985,29 @@ async function run() {
   assert(await stopBrowser(server), 'Could not stop owned fixture server');
   assert.equal(server.exitCode, 0, 'Fixture server must flush the newly authenticated player on shutdown');
   // Spawn is randomized. The real server creates the schema and player row;
-  // move that one row offline next to known grass, without modifying world or ledger.
+  // move that one row offline next to known terrain, without modifying world or ledger.
   const db = new DatabaseSync(join(env.XDG_DATA_HOME, 'haystack-server/game.sqlite'));
   try {
-    assert.equal(db.prepare('UPDATE game_users SET x = 0, y = 0').run().changes, 1);
+    assert.equal(db.prepare('UPDATE game_users SET x = ?, y = ?').run(...(toolsFixture?.start ?? [0, 0])).changes, 1);
   } finally { db.close(); }
   await startServer('existing');
+
+  if (toolsFixture) {
+    stage = 'fund both tools, reject mismatches and harvest the tree';
+    await load(true);
+    const toolChannels = await flow({phase:'tools', smoke});
+    assert.equal(swaps, 2, 'one browser mint swap per one-use channel');
+    assert.equal(opens, 2, 'one native open per tool');
+    assert.equal(cuts, 3, 'one wrong tool, one wrong channel, and one charged axe cut');
+    stage = 'restore distinct tool bindings and harvest the rock after reload';
+    await load(true);
+    assert.equal(await flow({phase:'tools-reconnect', toolChannels}), true);
+    assert.equal(swaps, 2, 'reconnect and pickaxe harvest must not swap');
+    assert.equal(opens, 2, 'reconnect must not reopen either channel');
+    assert.equal(cuts, 4, 'only one more cut after reconnect');
+    console.log('ok - axe (2 msat) and pickaxe (10 msat): mismatches not charged, independent depletion and settlement, restored auth bindings, and movement onto both harvested tiles');
+    return;
+  }
 
   if (renderer) {
     let areaReady = false;

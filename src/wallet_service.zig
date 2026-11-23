@@ -7,6 +7,7 @@ const commands = @import("wallet_commands.zig");
 const sf = @import("storage_fs.zig");
 const Locations = @import("paths.zig").Locations;
 const receiver = @import("wallet_receiver.zig");
+const protocol = @import("shared").protocol;
 const cdk = wallet.cdk;
 
 pub const LiveHoeChannel = receiver.LiveChannel;
@@ -109,6 +110,50 @@ test "delivery reports accepted results only, not idle polls or stale serials" {
     try std.testing.expect(!worker.step(&model, 0));
 }
 
+test "wallet guard validates capacity for the selected tool before funding" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const wallet_path = try std.fmt.allocPrintSentinel(a, "{s}/wallet.sqlite", .{dir}, 0);
+    const ledger_path = try std.fmt.allocPrintSentinel(a, "{s}/channels.sqlite", .{dir}, 0);
+    var headless = try Headless.testing.openWithLedger(t.io, a, wallet_path, ledger_path);
+    defer headless.close() catch unreachable;
+    const guard = headless.tryAcquire().?;
+    defer guard.release();
+    const owner_hex = "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa";
+    var owner: receiver.Pubkey = undefined;
+    _ = try std.fmt.hexToBytes(&owner, owner_hex);
+    const receiver_hex = std.fmt.bytesToHex(headless.receiverPubkey(3600).?, .lower);
+    const now = headless.unixSeconds().?;
+    for ([_]protocol.tool{ .axe, .hoe, .pickaxe }, [_]u64{ 2, 5, 10 }) |tool, price| {
+        for ([_]u64{ price, price + 1 }) |capacity| {
+            const params = try std.json.Stringify.valueAlloc(a, .{
+                .capacity = capacity,
+                .expiry_timestamp = now + 3600,
+                .funding_token_amount = 64,
+                .input_fee_ppk = 0,
+                .keyset_id = "test",
+                .maximum_amount = 64,
+                .mint = "https://mint.example.com",
+                .receiver_pubkey = receiver_hex[0..],
+                .sender_pubkey = owner_hex,
+                .setup_timestamp = now,
+                .unit = "msat",
+            }, .{});
+            const request: receiver.Open = .{ .id = @splat(1), .params_json = params, .funding_proofs_json = "[]" };
+            const expected = if (capacity == price) error.InvalidFundingProof else error.InvalidChannelParameters;
+            try t.expectError(expected, guard.acceptToolFunded(owner, request, now, tool));
+            if (tool == .hoe) try t.expectError(expected, guard.acceptFunded(owner, request, now));
+            try t.expectEqual(null, try guard.lookup(owner, request.id, now));
+        }
+    }
+    try t.expectError(error.ChannelNotFound, guard.closeChannel(owner, @splat(1), now));
+}
+
 const receiver_log = std.log.scoped(.hoe_channels);
 pub const ChannelPhase = receiver.Phase;
 
@@ -203,8 +248,12 @@ pub const Headless = struct {
         }
 
         pub fn acceptFunded(self: Locked, owner: receiver.Pubkey, request: receiver.Open, now: u64) !void {
+            return self.acceptToolFunded(owner, request, now, .hoe);
+        }
+
+        pub fn acceptToolFunded(self: Locked, owner: receiver.Pubkey, request: receiver.Open, now: u64, tool: protocol.tool) !void {
             const store = self.ledger();
-            const accepted = try store.acceptFunded(owner, request, now);
+            const accepted = try store.acceptToolFunded(owner, request, now, tool);
             // Mint verification may have taken time. Do not link an inactive channel.
             const after = self.headless.unixSeconds() orelse return error.ClockUnavailable;
             if (accepted.expiry <= after or accepted.expiry - after <= store.limits.stop_payments_before_expiry_seconds)

@@ -567,8 +567,8 @@ fn stepFrame(
     game_state.paid_hoe.refill_presented = hoe_visible and game_state.paid_hoe.view.can_refill and game_state.hoe_funding.canStart() and
         game_mod.hoeStatusBounds(driver.viewport_w, driver.viewport_h) != null;
     if (hoe_visible) {
-        const debit_limit = if (native_hoe.enabled) native_hoe.refill_debit_limit else 0;
-        rendering.drawHoeStatus(game_state.paid_hoe.view, game_state.hoe_funding, driver.viewport_w, driver.viewport_h, debit_limit);
+        const debit_limit = if (native_hoe.enabled) native_hoe.refillDebitLimit(game_state.selected_tool.protocolTool()) else 0;
+        rendering.drawToolStatus(game_state.selected_tool, game_state.paid_hoe.view, game_state.hoe_funding, driver.viewport_w, driver.viewport_h, debit_limit);
     }
     // Capture after drawing and before `endDrawing` swaps/presents, otherwise
     // the framebuffer read is the cleared back buffer (a black screenshot).

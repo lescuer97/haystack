@@ -24,16 +24,28 @@ pub const Db = struct {
     handle: *c.CdkSpilmanClientStorage_t,
 
     pub fn open(io: Io, root: []const u8) !Db {
+        return openTool(io, root, .hoe);
+    }
+
+    fn openTool(io: Io, root: []const u8, tool: protocol.tool) !Db {
+        // The C ABI fixes its metadata namespaces and pending key. Separate
+        // databases isolate those keys without moving any existing hoe records.
+        const name = switch (tool) {
+            .hoe => filename,
+            .axe => "spilman-axe.sqlite",
+            .pickaxe => "spilman-pickaxe.sqlite",
+        };
         if (!std.fs.path.isAbsolute(root)) return error.InvalidPath;
         const dir = try sf.openOwnedDir(io, root, .{ .iterate = true });
         defer dir.close(io);
         try checkLegacy(io, dir);
 
-        for ([_][]const u8{ filename ++ "-journal", filename ++ "-wal", filename ++ "-shm" }) |sidecar| {
-            _ = try verifyFile(io, dir, sidecar);
+        for ([_][]const u8{ "-journal", "-wal", "-shm" }) |suffix| {
+            var buf: [64]u8 = undefined;
+            _ = try verifyFile(io, dir, try std.fmt.bufPrint(&buf, "{s}{s}", .{ name, suffix }));
         }
-        if (!try verifyFile(io, dir, filename)) {
-            const file = try dir.createFile(io, filename, .{ .exclusive = true, .permissions = sf.mode_file });
+        if (!try verifyFile(io, dir, name)) {
+            const file = try dir.createFile(io, name, .{ .exclusive = true, .permissions = sf.mode_file });
             defer file.close(io);
             try sf.verifyFile(try file.stat(io));
             try sf.verifyNoExtendedAcl(file);
@@ -42,7 +54,7 @@ pub const Db = struct {
         const a = std.heap.page_allocator;
         const real_root = try dir.realPathFileAlloc(io, ".", a);
         defer a.free(real_root);
-        const path = try std.fmt.allocPrintSentinel(a, "{s}/" ++ filename, .{real_root}, 0);
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ real_root, name }, 0);
         defer a.free(path);
         const result = c.cdk_spilman_client_storage_open(path);
         defer c.cdk_string_free(result.@"error");
@@ -211,10 +223,15 @@ pub const Journal = struct {
     };
 
     db: Db,
+    tool: protocol.tool = .hoe,
 
     /// `root` must be an already durable, private Haystack directory.
     pub fn open(io: Io, root: []const u8) !Journal {
-        return .{ .db = try Db.open(io, root) };
+        return openTool(io, root, .hoe);
+    }
+
+    pub fn openTool(io: Io, root: []const u8, tool: protocol.tool) !Journal {
+        return .{ .db = try Db.openTool(io, root, tool), .tool = tool };
     }
 
     pub fn close(self: Journal, _: Io) void {
@@ -277,13 +294,19 @@ pub const Scope = struct {
     receiver: Pubkey,
     /// The recovered local sender key's true compressed public key.
     player: Pubkey,
+    tool: protocol.tool = .hoe,
 
     fn digest(self: Scope) ![32]u8 {
         if (self.server.len == 0 or std.mem.indexOfScalar(u8, self.server, 0) != null or
             !compressed(self.receiver) or !compressed(self.player) or
             eql(u8, self.receiver[1..], self.player[1..])) return error.InvalidScope;
         var hash = Sha256.init(.{});
-        hash.update("haystack/hoe-channel-store/v1");
+        if (self.tool == .hoe) {
+            hash.update("haystack/hoe-channel-store/v1");
+        } else {
+            hash.update("haystack/tool-channel-store/v1");
+            hash.update(&.{@backingInt(self.tool)});
+        }
         hash.update(&self.receiver);
         hash.update(&self.player);
         hash.update(self.server);
@@ -353,11 +376,16 @@ pub const Store = struct {
     scope: [32]u8,
     receiver: Pubkey,
     player: Pubkey,
+    tool: protocol.tool = .hoe,
 
     /// `root` must be an existing, durable private Haystack directory.
     pub fn open(io: Io, root: []const u8, scope: Scope) !Store {
         const digest = try scope.digest();
-        return .{ .db = try Db.open(io, root), .scope = digest, .receiver = scope.receiver, .player = scope.player };
+        return .{ .db = try Db.openTool(io, root, scope.tool), .scope = digest, .receiver = scope.receiver, .player = scope.player, .tool = scope.tool };
+    }
+
+    pub fn journal(self: Store) Journal {
+        return .{ .db = self.db, .tool = self.tool };
     }
 
     pub fn close(self: Store, _: Io) void {
@@ -368,6 +396,7 @@ pub const Store = struct {
     /// this known scope. This is not an admission API for untrusted input.
     /// A byte-identical retry is safe.
     pub fn saveFunded(self: Store, io: Io, a: Allocator, pending: Journal, verified: anytype) !void {
+        if (pending.tool != self.tool) return error.ScopeMismatch;
         const channel: Funded = .{
             .operation_id = verified.operation_id,
             .id = verified.id,
@@ -389,7 +418,7 @@ pub const Store = struct {
         defer if (entry) |saved| saved.deinit();
         const request = if (entry) |saved| request: {
             const swap = saved.value.operation.mint_swap;
-            try matchFunding(a, swap, channel);
+            try matchFunding(self.tool, a, swap, channel);
             break :request swap.request_json;
         } else "";
         const data = try std.json.Stringify.valueAlloc(a, Record{
@@ -484,6 +513,7 @@ pub const Store = struct {
     /// An absent journal entry is allowed on retry, but a missing, corrupt,
     /// or non-durable channel entry never authorizes retiring the journal.
     pub fn retireFundingAfterWalletRecovery(self: Store, io: Io, a: Allocator, pending: Journal, id: Id) !void {
+        if (pending.tool != self.tool) return error.ScopeMismatch;
         const saved = try self.read(io, a, id);
         defer saved.deinit();
         const channel = saved.value.channel;
@@ -492,7 +522,7 @@ pub const Store = struct {
             else => return err,
         };
         defer entry.deinit();
-        try matchFunding(a, entry.value.operation.mint_swap, channel);
+        try matchFunding(self.tool, a, entry.value.operation.mint_swap, channel);
         try pending.retire(io, channel.operation_id);
     }
 
@@ -627,11 +657,12 @@ test "funded channel discovery persists admission and holds settlement until rel
     try t.expectEqual(null, try store.discover(t.io, t.allocator));
 }
 
-fn matchFunding(a: Allocator, swap: Journal.MintSwap, channel: Funded) !void {
+fn matchFunding(tool: protocol.tool, a: Allocator, swap: Journal.MintSwap, channel: Funded) !void {
     if (swap.kind != .funding or !eql(u8, swap.mint_url, channel.mint_url)) return error.FundingMismatch;
     // Read the part of hoe_funding's journal material shared with the store.
     const parsed = try std.json.parseFromSlice(struct {
         version: u32,
+        tool: protocol.tool = .hoe,
         capacity_msats: u64,
         refund_time: u64,
         channel_secret_hex: []const u8,
@@ -641,7 +672,7 @@ fn matchFunding(a: Allocator, swap: Journal.MintSwap, channel: Funded) !void {
     }, a, swap.completion_material, .{});
     defer parsed.deinit();
     const m = parsed.value;
-    if (m.version != 1 or m.funding_secrets_json.len == 0 or
+    if (m.version != 1 or m.tool != tool or m.funding_secrets_json.len == 0 or
         m.capacity_msats != channel.capacity_msats or m.refund_time != channel.refund_time or
         !eql(u8, m.channel_secret_hex, channel.channel_secret_hex) or
         !eql(u8, m.params_json, channel.params_json) or !eql(u8, m.keyset_json, channel.keyset_json)) return error.FundingMismatch;
@@ -763,4 +794,30 @@ test "legacy recovery records block SQLite open without modification" {
     try t.expectError(error.FileNotFound, dir.statFile(t.io, filename, .{}));
     const journal = try Journal.open(t.io, root);
     defer journal.close(t.io);
+}
+
+test "each tool reopens only its own journal, keeping the original hoe database" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(&tmp);
+    defer t.allocator.free(root);
+    {
+        const legacy = try Journal.open(t.io, root);
+        defer legacy.close(t.io);
+        try legacy.prepare(t.io, t.allocator, mint_id, funding_swap);
+    }
+    for ([_]protocol.tool{ .axe, .pickaxe }) |tool| {
+        const journal = try Journal.openTool(t.io, root, tool);
+        defer journal.close(t.io);
+        try t.expectError(error.FileNotFound, journal.read(t.io, t.allocator, mint_id));
+        try journal.prepare(t.io, t.allocator, mint_id, close_swap);
+    }
+    for (protocol.tools) |tool| {
+        const journal = try Journal.openTool(t.io, root, tool);
+        defer journal.close(t.io);
+        const saved = try journal.read(t.io, t.allocator, mint_id);
+        defer saved.deinit();
+        const expected = if (tool == .hoe) funding_swap else close_swap;
+        try t.expectEqualDeep(expected, saved.value.operation);
+    }
 }

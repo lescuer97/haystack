@@ -72,10 +72,12 @@ pub const Live = struct {
     /// Copy the actual configured WebSocket endpoint, not a server-supplied label.
     server: Endpoint,
     session: u64,
+    tool: protocol.tool = .hoe,
     requirements: protocol.SpillmanChannelRequirementsRes,
 };
 
 pub const PlayScope = struct {
+    tool: protocol.tool = .hoe,
     server: Endpoint,
     receiver: [33]u8,
     /// Authenticated x-only identity encoded as a compressed public key.
@@ -95,6 +97,7 @@ pub const BindPlay = struct {
 pub const SenderProofs = Text(protocol.max_sender_change_proofs_bytes);
 
 pub const PlayView = struct {
+    tool: protocol.tool = .hoe,
     id: channels.Id,
     /// Durable evidence of admission, not evidence that the server is still open.
     confirmed: bool,
@@ -111,12 +114,12 @@ pub const PlayView = struct {
 pub const Request = union(enum) {
     bind_play: BindPlay,
     /// Only after an authenticated open acknowledgement or status for this ID.
-    mark_admitted: struct { session: u64, id: channels.Id },
+    mark_admitted: struct { session: u64, tool: protocol.tool = .hoe, id: channels.Id },
     /// Only for a correlated, authenticated settled reply. Null proofs mean
     /// the server confirmed that there is no sender change.
-    finalize_settled: struct { session: u64, id: channels.Id, sender_proofs: ?SenderProofs },
-    prepare_cut: struct { session: u64, id: protocol.Id, tile: protocol.Location },
-    resolve_cut: struct { session: u64, id: protocol.Id, resolution: HoePayment.State.Resolution },
+    finalize_settled: struct { session: u64, tool: protocol.tool = .hoe, id: channels.Id, sender_proofs: ?SenderProofs },
+    prepare_cut: struct { session: u64, tool: protocol.tool = .hoe, id: protocol.Id, tile: protocol.Location },
+    resolve_cut: struct { session: u64, tool: protocol.tool = .hoe, id: protocol.Id, resolution: HoePayment.State.Resolution },
     /// Returns the largest affordable whole-cut offer, up to ten cuts. Does
     /// not reserve or spend money. First use can open the existing CDK wallet
     /// (with its standard startup recovery) and initialize local storage.
@@ -136,6 +139,7 @@ pub const Request = union(enum) {
 };
 
 pub const Open = struct {
+    tool: protocol.tool = .hoe,
     id: [32]u8,
     operation_id: funding.OperationId,
     capacity_msats: u64,
@@ -145,11 +149,12 @@ pub const Open = struct {
 
     /// Borrows only from this copy; keep it alive through wire encoding.
     pub fn payload(self: *const Open) protocol.SpillmanChannelOpen {
-        return .{ .id = self.id, .params = self.params.slice(), .proof = self.proof.slice() };
+        return .{ .id = self.id, .tool = self.tool, .params = self.params.slice(), .proof = self.proof.slice() };
     }
 
-    fn copy(channel: anytype) !Open {
+    fn copy(tool: protocol.tool, channel: anytype) !Open {
         var out: Open = .{
+            .tool = tool,
             .id = channel.id,
             .operation_id = channel.operation_id,
             .capacity_msats = channel.capacity_msats,
@@ -218,10 +223,10 @@ pub const State = struct {
             const previous = try HoePayment.State.fromLocal(store, found.*);
             if (req.active) |active| {
                 if (!std.meta.eql(active.id, found.id)) return error.ChannelMismatch;
-                if (!protocol.validHoeCapacity(active.capacity_msats) or active.capacity_msats != found.capacity_msats) return error.CapacityMismatch;
+                if (!store.tool.validCapacity(active.capacity_msats) or active.capacity_msats != found.capacity_msats) return error.CapacityMismatch;
 
                 if (found.state.settlement == null) {
-                    const balance = try HoePayment.State.reconcile(previous, store.scope, active.id, active.balance_msats, found.capacity_msats);
+                    const balance = try HoePayment.State.reconcile(store.tool, previous, store.scope, active.id, active.balance_msats, found.capacity_msats);
                     var lifecycle = found.state;
                     lifecycle.admitted = true;
                     lifecycle.confirmed_balance_msats = balance.confirmed_balance_msats;
@@ -234,7 +239,7 @@ pub const State = struct {
         } else if (req.active != null) return error.NoFundedChannel;
         self.play_scope = req.scope;
         self.play_session = req.session;
-        return if (local) |found| playView(found, self.active != null) else null;
+        return if (local) |found| playView(store.tool, found, self.active != null) else null;
     }
 
     fn clearActive(self: *State, io: std.Io) void {
@@ -253,7 +258,7 @@ pub const State = struct {
         // Auth identifies an x-only key; the store uses the actual compressed key.
         if ((scope.player[0] != 2 and scope.player[0] != 3) or
             !std.mem.eql(u8, scope.player[1..], self.signer.pubkey[1..])) return error.IdentityMismatch;
-        return .{ .server = scope.server.slice(), .receiver = scope.receiver, .player = self.signer.pubkey };
+        return .{ .server = scope.server.slice(), .receiver = scope.receiver, .player = self.signer.pubkey, .tool = scope.tool };
     }
 
     fn openPlayStore(self: *State, io: std.Io, paths: wallet.Paths, scope: *const PlayScope) !channels.Store {
@@ -267,13 +272,14 @@ pub const State = struct {
         try store.writeLifecycle(a, local.id, lifecycle);
     }
 
-    fn playView(local: channels.LocalChannel, server_active: bool) PlayView {
+    fn playView(tool: protocol.tool, local: channels.LocalChannel, server_active: bool) PlayView {
         return .{
             .id = local.id,
+            .tool = tool,
             .confirmed = local.state.admitted,
             .server_active = server_active,
             .refund_time = local.refund_time,
-            .cuts_left = if (server_active) (local.capacity_msats - local.state.confirmed_balance_msats) / funding.price_msats else 0,
+            .cuts_left = if (server_active) (local.capacity_msats - local.state.confirmed_balance_msats) / tool.priceMsat() else 0,
             .capacity_msats = local.capacity_msats,
             .confirmed_balance_msats = local.state.confirmed_balance_msats,
             .payment_pending = local.state.pending_cut != null,
@@ -294,13 +300,14 @@ pub const State = struct {
     fn finalizeSettled(self: *State, io: std.Io, paths: wallet.Paths, owner: *?wallet.Wallet, req: @FieldType(Request, "finalize_settled")) !u64 {
         if (self.play_session != req.session) return error.StalePlaySession;
         const scope = self.play_scope orelse return error.MissingPlayScope;
+        if (scope.tool != req.tool) return error.ScopeMismatch;
         const store = try self.openPlayStore(io, paths, &scope);
         defer store.close(io);
         const saved = try store.read(io, a, req.id);
         defer saved.deinit();
         const channel = saved.value.channel;
         const policy = try mintPolicy(wallet.cdk.app_mint);
-        if (!std.mem.eql(u8, channel.mint_url, policy.mint_url) or !protocol.validHoeCapacity(channel.capacity_msats)) return error.PendingMismatch;
+        if (!std.mem.eql(u8, channel.mint_url, policy.mint_url) or !store.tool.validCapacity(channel.capacity_msats)) return error.PendingMismatch;
 
         const proofs = if (req.sender_proofs) |*text| blk: {
             if (text.len == 0 or text.len > protocol.max_sender_change_proofs_bytes) return error.InvalidSenderProofs;
@@ -319,7 +326,7 @@ pub const State = struct {
         self.clearOps(io);
 
         const handle = try walletHandle(io, paths, owner);
-        var ops: ops_mod.Ops = .{ .store = store, .journal = .{ .db = store.db }, .wallet = handle, .policy = policy };
+        var ops: ops_mod.Ops = .{ .store = store, .journal = store.journal(), .wallet = handle, .policy = policy };
         const funding_to_retire = try ops.closeFunding(io, a, channel.id);
         if (state.settlement == null) {
             var sender_key: [64:0]u8 = undefined;
@@ -354,6 +361,7 @@ pub const State = struct {
             .mark_admitted => |req| {
                 if (self.play_session != req.session) return error.StalePlaySession;
                 const scope = self.play_scope orelse return error.MissingPlayScope;
+                if (scope.tool != req.tool) return error.ScopeMismatch;
                 const store = try self.openPlayStore(io, paths, &scope);
                 defer store.close(io);
                 const local = (try store.discover(io, a)) orelse return error.NoFundedChannel;
@@ -369,6 +377,7 @@ pub const State = struct {
             .prepare_cut => |req| {
                 if (self.play_session != req.session or self.active == null) return error.NoActiveChannel;
                 const active = &self.active.?;
+                if (active.store.tool != req.tool) return error.ScopeMismatch;
                 var balance = try HoePayment.State.fromLocal(active.store, active.local);
                 const cut = try balance.prepareCut(io, a, &active.store, &self.signer, active.local.capacity_msats, req.id, req.tile);
                 try self.commitCut(io, balance);
@@ -377,10 +386,11 @@ pub const State = struct {
             .resolve_cut => |req| {
                 if (self.play_session != req.session or self.active == null) return error.NoActiveChannel;
                 const active = &self.active.?;
+                if (active.store.tool != req.tool) return error.ScopeMismatch;
                 var balance = try HoePayment.State.fromLocal(active.store, active.local);
                 try balance.resolve(req.id, req.resolution);
                 try self.commitCut(io, balance);
-                return .{ .cut_resolved = playView(active.local, true) };
+                return .{ .cut_resolved = playView(active.store.tool, active.local, true) };
             },
         };
         if (self.play_session != live.session or self.active != null) return error.FundingUnavailable;
@@ -389,7 +399,7 @@ pub const State = struct {
         _ = try loopbackPort(server, "ws://127.0.0.1:", true);
         const policy = comptime mintPolicy(wallet.cdk.app_mint) catch @compileError("hoe funding requires the exact Testnut URL or a local fake mint");
         const play_scope = self.play_scope orelse return error.MissingPlayScope;
-        if (!std.mem.eql(u8, play_scope.server.slice(), server) or !std.meta.eql(play_scope.receiver, live.requirements.pubkey)) return error.ScopeMismatch;
+        if (play_scope.tool != live.tool or !std.mem.eql(u8, play_scope.server.slice(), server) or !std.meta.eql(play_scope.receiver, live.requirements.pubkey)) return error.ScopeMismatch;
         const scope = try self.channelScope(io, paths, &play_scope);
         if (self.ops == null) {
             if (request == .fund_with_consent) return error.StaleOffer;
@@ -408,7 +418,7 @@ pub const State = struct {
         if (request == .recover_funding) {
             var channel = try ops.recoverFunding(io, a, request.recover_funding.operation_id);
             defer channel.deinit();
-            return .{ .funded = try Open.copy(channel) };
+            return .{ .funded = try Open.copy(live.tool, channel) };
         }
 
         var hex: [64:0]u8 = undefined;
@@ -420,12 +430,12 @@ pub const State = struct {
             .fund_with_consent => |req| blk: {
                 var channel = try ops.fundWithConsent(io, a, req.offer, live.requirements, sender);
                 defer channel.deinit();
-                break :blk .{ .funded = try Open.copy(channel) };
+                break :blk .{ .funded = try Open.copy(live.tool, channel) };
             },
             .resume_funding => |req| blk: {
                 var channel = try ops.resumeFunding(io, a, req.operation_id, live.requirements, sender);
                 defer channel.deinit();
-                break :blk .{ .funded = try Open.copy(channel) };
+                break :blk .{ .funded = try Open.copy(live.tool, channel) };
             },
             .recover_funding, .inspect, .bind_play, .mark_admitted, .finalize_settled, .prepare_cut, .resolve_cut => unreachable,
         };
@@ -527,7 +537,7 @@ fn inspect(ops: *const ops_mod.Ops, io: std.Io, a: std.mem.Allocator) !Pending {
             if (!std.mem.eql(u8, &channel.operation_id, &done.send.operation_id) or channel.capacity_msats != mark.offer.capacity_msats or
                 channel.refund_time != mark.offer.requirements.refundTime or
                 !std.mem.eql(u8, channel.mint_url, mark.mint_url)) return error.PendingMismatch;
-            break :blk .{ .funded = try Open.copy(channel) };
+            break :blk .{ .funded = try Open.copy(ops.store.tool, channel) };
         },
     };
 }
@@ -539,10 +549,14 @@ pub fn enabled(comptime mint: [:0]const u8, server: []const u8) bool {
 }
 
 pub fn refillDebitLimit(comptime mint: [:0]const u8) u64 {
+    return toolRefillDebitLimit(mint, .hoe);
+}
+
+pub fn toolRefillDebitLimit(comptime mint: [:0]const u8, tool: protocol.tool) u64 {
     const policy = comptime mintPolicy(mint) catch return 0;
-    // For up to 50 msat, each of the three mint fee passes costs at most
+    // For up to 100 msat, each of the three mint fee passes costs at most
     // 1 msat on Testnut (fewer than ten proofs in the binary split).
-    return protocol.hoe_capacity_msat + (if (policy.input_fee_ppk == 0) @as(u64, 0) else 3) + policy.max_sender_fee_msats;
+    return tool.priceMsat() * protocol.hoe_refill_cuts + (if (policy.input_fee_ppk == 0) @as(u64, 0) else 3) + policy.max_sender_fee_msats;
 }
 
 fn mintPolicy(comptime mint: [:0]const u8) !funding.Policy {
@@ -649,6 +663,9 @@ test "a restarted worker retains the local balance and reconciles only exact pen
 
     const cut_id: protocol.Id = @splat(3);
     const prepare: Request = .{ .prepare_cut = .{ .id = cut_id, .session = 1, .tile = .{ .x = 0, .y = 0 } } };
+    var wrong_tool = prepare;
+    wrong_tool.prepare_cut.tool = .axe;
+    try t.expectError(error.ScopeMismatch, state.execute(t.io, paths, &owner, wrong_tool));
     const active = state.active.?;
     var balance = try HoePayment.State.fromLocal(active.store, active.local);
     // This storage fixture has no spendable proofs. Commit the same reservation
@@ -758,8 +775,6 @@ const HoePayment = struct {
     pub const Payment = protocol.SpillmanChannelPayment;
     pub const CutRequest = protocol.RequestFor(.cut);
 
-    const cost_msats = protocol.hoe_price_msat;
-
     const Error = error{
         NoActiveChannel,
         BalanceUnknown,
@@ -777,6 +792,7 @@ const HoePayment = struct {
     pub const State = struct {
         const Self = @This();
 
+        tool: protocol.tool,
         scope: [32]u8,
         channel_id: channels.Id,
         confirmed_balance_msats: u64,
@@ -784,11 +800,12 @@ const HoePayment = struct {
 
         pub fn fromLocal(store: channels.Store, local: channels.LocalChannel) Error!Self {
             const balance = local.state.confirmed_balance_msats;
-            if (balance > local.capacity_msats or balance % cost_msats != 0) return error.BalanceUnknown;
+            if (!store.tool.validCapacity(local.capacity_msats) or balance > local.capacity_msats or balance % store.tool.priceMsat() != 0) return error.BalanceUnknown;
             if (local.state.pending_cut) |pending| {
-                if (pending.amount != try nextBalance(balance, local.capacity_msats)) return error.BalanceUnknown;
+                if (pending.amount != try nextBalance(store.tool, balance, local.capacity_msats)) return error.BalanceUnknown;
             }
             return .{
+                .tool = store.tool,
                 .scope = store.scope,
                 .channel_id = local.id,
                 .confirmed_balance_msats = balance,
@@ -796,11 +813,11 @@ const HoePayment = struct {
             };
         }
 
-        pub fn reconcile(previous: ?Self, scope: [32]u8, id: channels.Id, balance: u64, capacity: u64) Error!Self {
-            if (balance > capacity or balance % cost_msats != 0) return error.BalanceUnknown;
-            const fresh: Self = .{ .scope = scope, .channel_id = id, .confirmed_balance_msats = balance };
+        pub fn reconcile(tool: protocol.tool, previous: ?Self, scope: [32]u8, id: channels.Id, balance: u64, capacity: u64) Error!Self {
+            if (balance > capacity or balance % tool.priceMsat() != 0) return error.BalanceUnknown;
+            const fresh: Self = .{ .tool = tool, .scope = scope, .channel_id = id, .confirmed_balance_msats = balance };
             var old = previous orelse return fresh;
-            const same_channel = eql(u8, &old.channel_id, &id) and eql(u8, &old.scope, &scope);
+            const same_channel = old.tool == tool and eql(u8, &old.channel_id, &id) and eql(u8, &old.scope, &scope);
             if (old.prepared) |pending| {
                 if (!same_channel) return error.PaymentUnresolved;
                 const resolution: Resolution = if (balance == pending.amount) .charged else if (balance == old.confirmed_balance_msats) .not_charged else return error.PaymentUnresolved;
@@ -815,7 +832,7 @@ const HoePayment = struct {
         /// request is reserved, not charged. If dispatch is ambiguous, leave it
         /// reserved until the charge is resolved authoritatively.
         pub fn prepareCut(self: *Self, io: std.Io, a: std.mem.Allocator, store: *const channels.Store, identity: *const Signer, capacity: u64, request_id: protocol.Id, tile: protocol.Location) Error!CutRequest {
-            if (!eql(u8, &self.scope, &store.scope)) return error.NoActiveChannel;
+            if (self.tool != store.tool or !eql(u8, &self.scope, &store.scope)) return error.NoActiveChannel;
             if (self.prepared != null) return error.PaymentUnresolved;
             if (!eql(u8, &identity.pubkey, &store.player)) return error.IdentityMismatch;
 
@@ -827,14 +844,14 @@ const HoePayment = struct {
             const channel = record.value.channel;
             const now = std.Io.Clock.real.now(io).toSeconds();
             if (now < 0 or @as(u64, @intCast(now)) >= channel.refund_time or channel.capacity_msats != capacity) return error.ChannelUnavailable;
-            const amount = try nextBalance(self.confirmed_balance_msats, capacity);
+            const amount = try nextBalance(self.tool, self.confirmed_balance_msats, capacity);
 
             var secret_hex: [64:0]u8 = undefined;
             defer std.crypto.secureZero(u8, &secret_hex);
             try senderKey(identity, &secret_hex);
             const payment = try sign(a, channel, &secret_hex, amount);
             self.prepared = .{ .request_id = request_id, .amount = amount };
-            return .{ .request_id = request_id, .payload = .{ .x = tile.x, .y = tile.y, .payment = payment } };
+            return .{ .request_id = request_id, .payload = .{ .x = tile.x, .y = tile.y, .payment = payment, .tool = self.tool } };
         }
 
         pub const Resolution = enum { charged, not_charged };
@@ -860,8 +877,8 @@ const HoePayment = struct {
         hex[64] = 0;
     }
 
-    fn nextBalance(previous: u64, capacity: u64) Error!u64 {
-        const next = std.math.add(u64, previous, cost_msats) catch return error.InsufficientCapacity;
+    fn nextBalance(tool: protocol.tool, previous: u64, capacity: u64) Error!u64 {
+        const next = std.math.add(u64, previous, tool.priceMsat()) catch return error.InsufficientCapacity;
         if (next > capacity) return error.InsufficientCapacity;
         return next;
     }
@@ -887,23 +904,43 @@ const HoePayment = struct {
 };
 
 test "next balance costs five msats, including when capacity is exact" {
-    try t.expectEqual(@as(u64, 5), try HoePayment.nextBalance(0, 15));
-    try t.expectEqual(@as(u64, 15), try HoePayment.nextBalance(10, 15));
-    try t.expectError(error.InsufficientCapacity, HoePayment.nextBalance(10, 14));
-    try t.expectError(error.InsufficientCapacity, HoePayment.nextBalance(std.math.maxInt(u64) - 1, std.math.maxInt(u64)));
+    try t.expectEqual(@as(u64, 5), try HoePayment.nextBalance(.hoe, 0, 15));
+    try t.expectEqual(@as(u64, 15), try HoePayment.nextBalance(.hoe, 10, 15));
+    try t.expectError(error.InsufficientCapacity, HoePayment.nextBalance(.hoe, 10, 14));
+    try t.expectError(error.InsufficientCapacity, HoePayment.nextBalance(.hoe, std.math.maxInt(u64) - 1, std.math.maxInt(u64)));
 }
 
 test "a reconnect resolves only the exact pending balance in the same scope" {
-    var previous = try HoePayment.State.reconcile(null, @splat(1), @splat(2), 10, 24);
+    var previous = try HoePayment.State.reconcile(.hoe, null, @splat(1), @splat(2), 10, 24);
     previous.prepared = .{ .request_id = @splat(3), .amount = 15 };
     try t.expectError(error.UnexpectedResolution, previous.resolve(@splat(4), .not_charged));
     for ([_]u64{ 10, 15 }) |balance| {
-        const settled = try HoePayment.State.reconcile(previous, previous.scope, previous.channel_id, balance, 24);
+        const settled = try HoePayment.State.reconcile(.hoe, previous, previous.scope, previous.channel_id, balance, 24);
         try t.expectEqual(balance, settled.confirmed_balance_msats);
         try t.expect(settled.prepared == null);
     }
-    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(previous, previous.scope, previous.channel_id, 20, 24));
-    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(previous, @splat(9), previous.channel_id, 15, 24));
-    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(previous, previous.scope, @splat(9), 15, 24));
-    try t.expectError(error.BalanceUnknown, HoePayment.State.reconcile(previous, previous.scope, previous.channel_id, 25, 24));
+    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.hoe, previous, previous.scope, previous.channel_id, 20, 24));
+    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.hoe, previous, @splat(9), previous.channel_id, 15, 24));
+    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.hoe, previous, previous.scope, @splat(9), 15, 24));
+    try t.expectError(error.BalanceUnknown, HoePayment.State.reconcile(.hoe, previous, previous.scope, previous.channel_id, 25, 24));
+}
+
+test "reconciliation and refill debit are bound to the price and tool" {
+    const mint = "https://testnut.cashu.space/";
+    for (protocol.tools) |tool| {
+        const price = tool.priceMsat();
+        const capacity = price * protocol.hoe_refill_cuts;
+        try t.expectEqual(capacity + 5, toolRefillDebitLimit(mint, tool));
+        try t.expectEqual(capacity, toolRefillDebitLimit("http://127.0.0.1:18787", tool));
+        try t.expectEqual(capacity, try HoePayment.nextBalance(tool, capacity - price, capacity));
+        var previous = try HoePayment.State.reconcile(tool, null, @splat(1), @splat(2), price, capacity);
+        previous.prepared = .{ .request_id = @splat(3), .amount = price * 2 };
+        const recovered = try HoePayment.State.reconcile(tool, previous, previous.scope, previous.channel_id, price * 2, capacity);
+        try t.expectEqual(price * 2, recovered.confirmed_balance_msats);
+        try t.expect(recovered.prepared == null);
+        try t.expectError(error.BalanceUnknown, HoePayment.State.reconcile(tool, previous, previous.scope, previous.channel_id, price + 1, capacity));
+    }
+    var pending = try HoePayment.State.reconcile(.axe, null, @splat(1), @splat(2), 8, 20);
+    pending.prepared = .{ .request_id = @splat(3), .amount = 10 };
+    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.pickaxe, pending, pending.scope, pending.channel_id, 10, 20));
 }

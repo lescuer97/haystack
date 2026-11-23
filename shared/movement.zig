@@ -1,26 +1,46 @@
-//! Single-tile movement against generated terrain, independent of chunk residency.
+//! Single-tile movement against terrain and optional harvest state.
 const std = @import("std");
 const Location = @import("protocol.zig").Location;
 const world = @import("world.zig");
 
 pub const spawn: Location = .{ .x = 0, .y = 0 };
 
+const NoCleared = struct {
+    pub fn isCleared(_: @This(), _: Location) bool {
+        return false;
+    }
+};
+pub const AllCleared = struct {
+    pub fn isCleared(_: @This(), _: Location) bool {
+        return true;
+    }
+};
+
 fn walkable(pos: Location) bool {
+    return walkableWith(pos, NoCleared{});
+}
+
+fn walkableWith(pos: Location, state: anytype) bool {
     return switch (world.sampleTile(world.public_seed, pos.x, pos.y)) {
         .grass, .dirt => true,
-        .rock, .tree, .water => false,
+        .rock, .tree => state.isCleared(pos),
+        .water => false,
     };
 }
 
-/// A diagonal also needs both side tiles clear. An unchanged position is a no-op.
 pub fn canStep(from: Location, to: Location) bool {
+    return canStepWith(from, to, NoCleared{});
+}
+
+/// A diagonal also needs both side tiles clear. An unchanged position is a no-op.
+pub fn canStepWith(from: Location, to: Location, state: anytype) bool {
     const dx = @as(i64, to.x) - from.x;
     const dy = @as(i64, to.y) - from.y;
     if (dx == 0 and dy == 0) return true;
-    if (@abs(dx) > 1 or @abs(dy) > 1 or !walkable(to)) return false;
+    if (@abs(dx) > 1 or @abs(dy) > 1 or !walkableWith(to, state)) return false;
     if (dx == 0 or dy == 0) return true;
-    return walkable(.{ .x = to.x, .y = from.y }) and
-        walkable(.{ .x = from.x, .y = to.y });
+    return walkableWith(.{ .x = to.x, .y = from.y }, state) and
+        walkableWith(.{ .x = from.x, .y = to.y }, state);
 }
 
 test "walkable spawn and moves across a negative chunk boundary" {

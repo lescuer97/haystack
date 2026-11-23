@@ -8,8 +8,8 @@ The demo is a chunk-streaming viewer: the camera pans over an endless,
 deterministically generated tile world, and only the chunks near the view are
 kept in memory. The player moves one tile at a time against generated terrain,
 and the camera follows accepted steps. Dragging pans the view without moving the
-player. The standalone server uses the same terrain rule, but the client does
-not connect to it yet.
+player. The client and server both use the generated terrain and confirmed
+harvest state for movement.
 `Esc` toggles the demonstration menu; see `menu.md` for its controls and
 extension points.
 
@@ -19,9 +19,14 @@ With WASD, arrows, or a controller, the first press in a new facing direction
 turns the player in place. Press again or keep holding to step. Accepted steps
 play the walk animation; blocked steps don't. Releasing movement returns to
 idle. Mouse drag only pans the view.
-Click grass or press `Space` to aim a paid hoe cut. Keys `1`–`5` preview the
-pickaxe, axe, hoe, watering can, and collapse animations without affecting
-terrain, health, or inventory.
+Click the hotbar or press `1` for Pickaxe, `2` for Axe, or `3` for Hoe. The
+hoe starts selected. Aim with a world click or use `Space` on the tile you
+face: the pickaxe clears rock (10 msats), the axe clears trees (2 msats),
+and the hoe cuts grass (5 msats). Refill each tool separately. You can switch
+slots while a payment is pending; it still charges and animates the original
+tool, and a second paid action waits. Cleared trees and rocks become walkable
+and don’t drop inventory items. Keys `4` and `5` still preview the watering can
+and collapse animations.
 
 Oaks and the player are drawn back to front using the tree roots and the
 player's feet. An oak in front of the player fades to 40% opacity if its art
@@ -211,7 +216,7 @@ modal (initially a loading state) is drawn on the canvas. A wallet inspection,
 creation, recovery or storage failure appears as that blocked modal, not as the
 generic startup message. Ready means the persistent `haystack-user` records were
 provisioned and validated. The game then opens a `BrowserWallet` session for
-menu and gameplay operations. A paid hoe action still requires an authenticated
+menu and gameplay operations. A paid tool action still requires an authenticated
 connection and matching local and server channel state. See
 [browser-wallet.md](browser-wallet.md) for the IndexedDB records and their
 limitations.

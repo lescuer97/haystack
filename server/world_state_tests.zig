@@ -16,7 +16,7 @@ fn findTile(cuttable: bool, cx: i32, cy: i32) ?p.Cut {
         const tx = cx * 16 + @as(i32, @intCast(x));
         const ty = cy * 16 + @as(i32, @intCast(y));
         const terrain = world.sampleTile(world.public_seed, tx, ty);
-        if ((terrain == .grass or terrain == .tree) == cuttable) return .{ .x = tx, .y = ty };
+        if ((terrain == .grass) == cuttable) return .{ .x = tx, .y = ty };
     };
     return null;
 }
@@ -182,6 +182,68 @@ test "persistent cache starts empty and installs bitmaps once per address" {
     try t.expectEqual(@as(usize, 2), s.chunk_count);
     var cursor: usize = 0;
     try t.expect(s.nextDirty(&cursor) == null);
+}
+
+test "persistent pinned axe cut clears a tree for movement and survives reopen" {
+    try expectPersistentToolCut(.{ .x = 20, .y = 0, .tool = .axe }, .tree, .pickaxe);
+}
+
+test "persistent pinned pickaxe cut clears a rock for movement and survives reopen" {
+    try expectPersistentToolCut(.{ .x = 0, .y = -19, .tool = .pickaxe }, .rock, .axe);
+}
+
+fn expectPersistentToolCut(cut: p.Cut, terrain: world.Tile, wrong_tool: p.tool) !void {
+    const GameDb = @import("game_db.zig").GameDb;
+    const Persistence = @import("persistence.zig").Persistence;
+    const Registry = @import("sessions.zig").Registry;
+    const movement = shared.movement;
+    const from: p.Location = .{ .x = cut.x - 1, .y = cut.y };
+    const to: p.Location = .{ .x = cut.x, .y = cut.y };
+    const expected: p.State = .{ .x = cut.x, .y = cut.y, .terrain = terrain, .cut = true };
+    try t.expectEqual(terrain, world.sampleTile(world.public_seed, to.x, to.y));
+    const approach = world.sampleTile(world.public_seed, from.x, from.y);
+    try t.expect(approach == .grass or approach == .dirt);
+
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const path = try std.fmt.allocPrintSentinel(t.allocator, "{s}/game.sqlite3", .{dir}, 0);
+    defer t.allocator.free(path);
+
+    for ([_]bool{ false, true }) |reopened| {
+        var db = try GameDb.open(path);
+        defer db.close();
+        var s: WorldState = undefined;
+        var registry: Registry = .{ .io = t.io };
+        var persistence = try Persistence.init(t.io, t.allocator, &db, &s, &registry);
+        defer persistence.deinit(t.allocator);
+        {
+            var pins = try persistence.prepare(.{ .request_id = @splat(0), .operation = .{ .cut = cut } });
+            defer persistence.release(&pins);
+            try t.expectEqual(@as(usize, 1), pins.len);
+
+            if (!reopened) {
+                try t.expect(!movement.canStepWith(from, to, &s));
+                var mismatch = cut;
+                mismatch.tool = wrong_tool;
+                const rejected = s.prepareToolCut(mismatch);
+                try t.expect(rejected == .failed);
+                try t.expectEqual(.not_cuttable, rejected.failed);
+
+                const prepared = s.prepareToolCut(cut);
+                try t.expect(prepared == .ready);
+                try t.expect(!movement.canStepWith(from, to, &s));
+                try t.expectEqualDeep(expected, prepared.ready.apply());
+            }
+
+            try t.expect(movement.canStepWith(from, to, &s));
+            const repeated = s.prepareToolCut(cut);
+            try t.expect(repeated == .failed);
+            try t.expectEqualDeep(p.CutFailure{ .already_cut = expected }, repeated.failed);
+        }
+        if (!reopened) try persistence.flush();
+    }
 }
 
 test "persistent saves claim detached bitmaps, retain newer cuts and can retry failures" {

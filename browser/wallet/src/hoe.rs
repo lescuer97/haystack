@@ -9,9 +9,65 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-const PRICE: u64 = 5;
 const NS: &str = "browser_hoe";
 const KEY: &str = "payment_v1";
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum Tool {
+    Axe,
+    #[default]
+    Hoe,
+    Pickaxe,
+}
+
+impl Tool {
+    pub(super) const ALL: [Self; 3] = [Self::Axe, Self::Hoe, Self::Pickaxe];
+    pub(super) const MAX_CUTS: u64 = 10;
+
+    pub(super) fn parse(name: &str) -> Result<Self> {
+        match name {
+            "axe" => Ok(Self::Axe),
+            "hoe" => Ok(Self::Hoe),
+            "pickaxe" => Ok(Self::Pickaxe),
+            _ => Err(invalid()),
+        }
+    }
+
+    pub(super) fn is_hoe(&self) -> bool {
+        *self == Self::Hoe
+    }
+
+    pub(super) fn slot(self) -> &'static str {
+        match self {
+            Self::Axe => "axe",
+            Self::Hoe => "", // Preserve the deployed hoe keys.
+            Self::Pickaxe => "pickaxe",
+        }
+    }
+
+    pub(super) fn price(self) -> u64 {
+        match self {
+            Self::Axe => 2,
+            Self::Hoe => 5,
+            Self::Pickaxe => 10,
+        }
+    }
+
+    pub(super) fn valid_capacity(self, capacity: u64) -> bool {
+        let price = self.price();
+        (price..=price * Self::MAX_CUTS).contains(&capacity) && capacity % price == 0
+    }
+
+    pub(super) fn max_debit(self) -> u64 {
+        self.price() * Self::MAX_CUTS
+            + if cfg!(feature = "local-mint-fixture") {
+                0
+            } else {
+                5
+            }
+    }
+}
 
 type Result<T> = std::result::Result<T, FfiErr>;
 
@@ -78,9 +134,10 @@ async fn read(
     wallet: &CdkWallet,
     record: &funding::FundingRecord,
 ) -> Result<(Option<Vec<u8>>, Option<Payment>)> {
+    let price = record.tool.price();
     let prior = wallet
         .browser_database()
-        .kv_read(NS, "", KEY)
+        .kv_read(NS, record.tool.slot(), KEY)
         .await
         .map_err(database)?;
     let saved: Option<Payment> = prior
@@ -91,10 +148,10 @@ async fn read(
     let payment = match saved {
         Some(state) if state.operation == record.operation_id => {
             if state.balance > record.capacity_msats
-                || state.balance % PRICE != 0
+                || state.balance % price != 0
                 || state.pending.as_ref().is_some_and(|p| {
                     !hex(&p.id, 16)
-                        || p.amount != state.balance + PRICE
+                        || p.amount != state.balance + price
                         || p.amount > record.capacity_msats
                 })
                 || (state.pending.is_some() && state.receipt.is_some())
@@ -112,9 +169,14 @@ async fn read(
     Ok((prior, payment))
 }
 
-async fn save(wallet: &CdkWallet, prior: Option<&[u8]>, payment: &Payment) -> Result<Vec<u8>> {
+async fn save(
+    wallet: &CdkWallet,
+    tool: Tool,
+    prior: Option<&[u8]>,
+    payment: &Payment,
+) -> Result<Vec<u8>> {
     let next = serde_json::to_vec(payment).map_err(database)?;
-    let key = kv_key(NS, "", KEY);
+    let key = kv_key(NS, tool.slot(), KEY);
     wallet
         .browser_database()
         .write(|store| {
@@ -168,15 +230,20 @@ fn balance(state: &Payment) -> Value {
     json!({"balance_msats": state.balance.to_string()})
 }
 
-pub(super) async fn request(wallet: &mut CdkWallet, op: &str, args: &Args) -> Result<Value> {
+pub(super) async fn request(
+    wallet: &mut CdkWallet,
+    tool: Tool,
+    op: &str,
+    args: &Args,
+) -> Result<Value> {
     if wallet.is_poisoned() {
         return Err(super::api::poisoned_handle());
     }
     match op {
-        "quote" => return funding::quote(wallet, args).await,
-        "fund" => return funding::fund(wallet, args).await,
-        "resume_quote" => return funding::resume_quote(wallet, args).await,
-        "resume" => return funding::resume(wallet, args).await,
+        "quote" => return funding::quote(wallet, tool, args).await,
+        "fund" => return funding::fund(wallet, tool, args).await,
+        "resume_quote" => return funding::resume_quote(wallet, tool, args).await,
+        "resume" => return funding::resume(wallet, tool, args).await,
         _ => {}
     }
     let count = match op {
@@ -192,9 +259,9 @@ pub(super) async fn request(wallet: &mut CdkWallet, op: &str, args: &Args) -> Re
     }
     let scope = text(args, 0)?;
     let record = if op == "inspect" {
-        funding::recover(wallet, scope).await?
+        funding::recover(wallet, tool, scope).await?
     } else {
-        funding::load(wallet).await?
+        funding::load(wallet, tool).await?
     };
     let Some(record) = record else {
         return if op == "inspect" {
@@ -223,12 +290,12 @@ pub(super) async fn request(wallet: &mut CdkWallet, op: &str, args: &Args) -> Re
         "open_payload" if !admitted => record.open_payload(),
         "bind" if state.receipt.is_none() && number(args, 2)? == record.capacity_msats => {
             reconcile(&mut state, record.capacity_msats, number(args, 3)?)?;
-            save(wallet, prior.as_deref(), &state).await?;
+            save(wallet, tool, prior.as_deref(), &state).await?;
             Ok(balance(&state))
         }
         "prepare_cut" if admitted && state.pending.is_none() && state.receipt.is_none() => {
             let id = text(args, 2)?;
-            let next = state.balance + PRICE;
+            let next = state.balance + tool.price();
             let now = (js_sys::Date::now() / 1000.0) as u64;
             if !hex(id, 16)
                 || next > record.capacity_msats
@@ -260,7 +327,7 @@ pub(super) async fn request(wallet: &mut CdkWallet, op: &str, args: &Args) -> Re
                 id: id.to_owned(),
                 amount: next,
             });
-            save(wallet, prior.as_deref(), &state).await?;
+            save(wallet, tool, prior.as_deref(), &state).await?;
             Ok(json!({"signature": signature, "balance_msats": next.to_string()}))
         }
         "resolve_cut" if admitted => {
@@ -270,7 +337,7 @@ pub(super) async fn request(wallet: &mut CdkWallet, op: &str, args: &Args) -> Re
                 _ => return Err(invalid()),
             };
             resolve(&mut state, text(args, 2)?, charged)?;
-            save(wallet, prior.as_deref(), &state).await?;
+            save(wallet, tool, prior.as_deref(), &state).await?;
             Ok(balance(&state))
         }
         "finalize" if number(args, 2)? == record.capacity_msats => {
@@ -353,14 +420,14 @@ async fn finalize(
         let key = player_key(wallet, record)?;
         if parsed.is_empty() {
             state.receipt = Some(Receipt { hash, net: Some(0) });
-            save(wallet, prior, &state).await?;
+            save(wallet, record.tool, prior, &state).await?;
         } else {
             let receive = wallet
                 .prepare_receive_proofs(&record.mint_url, parsed, &[key])
                 .await
                 .map_err(|err| settlement_error("hoe_settlement_preflight", err))?;
             state.receipt = Some(Receipt { hash, net: None });
-            let attempted = save(receive.owner(), prior, &state).await?;
+            let attempted = save(receive.owner(), record.tool, prior, &state).await?;
             // From the durable attempt onward, never infer that it is safe to
             // replay wallet credit from an error status alone.
             let net = receive.execute().await.map_err(|_| credit_unknown())?;
@@ -371,12 +438,12 @@ async fn finalize(
                 hash,
                 net: Some(net),
             });
-            save(wallet, Some(&attempted), &state)
+            save(wallet, record.tool, Some(&attempted), &state)
                 .await
                 .map_err(|_| credit_unknown())?;
         }
     }
-    funding::release(wallet, &record.scope, &record.channel_id)
+    funding::release(wallet, record.tool, &record.scope, &record.channel_id)
         .await
         .map_err(|err| settlement_error("hoe_settlement_release_pending", err))?;
     Ok(json!({}))

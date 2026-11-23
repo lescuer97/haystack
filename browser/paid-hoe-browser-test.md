@@ -1,4 +1,4 @@
-# Chromium + native paid-hoe integration test (Linux)
+# Chromium + native paid-tool integration test (Linux)
 
 The default scenario drives the production Wasm wallet and game signer over
 Chromium's real WebSocket to the native game server, without the canvas or Zig
@@ -25,6 +25,56 @@ server is offline to avoid random spawn. Both fixture grass tiles, `(0,1)` and
    change due, wallet finalization releases the slot without credit or a
    browser swap. The reserved 5 msat then funds and admits a distinct channel
    at 0/5 msat. There are exactly two browser mint swaps overall.
+
+## Axe and pickaxe (`--tools`)
+
+This mode uses the production browser wallet's `tool_request` API and a real
+Chromium WebSocket to the native server. The offline player position `(80,11)`
+(grass), tree `(80,10)`, and rock `(80,12)` were selected by sampling terrain v2
+with `sampleTile(public_seed, x, y)` from `shared/world.zig`. Both targets are
+cardinal neighbors in chunk `(5,0)`.
+
+- Fetch native terms and quote one use each at 2 msat (axe) and 10 msat
+  (pickaxe), with no swap or debit until consent. Separate exact deposits fund
+  two distinct channels; each open and successful cut carries its tool TLV.
+  The wallet shares a whole-second funding timestamp across tools, so the
+  fixture waits for the next second before funding the pickaxe.
+- Send a valid pickaxe payment to the tree with the pickaxe tool, then send a
+  pickaxe payment to the tree with the axe tool. Both fail; wallet journals,
+  native channel status, and the area bitmap confirm neither charged nor cut.
+- Harvest the tree with the axe, depleting only the axe channel. Move onto the
+  harvested tree (blocked before harvest), then reload Chromium and authenticate
+  again. Auth reports the moved position and both original tool channels with
+  their independent balances. Harvest the rock using the restored active
+  pickaxe binding, verify both channels are depleted, and move onto the rock
+  (also blocked before harvest).
+- Close and settle both depleted channels. Finalizing the axe releases its
+  funding slot without touching the pickaxe journal.
+
+The runner expects two browser swaps, two opens, and four cut frames total.
+This mode covers direct wallet/socket integration, not the renderer, refunds,
+or server restart after harvest.
+
+Build the native fixture into its own prefix. Reuse `zig-out/wasm-test` if it
+already has the current browser wallet with `tool_request`:
+
+```sh
+zig build server -Dapp-fixture-mint=http://127.0.0.1:18787 -Doffline \
+  -p zig-out/paid-tools-check
+
+timeout -k 15s 120s unshare --map-root-user --net sh -c 'ip link set lo up && exec node "$@"' sh \
+  browser/paid-hoe-browser-test.mjs \
+  vendor/cdk-wallet-ffi/target/debug/examples/browser-test-mint \
+  zig-out/paid-tools-check/bin/haystack_server zig-out/wasm-test --tools
+```
+
+If the Wasm assets are stale, rebuild with the command below and pass
+`zig-out/paid-tools-check/wasm-test` instead. See [Build and run](#build-and-run)
+for tooling and mint setup.
+
+```sh
+zig build browser-fixture -Dplatform=wasm -Doffline -p zig-out/paid-tools-check
+```
 
 ## Lost funding response (`--funding-recovery`)
 
@@ -85,8 +135,9 @@ active on the native server and durably bound in the wallet at zero accepted.
 ## Renderer scenario (`--renderer-only`)
 
 The same bootstrap prepares a ready wallet with 10 msat and positions its
-player offline. Chromium then loads `/renderer/index.html` and uses CDP mouse
-input to click the HUD for a quote and click it again to consent to refill.
+player offline. Chromium then loads `/renderer/index.html`, selects the axe by
+clicking the hotbar, and uses `1` and `3` to select the pickaxe and hoe. It then
+clicks the HUD for a quote and clicks again to consent to refill.
 It then drags on grass and clicks the player's own tile, neither of which
 should prepare a payment. Finally it clicks four tiles down and one tile right
 and expects one 5-msat cut on the adjacent grass at `(0,1)`. The quote must not
@@ -136,7 +187,7 @@ timeout -k 15s 120s unshare --map-root-user --net sh -c 'ip link set lo up && ex
 
 Append one scenario flag to run it instead of the default direct wallet/socket
 regression: `--funding-recovery`, `--funding-change-recovery`, `--funding-resume`,
-`--renderer-funding-resume`, or `--renderer-only`.
+`--renderer-funding-resume`, `--renderer-only`, or `--tools`.
 
 The private namespace has only loopback; the fixed game and mint ports cannot
 collide with host services. Do not stop a host listener to run the test. The

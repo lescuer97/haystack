@@ -1,6 +1,8 @@
-//! Paid hoe opening: one journaled NUT-03 swap for a verified channel and free change.
+//! Paid tool opening: one journaled NUT-03 swap for a verified channel and free change.
 //! Recovery is read-only at the mint unless the user reauthorizes the exact saved request.
-use super::{browser_db::kv_key, onboarding_mint, wallet, Args, CdkStatus, CdkWallet, FfiErr};
+use super::{
+    browser_db::kv_key, hoe::Tool, onboarding_mint, wallet, Args, CdkStatus, CdkWallet, FfiErr,
+};
 use cdk::{
     mint_url::MintUrl,
     nuts::{
@@ -29,8 +31,6 @@ const RECORD: &str = "record";
 const OFFER: &str = "offer";
 const LAST_SETUP: &str = "last_setup";
 const VERSION: u32 = 2;
-const PRICE: u64 = 5;
-const MAX_CUTS: u64 = 10;
 const MIN_OPEN_SECONDS: u64 = 300;
 // Leave room for the wallet's 60-second mint request and server admission.
 const FUNDING_MARGIN_SECONDS: u64 = 90;
@@ -38,11 +38,6 @@ const CONSENT_SECONDS: u64 = 60;
 const MAX_OUTPUT: u64 = 1_000_000;
 const MAX_PARAMS_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = 3072;
-pub(super) const MAX_DEBIT_MSATS: u64 = if cfg!(feature = "local-mint-fixture") {
-    50
-} else {
-    55
-};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +68,8 @@ struct Offer {
 #[serde(deny_unknown_fields)]
 pub(super) struct FundingRecord {
     version: u32,
+    #[serde(default, skip_serializing_if = "Tool::is_hoe")]
+    pub(super) tool: Tool,
     pub(super) operation_id: Uuid,
     pub(super) scope: String,
     pub(super) mint_url: String,
@@ -214,8 +211,8 @@ fn parse_key(text: &str) -> Result<PublicKey> {
         .map_err(|_| invalid("invalid compressed public key"))
 }
 
-fn check_terms(terms: &Terms, time: u64) -> Result<()> {
-    if terms.amount_msats != PRICE
+fn check_terms(tool: Tool, terms: &Terms, time: u64) -> Result<()> {
+    if terms.amount_msats != tool.price()
         || terms.refund_time.saturating_sub(time) <= MIN_OPEN_SECONDS + FUNDING_MARGIN_SECONDS
     {
         return Err(invalid("invalid or expired hoe requirements"));
@@ -223,7 +220,7 @@ fn check_terms(terms: &Terms, time: u64) -> Result<()> {
     Ok(())
 }
 
-fn read_terms(args: &Args, offset: usize) -> Result<Terms> {
+fn read_terms(tool: Tool, args: &Args, offset: usize) -> Result<Terms> {
     if args.0.len() != offset + 5 {
         return Err(invalid(
             "expected scope, receiver key, amount, refund time and player key",
@@ -248,7 +245,7 @@ fn read_terms(args: &Args, offset: usize) -> Result<Terms> {
         refund_time: number(3)?,
         player_pubkey: parse_key(text(4)?)?.to_hex(),
     };
-    check_terms(&terms, now())?;
+    check_terms(tool, &terms, now())?;
     Ok(terms)
 }
 
@@ -510,6 +507,7 @@ fn check_layout(
 }
 
 fn prepare(
+    tool: Tool,
     offer: &Offer,
     keyset_json: String,
     keyset: KeysetInfo,
@@ -562,7 +560,7 @@ fn prepare(
             .zip(proofs)
             .any(|(input, proof)| !same_swap_input(input, proof))
         || layout.debit != offer.debit_msats
-        || layout.debit > MAX_DEBIT_MSATS
+        || layout.debit > tool.max_debit()
         || layout.change != selection.change
     {
         return Err(failed());
@@ -581,6 +579,7 @@ fn prepare(
     }
     Ok(Some(FundingRecord {
         version: VERSION,
+        tool,
         operation_id: offer.id,
         scope: offer.terms.scope.clone(),
         mint_url: offer.mint_url.clone(),
@@ -600,9 +599,9 @@ fn prepare(
     }))
 }
 
-pub(super) async fn quote(wallet: &CdkWallet, args: &Args) -> Result<Value> {
-    let terms = read_terms(args, 0)?;
-    if load(wallet).await?.is_some() {
+pub(super) async fn quote(wallet: &CdkWallet, tool: Tool, args: &Args) -> Result<Value> {
+    let terms = read_terms(tool, args, 0)?;
+    if load(wallet, tool).await?.is_some() {
         return Err(pending());
     }
     let (sender_pubkey, secret) = identity(wallet, &terms)?;
@@ -610,7 +609,7 @@ pub(super) async fn quote(wallet: &CdkWallet, args: &Args) -> Result<Value> {
     let (raw_keyset, keyset) = active_keyset(wallet, &mint, &terms).await?;
     let inputs = FundingInputs::load(wallet, mint.clone(), &keyset).await?;
     let setup = now();
-    check_terms(&terms, setup)?;
+    check_terms(tool, &terms, setup)?;
     let mut offer = Offer {
         version: VERSION,
         id: Uuid::new_v4(),
@@ -624,12 +623,12 @@ pub(super) async fn quote(wallet: &CdkWallet, args: &Args) -> Result<Value> {
         debit_msats: 0,
         keyset: serde_json::from_str(&raw_keyset).map_err(|_| failed())?,
     };
-    for cuts in (1..=MAX_CUTS).rev() {
-        let capacity = cuts * PRICE;
+    for cuts in (1..=Tool::MAX_CUTS).rev() {
+        let capacity = cuts * tool.price();
         let Some(nominal) = nominal_for(capacity, &raw_keyset, &keyset) else {
             continue;
         };
-        let Some(selection) = inputs.find(nominal, keyset.input_fee_ppk, MAX_DEBIT_MSATS) else {
+        let Some(selection) = inputs.find(nominal, keyset.input_fee_ppk, tool.max_debit()) else {
             continue;
         };
         let debit = selection.debit;
@@ -638,6 +637,7 @@ pub(super) async fn quote(wallet: &CdkWallet, args: &Args) -> Result<Value> {
         offer.debit_msats = debit;
         // Preflight the serialization and channel proof size, not just the balance.
         if prepare(
+            tool,
             &offer,
             raw_keyset.clone(),
             keyset.clone(),
@@ -653,10 +653,10 @@ pub(super) async fn quote(wallet: &CdkWallet, args: &Args) -> Result<Value> {
         wallet
             .browser_database()
             .write(|store| {
-                if store.kv.contains_key(&kv_key(NS, "", RECORD)) {
+                if store.kv.contains_key(&kv_key(NS, tool.slot(), RECORD)) {
                     return Err(corrupt());
                 }
-                store.kv.insert(kv_key(NS, "", OFFER), bytes);
+                store.kv.insert(kv_key(NS, tool.slot(), OFFER), bytes);
                 Ok(())
             })
             .await
@@ -664,7 +664,7 @@ pub(super) async fn quote(wallet: &CdkWallet, args: &Args) -> Result<Value> {
         return Ok(json!({
             "quote_id": offer.id, "scope": offer.terms.scope, "mint_url": offer.mint_url,
             "receiver_pubkey": offer.terms.receiver_pubkey, "sender_pubkey": offer.sender_pubkey,
-            "price_msats": PRICE.to_string(), "cuts": cuts.to_string(),
+            "price_msats": tool.price().to_string(), "cuts": cuts.to_string(),
             "capacity_msats": capacity.to_string(), "nominal_msats": nominal.to_string(),
             "swap_fee_msats": (debit - nominal).to_string(), "max_sender_fee_msats": "0",
             "max_debit_msats": debit.to_string(), "total_fee_msats": (debit - capacity).to_string(),
@@ -677,19 +677,19 @@ pub(super) async fn quote(wallet: &CdkWallet, args: &Args) -> Result<Value> {
     ))
 }
 
-pub(super) async fn fund(wallet: &CdkWallet, args: &Args) -> Result<Value> {
-    let terms = read_terms(args, 1)?;
+pub(super) async fn fund(wallet: &CdkWallet, tool: Tool, args: &Args) -> Result<Value> {
+    let terms = read_terms(tool, args, 1)?;
     let id = args
         .text(0)
         .ok()
         .and_then(|s| Uuid::parse_str(s).ok())
         .ok_or_else(|| invalid("invalid hoe quote ID"))?;
-    if load(wallet).await?.is_some() {
+    if load(wallet, tool).await?.is_some() {
         return Err(pending());
     }
     let db = wallet.browser_database();
     let offer_bytes = db
-        .kv_read(NS, "", OFFER)
+        .kv_read(NS, tool.slot(), OFFER)
         .await
         .map_err(database)?
         .ok_or_else(|| invalid("no live hoe quote"))?;
@@ -698,9 +698,8 @@ pub(super) async fn fund(wallet: &CdkWallet, args: &Args) -> Result<Value> {
         || offer.id != id
         || offer.terms != terms
         || now() >= offer.expires_at
-        || !(PRICE..=PRICE * MAX_CUTS).contains(&offer.capacity_msats)
-        || offer.capacity_msats % PRICE != 0
-        || offer.debit_msats > MAX_DEBIT_MSATS
+        || !tool.valid_capacity(offer.capacity_msats)
+        || offer.debit_msats > tool.max_debit()
     {
         return Err(invalid("hoe quote changed or expired"));
     }
@@ -722,22 +721,23 @@ pub(super) async fn fund(wallet: &CdkWallet, args: &Args) -> Result<Value> {
         .filter(|s| s.debit == offer.debit_msats)
         .ok_or_else(|| invalid("hoe funding debit changed; request a new quote"))?;
     let setup = now();
-    check_terms(&terms, setup)?;
+    check_terms(tool, &terms, setup)?;
     if setup >= offer.expires_at {
         return Err(invalid("hoe quote expired"));
     }
-    let record = prepare(&offer, raw_keyset, keyset, &secret, &selection, setup)?
+    let record = prepare(tool, &offer, raw_keyset, keyset, &secret, &selection, setup)?
         .ok_or_else(|| invalid("hoe funding exceeds the channel payload limit"))?;
     let record_bytes = encode(&record)?;
     db.write_hoe_funding(|store| {
-        if store.kv.contains_key(&kv_key(NS, "", RECORD))
-            || store.kv.get(&kv_key(NS, "", OFFER)) != Some(&offer_bytes)
+        if store.kv.contains_key(&kv_key(NS, tool.slot(), RECORD))
+            || store.kv.get(&kv_key(NS, tool.slot(), OFFER)) != Some(&offer_bytes)
             || now() >= offer.expires_at
         {
             return Err(corrupt());
         }
         // The setup timestamp contributes to the deterministic output IDs.
-        // Do not recycle it even after a channel has been retired.
+        // Keep this watermark shared across tools: channels of different tools
+        // can have identical capacities and otherwise identical parameters.
         if let Some(last) = store.kv.get(&kv_key(NS, "", LAST_SETUP)) {
             let last: u64 = serde_json::from_slice(last).map_err(|_| corrupt())?;
             if setup <= last {
@@ -755,13 +755,13 @@ pub(super) async fn fund(wallet: &CdkWallet, args: &Args) -> Result<Value> {
             proof.state = State::Reserved;
             proof.used_by_operation = Some(id);
         }
-        store.kv.remove(&kv_key(NS, "", OFFER));
+        store.kv.remove(&kv_key(NS, tool.slot(), OFFER));
         store
             .kv
             .insert(kv_key(NS, "", LAST_SETUP), setup.to_string().into_bytes());
         store
             .kv
-            .insert(kv_key(NS, "", RECORD), record_bytes.clone());
+            .insert(kv_key(NS, tool.slot(), RECORD), record_bytes.clone());
         Ok(())
     })
     .await
@@ -777,19 +777,19 @@ pub(super) async fn fund(wallet: &CdkWallet, args: &Args) -> Result<Value> {
         .open_payload()
 }
 
-async fn read_record(wallet: &CdkWallet) -> Result<Option<(FundingRecord, Vec<u8>)>> {
+async fn read_record(wallet: &CdkWallet, tool: Tool) -> Result<Option<(FundingRecord, Vec<u8>)>> {
     let Some(bytes) = wallet
         .browser_database()
-        .kv_read(NS, "", RECORD)
+        .kv_read(NS, tool.slot(), RECORD)
         .await
         .map_err(database)?
     else {
         return Ok(None);
     };
-    Ok(Some((decode_record(&bytes)?, bytes)))
+    Ok(Some((decode_record(tool, &bytes)?, bytes)))
 }
 
-fn decode_record(bytes: &[u8]) -> Result<FundingRecord> {
+fn decode_record(tool: Tool, bytes: &[u8]) -> Result<FundingRecord> {
     let record: FundingRecord = decode(bytes)?;
     if record.version != VERSION {
         return Err(FfiErr::new(
@@ -797,15 +797,22 @@ fn decode_record(bytes: &[u8]) -> Result<FundingRecord> {
             "unknown hoe funding record version",
         ));
     }
+    if record.tool != tool || !tool.valid_capacity(record.capacity_msats) {
+        return Err(failed());
+    }
     Ok(record)
 }
 
-pub(super) async fn load(wallet: &CdkWallet) -> Result<Option<FundingRecord>> {
-    Ok(read_record(wallet).await?.map(|(record, _)| record))
+pub(super) async fn load(wallet: &CdkWallet, tool: Tool) -> Result<Option<FundingRecord>> {
+    Ok(read_record(wallet, tool).await?.map(|(record, _)| record))
 }
 
-pub(super) async fn recover(wallet: &CdkWallet, scope: &str) -> Result<Option<FundingRecord>> {
-    let Some((record, bytes)) = read_record(wallet).await? else {
+pub(super) async fn recover(
+    wallet: &CdkWallet,
+    tool: Tool,
+    scope: &str,
+) -> Result<Option<FundingRecord>> {
+    let Some((record, bytes)) = read_record(wallet, tool).await? else {
         return Ok(None);
     };
     if record.scope != scope {
@@ -866,7 +873,7 @@ fn submitted(record: &FundingRecord) -> Result<Submitted<'_>> {
         .get_total_funding_token_amount()
         .map_err(|_| failed())?;
     let layout = check_layout(&swap, &keyset, nominal, funding_secrets_json, change)?;
-    if layout.debit > MAX_DEBIT_MSATS {
+    if layout.debit > record.tool.max_debit() {
         return Err(failed());
     }
     Ok(Submitted {
@@ -891,7 +898,7 @@ async fn evidence(wallet: &CdkWallet, record: &FundingRecord) -> Result<SwapEvid
 
 fn check_resume(record: &FundingRecord, debit: u64) -> Result<()> {
     if record.refund_time.saturating_sub(now()) <= MIN_OPEN_SECONDS + FUNDING_MARGIN_SECONDS
-        || debit > MAX_DEBIT_MSATS
+        || debit > record.tool.max_debit()
         || parse_mint()?.to_string() != record.mint_url
     {
         return Err(invalid(
@@ -902,14 +909,14 @@ fn check_resume(record: &FundingRecord, debit: u64) -> Result<()> {
 }
 
 /// Read-only display data for a separate, explicit resume confirmation.
-pub(super) async fn resume_quote(wallet: &CdkWallet, args: &Args) -> Result<Value> {
+pub(super) async fn resume_quote(wallet: &CdkWallet, tool: Tool, args: &Args) -> Result<Value> {
     if args.0.len() != 1 {
         return Err(invalid("expected hoe server scope"));
     }
     let scope = args
         .text(0)
         .map_err(|_| invalid("missing hoe server scope"))?;
-    let record = load(wallet)
+    let record = load(wallet, tool)
         .await?
         .ok_or_else(|| invalid("no saved hoe funding"))?;
     if record.scope != scope || record.funding_proofs_json().is_some() {
@@ -920,13 +927,13 @@ pub(super) async fn resume_quote(wallet: &CdkWallet, args: &Args) -> Result<Valu
     Ok(json!({
         "operation_id": record.operation_id, "scope": record.scope, "mint_url": record.mint_url,
         "channel_id": record.channel_id, "receiver_pubkey": record.receiver_pubkey,
-        "capacity_msats": record.capacity_msats.to_string(), "cuts": (record.capacity_msats / PRICE).to_string(),
+        "capacity_msats": record.capacity_msats.to_string(), "cuts": (record.capacity_msats / tool.price()).to_string(),
         "max_debit_msats": debit.to_string(), "refund_time": record.refund_time.to_string(),
     }))
 }
 
 /// Only call after a new user confirmation for this exact operation and debit.
-pub(super) async fn resume(wallet: &CdkWallet, args: &Args) -> Result<Value> {
+pub(super) async fn resume(wallet: &CdkWallet, tool: Tool, args: &Args) -> Result<Value> {
     if args.0.len() != 3 {
         return Err(invalid(
             "expected hoe scope, operation ID and confirmed debit",
@@ -943,7 +950,7 @@ pub(super) async fn resume(wallet: &CdkWallet, args: &Args) -> Result<Value> {
     let consent = args
         .number(2)
         .map_err(|_| invalid("invalid confirmed hoe debit"))?;
-    let (record, bytes) = read_record(wallet)
+    let (record, bytes) = read_record(wallet, tool)
         .await?
         .ok_or_else(|| invalid("no saved hoe funding"))?;
     if record.scope != scope || record.operation_id != id {
@@ -967,7 +974,7 @@ pub(super) async fn resume(wallet: &CdkWallet, args: &Args) -> Result<Value> {
     if !evidence.all_unspent(count) {
         return Err(pending_for(id));
     }
-    let current = read_record(wallet).await?;
+    let current = read_record(wallet, tool).await?;
     if current.as_ref().is_none_or(|(_, prior)| *prior != bytes) {
         return Err(pending_for(id));
     }
@@ -1067,7 +1074,15 @@ async fn complete(
     wallet
         .browser_database()
         .write_hoe_funding(|store| {
-            persist_funded(store, prior, funded, record.operation_id, &swap, change)
+            persist_funded(
+                store,
+                record.tool,
+                prior,
+                funded,
+                record.operation_id,
+                &swap,
+                change,
+            )
         })
         .await
         .map_err(database)?;
@@ -1076,13 +1091,14 @@ async fn complete(
 
 fn persist_funded(
     store: &mut super::browser_db::Store,
+    tool: Tool,
     prior: &[u8],
     funded: Vec<u8>,
     id: Uuid,
     swap: &SwapRequest,
     change: Vec<ProofInfo>,
 ) -> std::result::Result<(), DbError> {
-    let key = kv_key(NS, "", RECORD);
+    let key = kv_key(NS, tool.slot(), RECORD);
     if store.kv.get(&key).map(Vec::as_slice) != Some(prior) {
         return Err(corrupt());
     }
@@ -1109,8 +1125,13 @@ fn persist_funded(
 
 /// Call only after the parent module has durably reconciled the channel close
 /// or sender refund. This never releases raw funding inputs or a pending swap.
-pub(super) async fn release(wallet: &CdkWallet, scope: &str, channel_id: &str) -> Result<()> {
-    let Some((record, prior)) = read_record(wallet).await? else {
+pub(super) async fn release(
+    wallet: &CdkWallet,
+    tool: Tool,
+    scope: &str,
+    channel_id: &str,
+) -> Result<()> {
+    let Some((record, prior)) = read_record(wallet, tool).await? else {
         return Ok(());
     };
     if record.scope != scope
@@ -1122,10 +1143,10 @@ pub(super) async fn release(wallet: &CdkWallet, scope: &str, channel_id: &str) -
     wallet
         .browser_database()
         .write(|store| {
-            if store.kv.get(&kv_key(NS, "", RECORD)) != Some(&prior) {
+            if store.kv.get(&kv_key(NS, tool.slot(), RECORD)) != Some(&prior) {
                 return Err(corrupt());
             }
-            store.kv.remove(&kv_key(NS, "", RECORD));
+            store.kv.remove(&kv_key(NS, tool.slot(), RECORD));
             Ok(())
         })
         .await
@@ -1137,10 +1158,21 @@ pub(super) async fn release(wallet: &CdkWallet, scope: &str, channel_id: &str) -
 pub(crate) fn reserved_inputs(
     store: &super::browser_db::Store,
 ) -> std::result::Result<Vec<(String, ProofInfo)>, DbError> {
-    let Some(bytes) = store.kv.get(&kv_key(NS, "", RECORD)) else {
+    let mut protected = Vec::new();
+    for tool in Tool::ALL {
+        protected.extend(reserved_inputs_for(store, tool)?);
+    }
+    Ok(protected)
+}
+
+fn reserved_inputs_for(
+    store: &super::browser_db::Store,
+    tool: Tool,
+) -> std::result::Result<Vec<(String, ProofInfo)>, DbError> {
+    let Some(bytes) = store.kv.get(&kv_key(NS, tool.slot(), RECORD)) else {
         return Ok(vec![]);
     };
-    let record = decode_record(bytes).map_err(|_| corrupt())?;
+    let record = decode_record(tool, bytes).map_err(|_| corrupt())?;
     let FundingState::Submitted {
         swap_request_json, ..
     } = record.state
@@ -1169,11 +1201,13 @@ pub(crate) fn reserved_inputs(
 /// Seed restore must not re-import a reserved input as unspent while a raw swap
 /// can still commit. CDK's saga recovery does not own these proofs.
 pub(super) async fn guard_seed_restore(wallet: &CdkWallet, mint: &MintUrl) -> Result<()> {
-    if load(wallet)
-        .await?
-        .is_some_and(|r| r.mint_url == mint.to_string() && r.funding_proofs_json().is_none())
-    {
-        return Err(pending());
+    for tool in Tool::ALL {
+        if load(wallet, tool)
+            .await?
+            .is_some_and(|r| r.mint_url == mint.to_string() && r.funding_proofs_json().is_none())
+        {
+            return Err(pending());
+        }
     }
     Ok(())
 }
@@ -1216,6 +1250,16 @@ mod tests {
     }
 
     fn prepare_record(keyset: KeysetInfo, selection: &Selection<'_>) -> FundingRecord {
+        prepare_tool_record(Tool::Hoe, Uuid::nil(), 50, keyset, selection)
+    }
+
+    fn prepare_tool_record(
+        tool: Tool,
+        id: Uuid,
+        capacity: u64,
+        keyset: KeysetInfo,
+        selection: &Selection<'_>,
+    ) -> FundingRecord {
         let sender = SecretKey::from_slice(&[2; 32]).unwrap();
         let receiver = SecretKey::from_slice(&[3; 32]).unwrap().public_key();
         let sender_pubkey = sender.public_key().to_hex();
@@ -1227,23 +1271,23 @@ mod tests {
         let keyset_json = serde_json::to_string(&keyset).unwrap();
         let offer = Offer {
             version: VERSION,
-            id: Uuid::nil(),
+            id,
             mint_url: "https://example.com".into(),
             terms: Terms {
                 scope: "test".into(),
                 player_pubkey: sender_pubkey.clone(),
                 receiver_pubkey: receiver.to_hex(),
-                amount_msats: PRICE,
+                amount_msats: tool.price(),
                 refund_time: 2000,
             },
             sender_pubkey,
             expires_at: 1060,
-            capacity_msats: 50,
-            nominal_msats: nominal_for(50, &keyset_json, &keyset).unwrap(),
+            capacity_msats: capacity,
+            nominal_msats: nominal_for(capacity, &keyset_json, &keyset).unwrap(),
             debit_msats: selection.debit,
             keyset: serde_json::from_str(&keyset_json).unwrap(),
         };
-        prepare(&offer, keyset_json, keyset, &secret, selection, 1000)
+        prepare(tool, &offer, keyset_json, keyset, &secret, selection, 1000)
             .unwrap()
             .unwrap()
     }
@@ -1269,9 +1313,13 @@ mod tests {
         assert!(fragmented.find(52, 100, 55).is_none());
         assert!(fragmented.find(52, 100, 57).is_none());
         assert_eq!(fragmented.find(52, 100, 58).unwrap().debit, 58);
-        let largest = (1..=MAX_CUTS).rev().find_map(|cuts| {
+        let largest = (1..=Tool::MAX_CUTS).rev().find_map(|cuts| {
             fragmented
-                .find(nominal_for(cuts * PRICE, &raw, &keyset)?, 100, 55)
+                .find(
+                    nominal_for(cuts * Tool::Hoe.price(), &raw, &keyset)?,
+                    100,
+                    55,
+                )
                 .map(|s| (cuts, s.debit))
         });
         assert_eq!(largest, Some((9, 53)));
@@ -1285,12 +1333,76 @@ mod tests {
     }
 
     #[test]
+    fn journals_protect_each_tools_inputs_and_keep_the_legacy_hoe_slot() {
+        let (keyset, inputs) = fixture(0, &[32, 64]);
+        let mut store = super::super::browser_db::Store::default();
+        let mut records = Vec::new();
+        for (tool, capacity, id, input) in [(Tool::Axe, 20, 1, 1), (Tool::Hoe, 50, 2, 0)] {
+            let unspent = FundingInputs(vec![inputs.0[input].clone()]);
+            let selection = unspent.find(capacity, 0, tool.max_debit()).unwrap();
+            let record = prepare_tool_record(
+                tool,
+                Uuid::from_u128(id),
+                capacity,
+                keyset.clone(),
+                &selection,
+            );
+            let prior = encode(&record).unwrap();
+            let key = kv_key(NS, tool.slot(), RECORD);
+            if tool == Tool::Hoe {
+                assert_eq!(key, kv_key(NS, "", RECORD));
+                assert!(serde_json::from_slice::<Value>(&prior)
+                    .unwrap()
+                    .get("tool")
+                    .is_none());
+            }
+            assert!(decode_record(tool, &prior).is_ok());
+            // Capacity 20 is valid for both axe and pickaxe; the record must
+            // still be rejected if it appears in the wrong slot.
+            assert!(decode_record(Tool::Pickaxe, &prior).is_err());
+            store.kv.insert(key, prior.clone());
+            for selected in selection.proofs {
+                let mut input = selected.clone();
+                input.state = State::Reserved;
+                input.used_by_operation = Some(record.operation_id);
+                assert!(store.proofs.insert(input.y.to_string(), input).is_none());
+            }
+            records.push((record, prior));
+        }
+        assert_eq!(reserved_inputs(&store).unwrap().len(), 2);
+        let (mut axe, prior) = records.remove(0);
+        let saved = submitted(&axe).unwrap();
+        let (funding, change) = verify_completed(&axe, &saved, &sign(&saved.swap)).unwrap();
+        let swap = saved.swap;
+        axe.state = FundingState::Funded {
+            funding_proofs_json: funding,
+        };
+        persist_funded(
+            &mut store,
+            Tool::Axe,
+            &prior,
+            encode(&axe).unwrap(),
+            axe.operation_id,
+            &swap,
+            change,
+        )
+        .unwrap();
+        let protected = reserved_inputs(&store).unwrap();
+        assert_eq!(protected.len(), 1);
+        assert_eq!(
+            protected[0].1.used_by_operation,
+            Some(records[0].0.operation_id)
+        );
+        assert_eq!(store.kv[&kv_key(NS, "", RECORD)], records[0].1);
+    }
+
+    #[test]
     fn journal_restores_every_signature_and_credits_only_verified_change() {
         let (keyset, inputs) = fixture(0, &[64]);
         let selection = inputs.find(50, 0, 50).unwrap();
         let record = prepare_record(keyset, &selection);
         let prior = encode(&record).unwrap();
-        let mut record = decode_record(&prior).unwrap();
+        let mut record = decode_record(Tool::Hoe, &prior).unwrap();
         let saved = submitted(&record).unwrap();
         assert_eq!(saved.layout.debit, 50);
         assert_eq!(saved.layout.change, 14);
@@ -1344,6 +1456,7 @@ mod tests {
         let funded = encode(&record).unwrap();
         persist_funded(
             &mut store,
+            Tool::Hoe,
             &prior,
             funded.clone(),
             record.operation_id,
@@ -1359,6 +1472,7 @@ mod tests {
         }
         assert!(persist_funded(
             &mut store,
+            Tool::Hoe,
             &prior,
             funded,
             record.operation_id,
@@ -1372,7 +1486,7 @@ mod tests {
     #[test]
     fn testnut_returns_exact_change_net_of_the_raw_swap_fee() {
         let (keyset, inputs) = fixture(100, &[64]);
-        let selection = inputs.find(52, 100, MAX_DEBIT_MSATS).unwrap();
+        let selection = inputs.find(52, 100, Tool::Hoe.max_debit()).unwrap();
         let record = prepare_record(keyset, &selection);
         let saved = submitted(&record).unwrap();
         assert_eq!(u64::from(saved.swap.output_amount().unwrap()), 63);
@@ -1392,7 +1506,7 @@ mod tests {
         let (keyset, inputs) = fixture(0, &[32, 16, 2]);
         let selection = inputs.find(50, 0, 50).unwrap();
         let record = prepare_record(keyset, &selection);
-        let record = decode_record(&encode(&record).unwrap()).unwrap();
+        let record = decode_record(Tool::Hoe, &encode(&record).unwrap()).unwrap();
         let saved = submitted(&record).unwrap();
         assert!(verify_completed(&record, &saved, &sign(&saved.swap))
             .unwrap()
@@ -1403,17 +1517,17 @@ mod tests {
         for version in [1, VERSION + 1] {
             let mut wrong_version = value.clone();
             wrong_version["version"] = json!(version);
-            assert!(decode_record(&encode(&wrong_version).unwrap()).is_err());
+            assert!(decode_record(Tool::Hoe, &encode(&wrong_version).unwrap()).is_err());
         }
         let mut missing_change = value.clone();
         missing_change["state"]
             .as_object_mut()
             .unwrap()
             .remove("change_secrets_json");
-        assert!(decode_record(&encode(&missing_change).unwrap()).is_err());
+        assert!(decode_record(Tool::Hoe, &encode(&missing_change).unwrap()).is_err());
         let mut unknown_field = value;
         unknown_field["state"]["unknown"] = json!(true);
-        assert!(decode_record(&encode(&unknown_field).unwrap()).is_err());
+        assert!(decode_record(Tool::Hoe, &encode(&unknown_field).unwrap()).is_err());
     }
 
     #[test]

@@ -41,6 +41,12 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     root.addImport("websocket", websocket.module("websocket"));
     const secp = @import("secp256k1.zig").create(b, target, options.optimize) orelse return;
     secp.link(root);
+    const sqlite = (b.lazyDependency("zig_sqlite", .{
+        .target = target,
+        .optimize = options.optimize,
+        .server_namespace = true,
+    }) orelse return).module("sqlite");
+    root.addImport("sqlite", sqlite);
     root.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
     root.addImport("haystack_game", mod);
     root.addImport("raylib", raylib_module);
@@ -95,6 +101,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
     const wallet_storage_module = b.createModule(.{ .root_source_file = b.path("src/wallet_storage_test.zig"), .target = target, .optimize = options.optimize });
     wallet_storage_module.addImport("shared", shared);
+    wallet_storage_module.addImport("sqlite", sqlite);
     secp.link(wallet_storage_module);
     wallet_storage_module.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
     native.link(wallet_storage_module);

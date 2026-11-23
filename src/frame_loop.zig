@@ -163,6 +163,8 @@ pub const Driver = struct {
                     game.player_pos = before;
                     game.camera = before_camera;
                     game.player_walking = false;
+                    // The tool target was aimed from the rejected position.
+                    game.paid_hoe.target = null;
                 }
                 self.movement_blocked = true;
             }
@@ -366,6 +368,56 @@ test "turning in place never sends movement to the worker sink" {
     try driver.consume(right, 0, &game, null, sink, &privacy);
     try std.testing.expectEqual(game.player_pos, record.last.?);
     try std.testing.expectEqual(Location{ .x = 1, .y = 0 }, game.player_pos);
+}
+
+test "tool use sees queued selection and is discarded if its movement prediction fails" {
+    const player = @import("player.zig");
+    const shared = @import("shared");
+    const Sink = struct {
+        target: ?Location = null,
+        tool: ?shared.protocol.tool = null,
+
+        fn dispatch(_: ?*anyopaque, _: *onboarding.Onboarding, _: onboarding.Effect) void {}
+
+        fn after(context: ?*anyopaque, game: *game_mod.GameState) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.target = game.paid_hoe.target orelse return;
+            self.tool = game.selected_tool.protocolTool();
+        }
+
+        fn rejectMovement(_: ?*anyopaque, _: Location) bool {
+            return false;
+        }
+    };
+    var driver: Driver = .{};
+    defer driver.deinit();
+    var game = try game_mod.GameState.init(std.testing.allocator, 1000, 640);
+    defer game.deinit();
+    try driver.prepare(&game, 1000, 640);
+    game.player_animation.facing = .right;
+    const snapshot: shared.protocol.Snapshot = .{ .area = .{ .cx0 = 0, .cx1 = 0, .cy0 = 0, .cy1 = 0 }, .count = 1 };
+    game.world.applyCuts(&snapshot);
+    game.selected_tool = .axe;
+    var record: Sink = .{};
+    const sink: EffectSink = .{ .context = &record, .dispatch = Sink.dispatch, .after_input = Sink.after, .commit_movement = Sink.rejectMovement };
+    var privacy = false;
+    pushFrame(&driver, .{ .select_tool = .hoe });
+    pushFrame(&driver, .{ .use_tool = true });
+    _ = try driver.advance(0, &game, null, sink, &privacy);
+    try std.testing.expectEqual(Location{ .x = 1, .y = 0 }, record.target.?);
+    try std.testing.expectEqual(shared.protocol.tool.hoe, record.tool.?);
+    try std.testing.expectEqual(player.Sheet.character, game.player_animation.frame().sheet);
+    try std.testing.expect(game.paid_hoe.target == null);
+
+    record = .{};
+    const from: Location = .{ .x = -1, .y = 0 };
+    game.player_pos = from;
+    try game.camera.setTarget(from.x, from.y);
+    driver.repeat.beginTick();
+    try driver.consume(.{ .navigation = .{ .right = true }, .frame = .{ .use_tool = true } }, 0, &game, null, sink, &privacy);
+    try std.testing.expect(driver.movement_blocked);
+    try std.testing.expectEqual(from, game.player_pos);
+    try std.testing.expect(record.target == null);
 }
 
 test "short tap survives release and many taps permit at most one step per tick" {

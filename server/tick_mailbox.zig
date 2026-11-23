@@ -99,8 +99,8 @@ pub const Dispatcher = struct {
         if (session == null) {
             close = true;
             box.len = application.encodeCommonFailure(&box.reply, work.request, .invalid_request).len;
-        } else if (work.request.operation == .cut and app.needsHoeCut(work.request.operation.cut)) {
-            // The tick, including copied legacy replays, cannot authorize hoe cuts.
+        } else if (work.request.operation == .cut and app.requiresPaidCut(work.request.operation.cut)) {
+            // The tick, including copied legacy replays, cannot authorize paid cuts.
             box.len = application.encodeCommonFailure(&box.reply, work.request, .invalid_request).len;
         } else if (work.cut_replay) |outcome| {
             const req: p.RequestFor(.cut) = .{ .request_id = work.request.request_id, .payload = work.request.operation.cut };

@@ -191,12 +191,11 @@ walkable cardinal neighbor in the 9×9 chunk region centered on the origin, with
 `(0,0)` as fallback. The auth ACK carries this starting or restored position; a
 new player becomes eligible for saving only after authentication succeeds.
 
-A location update may stay put or move one tile onto grass or dirt. A diagonal
-also needs both side tiles clear. Rejected moves return `invalid_request` without
-changing position or closing a live session. Acknowledgement means RAM acceptance,
-not durability. Location
-updates are not replay-cached and do not enforce movement cadence or consult
-cuts or other characters. Cut/read connections must first complete authentication.
+A location update may stay put or move one tile onto grass, dirt, or a cleared
+rock or tree. A diagonal also needs both side tiles clear. Rejected moves return
+`invalid_request` without changing position or closing a live session.
+Acknowledgement means RAM acceptance, not durability. Location updates are not
+replay-cached and do not enforce movement cadence or consult other characters. Cut/read connections must first complete authentication.
 There is no listing, client query, subscription, broadcast or location history.
 
 The default Debug server (`zig build run-server -Dgame=false`) writes
@@ -310,8 +309,7 @@ with the usual 16-byte request `id` (`0x01`), then the following TLV fields:
 | Operation | Request / reply tags | Additional request fields, in order | Request size |
 |---|---|---|---:|
 | Requirements | `0x21` / `0xa1` | Tool (`0x23`, u8: axe=0, hoe=1, pickaxe=2) | 27 |
-| Funded open | `0x24` / `0xa2` | Channel ID (`0x20`, 32 bytes), funding proofs (`0x24`, 1–3072 bytes), canonical CDK params JSON (`0x25`, 1–4096 bytes) | 66–7232 |
-
+| Funded open | `0x24` / `0xa2` | Channel ID (`0x20`, 32 bytes), optional tool (`0x23`, defaults to hoe), funding proofs (`0x24`, 1–3072 bytes), canonical CDK params JSON (`0x25`, 1–4096 bytes) | 66–7236 |
 | Close | `0x23` / `0xa3` | Channel ID (`0x20`, 32 bytes) | 58 |
 | Status | `0x25` / `0xa5` | Channel ID (`0x20`, 32 bytes) | 58 |
 
@@ -323,9 +321,9 @@ return proofs. `channel_settled` (`0xa6`) is an unsolicited notice containing on
 the 32-byte channel ID. The codec treats proofs and params as opaque borrowed
 slices.
 
-Funded open accepts capacity for 1–10 whole cuts at the reported per-cut price
-(currently 5 msat, so 5–50 msat in 5-msat increments). Channel capacity does not
-include mint fees. The desktop shows the maximum wallet debit including those
+Funded open accepts capacity for 1–10 whole actions at the reported price:
+axe (tree) costs 2 msat per action, hoe (grass) costs 5, and pickaxe (rock) costs
+10. Channel capacity does not include mint fees. The desktop shows the maximum wallet debit including those
 fees before funding and opening the channel. The proof limit accommodates the
 three-proof layouts used by the supported funding fixtures.
 
@@ -338,11 +336,13 @@ proofs can finish a failed profile link without mint I/O; a different live
 channel is not replaced. Malformed messages receive
 `PROTOCOL_ERROR`.
 
-`game_users.hoe_channel_id` is the player's single optional hoe-channel
-reference. On login or successful funding, the connection slot caches the
-wallet's loaded channel. Each valid cut reuses it, verifies the next signed
-balance, and commits the payment to upstream storage before changing the slot
-or tile. Tile saves describe the world only; they do not record payment history.
+Each player has one optional channel reference per tool. The receiver ledger
+binds the channel ID to that tool's price. On login or successful funding, the
+connection caches each spendable channel separately. A paid cut carries an
+optional tool (`0x23`, defaults to hoe) after the payment fields. The server
+checks reach, terrain, cut state and the linked channel ID before accepting
+exactly one tool-priced increment. It commits the payment before marking the
+tile cleared. Tile saves describe the world only; they do not record payments.
 
 A depleted channel stays open at zero remaining until its owner requests close
 or it expires. Before expiry, auth includes its channel ID and fully consumed
@@ -357,7 +357,11 @@ channel ID, credits any sender change, and reauthenticates before funding the
 largest affordable refill up to ten whole cuts. The button displays an upper
 bound on the wallet debit including fees.
 
-At login the wallet resolves the profile reference before reporting any channel. If the ledger cannot resolve a
+At login the wallet resolves the tool references before reporting any channel.
+If an axe or pickaxe channel is restorable, auth success carries `tool_channels`
+(`0x28`) after the location. It contains ordered 49-byte entries: tool (u8),
+channel ID (32 bytes), capacity (u64), and accepted balance (u64). Hoe-only
+sessions keep the original auth reply layout. If the ledger cannot resolve a
 stored pointer because it is busy or unavailable, login returns `unavailable`
 without waiting for mint I/O. An expired channel is no longer
 usable for play, but that does not imply its settlement succeeded. The server
@@ -375,19 +379,19 @@ or `~/Library/Application Support/haystack-server/game.sqlite` on macOS.
 |---|---|
 | `game_meta` | Single row (`id = 1`) with the 32-byte public seed and generator version. |
 | `game_chunks` | `(cx, cy)` primary key in chunk coordinates and a 32-byte cut bitmap (`bits`). |
-| `game_users` | Canonical 33-byte `pubkey` primary key, signed 32-bit tile coordinates `x, y`, and a nullable 32-byte `hoe_channel_id`. |
+| `game_users` | Canonical 33-byte `pubkey` primary key, signed 32-bit tile coordinates `x, y`, and three nullable 32-byte channel IDs (`hoe_channel_id`, `axe_channel_id`, `pickaxe_channel_id`). |
 
 Startup creates the schema for a new database. For an existing database, it
 checks that SQLite opened it for writing, then validates the seed, generator
 version, integrity, and stored gameplay rows. A read-only database, mismatch,
-or invalid data fails startup rather than resetting the world. Startup renames
-`game_users.channel_id` to `hoe_channel_id`, preserving existing links. The
-same transaction expands the older renderer-limited player table to the full
-signed `i32` tile range when needed. The wire format is unchanged.
+or invalid data fails startup rather than resetting the world. There is no
+migration to the three-tool schema. For development, use a fresh server data
+root or back up and provision new stores; old gameplay and receiver databases
+are not automatically upgraded or reset.
 
 **No chunk rows are cached at startup or login.** On demand, connection tasks
-load missing cut/read chunks from SQLite, using an all-zero bitmap for an absent
-row, and pin them through tick execution. Cache hits need no disk I/O.
+load missing cut, read-area, and collision-dependent movement chunks from
+SQLite, using an all-zero bitmap for an absent row, and pin them through tick execution. Cache hits need no disk I/O.
 
 The server shares one cache across all connections: **5,184 base entries plus
 512 overflow entries**. At or above base capacity, a miss first tries to evict
@@ -412,9 +416,13 @@ returns a final save failure. An abrupt exit can lose uncommitted changes.
 
 ### Cut rules and replay
 
-Only generated grass/tree can be cut; cuts preserve the base terrain and set
-its cut bit. Dirt/rock/water reject; another ID for a cut tile gets `already_cut`.
-All 16 opaque ID bytes (including zero) bind the cut coordinates. A retained ID
+Cuts preserve the generated terrain and set its cut bit. A cleared tree or
+rock becomes walkable; water stays blocked. Axe and pickaxe actions always
+require payment, even without a configured receiver. Without a receiver the
+hoe can still cut grass for free. Paid cuts use the bitmap and ledger rather
+than the RAM replay history; a repeated cut returns `already_cut` without a
+second charge. For free cuts, all 16 opaque ID bytes (including zero) bind the
+cut coordinates. A retained ID
 replays its original success or terminal game error; different coordinates
 return `request_id_conflict` before mutation. Reads, location updates, malformed
 requests and capacity/admission failures do not consume IDs.

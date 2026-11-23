@@ -153,10 +153,19 @@ pub const WorldState = struct {
         return null;
     }
 
+    pub fn isCleared(self: *const WorldState, pos: p.Location) bool {
+        const address = ChunkAddress.fromTile(pos.x, pos.y);
+        const chunk = if (self.cache) |*cache|
+            &(cache.get(address) orelse return false).chunk
+        else
+            &self.chunks[self.findChunk(address) orelse return false];
+        return CutBit.init(.{ .x = pos.x, .y = pos.y }).isSet(chunk);
+    }
+
     /// Check replay/conflict before loading or pinning the target chunk.
     pub fn replayCut(self: *const WorldState, req: p.RequestFor(.cut)) ?p.Outcome(.cut) {
         const tile = req.payload;
-        if (tile.payment != null) return null;
+        if (tile.payment != null or tile.tool != .hoe) return null;
         for (self.replays[0..self.replay_count]) |entry| {
             if (!std.mem.eql(u8, &entry.id, &req.request_id)) continue;
             if (entry.tile.x != tile.x or entry.tile.y != tile.y)
@@ -167,7 +176,7 @@ pub const WorldState = struct {
     }
 
     pub fn cut(self: *WorldState, req: p.RequestFor(.cut)) error{CapacityExceeded}!p.Outcome(.cut) {
-        if (req.payload.payment != null) return .{ .failed = .invalid_request };
+        if (req.payload.payment != null or req.payload.tool != .hoe) return .{ .failed = .invalid_request };
         if (self.replayCut(req)) |result| return result;
         const tile = req.payload;
         const address = ChunkAddress.fromTile(tile.x, tile.y);
@@ -178,7 +187,7 @@ pub const WorldState = struct {
         const chunk = if (row) |r| &r.chunk else if (index) |i| &self.chunks[i] else null;
         const bit = CutBit.init(tile);
         const already = if (chunk) |c| bit.isSet(c) else false;
-        const result = actions.cutRule(.{ .x = tile.x, .y = tile.y, .terrain = world.sampleTile(world.public_seed, tile.x, tile.y), .cut = already });
+        const result = actions.cutRule(.{ .x = tile.x, .y = tile.y, .terrain = world.sampleTile(world.public_seed, tile.x, tile.y), .cut = already }, .hoe);
         if (result == .ok) {
             const target = chunk orelse new: {
                 if (self.chunk_count == capacity) return error.CapacityExceeded;
@@ -213,29 +222,28 @@ pub const WorldState = struct {
         }
     };
 
-    const PreparedHoeCut = struct {
+    const PreparedToolCut = struct {
         cache: *Cache,
         row: *Cache.Row,
         bit: CutBit,
         result: p.State,
 
         /// Apply under the same world lock and pin used to prepare.
-        pub fn apply(self: PreparedHoeCut) p.State {
+        pub fn apply(self: PreparedToolCut) p.State {
             self.cache.markCut(self.row, self.bit);
             return self.result;
         }
     };
 
     /// No global request-ID lookup: the authoritative bitmap determines whether
-    /// the pinned grass tile can be cut, and the ledger authorizes the payment.
-    pub fn prepareHoeCut(self: *WorldState, tile: p.Cut) union(enum) { ready: PreparedHoeCut, failed: p.CutFailure } {
+    /// the pinned target tile can be cut, and the ledger authorizes the payment.
+    pub fn prepareToolCut(self: *WorldState, tile: p.Cut) union(enum) { ready: PreparedToolCut, failed: p.CutFailure } {
         const cache = if (self.cache) |*cache| cache else return .{ .failed = .server_busy };
         const row = cache.get(ChunkAddress.fromTile(tile.x, tile.y)) orelse return .{ .failed = .server_busy };
         if (row.pins == 0) return .{ .failed = .server_busy };
         const terrain = world.sampleTile(world.public_seed, tile.x, tile.y);
-        if (terrain != .grass) return .{ .failed = .not_cuttable };
         const bit = CutBit.init(tile);
-        const result = actions.cutRule(.{ .x = tile.x, .y = tile.y, .terrain = terrain, .cut = bit.isSet(&row.chunk) });
+        const result = actions.cutRule(.{ .x = tile.x, .y = tile.y, .terrain = terrain, .cut = bit.isSet(&row.chunk) }, tile.tool);
         return switch (result) {
             .ok => |next| .{ .ready = .{ .cache = cache, .row = row, .bit = bit, .result = next } },
             .failed => |failure| .{ .failed = failure },
@@ -293,7 +301,7 @@ pub const WorldState = struct {
             return cache;
         }
 
-        fn get(self: *Cache, address: ChunkAddress) ?*Row {
+        fn get(self: *const Cache, address: ChunkAddress) ?*Row {
             return &self.rows[self.index.get(address) orelse return null];
         }
 

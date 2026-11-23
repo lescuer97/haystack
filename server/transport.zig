@@ -197,8 +197,8 @@ pub const Handler = struct {
         const req = wire.decodeMessage(data, tpe == .binary) catch |err|
             return self.sendProtocolError(err);
         if (p.isChannel(std.meta.activeTag(req.operation))) return self.handleChannel(req);
-        if (req.operation == .cut and self.app.needsHoeCut(req.operation.cut)) {
-            const outcome = try self.app.handleHoeCut(self.session.?, req);
+        if (req.operation == .cut and self.app.requiresPaidCut(req.operation.cut)) {
+            const outcome = try self.app.handlePaidCut(self.session.?, req);
             var reply: [p.max_response_bytes]u8 = undefined;
             const bytes = wire.encodeReply(&reply, .cut, .{ .request_id = req.request_id, .payload = req.operation.cut }, outcome) catch unreachable;
             return self.writeMessage(bytes, .binary);
@@ -210,7 +210,10 @@ pub const Handler = struct {
         var replay = try self.app.retainedCut(req);
         var pins: @import("persistence.zig").Pins = .{};
         if (storage) |store| {
-            if (replay == null) pins = store.prepare(req) catch |err| blk: {
+            if (replay == null) pins = (if (req.operation == .update_location)
+                store.prepareMovement(self.session.?, req)
+            else
+                store.prepare(req)) catch |err| blk: {
                 if (err == error.Canceled) return err;
                 // Another connection may have admitted this ID while prepare ran.
                 replay = try self.app.retainedCut(req);
@@ -241,9 +244,9 @@ pub const Handler = struct {
     fn handleChannel(self: *Handler, req: p.Request) !void {
         var reply: [75]u8 = undefined; // Envelope, ID TLV, and quote outcome TLV.
         const bytes = switch (req.operation) {
-            .channel_requirements => |payload| try wire.encodeReply(&reply, .channel_requirements, .{ .request_id = req.request_id, .payload = payload }, self.app.hoeRequirements(payload.tool)),
-            .channel_open => |payload| try wire.encodeReply(&reply, .channel_open, .{ .request_id = req.request_id, .payload = payload }, try self.app.handleHoeOpen(self.session.?, payload)),
-            .channel_close => |payload| try wire.encodeReply(&reply, .channel_close, .{ .request_id = req.request_id, .payload = payload }, self.app.handleHoeClose(self.session.?, payload)),
+            .channel_requirements => |payload| try wire.encodeReply(&reply, .channel_requirements, .{ .request_id = req.request_id, .payload = payload }, self.app.channelRequirements(payload.tool)),
+            .channel_open => |payload| try wire.encodeReply(&reply, .channel_open, .{ .request_id = req.request_id, .payload = payload }, try self.app.handleChannelOpen(self.session.?, payload)),
+            .channel_close => |payload| try wire.encodeReply(&reply, .channel_close, .{ .request_id = req.request_id, .payload = payload }, self.app.handleChannelClose(self.session.?, payload)),
             .channel_status => |payload| return self.handleChannelStatus(.{ .request_id = req.request_id, .payload = payload }),
             .cut, .read_area, .update_location => unreachable,
         };
@@ -253,7 +256,7 @@ pub const Handler = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const outcome = self.app.handleHoeStatus(self.session.?, req.payload, a);
+        const outcome = self.app.handleChannelStatus(self.session.?, req.payload, a);
         const proofs = if (outcome == .ok) outcome.ok.sender_proofs else null;
         var small: [p.channel_status_reply_overhead]u8 = undefined;
         const reply = if (proofs) |bytes| try a.alloc(u8, p.channel_status_reply_overhead + bytes.len) else &small;

@@ -21,13 +21,8 @@ var owner: ?*Worker = null;
 var next_token: u32 = 0;
 
 // Match ws_worker without pulling desktop socket or wallet dependencies into Wasm.
-pub const HoeChannel = struct {
-    id: [32]u8,
-    capacity_msats: u64,
-    balance_msats: u64,
-    player: [33]u8,
-};
-pub const HoeLogin = struct { player: [33]u8, channel: ?HoeChannel };
+pub const HoeChannel = sync.ToolChannel;
+pub const HoeLogin = sync.ToolLogin;
 
 pub const ChannelStatusOutcome = union(enum) {
     ok: struct {
@@ -120,7 +115,7 @@ pub const Worker = struct {
     move_outbox: ?protocol.Location = null,
     area: sync.AreaMailbox = .idle,
     auth_player: ?[33]u8 = null,
-    auth_hoe_channel: ?HoeChannel = null,
+    auth_tool_channels: sync.ToolChannels = @splat(null),
     channel: ChannelMailbox = .idle,
     channel_bytes: [max_outbound_bytes]u8 = undefined,
     cut: CutMailbox = .idle,
@@ -186,7 +181,7 @@ pub const Worker = struct {
         self.move_outbox = null;
         self.area = .idle;
         self.auth_player = null;
-        self.auth_hoe_channel = null;
+        self.auth_tool_channels = @splat(null);
         self.channel = .idle;
         self.cut = .idle;
         self.settled_count = 0;
@@ -213,16 +208,23 @@ pub const Worker = struct {
     }
 
     pub fn hoeLogin(self: *const Worker, session: u64) ?HoeLogin {
-        if (!self.ready(session)) return null;
-        return .{ .player = self.auth_player orelse return null, .channel = self.auth_hoe_channel };
+        return self.toolLogin(session, .hoe);
     }
 
-    /// The balance is from login, not a live channel query.
     pub fn hoeChannel(self: *const Worker, session: u64) ?HoeChannel {
-        return (self.hoeLogin(session) orelse return null).channel;
+        return self.toolChannel(session, .hoe);
     }
 
-    /// Drop all queued work and get a fresh authenticated balance. Never replay a command.
+    pub fn toolLogin(self: *const Worker, session: u64, tool: protocol.tool) ?HoeLogin {
+        if (self.stage != .play or self.state.status != .ready or session != self.state.session) return null;
+        return .{ .player = self.auth_player orelse return null, .channel = self.auth_tool_channels[@backingInt(tool)] };
+    }
+
+    /// Login snapshot, not a live balance. Never returned for a stale session.
+    pub fn toolChannel(self: *const Worker, session: u64, tool: protocol.tool) ?HoeChannel {
+        return (self.toolLogin(session, tool) orelse return null).channel;
+    }
+
     pub fn reauthenticate(self: *Worker, session: u64) void {
         if (!self.ready(session)) return;
         self.close();
@@ -367,20 +369,9 @@ pub const Worker = struct {
 
     fn restoreLogin(self: *Worker, reply: protocol.AuthOutcome) !void {
         const player = self.auth_player orelse return error.UnexpectedReply;
-        self.auth_hoe_channel = null;
-        self.state.confirmed = switch (reply) {
-            .ok => |location| location,
-            .ok_with_hoe_channel => |success| blk: {
-                self.auth_hoe_channel = .{
-                    .id = success.hoe_channel_id,
-                    .capacity_msats = success.hoe_channel_capacity_msat,
-                    .balance_msats = success.hoe_channel_balance_msat,
-                    .player = player,
-                };
-                break :blk success.location;
-            },
-            .failed => unreachable,
-        };
+        const restored = sync.AuthRestore.fromReply(reply, player) orelse return error.UnexpectedReply;
+        self.auth_tool_channels = restored.channels;
+        self.state.confirmed = restored.location;
         self.stage = .play;
         self.state.status = .ready;
         self.backoff = 0.25;

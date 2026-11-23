@@ -119,7 +119,7 @@ test "cut payment requires all three fixed-length fields in order" {
         .{ .want = error.TruncatedFieldValue, .suffix = cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv[0..66] },
         .{ .want = error.DuplicateField, .suffix = cut_channel_tlv ++ cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv },
         .{ .want = error.DuplicateField, .suffix = cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv ++ cut_signature_tlv },
-        .{ .want = error.UnknownField, .suffix = cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv ++ "\x23\x01\x00\x01" },
+        .{ .want = error.UnknownField, .suffix = cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv ++ "\x27\x01\x00\x01" },
     };
     var body: [p.max_gameplay_request_bytes]u8 = undefined;
     var buf: [p.max_gameplay_request_bytes]u8 = undefined;
@@ -442,6 +442,7 @@ test "channel open with params enforces independent field and frame bounds" {
         .id = @splat(0x42),
         .proof = proof[0..p.max_channel_proof_bytes],
         .params = params[0..p.max_channel_params_bytes],
+        .tool = .axe,
     } };
     var buf: [p.max_channel_open_with_params_bytes + 1]u8 = undefined;
     const data = try wire.encodeRequest(&buf, .channel_open, req);
@@ -595,4 +596,34 @@ test "wire decoders are panic-free on deterministic random input" {
         buf[random.intRangeLessThan(usize, 0, seed.len)] ^= random.intRangeAtMost(u8, 1, 255);
         try exerciseDecoders(buf[0..seed.len]);
     }
+}
+
+test "tool cut requests and restored channel groups round trip" {
+    var buf: [p.max_gameplay_request_bytes]u8 = undefined;
+    const payment: p.SpillmanChannelPayment = .{ .id = @splat(3), .amount = 10, .signature = @splat(4) };
+    for (p.tools) |tool| {
+        for ([_]?p.SpillmanChannelPayment{ null, payment }) |proof| {
+            const cut: p.Cut = .{ .x = -1, .y = 6, .tool = tool, .payment = proof };
+            const bytes = try wire.encodeRequest(&buf, .cut, .{ .request_id = id.*, .payload = cut });
+            try t.expectEqualDeep(cut, (try wire.decodeMessage(bytes, true)).operation.cut);
+            if (tool != .hoe) {
+                buf[bytes.len - 2] = 3;
+                try t.expectError(error.InvalidFieldValue, wire.decodeMessage(bytes, true));
+            }
+        }
+    }
+
+    const reply: p.AuthMessage = .{ .reply = .{ .ok_with_tool_channels = .{
+        .location = .{ .x = -3, .y = 1 },
+        .channels = .{
+            .{ .id = @splat(1), .capacity_msat = 20, .balance_msat = 2 },
+            .{ .id = @splat(2), .capacity_msat = 50, .balance_msat = 5 },
+            .{ .id = @splat(3), .capacity_msat = 100, .balance_msat = 100 },
+        },
+    } } };
+    const bytes = try wire.encodeAuth(&buf, reply);
+    try t.expectEqual(wire.max_auth_reply_bytes, bytes.len);
+    try t.expectEqualDeep(reply, try wire.decodeAuth(bytes, true, .reply));
+    buf[3 + 11 + 3 + 49] = 0; // Duplicate the first tool's index.
+    try t.expectError(error.InvalidFieldValue, wire.decodeAuth(bytes, true, .reply));
 }

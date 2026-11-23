@@ -17,17 +17,20 @@ section also documents the explicit
 that fails when the two Cargo roots disagree about a package's source, tag or
 commit.
 
-## Browser paid hoe
+## Browser paid tools
 
 The renderer uses the existing authenticated binary WebSocket service, not a
 separate HTTP payment API. Run the native game server and browser bundle on
-loopback as described in the [README](../README.md). Select the hoe and quote a
-refill, then approve the actual maximum debit. One cut costs 5 msat. A depleted
-channel must be closed and settled before a replacement can be quoted.
+loopback as described in the [README](../README.md). Select a tool and quote a
+refill, then approve the actual maximum debit. Axe, hoe, and pickaxe actions
+cost 2, 5, and 10 msat respectively. Each tool has its own IndexedDB channel and
+funding journal; a depleted channel must be closed and settled before that tool
+can be refilled.
 
 The browser quotes up to ten cuts, selecting eligible active-keyset proofs and
 returning any wallet change in the same raw mint swap. The quote includes fees
-and caps the net debit at 55 msat on Testnut (50 msat in the zero-fee fixture).
+and caps the net debit per tool. The hoe cap, for example, is 55 msat on
+Testnut and 50 msat in the zero-fee fixture.
 It does not use the wallet's nested online send/swap path. IndexedDB commits the
 proof reservation and exact request before mint I/O. A successful checkpoint
 marks the inputs spent, credits verified change, and saves the channel together.

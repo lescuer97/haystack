@@ -18,6 +18,7 @@ const Ref = struct { id: Id, owner: Pubkey };
 pub const Phase = enum { active, depleted, closing_window, expired, sender_refund_required, settlement_pending, settled };
 pub const Info = struct {
     capacity_msat: u64,
+    price_msat: u64,
     balance_msat: u64,
     expiry: u64,
     phase: Phase,
@@ -41,7 +42,7 @@ pub const LiveChannel = struct {
     secret: [:0]const u8,
 
     pub fn exhausted(self: *const LiveChannel) bool {
-        return self.data.info.remaining() < hoe_price_msat;
+        return self.data.info.remaining() < self.data.info.price_msat;
     }
 
     pub fn deinit(self: *LiveChannel) void {
@@ -91,7 +92,8 @@ const Keyset = struct { keysetId: []const u8, unit: []const u8, finalExpiry: ?u6
 const metadata_schema =
     \\CREATE TABLE receiver_channels (
     \\  id BLOB PRIMARY KEY CHECK(length(id)=32), owner BLOB NOT NULL CHECK(length(owner)=33),
-    \\  wallet_net_msat INTEGER CHECK(wallet_net_msat>0)
+    \\  wallet_net_msat INTEGER CHECK(wallet_net_msat>0),
+++ std.fmt.comptimePrint("  price_msat INTEGER NOT NULL DEFAULT {d} CHECK(price_msat>0)\n", .{hoe_price_msat}) ++
     \\) STRICT, WITHOUT ROWID;
 ;
 
@@ -107,7 +109,7 @@ const receiver_view =
     \\    CAST(json_extract(s.funding_json,'$.funding_proofs_json') AS BLOB) AS proofs,
     \\    CASE WHEN s.state='Closing' AND j.journal<>'refund_only' THEN CAST(j.journal AS BLOB) END AS pending,
     \\    CAST(s.closed_json AS BLOB) AS receipt, s.state,
-    \\    CASE WHEN s.state='Closing' AND j.journal='refund_only' THEN 1 ELSE 0 END AS refund_only
+    \\    CASE WHEN s.state='Closing' AND j.journal='refund_only' THEN 1 ELSE 0 END AS refund_only, m.price_msat
     \\  FROM receiver_channels m JOIN spilman_channels s ON s.channel_id=lower(hex(m.id))
     \\  LEFT JOIN spilman_close_journals j ON j.channel_id=s.channel_id;
 ;
@@ -167,9 +169,10 @@ pub const Ledger = struct {
         }
         const legacy = try hasTable(db, "hoe_channel");
         if (mode == .existing and !legacy) {
-            if (try hasColumn(db, "receiver_channels", "expiry") or try hasColumn(db, "receiver_channels", "capacity"))
+            if (!try hasColumn(db, "receiver_channels", "price_msat") or
+                try hasColumn(db, "receiver_channels", "expiry") or try hasColumn(db, "receiver_channels", "capacity"))
                 return error.OutdatedChannelDatabase;
-            const check = try db.prepare("SELECT id, expiry, capacity, state FROM receiver_state LIMIT 0");
+            const check = try db.prepare("SELECT id, expiry, capacity, state, price_msat FROM receiver_state LIMIT 0");
             defer check.finalize();
             try check.finish();
         }
@@ -210,7 +213,7 @@ pub const Ledger = struct {
         defer stmt.finalize();
         if (!try stmt.next()) return null;
         const info = try self.readInfo(stmt, now);
-        if (info.phase != .active or info.remaining() < hoe_price_msat)
+        if (info.phase != .active or info.remaining() < info.price_msat)
             return .{ .info = info };
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
@@ -222,18 +225,23 @@ pub const Ledger = struct {
         return .{ .info = info, .live = live };
     }
 
+    pub fn acceptFunded(self: *Ledger, owner: Pubkey, request: Open, now: u64) !Info {
+        return self.acceptToolFunded(owner, request, now, .hoe);
+    }
+
     /// Accept already funded proofs. No swap is submitted by open. New entries
     /// require local funding verification and an UNSPENT mint report. An exact
-    /// retry by the same owner can use an active, previously verified entry.
-    pub fn acceptFunded(self: *Ledger, owner: Pubkey, request: Open, now: u64) !Info {
-        {
+    /// retry by the same owner and tool can use an active, previously verified entry.
+    pub fn acceptToolFunded(self: *Ledger, owner: Pubkey, request: Open, now: u64, tool: protocol.tool) !Info {
+        const price = tool.priceMsat();
+        if (try self.checkBinding(owner, request.id, price)) {
             const stmt = try self.row(owner, request.id);
             defer stmt.finalize();
             if (try stmt.next()) {
                 if (!eql(try stmt.blobSlice(4), request.params_json) or !eql(try stmt.blobSlice(6), request.funding_proofs_json))
                     return error.ChannelIdConflict;
                 const existing = try self.readInfo(stmt, now);
-                if (existing.phase != .active or existing.remaining() < hoe_price_msat) return error.ChannelNotActive;
+                if (existing.phase != .active or existing.remaining() < price) return error.ChannelNotActive;
                 return existing;
             }
         }
@@ -249,7 +257,7 @@ pub const Ledger = struct {
             (owner[0] != 2 and owner[0] != 3) or (sender[0] != 2 and sender[0] != 3) or
             !eql(&(try decodeHex(33, params.receiver_pubkey)), &self.receiver_pubkey) or
             eql(sender[1..], self.receiver_pubkey[1..]) or
-            !protocol.validHoeCapacity(params.capacity) or params.capacity > params.funding_token_amount or
+            !tool.validCapacity(params.capacity) or params.capacity > params.funding_token_amount or
             params.funding_token_amount > self.limits.max_funding_msat or
             params.maximum_amount == 0 or params.maximum_amount > self.limits.max_funding_msat or
             params.setup_timestamp > now or params.expiry_timestamp <= now or
@@ -284,20 +292,9 @@ pub const Ledger = struct {
         try status(c.cdk_spilman_verify_valid_channel(params_json.ptr, secret.ptr, keyset.ptr, proofs_json.ptr), error.InvalidFundingProof);
         try self.checkUnspent(a, proofs_json, proofs[0], proofs.len);
 
-        {
-            const stmt = try self.db.prepare("INSERT INTO receiver_channels (id,owner) VALUES (?1,?2) ON CONFLICT(id) DO NOTHING");
-            defer stmt.finalize();
-            try bindRef(stmt, request.id, owner);
-            try stmt.finish();
-        }
         // Metadata is written first; if interrupted, retrying the same funded
         // open can finish it. An incomplete entry is never reported as active.
-        {
-            const stmt = try self.db.prepare("SELECT 1 FROM receiver_channels WHERE id=?1 AND owner=?2");
-            defer stmt.finalize();
-            try bindRef(stmt, request.id, owner);
-            if (!try stmt.next()) return error.ChannelIdConflict;
-        }
+        try self.bindPrice(owner, request.id, price);
         try self.persist(a, request.id, .{ .op = "fund", .funding = .{
             .params_json = params_json,
             .channel_secret_hex = secret,
@@ -309,13 +306,31 @@ pub const Ledger = struct {
         return opened;
     }
 
+    fn checkBinding(self: *const Ledger, owner: Pubkey, id: Id, price: u64) !bool {
+        const stmt = try self.db.prepare("SELECT owner,price_msat FROM receiver_channels WHERE id=?1");
+        defer stmt.finalize();
+        try stmt.bindBlob(1, &id);
+        if (!try stmt.next()) return false;
+        if (!eql(&(try stmt.blob(33, 0)), &owner) or try stmt.uint(1) != price) return error.ChannelIdConflict;
+        return true;
+    }
+
+    fn bindPrice(self: *const Ledger, owner: Pubkey, id: Id, price: u64) !void {
+        const stmt = try self.db.prepare("INSERT INTO receiver_channels (id,owner,price_msat) VALUES (?1,?2,?3) ON CONFLICT(id) DO NOTHING");
+        defer stmt.finalize();
+        try bindRef(stmt, id, owner);
+        try stmt.bindUInt(3, price);
+        try stmt.finish();
+        if (!try self.checkBinding(owner, id, price)) return error.ChannelIdConflict;
+    }
+
     /// Exactly one step; repeats, gaps and regressions are rejected. Return only
     /// after the new cumulative balance AND its signature commit together.
     pub fn acceptPayment(self: *Ledger, live: *LiveChannel, payment: Payment, now: u64) !void {
         const data = &live.data;
         if (data.info.expiry -| now <= self.limits.stop_payments_before_expiry_seconds)
             return error.ChannelNotActive;
-        const price = hoe_price_msat;
+        const price = data.info.price_msat;
         if (payment.balance_msat <= data.info.balance_msat or
             payment.balance_msat - data.info.balance_msat != price or payment.balance_msat > data.info.capacity_msat)
             return error.InvalidPaymentStep;
@@ -494,7 +509,7 @@ pub const Ledger = struct {
     }
 
     fn row(self: *const Ledger, owner: Pubkey, id: Id) !*Stmt {
-        const stmt = try self.db.prepare("SELECT expiry,capacity,balance,signature,params,keyset,proofs,pending,receipt,wallet_net_msat,refund_only,state FROM receiver_state WHERE id=?1 AND owner=?2");
+        const stmt = try self.db.prepare("SELECT expiry,capacity,balance,signature,params,keyset,proofs,pending,receipt,wallet_net_msat,refund_only,state,price_msat FROM receiver_state WHERE id=?1 AND owner=?2");
         errdefer stmt.finalize();
         try bindRef(stmt, id, owner);
         return stmt;
@@ -504,7 +519,8 @@ pub const Ledger = struct {
         const expiry = try stmt.uint(0);
         const balance = try stmt.uint(2);
         const capacity = try stmt.uint(1);
-        if (expiry == 0 or capacity < hoe_price_msat or balance > capacity or
+        const price = try stmt.uint(12);
+        if (expiry == 0 or price == 0 or capacity < price or balance > capacity or
             (balance == 0) != stmt.isNull(3)) return error.InvalidChannelDatabase;
         if (balance != 0) _ = try stmt.blob(64, 3);
         const phase: Phase = if (stmt.textEquals(11, "Closed")) closed: {
@@ -524,6 +540,7 @@ pub const Ledger = struct {
         return .{
             .expiry = expiry,
             .capacity_msat = capacity,
+            .price_msat = price,
             .balance_msat = balance,
             .phase = phase,
             .wallet_redeemed = !stmt.isNull(9),
@@ -783,7 +800,13 @@ test "ledger requires explicit provisioning and pins mint and receiver" {
         .keyset_info_json = "{}",
         .funding_proofs_json = "[]",
     } });
-    try t.expectEqual(.active, (try service.lookup(owner, id, 1)).?.phase);
+    const accepted = try service.acceptFunded(owner, .{
+        .id = id,
+        .params_json = "{\"expiry_timestamp\":3600,\"capacity\":100}",
+        .funding_proofs_json = "[]",
+    }, 1);
+    try t.expectEqual(.active, accepted.phase);
+    try t.expectEqual(hoe_price_msat, accepted.price_msat);
     try t.expectEqual(null, try service.nextDue(null, 3600)); // Nothing for the receiver to collect.
 
     const pragmas = try service.db.prepare("SELECT (SELECT synchronous FROM pragma_synchronous), (SELECT fullfsync FROM pragma_fullfsync), (SELECT trusted_schema FROM pragma_trusted_schema)");
@@ -815,6 +838,78 @@ test "receiver ledgers with redundant funding columns are rejected without rewri
     defer db.close();
     try t.expect(try hasColumn(db, "receiver_channels", "expiry"));
     try t.expect(try hasColumn(db, "receiver_channels", "capacity"));
+}
+
+test "funded channel price survives reopen and controls retries and signed payments" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try tmpPath(a, &tmp, "channels.sqlite");
+    const wallet = try openWallet(try tmpPath(a, &tmp, "wallet.sqlite"), 0x42);
+    defer closeWallet(wallet);
+    const fixture = try parse(a, struct {
+        mint_url: [:0]const u8,
+        alice_pubkey: []const u8,
+        alice_secret: [:0]const u8,
+        channel_secret: [:0]const u8,
+        expiry_timestamp: u64,
+        params_json: [:0]const u8,
+        keyset_json: [:0]const u8,
+        funding_proofs_json: [:0]const u8,
+    }, @embedFile("testdata/spilman_vectors.json"));
+    const owner = try decodeHex(33, fixture.alice_pubkey);
+    const tool: protocol.tool = .pickaxe;
+    const now = fixture.expiry_timestamp - 3600;
+    const id_result = c.cdk_spilman_channel_parameters_get_channel_id(fixture.params_json.ptr, fixture.channel_secret.ptr, fixture.keyset_json.ptr);
+    defer free(id_result.value);
+    const id = try decodeHex(32, try take(id_result, error.TestCdkFailure));
+    const request: Open = .{ .id = id, .params_json = fixture.params_json, .funding_proofs_json = fixture.funding_proofs_json };
+
+    {
+        var ledger = try Ledger.open(a, path, .create, wallet, fixture.mint_url, bob_key, .{});
+        defer ledger.close();
+        try ledger.bindPrice(owner, id, tool.priceMsat());
+    }
+    for (0..2) |run| {
+        var ledger = try Ledger.open(a, path, .existing, wallet, fixture.mint_url, bob_key, .{});
+        defer ledger.close();
+        // The binding exists even before the separate funding write.
+        try t.expectError(error.ChannelIdConflict, ledger.acceptFunded(owner, request, now));
+        try t.expectError(error.ChannelIdConflict, ledger.acceptToolFunded(owner, request, now, .axe));
+        if (run == 0) {
+            try t.expectEqual(null, try ledger.lookup(owner, id, now));
+            try ledger.bindPrice(owner, id, tool.priceMsat());
+            try ledger.persist(a, id, .{ .op = "fund", .funding = .{
+                .params_json = fixture.params_json,
+                .channel_secret_hex = fixture.channel_secret,
+                .keyset_info_json = fixture.keyset_json,
+                .funding_proofs_json = fixture.funding_proofs_json,
+            } });
+            try t.expectError(error.ChannelIdConflict, ledger.acceptFunded(owner, request, now));
+        }
+        const accepted = try ledger.acceptToolFunded(owner, request, now, tool);
+        try t.expectEqual(10, accepted.price_msat);
+        try t.expectEqual(run * 10, accepted.balance_msat);
+        const loaded = (try ledger.loadLive(owner, id, now)).?;
+        const live = loaded.live.?;
+        defer live.deinit();
+        try t.expectEqual(accepted, loaded.info);
+        try t.expect(!live.exhausted());
+        try t.expectError(error.InvalidPaymentStep, ledger.acceptPayment(live, .{
+            .balance_msat = accepted.balance_msat + hoe_price_msat,
+            .signature = @splat(0),
+        }, now));
+        const balance = accepted.balance_msat + accepted.price_msat;
+        const result = c.cdk_spilman_create_signed_balance_update(fixture.params_json.ptr, fixture.keyset_json.ptr, fixture.alice_secret.ptr, fixture.funding_proofs_json.ptr, balance);
+        defer free(result.value);
+        const signed = try parse(a, struct { signature: []const u8 }, try take(result, error.TestCdkFailure));
+        const payment: Payment = .{ .balance_msat = balance, .signature = try decodeHex(64, signed.signature) };
+        try ledger.acceptPayment(live, payment, now);
+        try t.expectError(error.InvalidPaymentStep, ledger.acceptPayment(live, payment, now));
+        try t.expectEqual(balance, (try ledger.lookup(owner, id, now)).?.balance_msat);
+    }
 }
 
 test "legacy receiver channels migrate in place without reopening a pending close" {
@@ -865,6 +960,7 @@ test "legacy receiver channels migrate in place without reopening a pending clos
         const paid = (try ledger.lookup(owner, @splat(2), 1)).?;
         try t.expectEqual(.settlement_pending, paid.phase);
         try t.expectEqual(5, paid.balance_msat);
+        try t.expectEqual(hoe_price_msat, paid.price_msat);
         const data = try ledger.load(a, owner, @splat(2), 1);
         try t.expectEqual(@as(Signature, @splat(0x81)), data.signature.?);
         try t.expectEqualStrings("exact submitted request", data.pending.?);

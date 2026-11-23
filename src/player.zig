@@ -1,7 +1,46 @@
 //! Frame coordinates and playback for the Cute Fantasy player sheets.
 const std = @import("std");
+const ProtocolTool = @import("shared").protocol.tool;
 
-pub const Tool = enum { hoe };
+pub const Tool = enum {
+    pickaxe,
+    axe,
+    hoe,
+
+    pub const slots = [_]Tool{ .pickaxe, .axe, .hoe };
+
+    pub fn protocolTool(self: Tool) ProtocolTool {
+        return switch (self) {
+            .pickaxe => .pickaxe,
+            .axe => .axe,
+            .hoe => .hoe,
+        };
+    }
+
+    pub fn fromProtocol(tool: ProtocolTool) Tool {
+        return switch (tool) {
+            .pickaxe => .pickaxe,
+            .axe => .axe,
+            .hoe => .hoe,
+        };
+    }
+
+    pub fn animation(self: Tool) Action {
+        return switch (self) {
+            .pickaxe => .pickaxe,
+            .axe => .axe,
+            .hoe => .hoe,
+        };
+    }
+
+    pub fn label(self: Tool) [:0]const u8 {
+        return switch (self) {
+            .pickaxe => "Pickaxe",
+            .axe => "Axe",
+            .hoe => "Hoe",
+        };
+    }
+};
 pub const Action = enum { sword, pickaxe, axe, hoe, water, collapse };
 const Facing = enum {
     down,
@@ -107,6 +146,16 @@ pub const Animation = struct {
         };
     }
 };
+
+test "toolbar order maps to protocol tools and existing swing clips" {
+    const protocol_tools = [_]ProtocolTool{ .pickaxe, .axe, .hoe };
+    const swings = [_]Action{ .pickaxe, .axe, .hoe };
+    for (Tool.slots, protocol_tools, swings) |tool, protocol_tool, swing| {
+        try std.testing.expectEqual(protocol_tool, tool.protocolTool());
+        try std.testing.expectEqual(tool, Tool.fromProtocol(protocol_tool));
+        try std.testing.expectEqual(swing, tool.animation());
+    }
+}
 
 test "sheet coordinates match the measured direction rows" {
     const directions = [_]Facing{ .down, .right, .up, .left };

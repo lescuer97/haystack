@@ -23,22 +23,24 @@ pub const Settings = settings_mod.Settings;
 
 pub const ToolbarLayout = struct {
     bounds: menu.Rect,
-    hoe: menu.Rect,
+    slots: [player.Tool.slots.len]menu.Rect,
 };
 
 pub fn toolbarLayout(viewport_w: f32, viewport_h: f32) ?ToolbarLayout {
-    const width = 80;
+    const slot_width = 84;
     const height = 48;
     const margin = 8;
     const padding = 6;
+    const width = player.Tool.slots.len * slot_width + (player.Tool.slots.len + 1) * padding;
     if (viewport_w < width + 2 * margin or viewport_h < height + 2 * margin) return null;
 
     const x = (viewport_w - width) / 2;
     const y = viewport_h - height - margin;
-    return .{
-        .bounds = .{ .x = x, .y = y, .width = width, .height = height },
-        .hoe = .{ .x = x + padding, .y = y + padding, .width = width - 2 * padding, .height = height - 2 * padding },
-    };
+    var layout: ToolbarLayout = .{ .bounds = .{ .x = x, .y = y, .width = width, .height = height }, .slots = undefined };
+    for (&layout.slots, 0..) |*slot, i| {
+        slot.* = .{ .x = x + padding + @as(f32, @floatFromInt(i * (slot_width + padding))), .y = y + padding, .width = slot_width, .height = height - 2 * padding };
+    }
+    return layout;
 }
 
 pub fn walletBadgeBounds(vw: f32, vh: f32) ?menu.Rect {
@@ -55,13 +57,13 @@ pub fn walletBadgeBounds(vw: f32, vh: f32) ?menu.Rect {
     return .{ .x = margin, .y = y, .width = width, .height = height };
 }
 
-/// Both pointer routing and drawing use the same status panel above the hoe.
+/// Both pointer routing and drawing use the same status panel above the toolbar.
 pub fn hoeStatusBounds(vw: f32, vh: f32) ?menu.Rect {
     const margin = 8;
     const width = @min(320, vw - 2 * margin);
     if (width < 288) return null;
     const toolbar = toolbarLayout(vw, vh) orelse return null;
-    const x = toolbar.hoe.centerX() - width / 2;
+    const x = toolbar.bounds.centerX() - width / 2;
     var anchor_y = toolbar.bounds.y;
     if (walletBadgeBounds(vw, vh)) |badge| {
         if (x < badge.x + badge.width + margin) anchor_y = @min(anchor_y, badge.y);
@@ -89,10 +91,10 @@ pub const HoeFundingUi = struct {
             return switch (self) {
                 .checking => "Checking wallet and server...",
                 .quote_failed => "Check wallet or mint",
-                .funding => "Refilling hoe...",
-                .opening => "Opening hoe channel...",
+                .funding => "Refilling...",
+                .opening => "Opening channel...",
                 .unavailable => "Refill unavailable",
-                .recovery => "Hoe recovery required",
+                .recovery => "Recovery required",
             };
         }
     };
@@ -235,6 +237,7 @@ pub const GameState = struct {
         }
 
         if (!frame.dragging or frame.clicked) self.ui_press_held = false;
+        var aim_pointer = false;
         if (frame.clicked) {
             self.paid_hoe.click_origin = null;
             if (walletBadgeBounds(frame.viewport_w, frame.viewport_h)) |bounds| {
@@ -245,15 +248,20 @@ pub const GameState = struct {
                     return;
                 }
             }
-            const toolbar = toolbarLayout(frame.viewport_w, frame.viewport_h);
-            const over_toolbar = if (toolbar) |layout| layout.bounds.contains(frame.pointer_x, frame.pointer_y) else false;
-            self.ui_press_held = frame.dragging and over_toolbar;
-            if (toolbar) |layout| {
-                if (layout.hoe.contains(frame.pointer_x, frame.pointer_y)) self.selected_tool = .hoe;
+            if (toolbarLayout(frame.viewport_w, frame.viewport_h)) |layout| {
+                if (layout.bounds.contains(frame.pointer_x, frame.pointer_y)) {
+                    for (layout.slots, player.Tool.slots) |slot, tool| {
+                        if (slot.contains(frame.pointer_x, frame.pointer_y)) self.selectTool(tool);
+                    }
+                    self.ui_press_held = frame.dragging;
+                    self.player_walking = false;
+                    self.camera.resetDrag();
+                    return;
+                }
             }
-            if (!over_toolbar and !frame.right_clicked) {
+            if (!frame.right_clicked) {
                 if (!frame.dragging) {
-                    self.paid_hoe.target = self.hoeTarget(frame);
+                    aim_pointer = true;
                 } else if (frame.drag_x == 0 and frame.drag_y == 0) {
                     // Browser left press may become a camera pan. Only a
                     // stationary release may turn it into a paid action.
@@ -261,12 +269,13 @@ pub const GameState = struct {
                 }
             }
         }
+        if (frame.select_tool) |tool| self.selectTool(tool);
         if (self.paid_hoe.click_origin) |origin| {
             if (frame.drag_x != 0 or frame.drag_y != 0 or frame.right_clicked or
                 @abs(frame.pointer_x - origin.x) > 3 or @abs(frame.pointer_y - origin.y) > 3)
                 self.paid_hoe.click_origin = null;
             if (!frame.dragging) {
-                if (frame.released and self.paid_hoe.click_origin != null) self.paid_hoe.target = self.hoeTarget(frame);
+                if (frame.released and self.paid_hoe.click_origin != null) aim_pointer = true;
                 self.paid_hoe.click_origin = null;
             }
         }
@@ -291,7 +300,7 @@ pub const GameState = struct {
                     var next_camera = self.camera;
                     if (next_camera.setTarget(@as(i64, self.player_pos.x) + dx, @as(i64, self.player_pos.y) + dy)) |_| {
                         const next: Location = .{ .x = next_camera.tile_x, .y = next_camera.tile_y };
-                        self.player_walking = movement.canStep(self.player_pos, next);
+                        self.player_walking = movement.canStepWith(self.player_pos, next, self);
                         if (self.player_walking) {
                             self.player_pos = next;
                             self.camera = next_camera;
@@ -303,16 +312,23 @@ pub const GameState = struct {
             }
             self.camera.resetDrag();
         }
-        self.player_animation.update(frame.dt, facing_dx, facing_dy, self.player_walking, frame.action);
+        self.player_animation.update(frame.dt, facing_dx, facing_dy, self.player_walking, null);
+        if (aim_pointer) self.paid_hoe.target = self.pointerToolTarget(frame);
         if (frame.use_tool and !frame.dragging and self.paid_hoe.target == null) {
-            self.paid_hoe.target = self.facingHoeTarget();
+            self.paid_hoe.target = self.facingToolTarget();
         }
 
         if (frame.toggle_grid) self.settings.debug.tile_grid = !self.settings.debug.tile_grid;
         if (frame.toggle_borders) self.settings.debug.chunk_borders = !self.settings.debug.chunk_borders;
     }
 
-    fn hoeTarget(self: *const GameState, frame: input.FrameInput) ?Location {
+    fn selectTool(self: *GameState, tool: player.Tool) void {
+        if (self.selected_tool == tool) return;
+        self.selected_tool = tool;
+        self.paid_hoe.refill_presented = false;
+    }
+
+    fn pointerToolTarget(self: *const GameState, frame: input.FrameInput) ?Location {
         if (!(frame.pointer_x >= 0 and frame.pointer_x < frame.viewport_w and
             frame.pointer_y >= 0 and frame.pointer_y < frame.viewport_h)) return null;
         const center = camera.relativeTileCenter(self.player_pos.x, self.player_pos.y, self.camera.tile_x, self.camera.tile_y);
@@ -322,37 +338,41 @@ pub const GameState = struct {
         if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return null;
         if (dx >= -half_tile and dx < half_tile and dy >= -half_tile and dy < half_tile) return null;
         // Aim along the dominant axis, regardless of distance or player facing.
-        return self.adjacentHoeTarget(if (@abs(dx) >= @abs(dy))
+        return self.adjacentToolTarget(if (@abs(dx) >= @abs(dy))
             .{ .x = if (dx < 0) -1 else 1, .y = 0 }
         else
             .{ .x = 0, .y = if (dy < 0) -1 else 1 });
     }
 
-    fn facingHoeTarget(self: *const GameState) ?Location {
+    fn facingToolTarget(self: *const GameState) ?Location {
         const offset: Location = switch (self.player_animation.facing) {
             .up => .{ .x = 0, .y = -1 },
             .down => .{ .x = 0, .y = 1 },
             .left => .{ .x = -1, .y = 0 },
             .right => .{ .x = 1, .y = 0 },
         };
-        return self.adjacentHoeTarget(offset);
+        return self.adjacentToolTarget(offset);
     }
 
-    fn adjacentHoeTarget(self: *const GameState, offset: Location) ?Location {
-        return self.cuttableGrass(.{
+    fn adjacentToolTarget(self: *const GameState, offset: Location) ?Location {
+        const tile: Location = .{
             .x = std.math.add(i32, self.player_pos.x, offset.x) catch return null,
             .y = std.math.add(i32, self.player_pos.y, offset.y) catch return null,
-        });
-    }
-
-    fn cuttableGrass(self: *const GameState, tile: Location) ?Location {
-        if (self.selected_tool != .hoe) return null;
+        };
         const addr = cutAddress(tile);
         const chunk = self.world.get(addr.area.cx0, addr.area.cy0) orelse return null;
-        if (!chunk.cutsSynced() or chunk.tiles[addr.index] != .grass or chunk.isCut(addr.index)) return null;
+        if (!chunk.cutsSynced() or chunk.tiles[addr.index] != self.selected_tool.protocolTool().terrain() or chunk.isCut(addr.index)) return null;
         return tile;
     }
 
+    /// Cached visuals can survive invalidation; collision needs a current snapshot.
+    pub fn isCleared(self: *const GameState, tile: Location) bool {
+        const addr = cutAddress(tile);
+        const chunk = self.world.get(addr.area.cx0, addr.area.cy0) orelse return false;
+        return chunk.cutsSynced() and chunk.isCut(addr.index);
+    }
+
+    /// Legacy runtime entry point for a confirmed clear by any tool.
     pub fn applyHoeCut(self: *GameState, tile: Location) void {
         const addr = cutAddress(tile);
         const chunk = self.world.get(addr.area.cx0, addr.area.cy0) orelse return;
@@ -521,6 +541,65 @@ test "Space targets grass in front of the player only during gameplay" {
     try t.expect(game.paid_hoe.target == null);
 }
 
+test "axe and pickaxe target matching synced terrain and open it for movement" {
+    const t = std.testing;
+    const terrain = shared.world;
+    var game = try GameState.init(t.allocator, 1000, 640);
+    defer game.deinit();
+    try game.world.stream(.{ .cx0 = -2, .cx1 = 2, .cy0 = -2, .cy1 = 2 });
+
+    for ([_]player.Tool{ .axe, .pickaxe }) |tool| {
+        const tile = find: {
+            for (0..80) |row| {
+                const y = @as(i32, @intCast(row)) - 32;
+                for (1..80) |col| {
+                    const x = @as(i32, @intCast(col)) - 32;
+                    if (terrain.sampleTile(terrain.public_seed, x, y) != tool.protocolTool().terrain()) continue;
+                    const west = terrain.sampleTile(terrain.public_seed, x - 1, y);
+                    if (west == .grass or west == .dirt) break :find Location{ .x = x, .y = y };
+                }
+            }
+            return error.TestUnexpectedResult;
+        };
+        const from: Location = .{ .x = tile.x - 1, .y = tile.y };
+        game.player_pos = from;
+        try game.camera.setTarget(from.x, from.y);
+        game.player_animation.facing = .right;
+        const step: input.FrameInput = .{ .right = true };
+        const click: input.FrameInput = .{ .clicked = true, .pointer_x = 600, .pointer_y = 320 };
+        const addr = GameState.cutAddress(tile);
+        const snapshot: shared.protocol.Snapshot = .{ .area = addr.area, .count = 1 };
+
+        game.world.invalidateCuts();
+        try game.update(.{ .select_tool = tool, .use_tool = true });
+        try t.expect(game.paid_hoe.target == null);
+        try game.update(step);
+        try t.expectEqual(from, game.player_pos);
+
+        game.world.applyCuts(&snapshot);
+        try game.update(.{ .select_tool = .hoe, .use_tool = true });
+        try t.expect(game.paid_hoe.target == null);
+        try game.update(.{ .select_tool = tool, .use_tool = true });
+        try t.expectEqual(tile, game.paid_hoe.target.?);
+        try game.update(click);
+        try t.expectEqual(tile, game.paid_hoe.target.?);
+        try t.expectEqual(@as(?player.Action, null), game.player_animation.action);
+
+        // A confirmation sets the bit, but stale bits are not safe to predict against.
+        game.applyHoeCut(tile);
+        try game.update(.{ .use_tool = true });
+        try t.expect(game.paid_hoe.target == null);
+        game.world.invalidateCuts();
+        try game.update(step);
+        try t.expectEqual(from, game.player_pos);
+        game.world.applyCuts(&snapshot);
+        game.applyHoeCut(tile);
+        try game.update(step);
+        try t.expectEqual(tile, game.player_pos);
+        try t.expect(game.player_walking);
+    }
+}
+
 test "wallet badge opens Wallet directly and consumes gameplay input" {
     for ([_]f32{ 320, 1000 }) |width| {
         var game = try GameState.init(std.testing.allocator, width, 640);
@@ -540,7 +619,7 @@ test "wallet badge opens Wallet directly and consumes gameplay input" {
         frame.confirm = true;
         frame.dragging = true;
         frame.drag_x = world.TILE_PX;
-        frame.action = .hoe;
+        frame.select_tool = .axe;
         frame.toggle_grid = true;
         const grid_before = game.settings.debug.tile_grid;
         try game.update(frame);
@@ -548,6 +627,7 @@ test "wallet badge opens Wallet directly and consumes gameplay input" {
         try std.testing.expect(game.menu.wallet.balance_dirty);
         try std.testing.expectEqual(@as(usize, 0), game.menu.selected_index);
         try std.testing.expectEqual(grid_before, game.settings.debug.tile_grid);
+        try std.testing.expectEqual(player.Tool.hoe, game.selected_tool);
         try std.testing.expectEqual(@as(?player.Action, null), game.player_animation.action);
         try std.testing.expectEqualDeep(initial_pos, game.player_pos);
         try std.testing.expectEqualDeep(initial_camera, game.camera);
@@ -610,18 +690,22 @@ test "hoe starts selected and a toolbar press does not swing or pan" {
     try std.testing.expectEqual(@as(f32, 500), layout.bounds.x + layout.bounds.width / 2);
     try std.testing.expectEqual(@as(f32, 632), layout.bounds.y + layout.bounds.height);
 
-    try game.update(.{ .clicked = true, .dragging = true, .pointer_x = layout.hoe.x + 1, .pointer_y = layout.hoe.y + 1, .drag_x = world.TILE_PX });
-    try std.testing.expect(game.ui_press_held);
-    try game.update(.{ .dragging = true, .pointer_x = 20, .pointer_y = 20, .drag_x = world.TILE_PX });
-    try std.testing.expectEqual(initial_camera_x, game.camera.tile_x);
-    try std.testing.expectEqual(player.Tool.hoe, game.selected_tool);
-    try std.testing.expectEqual(@as(?player.Action, null), game.player_animation.action);
+    for (layout.slots, player.Tool.slots) |slot, tool| {
+        try game.update(.{ .clicked = true, .dragging = true, .pointer_x = slot.x + 1, .pointer_y = slot.y + 1, .drag_x = world.TILE_PX });
+        try std.testing.expect(game.ui_press_held);
+        try game.update(.{ .dragging = true, .pointer_x = 20, .pointer_y = 20, .drag_x = world.TILE_PX });
+        try std.testing.expectEqual(initial_camera_x, game.camera.tile_x);
+        try std.testing.expectEqual(tool, game.selected_tool);
+        try std.testing.expectEqual(@as(?player.Action, null), game.player_animation.action);
+        try game.update(.{ .released = true, .pointer_x = slot.x + 1, .pointer_y = slot.y + 1 });
+        try std.testing.expect(game.paid_hoe.target == null);
+    }
 
     try game.update(.{});
     try game.update(.{ .clicked = true, .dragging = true, .pointer_x = 20, .pointer_y = 20, .drag_x = world.TILE_PX });
     try std.testing.expectEqual(initial_camera_x - 1, game.camera.tile_x);
     // A world drag crossing the toolbar is still a world drag.
-    try game.update(.{ .dragging = true, .pointer_x = layout.hoe.x + 1, .pointer_y = layout.hoe.y + 1, .drag_x = world.TILE_PX });
+    try game.update(.{ .dragging = true, .pointer_x = layout.slots[2].x + 1, .pointer_y = layout.slots[2].y + 1, .drag_x = world.TILE_PX });
     try std.testing.expectEqual(initial_camera_x - 2, game.camera.tile_x);
 }
 
@@ -679,14 +763,14 @@ test "camera follows steps but does not follow turns; drag only pans the view" {
 
     try std.testing.expectEqualDeep(before_drag, game_state.player_pos);
 
-    // An in-place action doesn't pull a panned camera back to the player.
-    try game_state.update(.{ .action = .axe });
+    // Selecting a tool doesn't pull a panned camera back to the player.
+    try game_state.update(.{ .select_tool = .axe });
     try std.testing.expectEqual(@as(i32, 2), game_state.camera.tile_x);
     try std.testing.expectEqual(@as(i32, -1), game_state.camera.tile_y);
     try std.testing.expectEqualDeep(before_drag, game_state.player_pos);
 
-    // Turning after the action leaves the camera panned; the step starts at the player.
-    try game_state.update(.{ .right = true, .dt = 0.4 });
+    // Turning leaves the camera panned; the step starts at the player.
+    try game_state.update(.{ .right = true });
     try std.testing.expect(game_state.camera.tile_x == 2 and game_state.camera.tile_y == -1);
     try std.testing.expectEqualDeep(before_drag, game_state.player_pos);
     try game_state.update(.{ .right = true });
@@ -701,7 +785,7 @@ test "camera follows steps but does not follow turns; drag only pans the view" {
     try std.testing.expectEqual(!borders_before, game_state.settings.debug.chunk_borders);
 }
 
-test "player walks between tile steps and the menu consumes action input" {
+test "player walks between tile steps and the menu consumes tool selection" {
     var game_state = try GameState.init(std.testing.allocator, 1000, 640);
     defer game_state.deinit();
 
@@ -712,13 +796,15 @@ test "player walks between tile steps and the menu consumes action input" {
     try std.testing.expectEqual(@as(i32, 32), game_state.player_animation.frame().x);
 
     const before = game_state.player_animation.frame();
-    try game_state.update(.{ .escape_clicked = true, .action = .sword });
-    try game_state.update(.{ .action = .axe, .dt = 0.25 });
-    try game_state.update(.{ .escape_clicked = true, .action = .hoe });
+    try game_state.update(.{ .escape_clicked = true, .select_tool = .pickaxe });
+    try game_state.update(.{ .select_tool = .axe, .dt = 0.25 });
+    try game_state.update(.{ .escape_clicked = true, .select_tool = .pickaxe });
     try std.testing.expectEqualDeep(before, game_state.player_animation.frame());
+    try std.testing.expectEqual(player.Tool.hoe, game_state.selected_tool);
 
-    try game_state.update(.{ .action = .water });
-    try std.testing.expectEqual(player.Sheet.tools, game_state.player_animation.frame().sheet);
+    try game_state.update(.{ .select_tool = .axe });
+    try std.testing.expectEqual(player.Tool.axe, game_state.selected_tool);
+    try std.testing.expectEqual(player.Sheet.character, game_state.player_animation.frame().sheet);
 }
 
 test "blocked steps leave player and panned camera in place without walking" {

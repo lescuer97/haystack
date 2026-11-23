@@ -62,18 +62,43 @@ pub const Persistence = struct {
         return self.registry.claimStored(key, deadline, user);
     }
 
-    /// Called with the hoe lock held, after ledger admission. Never take that
-    /// lock from a disk-locked path. Nothing changes in memory if the write fails.
-    pub fn linkChannel(self: *Persistence, handle: sessions.Handle, previous: ?[32]u8, id: [32]u8) !void {
+    /// Called after ledger admission, with the caller's channel lock held. Never
+    /// take that lock from a disk-locked path. A failed write leaves memory unchanged.
+    pub fn linkToolChannel(self: *Persistence, handle: sessions.Handle, tool: p.tool, previous: ?[32]u8, id: [32]u8) !void {
         try self.disk_lock.lock(self.io);
         defer self.disk_lock.unlock(self.io);
         var snapshot = try self.registry.storedUser(handle);
-        if (std.meta.eql(snapshot.user.hoe_channel_id, @as(?[32]u8, id))) return;
-        if (!std.meta.eql(snapshot.user.hoe_channel_id, previous)) return error.ChannelLinkChanged;
-        snapshot.user.hoe_channel_id = id;
+        const target: ?[32]u8 = id;
+        for (std.enums.values(p.tool)) |other| {
+            if (other != tool and std.meta.eql(snapshot.user.channelId(other), target)) return error.ChannelLinkedToDifferentTool;
+        }
+        const current = snapshot.user.channelId(tool);
+        if (std.meta.eql(current, target)) return;
+        if (!std.meta.eql(current, previous)) return error.ChannelLinkChanged;
+        snapshot.user.setChannelId(tool, id);
         try self.db.reopenIfPoisoned();
         try self.db.saveUser(snapshot.pubkey, snapshot.user);
-        self.registry.publishChannelLink(snapshot);
+        self.registry.publishToolChannelLink(tool, snapshot);
+    }
+
+    pub fn linkChannel(self: *Persistence, handle: sessions.Handle, previous: ?[32]u8, id: [32]u8) !void {
+        return self.linkToolChannel(handle, .hoe, previous, id);
+    }
+
+    /// Load and pin the diagonal's side tiles and destination before handing off to the tick.
+    pub fn prepareMovement(self: *Persistence, handle: sessions.Handle, request: p.Request) !Pins {
+        const movement = @import("shared").movement;
+        const from = (self.registry.get(handle) orelse return .{}).location.?;
+        const to = request.operation.update_location;
+        if (movement.canStep(from, to) or !movement.canStepWith(from, to, movement.AllCleared{})) return .{};
+        const a = ChunkAddress.fromTile(from.x, from.y);
+        const b = ChunkAddress.fromTile(to.x, to.y);
+        return self.prepare(.{ .request_id = request.request_id, .operation = .{ .read_area = .{
+            .cx0 = @min(a.cx, b.cx),
+            .cy0 = @min(a.cy, b.cy),
+            .cx1 = @max(a.cx, b.cx),
+            .cy1 = @max(a.cy, b.cy),
+        } } });
     }
 
     pub fn prepare(self: *Persistence, request: p.Request) !Pins {
@@ -208,6 +233,58 @@ pub const Persistence = struct {
         return self.chunk_batch[0..count];
     }
 };
+
+test "independent tool links survive movement, flush and reopen" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", t.allocator);
+    defer t.allocator.free(dir);
+    const path = try std.fmt.allocPrintSentinel(t.allocator, "{s}/game.sqlite3", .{dir}, 0);
+    defer t.allocator.free(path);
+    const key: sessions.Pubkey = @splat(0xa5);
+    const spawn = @import("shared").movement.spawn;
+    const moved: p.Location = .{ .x = -1, .y = 0 };
+    const hoe: [32]u8 = @splat(1);
+    const axe: [32]u8 = @splat(2);
+    const pickaxe: [32]u8 = @splat(3);
+    const replacement: [32]u8 = @splat(4);
+
+    {
+        var db = try GameDb.open(path);
+        defer db.close();
+        try db.saveUser(key, .{ .location = spawn });
+        var registry: sessions.Registry = .{ .io = t.io };
+        var world: WorldState = undefined;
+        var persistence = try Persistence.init(t.io, t.allocator, &db, &world, &registry);
+        defer persistence.deinit(t.allocator);
+        const handle = try persistence.claim(key, .fromNow(t.io, .{ .raw = .fromSeconds(60), .clock = .awake }));
+
+        try persistence.linkChannel(handle, null, hoe);
+        try t.expectError(error.ChannelLinkedToDifferentTool, persistence.linkToolChannel(handle, .axe, null, hoe));
+        try persistence.linkToolChannel(handle, .axe, null, axe);
+        try persistence.linkToolChannel(handle, .pickaxe, null, pickaxe);
+        try t.expectError(error.ChannelLinkedToDifferentTool, persistence.linkToolChannel(handle, .axe, axe, pickaxe));
+        try t.expectError(error.ChannelLinkChanged, persistence.linkToolChannel(handle, .axe, null, replacement));
+        const snapshot = registry.get(handle).?;
+        try t.expectEqual(hoe, snapshot.channelId(.hoe).?);
+        try t.expectEqual(axe, snapshot.channelId(.axe).?);
+        try t.expectEqual(pickaxe, snapshot.channelId(.pickaxe).?);
+        try persistence.linkToolChannel(handle, .axe, axe, replacement);
+        try persistence.linkToolChannel(handle, .axe, axe, replacement); // Same-target retry.
+
+        try registry.update(handle, moved);
+        registry.release(handle);
+        try persistence.flush();
+    }
+    var db = try GameDb.open(path);
+    defer db.close();
+    const stored = (try db.loadUser(key)).?;
+    try t.expectEqual(moved, stored.location);
+    try t.expectEqual(hoe, stored.channelId(.hoe).?);
+    try t.expectEqual(replacement, stored.channelId(.axe).?);
+    try t.expectEqual(pickaxe, stored.channelId(.pickaxe).?);
+}
 
 test "periodic saves keep their cadence and skip elapsed deadlines" {
     const deadline: std.Io.Clock.Timestamp = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake };

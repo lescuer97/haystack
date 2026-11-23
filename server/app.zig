@@ -84,41 +84,58 @@ pub const App = struct {
     pub fn authOutcome(self: *App, handle: sessions.Handle) p.AuthOutcome {
         const session = self.registry.get(handle) orelse return .{ .failed = .unavailable };
         const plain: p.AuthOutcome = .{ .ok = session.location.? };
-        const id = session.hoe_channel_id orelse return plain;
+        const location = plain.ok;
+        for (p.tools) |tool| {
+            if (session.channelId(tool) != null) break;
+        } else return plain;
         const unavailable: p.AuthOutcome = .{ .failed = .unavailable };
         const wallet = self.wallet orelse return unavailable;
-        // Settlement and open can hold this lock across mint I/O. Do not wait,
-        // and don't turn an unresolved pointer into a no-channel ACK.
+        // Login must not wait behind mint I/O or silently drop an unresolved link.
         const channels = wallet.tryAcquire() orelse return unavailable;
         defer channels.release();
         const now = self.unixSeconds() orelse return unavailable;
-        const loaded = (channels.loadLive(session.pubkey, id, now) catch |err| {
-            hoe_log.debug("login ledger lookup failed: {s}", .{@errorName(err)});
-            return unavailable;
-        }) orelse return plain;
-        self.registry.setHoeChannel(handle, loaded.live);
-        const info = loaded.info;
-        if (loaded.live == null and info.phase != .depleted) return plain;
+        var restored: p.ToolChannels = @splat(null);
+        for (p.tools) |tool| {
+            const id = session.channelId(tool) orelse continue;
+            const loaded = (channels.loadLive(session.pubkey, id, now) catch |err| {
+                hoe_log.debug("login ledger lookup failed: {s}", .{@errorName(err)});
+                return unavailable;
+            }) orelse continue;
+            if (loaded.info.price_msat != tool.priceMsat()) {
+                if (loaded.live) |live| live.deinit();
+                return unavailable;
+            }
+            self.registry.setToolChannel(handle, tool, loaded.live);
+            if (loaded.live == null and loaded.info.phase != .depleted) continue;
+            restored[@backingInt(tool)] = .{
+                .id = id,
+                .capacity_msat = loaded.info.capacity_msat,
+                .balance_msat = loaded.info.balance_msat,
+            };
+        }
+        if (restored[@backingInt(p.tool.axe)] != null or restored[@backingInt(p.tool.pickaxe)] != null) {
+            return .{ .ok_with_tool_channels = .{ .location = location, .channels = restored } };
+        }
+        const hoe = restored[@backingInt(p.tool.hoe)] orelse return plain;
         return .{ .ok_with_hoe_channel = .{
-            .location = plain.ok,
-            .hoe_channel_id = id,
-            .hoe_channel_capacity_msat = info.capacity_msat,
-            .hoe_channel_balance_msat = info.balance_msat,
+            .location = location,
+            .hoe_channel_id = hoe.id,
+            .hoe_channel_capacity_msat = hoe.capacity_msat,
+            .hoe_channel_balance_msat = hoe.balance_msat,
         } };
     }
-    pub fn hoeRequirements(self: *const App, tool: p.tool) p.Outcome(.channel_requirements) {
+    pub fn channelRequirements(self: *const App, tool: p.tool) p.Outcome(.channel_requirements) {
         const unavailable: p.Outcome(.channel_requirements) = .{ .failed = .unavailable };
         const wallet = self.wallet orelse return unavailable;
-        if (tool != .hoe) return unavailable;
         const receiver_key = wallet.receiverPubkey(hoe_refund_seconds) orelse return unavailable;
         const now = self.unixSeconds() orelse return unavailable;
         return .{ .ok = .{
             .pubkey = receiver_key,
-            .amount = p.hoe_price_msat,
+            .amount = tool.priceMsat(),
             .refundTime = now + hoe_refund_seconds,
         } };
     }
-    pub fn handleHoeOpen(self: *App, handle: sessions.Handle, open: p.SpillmanChannelOpen) std.Io.Cancelable!p.Outcome(.channel_open) {
+    pub fn handleChannelOpen(self: *App, handle: sessions.Handle, open: p.SpillmanChannelOpen) std.Io.Cancelable!p.Outcome(.channel_open) {
         const unavailable: p.Outcome(.channel_open) = .{ .failed = .unavailable };
         const wallet = self.wallet orelse return unavailable;
         if (!wallet.hasReceiver()) return unavailable;
@@ -128,7 +145,7 @@ pub const App = struct {
         defer channels.release();
 
         const profile = self.registry.storedUser(handle) catch return .{ .failed = .invalid_request };
-        const previous = profile.user.hoe_channel_id;
+        const previous = profile.user.channelId(open.tool);
         const now = self.unixSeconds() orelse return unavailable;
         if (previous) |id| {
             if (!std.mem.eql(u8, &id, &open.id)) {
@@ -138,7 +155,7 @@ pub const App = struct {
                 };
                 if (info) |existing| switch (existing.phase) {
                     .depleted => return .{ .failed = .invalid_request },
-                    .active, .closing_window => if (existing.remaining() >= p.hoe_price_msat) return .{ .failed = .invalid_request },
+                    .active, .closing_window => if (existing.remaining() >= open.tool.priceMsat()) return .{ .failed = .invalid_request },
                     .expired, .sender_refund_required, .settlement_pending, .settled => {},
                 };
             }
@@ -146,11 +163,11 @@ pub const App = struct {
 
         // The wire carries no independent sender binding; new admissions must
         // use the authenticated account's x-only sender key.
-        channels.acceptFunded(profile.pubkey, .{
+        channels.acceptToolFunded(profile.pubkey, .{
             .id = open.id,
             .params_json = open.params,
             .funding_proofs_json = open.proof,
-        }, now) catch |err| switch (err) {
+        }, now, open.tool) catch |err| switch (err) {
             error.InvalidChannelPayload,
             error.InvalidChannelParameters,
             error.InvalidChannelHex,
@@ -173,20 +190,21 @@ pub const App = struct {
         const loaded = (channels.loadLive(profile.pubkey, open.id, now) catch return unavailable) orelse return unavailable;
         var transferred = false;
         defer if (!transferred) if (loaded.live) |live| live.deinit();
-        storage.linkChannel(handle, previous, open.id) catch |err| {
+        storage.linkToolChannel(handle, open.tool, previous, open.id) catch |err| {
             if (err == error.Canceled) return error.Canceled;
+            if (err == error.ChannelLinkedToDifferentTool) return .{ .failed = .invalid_request };
             // The verified ledger entry stays intact. Retrying the same open
             // resumes the link without contacting the mint again.
             hoe_log.debug("open profile link failed: {s}", .{@errorName(err)});
             return unavailable;
         };
-        self.registry.setHoeChannel(handle, loaded.live);
+        self.registry.setToolChannel(handle, open.tool, loaded.live);
         transferred = true;
         return .{ .ok = {} };
     }
     /// The handler calls this only after authentication. Authorize against the
     /// ledger, not a profile link that may have been replaced since expiry.
-    pub fn handleHoeClose(self: *App, handle: sessions.Handle, close: p.SpillmanChannelClosing) p.Outcome(.channel_close) {
+    pub fn handleChannelClose(self: *App, handle: sessions.Handle, close: p.SpillmanChannelClosing) p.Outcome(.channel_close) {
         const unavailable: p.Outcome(.channel_close) = .{ .failed = .unavailable };
         const wallet = self.wallet orelse return unavailable;
         if (!wallet.hasReceiver()) return unavailable;
@@ -207,7 +225,7 @@ pub const App = struct {
         return .ok;
     }
 
-    pub fn handleHoeStatus(self: *App, handle: sessions.Handle, request: p.SpillmanChannelClosing, reply_allocator: std.mem.Allocator) p.Outcome(.channel_status) {
+    pub fn handleChannelStatus(self: *App, handle: sessions.Handle, request: p.SpillmanChannelClosing, reply_allocator: std.mem.Allocator) p.Outcome(.channel_status) {
         const unavailable: p.Outcome(.channel_status) = .{ .failed = .unavailable };
         const wallet = self.wallet orelse return unavailable;
         if (!wallet.hasReceiver()) return unavailable;
@@ -220,7 +238,7 @@ pub const App = struct {
             return if (err == error.SqliteBusy) .{ .failed = .server_busy } else unavailable;
         }) orelse return .{ .failed = .not_found };
         const phase: p.ChannelPhase = switch (info.phase) {
-            .active => if (info.remaining() < p.hoe_price_msat) .settlement_pending else .active,
+            .active => if (info.remaining() < info.price_msat) .settlement_pending else .active,
             .depleted => .depleted,
             .closing_window, .expired => if (info.balance_msat == 0) .sender_refund_required else .settlement_pending,
             .settlement_pending => .settlement_pending,
@@ -238,21 +256,32 @@ pub const App = struct {
         } };
     }
     pub fn handleLocation(self: *App, handle: sessions.Handle, req: p.RequestFor(.update_location)) p.Outcome(.update_location) {
-        self.registry.update(handle, req.payload) catch return .{ .failed = .invalid_request };
+        self.registry.update(handle, req.payload) catch |err| {
+            if (err != error.BlockedMovement) return .{ .failed = .invalid_request };
+            const from = (self.registry.get(handle) orelse return .{ .failed = .invalid_request }).location.?;
+            if (!shared.movement.canStepWith(from, req.payload, shared.movement.AllCleared{})) return .{ .failed = .invalid_request };
+            const context = self.lease() orelse return .{ .failed = .server_busy };
+            defer self.release(context);
+            self.registry.updateWithWorld(handle, req.payload, &context.state) catch return .{ .failed = .invalid_request };
+        };
         return .{ .ok = {} };
     }
     fn hasReceiver(self: *const App) bool {
         return if (self.wallet) |wallet| wallet.hasReceiver() else false;
     }
-    pub fn needsHoeCut(self: *const App, tile: p.Cut) bool {
+    pub fn requiresPaidCut(self: *const App, tile: p.Cut) bool {
         const world = shared.world;
-        return tile.payment != null or (self.hasReceiver() and
-            world.sampleTile(world.public_seed, tile.x, tile.y) == .grass);
+        if (tile.payment != null or tile.tool != .hoe) return true;
+        return switch (world.sampleTile(world.public_seed, tile.x, tile.y)) {
+            .tree, .rock => true,
+            .grass => self.hasReceiver(),
+            .dirt, .water => false,
+        };
     }
 
     /// Run on the connection task, which owns the confirmed session and has
     /// no other gameplay request in flight for it.
-    pub fn handleHoeCut(self: *App, handle: sessions.Handle, req: p.Request) std.Io.Cancelable!p.Outcome(.cut) {
+    pub fn handlePaidCut(self: *App, handle: sessions.Handle, req: p.Request) std.Io.Cancelable!p.Outcome(.cut) {
         const invalid: p.Outcome(.cut) = .{ .failed = .invalid_request };
         const busy: p.Outcome(.cut) = .{ .failed = .server_busy };
         const tile = req.operation.cut;
@@ -260,6 +289,9 @@ pub const App = struct {
         const wallet = self.wallet orelse return invalid;
         if (!wallet.hasReceiver()) return invalid;
         const storage = self.persistence orelse return invalid;
+        const profile = self.registry.storedUser(handle) catch return invalid;
+        const location = profile.user.location;
+        if (@abs(@as(i64, tile.x) - location.x) > 1 or @abs(@as(i64, tile.y) - location.y) > 1) return invalid;
         var pins = storage.prepare(req) catch |err| {
             if (err == error.Canceled) return error.Canceled;
             return busy;
@@ -272,14 +304,11 @@ pub const App = struct {
         const context = self.lease() orelse return busy;
         defer self.release(context);
 
-        const profile = self.registry.storedUser(handle) catch return invalid;
-        const location = profile.user.location;
-        if (@abs(@as(i64, tile.x) - location.x) > 1 or @abs(@as(i64, tile.y) - location.y) > 1) return invalid;
-        const prepared = switch (context.state.prepareHoeCut(tile)) {
+        const prepared = switch (context.state.prepareToolCut(tile)) {
             .ready => |ready| ready,
             .failed => |failure| return .{ .failed = failure },
         };
-        const live = self.registry.hoeChannel(handle) orelse return invalid;
+        const live = self.registry.toolChannel(handle, tile.tool) orelse return invalid;
         if (!std.mem.eql(u8, &live.id, &payment.id)) return invalid;
         const now = self.unixSeconds() orelse return busy;
         try self.registry.io.checkCancel();
@@ -300,7 +329,7 @@ pub const App = struct {
         // The row is still pinned and exclusively leased. No I/O, allocation,
         // replay lookup or cancellation point before marking the bitmap dirty.
         const tile_state = prepared.apply();
-        if (live.exhausted()) self.registry.setHoeChannel(handle, null);
+        if (live.exhausted()) self.registry.setToolChannel(handle, tile.tool, null);
         return .{ .ok = tile_state };
     }
 
@@ -310,7 +339,7 @@ pub const App = struct {
             .cut => |tile| tile,
             else => return null,
         };
-        if (self.needsHoeCut(tile)) return null;
+        if (self.requiresPaidCut(tile)) return null;
         try storage.world_lock.lock(storage.io);
         defer storage.world_lock.unlock(storage.io);
         return self.context.state.replayCut(.{ .request_id = req.request_id, .payload = tile });

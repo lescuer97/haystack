@@ -24,6 +24,16 @@ pub const cuts = protocol.hoe_refill_cuts;
 pub const capacity_msats = protocol.hoe_capacity_msat;
 pub const min_open_remaining_seconds = 300;
 
+/// Different tools can quote the same capacity to the same receiver in the
+/// same second. Spilman IDs do not include the tool, but do include expiry.
+/// Shorten new quotes by at most two seconds to give each tool a distinct
+/// expiry residue. Never change the expiry of existing journaled material.
+pub fn toolRefundTime(tool: protocol.tool, expiry: u64) u64 {
+    const count = protocol.tools.len;
+    const slot = @backingInt(tool);
+    return expiry -| ((expiry % count + count - slot) % count);
+}
+
 pub const Policy = struct {
     /// Canonical CDK mint URL, as returned in Spilman parameters. Only enable
     /// funding for a trusted mint known to support NUT-07 and NUT-09 recovery
@@ -44,6 +54,7 @@ pub const Sender = struct {
 
 const Material = struct {
     version: u32 = 1,
+    tool: protocol.tool = .hoe,
     capacity_msats: u64,
     refund_time: u64,
     channel_secret_hex: [:0]const u8,
@@ -54,6 +65,7 @@ const Material = struct {
 
 pub const Channel = struct {
     arena: std.heap.ArenaAllocator,
+    tool: protocol.tool,
     operation_id: OperationId,
     id: [32]u8,
     mint_url: [:0]const u8,
@@ -66,7 +78,7 @@ pub const Channel = struct {
 
     /// Borrows the verified funding proofs and canonical CDK parameters.
     pub fn openPayload(self: Channel) protocol.SpillmanChannelOpen {
-        return .{ .id = self.id, .proof = self.funding_proofs_json, .params = self.params_json };
+        return .{ .id = self.id, .tool = self.tool, .proof = self.funding_proofs_json, .params = self.params_json };
     }
 
     pub fn deinit(self: *Channel) void {
@@ -153,15 +165,31 @@ pub fn preflight(
     keyset: [:0]const u8,
     sender: Sender,
 ) !Attempt {
+    return preflightTool(.hoe, io, allocator, wallet, pending_send, policy, quote, amounts, keyset, sender);
+}
+
+pub fn preflightTool(
+    tool: protocol.tool,
+    io: std.Io,
+    allocator: Allocator,
+    wallet: *const c.CdkWallet_t,
+    pending_send: OperationId,
+    policy: Policy,
+    quote: protocol.SpillmanChannelRequirementsRes,
+    amounts: Amounts,
+    keyset: [:0]const u8,
+    sender: Sender,
+) !Attempt {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
     const now = std.Io.Clock.real.now(io).toSeconds();
     if (now < 0) return error.InvalidClock;
     try validateQuote(policy, quote, @intCast(now));
-    if (quote.amount != price_msats or !protocol.validHoeCapacity(amounts.capacity)) return error.InvalidCapacity;
+    if (quote.amount != tool.priceMsat() or !tool.validCapacity(amounts.capacity)) return error.InvalidCapacity;
     const token = try take(a, c.cdk_wallet_get_pending_token(wallet, cdk.byteSlice(&pending_send)));
-    const prepared = try prepareExact(a, policy, quote, amounts, token, try a.dupeSentinel(u8, keyset, 0), sender);
+    var prepared = try prepareExact(a, policy, quote, amounts, token, try a.dupeSentinel(u8, keyset, 0), sender);
+    prepared.material.tool = tool;
     if (prepared.proof_bytes > protocol.max_channel_proof_bytes) return error.ProofTooLarge;
     return .{ .arena = arena, .prepared = prepared, .operation_id = pending_send };
 }
@@ -199,6 +227,7 @@ const Verified = struct {
     fn owned(self: Verified, arena: std.heap.ArenaAllocator, op: OperationId, p: Prepared) Channel {
         return .{
             .arena = arena,
+            .tool = p.material.tool,
             .operation_id = op,
             .id = self.id,
             .mint_url = p.mint_url,
@@ -329,6 +358,7 @@ fn checkLayout(a: Allocator, prepared: Prepared, amounts: Amounts, fee_ppk: u64)
 }
 
 fn submit(io: std.Io, a: Allocator, journal: Journal, id: OperationId, p: Prepared, context: anytype, comptime post: anytype) !Verified {
+    if (journal.tool != p.material.tool) return error.ScopeMismatch;
     // Validate/derive the ID before the first external write as well.
     const cid = try channelId(a, p.material);
     const material = try std.json.Stringify.valueAlloc(a, p.material, .{});
@@ -354,7 +384,8 @@ fn load(io: std.Io, a: Allocator, journal: Journal, id: OperationId) !Prepared {
     if (swap.kind != .funding) return error.NotFundingRecord;
     const material = try std.json.parseFromSliceLeaky(Material, a, swap.completion_material, .{ .allocate = .alloc_always });
     if (material.version != 1) return error.UnsupportedFundingVersion;
-    if (!protocol.validHoeCapacity(material.capacity_msats)) return error.InvalidCapacity;
+    if (material.tool != journal.tool) return error.ScopeMismatch;
+    if (!material.tool.validCapacity(material.capacity_msats)) return error.InvalidCapacity;
     return .{
         .mint_url = try a.dupeSentinel(u8, swap.mint_url, 0),
         .request_json = try a.dupeSentinel(u8, swap.request_json, 0),
@@ -574,16 +605,15 @@ fn testResponse(a: Allocator, request_json: []const u8) ![:0]const u8 {
     return a.dupeSentinel(u8, text, 0);
 }
 
-test "both mint fee policies produce and verify exactly ten 5-msat cuts" {
+test "both mint fee policies produce and verify exactly ten cuts for each tool" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const f = TestInputs;
     var q = try f.quote();
-    q.amount = price_msats;
     var keys: std.json.ArrayHashMap([66]u8) = .{};
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    for (0..6) |shift| {
+    for (0..7) |shift| {
         const amount = @as(u64, 1) << @intCast(shift);
         var scalar: [32]u8 = @splat(0);
         std.mem.writeInt(u64, scalar[24..], amount, .big);
@@ -598,23 +628,32 @@ test "both mint fee policies produce and verify exactly ten 5-msat cuts" {
         const policy: Policy = .{ .mint_url = f.policy.mint_url, .max_output_msats = 1_000_000, .input_fee_ppk = ppk };
         const text = try std.json.Stringify.valueAlloc(a, .{ .keyset_id = keyset_id, .unit = "msat", .input_fee_ppk = ppk, .keys = keys }, .{});
         const keyset = try a.dupeSentinel(u8, text, 0);
-        const inputs: []const u64 = if (ppk == 0) &.{ 32, 16, 2 } else &.{ 32, 16, 4, 1 };
-        const amounts: Amounts = .{ .capacity = capacity_msats, .nominal = if (ppk == 0) 50 else 52, .send = if (ppk == 0) 50 else 53 };
-        try t.expectEqual(amounts.nominal, try nominalForCapacity(capacity_msats, keyset, policy.max_output_msats));
-        const token = try f.tokenForKeyset(a, inputs, policy.mint_url, keyset_id);
-        const prepared = try prepareExact(a, policy, q, amounts, token, keyset, f.sender);
-        try t.expectEqual(capacity_msats, prepared.material.capacity_msats);
-        try t.expectEqual(try quotedProofBytes(a, amounts.nominal, keyset_id, q.refundTime), prepared.proof_bytes);
-        const id = try channelId(a, prepared.material);
-        const response = try testResponse(a, prepared.request_json);
-        try t.expectError(error.ProofTooLarge, complete(a, prepared.material, id, response, 1024));
-        const verified = try complete(a, prepared.material, id, response, 8192);
-        try t.expectEqual(prepared.proof_bytes, verified.proofs.len);
-        try t.expect(verified.proofs.len <= 3072);
-        try t.expect(try quotedProofBytes(a, amounts.nominal, &@as([66]u8, @splat('0')), std.math.maxInt(i64)) <= 3072);
-        try t.expectEqual(@popCount(amounts.nominal), (try parse([]SwapProof, a, verified.proofs)).len);
-        for (1..cuts + 1) |cut| {
-            _ = try take(a, c.cdk_spilman_create_signed_balance_update(prepared.material.params_json, keyset, f.sender.secret_key_hex, verified.proofs, cut * price_msats));
+        for (protocol.tools) |tool| {
+            q.amount = tool.priceMsat();
+            const capacity = cuts * q.amount;
+            const nominal = try nominalForCapacity(capacity, keyset, policy.max_output_msats);
+            const send = nominal + try inputFee(ppk, @popCount(nominal));
+            const amounts: Amounts = .{ .capacity = capacity, .nominal = nominal, .send = send };
+            var input_buffer: [64]u64 = undefined;
+            var remaining = send;
+            const inputs = input_buffer[0..@popCount(send)];
+            for (inputs) |*input| {
+                input.* = @as(u64, 1) << @intCast(@ctz(remaining));
+                remaining ^= input.*;
+            }
+            const token = try f.tokenForKeyset(a, inputs, policy.mint_url, keyset_id);
+            const prepared = try prepareExact(a, policy, q, amounts, token, keyset, f.sender);
+            try t.expectEqual(capacity, prepared.material.capacity_msats);
+            try t.expectEqual(try quotedProofBytes(a, nominal, keyset_id, q.refundTime), prepared.proof_bytes);
+            const id = try channelId(a, prepared.material);
+            const response = try testResponse(a, prepared.request_json);
+            try t.expectError(error.ProofTooLarge, complete(a, prepared.material, id, response, 1024));
+            const verified = try complete(a, prepared.material, id, response, 8192);
+            try t.expectEqual(prepared.proof_bytes, verified.proofs.len);
+            try t.expectEqual(@popCount(nominal), (try parse([]SwapProof, a, verified.proofs)).len);
+            for (1..cuts + 1) |cut| {
+                _ = try take(a, c.cdk_spilman_create_signed_balance_update(prepared.material.params_json, keyset, f.sender.secret_key_hex, verified.proofs, cut * q.amount));
+            }
         }
     }
 }
@@ -633,7 +672,8 @@ test "ambiguous funding is journaled before POST and recovery verifies the exact
     defer arena.deinit();
     const a = arena.allocator();
     const f = TestInputs;
-    const q = try f.quote();
+    var q = try f.quote();
+    q.amount = protocol.tool.pickaxe.priceMsat();
     // 33 msat input -> 32 msat funding proof -> 31 -> 30 msat spendable after fees.
     const token = try f.token(a, &.{ 32, 1 }, f.policy.mint_url);
     const fee_keyset = try a.dupeSentinel(u8, try std.mem.replaceOwned(u8, a, f.keyset, "\"input_fee_ppk\":0", "\"input_fee_ppk\":100"), 0);
@@ -641,7 +681,8 @@ test "ambiguous funding is journaled before POST and recovery verifies the exact
     identity.pubkey[0] = 2; // The server normalizes the odd-Y login key.
     var fee_policy = f.policy;
     fee_policy.input_fee_ppk = 100;
-    const p = try prepareExact(a, fee_policy, q, .{ .capacity = 30, .nominal = 32, .send = 33 }, token, fee_keyset, identity);
+    var p = try prepareExact(a, fee_policy, q, .{ .capacity = 30, .nominal = 32, .send = 33 }, token, fee_keyset, identity);
+    p.material.tool = .pickaxe;
     const terms: Amounts = .{ .capacity = 14, .nominal = 16, .send = 17 };
     const exact = try f.token(a, &.{ 1, 16 }, f.policy.mint_url);
     try checkLayout(a, try prepare(a, f.policy, q, terms.capacity, exact, fee_keyset, identity), terms, 100);
@@ -661,7 +702,7 @@ test "ambiguous funding is journaled before POST and recovery verifies the exact
         }
     };
     {
-        const journal = try Journal.open(t.io, root);
+        const journal = try Journal.openTool(t.io, root, .pickaxe);
         defer journal.close(t.io);
         var fake: Fake = .{ .journal = journal };
         var oversized = p;
@@ -674,7 +715,7 @@ test "ambiguous funding is journaled before POST and recovery verifies the exact
         try t.expectError(error.AlreadyPending, submit(t.io, a, journal, id, p, &fake, Fake.post));
         try t.expectEqual(@as(usize, 1), fake.calls);
     }
-    const journal = try Journal.open(t.io, root);
+    const journal = try Journal.openTool(t.io, root, .pickaxe);
     defer journal.close(t.io);
     const saved = try load(t.io, a, journal, id);
     try t.expectEqualDeep(p.material, saved.material);
@@ -690,11 +731,12 @@ test "ambiguous funding is journaled before POST and recovery verifies the exact
     try t.expect(verified.proofs.len <= protocol.max_channel_proof_bytes);
     const channel = verified.owned(arena, id, saved);
     const open = channel.openPayload();
+    try t.expectEqual(protocol.tool.pickaxe, open.tool);
     try t.expectEqual(verified.id, open.id);
     try t.expectEqualStrings(verified.proofs, open.proof);
     try t.expectEqualStrings(saved.material.params_json, open.params);
     const params = try parse(struct { sender_pubkey: [:0]const u8, capacity: u64, funding_token_amount: u64 }, a, open.params);
-    try t.expectEqual(@as(u64, 6) * q.amount, channel.capacity_msats);
+    try t.expectEqual(@as(u64, 3) * q.amount, channel.capacity_msats);
     try t.expectEqual(channel.capacity_msats, params.capacity);
     try t.expectEqual(@as(u64, 32), params.funding_token_amount);
     try t.expectEqualStrings(&std.fmt.bytesToHex(f.sender.pubkey, .lower), params.sender_pubkey);
@@ -705,7 +747,7 @@ test "ambiguous funding is journaled before POST and recovery verifies the exact
 
     // Hand off the actual recovered channel through the desktop ABI, then
     // verify exact material and funding association after reopening.
-    var scope: client.Scope = .{ .server = "wss://game.example/play", .player = f.sender.pubkey, .receiver = q.pubkey };
+    var scope: client.Scope = .{ .server = "wss://game.example/play", .player = f.sender.pubkey, .receiver = q.pubkey, .tool = .pickaxe };
     {
         const store = try client.Store.open(t.io, root, scope);
         defer store.close(t.io);
@@ -746,4 +788,14 @@ test "ambiguous funding is journaled before POST and recovery verifies the exact
     try t.expectEqual(@as(usize, 0), (try other.list(t.io, a)).len);
     try t.expectError(error.FileNotFound, other.read(t.io, a, channel.id));
     try t.expectError(error.ChannelConflict, other.saveFunded(t.io, a, journal, channel));
+}
+
+test "new tool expiries cannot alias even with identical channel capacities" {
+    for (1000..1006) |expiry| {
+        for (protocol.tools) |tool| {
+            const result = toolRefundTime(tool, expiry);
+            try t.expect(result <= expiry and expiry - result < protocol.tools.len);
+            try t.expectEqual(@as(u64, @backingInt(tool)), result % protocol.tools.len);
+        }
+    }
 }

@@ -17,7 +17,7 @@ pub const FrameInput = struct {
     held_dx: i8 = 0,
     held_dy: i8 = 0,
     dt: f32 = 0,
-    action: ?player.Action = null,
+    select_tool: ?player.Tool = null,
     use_tool: bool = false,
     dragging: bool = false,
     drag_x: f32 = 0,
@@ -71,7 +71,7 @@ pub const RawSample = struct {
         const f = self.frame;
         return !f.clicked and !f.released and !f.right_clicked and !f.escape_clicked and !f.confirm and !f.backspace and
             !f.paste_shortcut and !f.toggle_grid and !f.toggle_borders and
-            !f.use_tool and f.action == null and f.character_count == 0 and f.drag_x == 0 and f.drag_y == 0;
+            !f.use_tool and f.select_tool == null and f.character_count == 0 and f.drag_x == 0 and f.drag_y == 0;
     }
 };
 
@@ -115,11 +115,12 @@ pub const Reader = struct {
         held.toggle_grid = rl.isKeyPressed(.g);
         held.toggle_borders = rl.isKeyPressed(.b);
         held.use_tool = rl.isKeyPressed(.space);
-        const bindings = .{
-            .{ .one, .pickaxe }, .{ .two, .axe }, .{ .three, .hoe }, .{ .four, .water }, .{ .five, .collapse },
-        };
-        inline for (bindings) |binding| {
-            if (held.action == null and rl.isKeyPressed(binding[0])) held.action = binding[1];
+        const keys = [_]rl.KeyboardKey{ .one, .two, .three };
+        for (keys, player.Tool.slots) |key, tool| {
+            if (rl.isKeyPressed(key)) {
+                held.select_tool = tool;
+                break;
+            }
         }
         while (true) {
             const cp = rl.getCharPressed();
@@ -152,7 +153,7 @@ pub const Repeater = struct {
         out.up = false;
         out.down = false;
         if (modal) {
-            out.action = null;
+            out.select_tool = null;
             out.use_tool = false;
         }
         const nav = sample.navigation;
@@ -194,6 +195,15 @@ fn stickAxis(value: f32) i8 {
     if (value <= -stick_deadzone) return -1;
     if (value >= stick_deadzone) return 1;
     return 0;
+}
+
+test "tool selection is a gameplay-only edge" {
+    const sample: RawSample = .{ .frame = .{ .select_tool = .axe } };
+    try std.testing.expect(!sample.quiet());
+    try std.testing.expect(sample.continuous().quiet());
+    var repeat: Repeater = .{};
+    try std.testing.expectEqual(@as(?player.Tool, .axe), repeat.route(sample, false).select_tool);
+    try std.testing.expectEqual(@as(?player.Tool, null), repeat.route(sample, true).select_tool);
 }
 
 test "right click is an edge preserved by routing but not reconciliation" {

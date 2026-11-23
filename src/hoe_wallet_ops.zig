@@ -24,6 +24,7 @@ const zero_id: OperationId = @splat(0);
 
 pub const Offer = struct {
     id: [16]u8,
+    tool: protocol.tool = .hoe,
     requirements: Requirements,
     capacity_msats: u64,
     nominal_msats: u64,
@@ -71,7 +72,7 @@ pub const Ops = struct {
     pub fn open(io: Io, root_path: []const u8, wallet: *c.CdkWallet_t, scope: channels.Scope, policy: funding.Policy) !Ops {
         if (!std.fs.path.isAbsolute(root_path) or !validPolicy(policy)) return error.InvalidPolicy;
         const store = try channels.Store.open(io, root_path, scope);
-        return .{ .store = store, .journal = .{ .db = store.db }, .wallet = wallet, .policy = policy };
+        return .{ .store = store, .journal = store.journal(), .wallet = wallet, .policy = policy };
     }
 
     pub fn close(self: *Ops, io: Io) void {
@@ -92,7 +93,7 @@ pub const Ops = struct {
         const json = try self.activeKeyset();
         defer freeString(json);
         const keyset_json = std.mem.span(json.value);
-        var fresh = try choose(a, requirements, self.policy, keyset_json, try self.balance(), protocol.max_channel_proof_bytes);
+        var fresh = try chooseForTool(self.store.tool, a, requirements, self.policy, keyset_json, try self.balance(), protocol.max_channel_proof_bytes);
         try self.checkExistingChannel(io, a, fresh);
         try checkExpiry(io, requirements);
         io.random(&fresh.id);
@@ -196,7 +197,7 @@ pub const Ops = struct {
             .send = accepted.send_msats,
             .nominal = accepted.nominal_msats,
         };
-        var attempt = try funding.preflight(io, a, self.wallet, send.operation_id, self.policy, accepted.requirements, amounts, std.mem.span(keyset.value), sender);
+        var attempt = try funding.preflightTool(self.store.tool, io, a, self.wallet, send.operation_id, self.policy, accepted.requirements, amounts, std.mem.span(keyset.value), sender);
         defer attempt.deinit();
         try checkExpiry(io, accepted.requirements);
         // `fund` commits the replay guard before the POST. Until it commits,
@@ -240,7 +241,7 @@ pub const Ops = struct {
     }
 
     fn saveFunded(self: Ops, io: Io, a: Allocator, pending: Pending, send: ConfirmedSend, channel: funding.Channel) !void {
-        if (!eql(u8, &channel.operation_id, &send.operation_id) or !eql(u8, channel.mint_url, pending.mint_url) or
+        if (channel.tool != self.store.tool or !eql(u8, &channel.operation_id, &send.operation_id) or !eql(u8, channel.mint_url, pending.mint_url) or
             channel.capacity_msats != pending.offer.capacity_msats or channel.refund_time != pending.offer.requirements.refundTime)
             return error.PendingMismatch;
         try self.store.saveFunded(io, a, self.journal, channel);
@@ -256,6 +257,7 @@ pub const Ops = struct {
         const parsed = try self.store.db.read(Pending, a, channels.wallet_namespace, channels.pending_key, max_record_bytes);
         errdefer parsed.deinit();
         try validatePending(parsed.value);
+        if (parsed.value.offer.tool != self.store.tool) return error.PendingMismatch;
         return parsed;
     }
 
@@ -351,6 +353,7 @@ pub const Ops = struct {
 
     fn writePending(self: Ops, _: Io, a: Allocator, pending: Pending) !void {
         try validatePending(pending);
+        if (pending.offer.tool != self.store.tool) return error.PendingMismatch;
         const data = try std.json.Stringify.valueAlloc(a, pending, .{});
         defer a.free(data);
         if (data.len > max_record_bytes) return error.RecordTooLarge;
@@ -381,7 +384,7 @@ pub const Ops = struct {
 
     fn validateTerms(self: Ops, io: Io, requirements: Requirements, sender: funding.Sender) !void {
         try checkExpiry(io, requirements);
-        if (requirements.amount != funding.price_msats or !eql(u8, &requirements.pubkey, &self.store.receiver)) return error.InvalidRequirements;
+        if (requirements.amount != self.store.tool.priceMsat() or !eql(u8, &requirements.pubkey, &self.store.receiver)) return error.InvalidRequirements;
         if ((sender.pubkey[0] != 2 and sender.pubkey[0] != 3) or !eql(u8, sender.pubkey[1..], self.store.player[1..]) or
             sender.secret_key_hex.len != 64 or std.mem.indexOfScalar(u8, sender.secret_key_hex, 0) != null) return error.InvalidSender;
         const key = c.cdk_spilman_secret_key_to_pubkey(sender.secret_key_hex);
@@ -452,7 +455,11 @@ fn checkExpiry(io: Io, req: Requirements) !void {
 }
 
 fn choose(a: Allocator, req: Requirements, policy: funding.Policy, json: [:0]const u8, available: u64, proof_limit: usize) !Offer {
-    if (req.amount != funding.price_msats) return error.InvalidRequirements;
+    return chooseForTool(.hoe, a, req, policy, json, available, proof_limit);
+}
+
+fn chooseForTool(tool: protocol.tool, a: Allocator, req: Requirements, policy: funding.Policy, json: [:0]const u8, available: u64, proof_limit: usize) !Offer {
+    if (req.amount != tool.priceMsat()) return error.InvalidRequirements;
     const keyset = try parseKeyset(a, json, req, policy);
     defer keyset.deinit();
     var mask: u64 = 0;
@@ -460,16 +467,16 @@ fn choose(a: Allocator, req: Requirements, policy: funding.Policy, json: [:0]con
     // Proof sizes and fee splits need not be monotonic in capacity.
     var cuts = protocol.hoe_refill_cuts;
     while (cuts > 1) : (cuts -= 1) {
-        const offer = quoteCapacity(a, req, policy, json, keyset.value, mask, cuts * req.amount, available, proof_limit) catch |err| switch (err) {
+        const offer = quoteCapacity(tool, a, req, policy, json, keyset.value, mask, cuts * req.amount, available, proof_limit) catch |err| switch (err) {
             error.InsufficientBalance, error.UnquotableFundingLayout, error.ProofTooLarge => continue,
             else => return err,
         };
         return offer;
     }
-    return quoteCapacity(a, req, policy, json, keyset.value, mask, req.amount, available, proof_limit);
+    return quoteCapacity(tool, a, req, policy, json, keyset.value, mask, req.amount, available, proof_limit);
 }
 
-fn quoteCapacity(a: Allocator, req: Requirements, policy: funding.Policy, json: [:0]const u8, keyset: Keyset, mask: u64, capacity: u64, available: u64, proof_limit: usize) !Offer {
+fn quoteCapacity(tool: protocol.tool, a: Allocator, req: Requirements, policy: funding.Policy, json: [:0]const u8, keyset: Keyset, mask: u64, capacity: u64, available: u64, proof_limit: usize) !Offer {
     const fee_cap = policy.max_sender_fee_msats;
     const fee_ppk = keyset.inputFeePpk;
     if (capacity > @min(mask, policy.max_output_msats)) return error.UnquotableFundingLayout;
@@ -495,6 +502,7 @@ fn quoteCapacity(a: Allocator, req: Requirements, policy: funding.Policy, json: 
     if (try funding.quotedProofBytes(a, nominal, keyset.keysetId, req.refundTime) > proof_limit) return error.ProofTooLarge;
     return .{
         .id = @splat(0),
+        .tool = tool,
         .requirements = req,
         .capacity_msats = capacity,
         .nominal_msats = nominal,
@@ -526,7 +534,7 @@ fn validPolicy(policy: funding.Policy) bool {
 fn validatePending(pending: Pending) !void {
     const o = pending.offer;
     if (pending.version != 2 or !validPolicy(.{ .mint_url = pending.mint_url, .max_output_msats = pending.max_output_msats }) or
-        o.requirements.amount != funding.price_msats or o.requirements.refundTime == 0 or !protocol.validHoeCapacity(o.capacity_msats) or
+        o.requirements.amount != o.tool.priceMsat() or o.requirements.refundTime == 0 or !o.tool.validCapacity(o.capacity_msats) or
         o.capacity_msats > o.nominal_msats or o.nominal_msats > pending.max_output_msats or o.nominal_msats > o.send_msats or
         o.max_debit_msats > max_amount or o.send_msats > o.max_debit_msats or o.max_sender_fee_msats != o.max_debit_msats - o.send_msats)
         return error.InvalidPending;
@@ -594,6 +602,19 @@ test "quote picks the largest whole-cut offer that fits balance, fees, denominat
 
     const fee = try a.dupeSentinel(u8, try std.mem.replaceOwned(u8, a, zero, "\"inputFeePpk\":0", "\"inputFeePpk\":100"), 0);
     const testnut: funding.Policy = .{ .mint_url = "https://testnut.cashu.space", .max_output_msats = 1_000_000, .input_fee_ppk = 100, .max_sender_fee_msats = 2 };
+    for (protocol.tools) |tool| {
+        var terms = req;
+        terms.amount = tool.priceMsat();
+        const capacity = terms.amount * protocol.hoe_refill_cuts;
+        const full = try chooseForTool(tool, a, terms, fixture, zero, capacity, limit);
+        try t.expectEqual(tool, full.tool);
+        try t.expectEqual(capacity, full.max_debit_msats);
+        try t.expectEqual(protocol.hoe_refill_cuts, full.cuts());
+        const bounded = try chooseForTool(tool, a, terms, testnut, fee, capacity + 5, protocol.max_channel_proof_bytes);
+        try t.expect(tool.validCapacity(bounded.capacity_msats));
+        try t.expect(bounded.max_debit_msats <= capacity + 5);
+        try t.expectError(error.InvalidRequirements, chooseForTool(tool, a, .{ .pubkey = terms.pubkey, .amount = terms.amount + 1, .refundTime = terms.refundTime }, fixture, zero, capacity, limit));
+    }
     const offer = try choose(a, req, testnut, fee, 55, limit);
     try t.expectEqual(50, offer.capacity_msats);
     try t.expectEqual(52, offer.nominal_msats);
@@ -640,6 +661,15 @@ test "an uncertain send preserves the exact returned ID and blocks across reopen
         var ops = try Ops.open(t.io, root, wallet, scope, policy);
         defer ops.close(t.io);
         try t.expectError(error.SendNeedsReconciliation, ops.recordSend(t.io, t.allocator, offer, Fake.send));
+        // Simulate the exact pre-tool pending JSON, which omitted Offer.tool.
+        const saved = try ops.readPending(t.io, t.allocator);
+        defer saved.deinit();
+        const encoded = try std.json.Stringify.valueAlloc(t.allocator, saved.value, .{});
+        defer t.allocator.free(encoded);
+        const legacy = try std.mem.replaceOwned(u8, t.allocator, encoded, "\"tool\":\"hoe\",", "");
+        defer t.allocator.free(legacy);
+        try t.expect(legacy.len < encoded.len);
+        try ops.store.db.put(channels.wallet_namespace, channels.pending_key, legacy, true);
     }
     var ops = try Ops.open(t.io, root, wallet, scope, policy);
     defer ops.close(t.io);
@@ -648,6 +678,23 @@ test "an uncertain send preserves the exact returned ID and blocks across reopen
     try t.expectEqualDeep(offer, saved.value.offer);
     try t.expectEqual(c.CDK_STATUS_SEND_UNCERTAIN, saved.value.state.send_failed.status);
     try t.expectEqual(@as(OperationId, @splat(7)), saved.value.state.send_failed.operation_id.?);
+    var axe_scope = scope;
+    axe_scope.tool = .axe;
+    var axe = try Ops.open(t.io, root, wallet, axe_scope, policy);
+    defer axe.close(t.io);
+    try axe.requireIdle(t.io, t.allocator);
+    try t.expectError(error.PendingMismatch, axe.recordSend(t.io, t.allocator, offer, Fake.send));
+    var axe_offer = offer;
+    axe_offer.tool = .axe;
+    axe_offer.requirements.amount = protocol.tool.axe.priceMsat();
+    axe_offer.capacity_msats = 20;
+    try t.expectError(error.SendNeedsReconciliation, axe.recordSend(t.io, t.allocator, axe_offer, Fake.send));
+    const axe_saved = try axe.readPending(t.io, t.allocator);
+    defer axe_saved.deinit();
+    try t.expectEqualDeep(axe_offer, axe_saved.value.offer);
+    const hoe_saved = try ops.readPending(t.io, t.allocator);
+    defer hoe_saved.deinit();
+    try t.expectEqualDeep(offer, hoe_saved.value.offer);
     const sender: funding.Sender = .{ .pubkey = scope.player, .secret_key_hex = test_sender_secret };
     try t.expectError(error.HoeOperationPending, ops.quote(t.io, t.allocator, req, sender));
     try t.expectError(error.StaleOffer, ops.fundWithConsent(t.io, t.allocator, offer, req, sender));

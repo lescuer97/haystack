@@ -1,4 +1,4 @@
-//! Browser paid hoe. The wallet owns all durable state; this runtime owns only
+//! Browser paid tools. The wallet owns all durable state; this runtime owns only
 //! one authenticated exchange and one wallet request at a time.
 const std = @import("std");
 const protocol = @import("shared").protocol;
@@ -7,15 +7,15 @@ const ws = @import("browser_ws.zig");
 const Snapshot = @import("ws_sync.zig").Snapshot;
 const game_mod = @import("game.zig");
 const Game = game_mod.GameState;
+const PlayerTool = @import("player.zig").Tool;
 
 const scope = "ws://127.0.0.1:9224/";
-const price = protocol.hoe_price_msat;
 const open_remaining_seconds = 300;
 const payment_remaining_seconds = 120;
-const max_debit_msats = 55; // Wallet enforces the selected mint's cap (50 in fixtures).
+const max_funding_overhead_msats = 5; // Fixtures enforce zero overhead in the wallet.
 const Op = enum(c_int) { inspect = 1, quote, fund, open_payload, bind, prepare_cut, resolve_cut, finalize, resume_quote, resume_funding };
 const Callback = *const fn (c_int, u32, u32, [*c]const u8, u32) callconv(.c) void;
-extern fn haystack_hoe_request(u32, u32, c_int, [*]const u8, u32, Callback) void;
+extern fn haystack_tool_request(u32, u32, c_int, c_int, [*]const u8, u32, Callback) void;
 extern "c" fn getentropy([*]u8, usize) c_int;
 
 var owner: ?*Runtime = null;
@@ -81,6 +81,7 @@ const Job = struct { session: u64, serial: u32, op: Op, started: f64 };
 pub const Runtime = struct {
     generation: ?u32 = null,
     session: ?u64 = null,
+    tool: protocol.tool = .hoe,
     phase: Phase = .inspect,
     record: ?Record = null,
     server: ?u64 = null,
@@ -119,38 +120,58 @@ pub const Runtime = struct {
                 self.generation = gen;
                 self.session = null;
                 self.settled = false;
+                self.resetChannel();
             }
             owner = self;
         }
-        const login = if (generation != null) connection.hoeLogin(network.session) else null;
+        var login = if (generation != null) connection.toolLogin(network.session, self.tool) else null;
         const session = if (login != null) network.session else null;
         if (session != self.session) {
             self.session = session;
-            self.restartQuery();
-            self.phase = .inspect;
-            self.record = null;
-            self.server = null;
-            self.terms = null;
-            self.offer = null;
-            self.consent = false;
-            self.quote_failed = false;
-            self.notice = false;
-            self.refresh_after_bind = false;
-            self.open_delay = 1;
-            self.cut = null;
+            self.resetChannel();
         }
+        const switched = self.selectTool(game.selected_tool.protocolTool());
+        if (switched and session != null) login = connection.toolLogin(network.session, self.tool);
         self.advance(connection, network, login, game, now, clock, area_pending) catch |err| {
-            std.log.debug("browser hoe blocked: {s}", .{@errorName(err)});
+            std.log.debug("browser tool blocked: {s}", .{@errorName(err)});
             self.phase = .recovery;
             self.cut = null;
         };
         self.publish(game, now, clock);
-        const changed = !std.meta.eql(before, game.paid_hoe.view) or funding_before != game.hoe_funding.status;
+        const changed = switched or !std.meta.eql(before, game.paid_hoe.view) or funding_before != game.hoe_funding.status;
         if (changed) {
             game.paid_hoe.refill_presented = false;
             game.paid_hoe.click_origin = null;
         }
         return changed;
+    }
+
+    fn selectTool(self: *Runtime, selected: protocol.tool) bool {
+        if (selected == self.tool or self.job != null or self.request != null or self.cut != null) return false;
+        // Complete an immediate reconciliation (e.g. after Close) before
+        // switching, but don't hold the input slot across status backoff.
+        if (self.phase == .query and self.query_at == 0) return false;
+        self.tool = selected;
+        self.settled = false;
+        self.resetChannel();
+        return true;
+    }
+
+    fn resetChannel(self: *Runtime) void {
+        // Re-inspect the selected journal when revisiting a tool. Never reuse
+        // another tool's balances, offer, or login channel.
+        self.restartQuery();
+        self.phase = .inspect;
+        self.record = null;
+        self.server = null;
+        self.terms = null;
+        self.offer = null;
+        self.consent = false;
+        self.quote_failed = false;
+        self.notice = false;
+        self.refresh_after_bind = false;
+        self.open_delay = 1;
+        self.cut = null;
     }
 
     fn advance(self: *Runtime, connection: *ws.Worker, network: Snapshot, login_opt: ?ws.HoeLogin, game: *Game, now: ?u64, clock: f64, area_pending: bool) !void {
@@ -200,7 +221,7 @@ pub const Runtime = struct {
             // Apply the cut only after earlier queued area data has been consumed.
             if (area_pending) return;
             const outcome = connection.takeCut(network.session, cut.id) orelse return;
-            const verdict = classify(cut.tile, outcome) orelse {
+            const verdict = classify(self.tool, cut.tile, outcome) orelse {
                 self.cut = null;
                 self.phase = .recovery;
                 connection.refreshAuth(network.session);
@@ -283,8 +304,12 @@ pub const Runtime = struct {
             }
             return;
         }
+        if (game.selected_tool.protocolTool() != self.tool) {
+            self.publish(game, now, clock);
+            return;
+        }
         const session = self.session orelse return;
-        if (self.job != null or self.request != null or self.cut != null or connection.hoeLogin(session) == null) return;
+        if (self.job != null or self.request != null or self.cut != null or connection.toolLogin(session, self.tool) == null) return;
         self.act(connection, network, game, refill, tile, now, clock) catch {
             self.phase = .recovery;
             self.cut = null;
@@ -297,12 +322,12 @@ pub const Runtime = struct {
             switch (self.phase) {
                 .unfunded => {
                     self.quote_failed = false;
-                    try self.channel(connection, .channel_requirements, .{ .tool = .hoe });
+                    try self.channel(connection, .channel_requirements, .{ .tool = self.tool });
                     self.phase = .quote_terms;
                 },
                 .offer => {
                     if (!self.offerUsable(now)) return;
-                    try self.channel(connection, .channel_requirements, .{ .tool = .hoe });
+                    try self.channel(connection, .channel_requirements, .{ .tool = self.tool });
                     self.consent = true;
                     self.phase = .confirm_terms;
                 },
@@ -334,7 +359,7 @@ pub const Runtime = struct {
             .channel_requirements => |response| {
                 const confirming = self.phase == .confirm_terms;
                 defer self.consent = false;
-                if (response != .ok or now == null or response.ok.amount != price or response.ok.refundTime <= now.?) {
+                if (response != .ok or now == null or response.ok.amount != self.tool.priceMsat() or response.ok.refundTime <= now.?) {
                     self.discardOffer();
                     self.quote_failed = true;
                     return;
@@ -401,7 +426,7 @@ pub const Runtime = struct {
                 },
                 .ok => |status| {
                     const record = self.record.?;
-                    if (status.capacity_msat != record.capacity or !validBalance(record.capacity, status.balance_msat)) return error.BadStatus;
+                    if (status.capacity_msat != record.capacity or !validBalance(self.tool, record.capacity, status.balance_msat)) return error.BadStatus;
                     self.server = status.balance_msat;
                     switch (status.phase) {
                         .active => if (login.channel == null) {
@@ -449,15 +474,15 @@ pub const Runtime = struct {
                         break :blk admitted.bool;
                     },
                 };
-                if (record.refund == 0 or !protocol.validHoeCapacity(record.capacity) or !validBalance(record.capacity, record.accepted)) return error.BadInspect;
+                if (record.refund == 0 or !self.tool.validCapacity(record.capacity) or !validBalance(self.tool, record.capacity, record.accepted)) return error.BadInspect;
                 if (login.channel) |live| {
-                    if (!std.meta.eql(live.id, record.id) or live.capacity_msats != record.capacity or !validBalance(record.capacity, live.balance_msats)) return error.LoginMismatch;
+                    if (!std.meta.eql(live.id, record.id) or live.capacity_msats != record.capacity or !validBalance(self.tool, record.capacity, live.balance_msats)) return error.LoginMismatch;
                 }
                 self.record = record;
                 self.restartQuery();
             },
             .quote => {
-                const offer = parseOffer(result, self.terms.?) catch {
+                const offer = parseOffer(self.tool, result, self.terms.?) catch {
                     self.phase = .unfunded;
                     self.quote_failed = true;
                     return;
@@ -470,7 +495,7 @@ pub const Runtime = struct {
                     self.phase = .resume_available;
                     return;
                 }
-                self.offer = try parseResumeOffer(result);
+                self.offer = try parseResumeOffer(self.tool, result);
                 self.phase = .offer;
             },
             .fund, .resume_funding, .open_payload => {
@@ -492,7 +517,7 @@ pub const Runtime = struct {
                     if (!std.meta.eql(record.id, id) or capacity != record.capacity or refund != record.refund) return error.FundingMismatch;
                 }
                 if (!self.record.?.canReopen(login.channel != null, now)) return error.StaleOpen;
-                try self.channel(connection, .channel_open, .{ .id = id, .proof = try text(result, "funding_proofs_json"), .params = try text(result, "params_json") });
+                try self.channel(connection, .channel_open, .{ .id = id, .proof = try text(result, "funding_proofs_json"), .params = try text(result, "params_json"), .tool = self.tool });
                 self.phase = .opening;
             },
             .bind => {
@@ -511,7 +536,7 @@ pub const Runtime = struct {
                 const cut = self.cut.?;
                 const record = self.record.?;
                 const signature = try hexField(64, result, "signature");
-                const next = record.accepted + price;
+                const next = record.accepted + self.tool.priceMsat();
                 if (try number(result, "balance_msats") != next or next > record.capacity) return error.PrepareMismatch;
                 // Preparation is durable, but submitting false guarantees it
                 // never reached the pending queue. Only that case can roll back.
@@ -519,6 +544,7 @@ pub const Runtime = struct {
                     !connection.submitCut(network.session, .{ .request_id = cut.id, .payload = .{
                         .x = cut.tile.x,
                         .y = cut.tile.y,
+                        .tool = self.tool,
                         .payment = .{ .id = record.id, .amount = next, .signature = signature },
                     } })) try self.resolve(cut, .not_sent, clock);
             },
@@ -526,7 +552,7 @@ pub const Runtime = struct {
                 const cut = self.cut.?;
                 const verdict = cut.verdict.?;
                 const record = &self.record.?;
-                const accepted = record.accepted + (if (verdict == .charged) price else 0);
+                const accepted = record.accepted + (if (verdict == .charged) self.tool.priceMsat() else 0);
                 if (try number(result, "balance_msats") != accepted) return error.ResolveMismatch;
                 self.server = accepted;
                 record.accepted = accepted;
@@ -534,7 +560,7 @@ pub const Runtime = struct {
                 if (verdict != .not_sent) game.applyHoeCut(cut.tile);
                 if (verdict == .charged) {
                     game.cut_feedback.confirm(.{ .tile = cut.tile, .refill_needed = accepted == record.capacity });
-                    game.player_animation.update(0, direction(cut.tile.x, game.player_pos.x), direction(cut.tile.y, game.player_pos.y), false, .hoe);
+                    game.player_animation.update(0, direction(cut.tile.x, game.player_pos.x), direction(cut.tile.y, game.player_pos.y), false, PlayerTool.fromProtocol(self.tool).animation());
                 }
                 if (accepted == record.capacity) self.restartQuery();
             },
@@ -606,7 +632,7 @@ pub const Runtime = struct {
         }
         next_serial +%= 1;
         self.job = .{ .session = self.session.?, .serial = next_serial, .op = op, .started = clock };
-        haystack_hoe_request(self.generation.?, next_serial, @backingInt(op), json.ptr, @intCast(json.len), deliver);
+        haystack_tool_request(self.generation.?, next_serial, @backingInt(self.tool), @backingInt(op), json.ptr, @intCast(json.len), deliver);
     }
 
     fn clearResponse(self: *Runtime) void {
@@ -617,11 +643,15 @@ pub const Runtime = struct {
     fn publish(self: *const Runtime, game: *Game, now: ?u64, clock: f64) void {
         var view: game_mod.HoeView = .{};
         var funding: ?game_mod.HoeFundingUi.Status = null;
-        if (self.session != null) {
+        if (self.session != null and game.selected_tool.protocolTool() != self.tool) {
+            // Do not present another tool's capacity or consent controls.
+            view.payment_pending = self.cut != null;
+            view.status = if (self.cut != null) .pending else .checking;
+        } else if (self.session != null) {
             if (self.record) |record| {
                 view.client = .{ .capacity = record.capacity, .accepted = record.accepted, .stale = self.phase == .recovery };
                 if (self.server) |accepted| view.server = .{ .capacity = record.capacity, .accepted = accepted, .stale = self.cut != null or self.phase == .recovery };
-                if (self.phase == .active or self.phase == .depleted) view.cuts_left = (record.capacity - record.accepted) / price;
+                if (self.phase == .active or self.phase == .depleted) view.cuts_left = (record.capacity - record.accepted) / self.tool.priceMsat();
             }
             view.payment_pending = self.cut != null;
             view.status = if (self.cut != null) .pending else switch (self.phase) {
@@ -641,7 +671,7 @@ pub const Runtime = struct {
             };
             if (self.phase == .offer and self.offerUsable(now)) {
                 const offer = self.offer.?;
-                view.offer = .{ .cuts = offer.capacity / price, .debit = offer.debit, .resume_funding = offer.resume_funding != null };
+                view.offer = .{ .cuts = offer.capacity / self.tool.priceMsat(), .debit = offer.debit, .resume_funding = offer.resume_funding != null };
             }
             view.close_first = self.phase == .depleted and self.canClose(now);
             view.recovery_action = switch (self.phase) {
@@ -701,27 +731,27 @@ fn hexField(comptime len: usize, result: std.json.ObjectMap, key: []const u8) ![
     return decoded;
 }
 
-fn parseOffer(result: std.json.ObjectMap, terms: Terms) !Offer {
+fn parseOffer(tool: protocol.tool, result: std.json.ObjectMap, terms: Terms) !Offer {
     const id = try text(result, "quote_id");
     const capacity = try number(result, "capacity_msats");
     const debit = try number(result, "max_debit_msats");
     const expires = try number(result, "expires_at");
-    if (id.len != 36 or !validDebit(capacity, debit) or try number(result, "cuts") != capacity / price or expires == 0 or expires >= terms.server.refundTime or
-        try number(result, "refund_time") != terms.server.refundTime or try number(result, "price_msats") != terms.server.amount or
+    if (id.len != 36 or !validDebit(tool, capacity, debit) or try number(result, "cuts") != capacity / tool.priceMsat() or expires == 0 or expires >= terms.server.refundTime or
+        try number(result, "refund_time") != terms.server.refundTime or try number(result, "price_msats") != tool.priceMsat() or terms.server.amount != tool.priceMsat() or
         !std.meta.eql(try hexField(33, result, "receiver_pubkey"), terms.server.pubkey) or !std.mem.eql(u8, try text(result, "scope"), scope)) return error.BadOffer;
     return .{ .id = id[0..36].*, .capacity = capacity, .debit = debit, .expires = expires };
 }
 
-fn validDebit(capacity: u64, debit: u64) bool {
-    return protocol.validHoeCapacity(capacity) and debit >= capacity and debit <= max_debit_msats;
+fn validDebit(tool: protocol.tool, capacity: u64, debit: u64) bool {
+    return tool.validCapacity(capacity) and debit >= capacity and debit <= tool.priceMsat() * protocol.hoe_refill_cuts + max_funding_overhead_msats;
 }
 
-fn parseResumeOffer(result: std.json.ObjectMap) !Offer {
+fn parseResumeOffer(tool: protocol.tool, result: std.json.ObjectMap) !Offer {
     const id = try text(result, "operation_id");
     const capacity = try number(result, "capacity_msats");
     const debit = try number(result, "max_debit_msats");
     const refund = try number(result, "refund_time");
-    if (id.len != 36 or !validDebit(capacity, debit) or try number(result, "cuts") != capacity / price or
+    if (id.len != 36 or !validDebit(tool, capacity, debit) or try number(result, "cuts") != capacity / tool.priceMsat() or
         refund <= open_remaining_seconds or !std.mem.eql(u8, try text(result, "scope"), scope)) return error.BadOffer;
     return .{
         .id = id[0..36].*,
@@ -753,8 +783,8 @@ fn requestId() !protocol.Id {
     return id;
 }
 
-fn validBalance(capacity: u64, accepted: u64) bool {
-    return accepted <= capacity and accepted % price == 0;
+fn validBalance(tool: protocol.tool, capacity: u64, accepted: u64) bool {
+    return accepted <= capacity and accepted % tool.priceMsat() == 0;
 }
 
 fn canCut(network: Snapshot, tile: protocol.Location) bool {
@@ -766,16 +796,21 @@ fn direction(target: i32, origin: i32) i8 {
     return if (target < origin) -1 else if (target > origin) 1 else 0;
 }
 
-fn classify(tile: protocol.Location, outcome: protocol.Outcome(.cut)) ?Verdict {
-    return switch (paid_cut.classify(tile, outcome) orelse return null) {
-        .charged => .charged,
-        .already_cut => .already_cut,
+fn classify(tool: protocol.tool, tile: protocol.Location, outcome: protocol.Outcome(.cut)) ?Verdict {
+    const state = switch (outcome) {
+        .ok => |state| state,
+        .failed => |failure| switch (failure) {
+            .already_cut => |state| state,
+            else => return null,
+        },
     };
+    if (state.x != tile.x or state.y != tile.y or state.terrain != tool.terrain() or !state.cut) return null;
+    return if (outcome == .ok) .charged else .already_cut;
 }
 
 test "browser hoe quotes bind to original terms and expose the wallet's maximum debit" {
     const t = std.testing;
-    const terms: Terms = .{ .player = @splat(2), .server = .{ .pubkey = @splat(3), .amount = price, .refundTime = 120 } };
+    const terms: Terms = .{ .player = @splat(2), .server = .{ .pubkey = @splat(3), .amount = protocol.tool.hoe.priceMsat(), .refundTime = 120 } };
     const receiver = std.fmt.bytesToHex(terms.server.pubkey, .lower);
     const json = try std.json.Stringify.valueAlloc(t.allocator, .{
         .status = 0,
@@ -793,12 +828,12 @@ test "browser hoe quotes bind to original terms and expose the wallet's maximum 
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
     defer parsed.deinit();
     const fields = try successful(parsed.value);
-    const offer = try parseOffer(fields, terms);
+    const offer = try parseOffer(.hoe, fields, terms);
     try t.expectEqual(@as(u64, 53), offer.debit);
     var fresh = terms.server;
     fresh.refundTime += 5;
     try t.expect(terms.acceptsFresh(fresh, terms.player));
-    try t.expectError(error.BadOffer, parseOffer(fields, .{ .server = fresh, .player = terms.player }));
+    try t.expectError(error.BadOffer, parseOffer(.hoe, fields, .{ .server = fresh, .player = terms.player }));
     fresh.refundTime = 119;
     try t.expect(!terms.acceptsFresh(fresh, terms.player));
     fresh.refundTime = 120;
@@ -810,14 +845,54 @@ test "browser hoe accepts only a matching authoritative grass reply for a cut" {
     const t = std.testing;
     const tile: protocol.Location = .{ .x = 5, .y = -2 };
     const grass: protocol.State = .{ .x = 5, .y = -2, .terrain = .grass, .cut = true };
-    try t.expectEqual(Verdict.charged, classify(tile, .{ .ok = grass }).?);
-    try t.expectEqual(Verdict.already_cut, classify(tile, .{ .failed = .{ .already_cut = grass } }).?);
-    try t.expect(classify(tile, .{ .failed = .server_busy }) == null);
-    try t.expect(classify(.{ .x = 6, .y = -2 }, .{ .ok = grass }) == null);
+    try t.expectEqual(Verdict.charged, classify(.hoe, tile, .{ .ok = grass }).?);
+    try t.expectEqual(Verdict.already_cut, classify(.hoe, tile, .{ .failed = .{ .already_cut = grass } }).?);
+    try t.expect(classify(.hoe, tile, .{ .failed = .server_busy }) == null);
+    try t.expect(classify(.hoe, .{ .x = 6, .y = -2 }, .{ .ok = grass }) == null);
     var network: Snapshot = .{ .status = .ready, .confirmed = .{ .x = 4, .y = -1 } };
     try t.expect(canCut(network, tile));
     network.pending = true;
     try t.expect(!canCut(network, tile));
+}
+
+test "browser tool replies and balances belong to the pinned tool" {
+    const t = std.testing;
+    const tile: protocol.Location = .{ .x = 1, .y = 2 };
+    for (protocol.tools) |tool| {
+        const state: protocol.State = .{ .x = tile.x, .y = tile.y, .terrain = tool.terrain(), .cut = true };
+        const capacity = tool.priceMsat() * protocol.hoe_refill_cuts;
+        try t.expect(validBalance(tool, capacity, capacity - tool.priceMsat()));
+        try t.expect(!validBalance(tool, capacity, capacity - 1));
+        try t.expect(validDebit(tool, capacity, capacity + 5));
+        try t.expect(!validDebit(tool, capacity, capacity + 6));
+        try t.expect(!validDebit(tool, capacity + tool.priceMsat(), capacity + tool.priceMsat()));
+        for (protocol.tools) |other| {
+            try t.expectEqual(tool == other, classify(other, tile, .{ .ok = state }) == .charged);
+            try t.expectEqual(tool == other, classify(other, tile, .{ .failed = .{ .already_cut = state } }) == .already_cut);
+        }
+    }
+}
+
+test "browser tool switch cannot change the owner of wallet, channel or cut requests" {
+    const t = std.testing;
+    var runtime: Runtime = .{ .tool = .axe, .job = .{ .op = .fund, .session = 1, .serial = 7, .started = 0 } };
+    try t.expect(!runtime.selectTool(.pickaxe));
+    runtime.job = null;
+    runtime.request = @splat(1);
+    try t.expect(!runtime.selectTool(.pickaxe));
+    runtime.request = null;
+    runtime.cut = .{ .id = @splat(2), .tile = .{ .x = 0, .y = 0 } };
+    try t.expect(!runtime.selectTool(.pickaxe));
+    runtime.cut = null;
+    runtime.record = .{ .id = @splat(3), .capacity = 20, .refund = 400, .accepted = 2, .admitted = true };
+    runtime.restartQuery();
+    try t.expect(!runtime.selectTool(.pickaxe));
+    try t.expectEqual(protocol.tool.axe, runtime.tool);
+    runtime.retryQuery(10);
+    try t.expect(runtime.selectTool(.pickaxe));
+    try t.expectEqual(protocol.tool.pickaxe, runtime.tool);
+    try t.expectEqual(Phase.inspect, runtime.phase);
+    try t.expect(runtime.record == null and runtime.offer == null);
 }
 
 test "browser hoe gates saved admission and explicit close on authoritative state" {

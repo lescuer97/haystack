@@ -4,14 +4,25 @@ const shared = @import("shared");
 const game_db = @import("game_db.zig");
 const LiveHoeChannel = @import("native_storage").wallet_service.LiveHoeChannel;
 const Location = shared.protocol.Location;
+const Tool = shared.protocol.tool;
 pub const Pubkey = [33]u8;
 pub const SettlementQueue = std.Io.Queue([32]u8);
 pub const Handle = struct { index: usize, generation: u64 };
 pub const SessionSnapshot = struct {
     pubkey: Pubkey,
     location: ?Location,
-    /// Profile pointer only; it must be validated against the channel ledger before use.
-    hoe_channel_id: ?[32]u8,
+    hoe_channel_id: ?[32]u8 = null,
+    axe_channel_id: ?[32]u8 = null,
+    pickaxe_channel_id: ?[32]u8 = null,
+
+    /// Profile pointer only; validate it against the channel ledger before use.
+    pub fn channelId(self: SessionSnapshot, tool: Tool) ?[32]u8 {
+        return switch (tool) {
+            .hoe => self.hoe_channel_id,
+            .axe => self.axe_channel_id,
+            .pickaxe => self.pickaxe_channel_id,
+        };
+    }
 };
 pub const user_capacity = 1024;
 pub const UserSnapshot = struct { pubkey: Pubkey, user: game_db.User, index: usize };
@@ -23,12 +34,14 @@ pub const Registry = struct {
         pubkey: Pubkey = @splat(0),
         location: ?Location = null,
         user_index: ?usize = null,
-        hoe_channel: ?*LiveHoeChannel = null,
+        channels: std.EnumArray(Tool, ?*LiveHoeChannel) = .initFill(null),
         settlements: ?*SettlementQueue = null,
 
-        fn clearHoe(self: *Slot) void {
-            if (self.hoe_channel) |channel| channel.deinit();
-            self.hoe_channel = null;
+        fn clearChannels(self: *Slot) void {
+            for (&self.channels.values) |*channel| {
+                if (channel.*) |live| live.deinit();
+                channel.* = null;
+            }
         }
     };
     const UserRecord = struct {
@@ -64,7 +77,7 @@ pub const Registry = struct {
             if (self.users.len == 0) return;
             for (&self.slots) |*slot| {
                 slot.user_index = null;
-                slot.clearHoe();
+                slot.clearChannels();
             }
             const users = self.users;
             self.users = &.{};
@@ -176,16 +189,29 @@ pub const Registry = struct {
                 self.users[i] = null;
             }
         }
-        slot.clearHoe();
+        slot.clearChannels();
         slot.* = .{};
     }
     pub fn update(self: *Registry, handle: Handle, location: Location) !void {
+        return self.updateMovement(handle, location, {}, false);
+    }
+
+    /// The caller must keep state readable while movement is checked.
+    pub fn updateWithWorld(self: *Registry, handle: Handle, location: Location, state: anytype) !void {
+        return self.updateMovement(handle, location, state, true);
+    }
+
+    fn updateMovement(self: *Registry, handle: Handle, location: Location, state: anytype, comptime with_world: bool) !void {
         const move = capture: {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             const slot = self.slotFor(handle) orelse return error.StaleSession;
             const from = slot.location.?;
-            if (!shared.movement.canStep(from, location)) return error.BlockedMovement;
+            const allowed = if (with_world)
+                shared.movement.canStepWith(from, location, state)
+            else
+                shared.movement.canStep(from, location);
+            if (!allowed) return error.BlockedMovement;
             if (from.x == location.x and from.y == location.y) return;
             if (slot.user_index) |i| {
                 const record = &self.users[i].?;
@@ -207,30 +233,43 @@ pub const Registry = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const slot = self.slotFor(handle) orelse return null;
-        return .{
-            .pubkey = slot.pubkey,
-            .location = slot.location,
-            .hoe_channel_id = if (slot.user_index) |i| self.users[i].?.user.hoe_channel_id else null,
-        };
+        var snapshot: SessionSnapshot = .{ .pubkey = slot.pubkey, .location = slot.location };
+        if (slot.user_index) |i| {
+            const user = &self.users[i].?.user;
+            snapshot.hoe_channel_id = user.channelId(.hoe);
+            snapshot.axe_channel_id = user.channelId(.axe);
+            snapshot.pickaxe_channel_id = user.channelId(.pickaxe);
+        }
+        return snapshot;
     }
     // Only the owning connection task borrows the channel. The registry lock
     // protects publication; no background task touches the borrowed pointer.
-    pub fn hoeChannel(self: *Registry, handle: Handle) ?*LiveHoeChannel {
+    pub fn toolChannel(self: *Registry, handle: Handle, tool: Tool) ?*LiveHoeChannel {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return (self.slotFor(handle) orelse return null).hoe_channel;
+        return (self.slotFor(handle) orelse return null).channels.get(tool);
     }
 
-    /// Takes ownership even if the slot is stale.
-    pub fn setHoeChannel(self: *Registry, handle: Handle, channel: ?*LiveHoeChannel) void {
+    /// Takes ownership even if the slot is stale. A live channel belongs to one slot and tool.
+    pub fn setToolChannel(self: *Registry, handle: Handle, tool: Tool, channel: ?*LiveHoeChannel) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const slot = self.slotFor(handle) orelse {
             if (channel) |live| live.deinit();
             return;
         };
-        slot.clearHoe();
-        slot.hoe_channel = channel;
+        const current = slot.channels.getPtr(tool);
+        if (current.* == channel) return;
+        if (current.*) |live| live.deinit();
+        current.* = channel;
+    }
+
+    pub fn hoeChannel(self: *Registry, handle: Handle) ?*LiveHoeChannel {
+        return self.toolChannel(handle, .hoe);
+    }
+
+    pub fn setHoeChannel(self: *Registry, handle: Handle, channel: ?*LiveHoeChannel) void {
+        self.setToolChannel(handle, .hoe, channel);
     }
 
     /// Only the confirmed connection installs a queue. Detach it before the
@@ -256,7 +295,7 @@ pub const Registry = struct {
     }
 
     pub fn clearSlots(self: *Registry) void {
-        for (&self.slots) |*slot| slot.clearHoe();
+        for (&self.slots) |*slot| slot.clearChannels();
         self.slots = @splat(.{});
     }
 
@@ -273,16 +312,20 @@ pub const Registry = struct {
     /// Publish only the channel from the committed snapshot. A concurrent move
     /// stays dirty, even if the session disconnected while the disk write ran.
     /// The disk lock excludes claims and other saves until publication.
-    pub fn publishChannelLink(self: *Registry, saved: UserSnapshot) void {
+    pub fn publishToolChannelLink(self: *Registry, tool: Tool, saved: UserSnapshot) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const entry = &self.users[saved.index];
         if (entry.*) |*record| {
             std.debug.assert(std.mem.eql(u8, &record.pubkey, &saved.pubkey));
-            record.user.hoe_channel_id = saved.user.hoe_channel_id;
+            record.user.setChannelId(tool, saved.user.channelId(tool));
             record.dirty = !std.meta.eql(record.user.location, saved.user.location);
             if (!record.active and !record.dirty) entry.* = null;
         }
+    }
+
+    pub fn publishChannelLink(self: *Registry, saved: UserSnapshot) void {
+        self.publishToolChannelLink(.hoe, saved);
     }
 
     pub fn activeLocations(self: *Registry, out: *[64]Location) []const Location {
