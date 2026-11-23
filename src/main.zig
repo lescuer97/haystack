@@ -621,6 +621,9 @@ test "onboarding consumes game input including the completion transition" {
     try std.testing.expect(!game.menu.opened);
     model.receive(.complete_success);
     _ = try routeFrame(&game, &model, .{ .right = true });
+    try std.testing.expect(game.player_animation.facing == .right);
+    try std.testing.expectEqual(camera_before.tile_x, game.camera.tile_x);
+    _ = try routeFrame(&game, &model, .{ .right = true });
     try std.testing.expectEqual(@as(i32, 1), game.camera.tile_x);
 }
 

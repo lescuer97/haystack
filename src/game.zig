@@ -199,9 +199,9 @@ pub const GameState = struct {
     }
 
     /// Apply one frame of already-collected input to persistent state.
-    /// Step requests are checked before moving the player and following with the
-    /// camera. A drag pans only the view. Attempts to cross the world edge
-    /// leave the camera or player in place.
+    /// A direction request turns the player in place if they aren't already
+    /// facing that way. Accepted steps move the player and camera together.
+    /// A drag pans only the view, within the world bounds.
     ///
     /// Menu input is modal. While the menu is open, and on the frame that opens
     /// or closes it, neither the camera nor the gameplay hotkeys see the frame.
@@ -286,20 +286,20 @@ pub const GameState = struct {
             if (dx != 0 or dy != 0) {
                 facing_dx = dx;
                 facing_dy = dy;
-                var next_camera = self.camera;
                 self.player_walking = false;
-                if (next_camera.setTarget(@as(i64, self.player_pos.x) + dx, @as(i64, self.player_pos.y) + dy)) |_| {
-                    const next: Location = .{ .x = next_camera.tile_x, .y = next_camera.tile_y };
-                    self.player_walking = movement.canStep(self.player_pos, next);
-                    if (self.player_walking) {
-                        self.player_pos = next;
-                        self.camera = next_camera;
-                    }
-                } else |_| {}
-            } else {
-                facing_dx = frame.held_dx;
-                facing_dy = frame.held_dy;
-                if (facing_dx == 0 and facing_dy == 0) self.player_walking = false;
+                if (self.player_animation.faces(dx, dy)) {
+                    var next_camera = self.camera;
+                    if (next_camera.setTarget(@as(i64, self.player_pos.x) + dx, @as(i64, self.player_pos.y) + dy)) |_| {
+                        const next: Location = .{ .x = next_camera.tile_x, .y = next_camera.tile_y };
+                        self.player_walking = movement.canStep(self.player_pos, next);
+                        if (self.player_walking) {
+                            self.player_pos = next;
+                            self.camera = next_camera;
+                        }
+                    } else |_| {}
+                }
+            } else if (frame.held_dx == 0 and frame.held_dy == 0) {
+                self.player_walking = false;
             }
             self.camera.resetDrag();
         }
@@ -589,6 +589,7 @@ test "input at the world edge cannot move or pan beyond it" {
     const corner: Location = .{ .x = std.math.maxInt(i32), .y = std.math.minInt(i32) };
     game.player_pos = corner;
     try game.camera.setTarget(corner.x, corner.y);
+    game.player_animation.facing = .right;
     try game.update(.{ .right = true, .up = true });
     try std.testing.expectEqual(corner, game.player_pos);
     try std.testing.expect(!game.player_walking);
@@ -642,14 +643,24 @@ test "streaming covers the fixed minimap while panning across chunk boundaries" 
     }
 }
 
-test "camera follows accepted player steps but drag only pans the view" {
+test "camera follows steps but does not follow turns; drag only pans the view" {
     var game_state = try GameState.init(std.testing.allocator, 1000, 640);
     defer game_state.deinit();
+
+    try game_state.update(.{ .right = true });
+    try std.testing.expectEqualDeep(Location{ .x = 0, .y = 0 }, game_state.player_pos);
+    try std.testing.expect(game_state.camera.tile_x == 0 and game_state.camera.tile_y == 0);
+    try std.testing.expect(game_state.player_animation.facing == .right);
+    try std.testing.expect(!game_state.player_animation.walking);
 
     try game_state.update(.{ .right = true });
     try std.testing.expectEqual(@as(i32, 1), game_state.camera.tile_x);
     try std.testing.expectEqual(@as(i32, 0), game_state.camera.tile_y);
 
+    try game_state.update(.{ .up = true });
+    try std.testing.expectEqualDeep(Location{ .x = 1, .y = 0 }, game_state.player_pos);
+    try std.testing.expect(game_state.player_animation.facing == .up);
+    try std.testing.expect(!game_state.player_animation.walking);
     try game_state.update(.{ .up = true });
     try std.testing.expectEqual(@as(i32, 1), game_state.camera.tile_x);
     try std.testing.expectEqual(@as(i32, -1), game_state.camera.tile_y);
@@ -674,7 +685,10 @@ test "camera follows accepted player steps but drag only pans the view" {
     try std.testing.expectEqual(@as(i32, -1), game_state.camera.tile_y);
     try std.testing.expectEqualDeep(before_drag, game_state.player_pos);
 
-    // The next step starts at the player, not the panned camera.
+    // Turning after the action leaves the camera panned; the step starts at the player.
+    try game_state.update(.{ .right = true, .dt = 0.4 });
+    try std.testing.expect(game_state.camera.tile_x == 2 and game_state.camera.tile_y == -1);
+    try std.testing.expectEqualDeep(before_drag, game_state.player_pos);
     try game_state.update(.{ .right = true });
     try std.testing.expectEqualDeep(Location{ .x = 2, .y = -1 }, game_state.player_pos);
     try std.testing.expectEqual(game_state.player_pos.x, game_state.camera.tile_x);
@@ -691,6 +705,7 @@ test "player walks between tile steps and the menu consumes action input" {
     var game_state = try GameState.init(std.testing.allocator, 1000, 640);
     defer game_state.deinit();
 
+    game_state.player_animation.facing = .right;
     try game_state.update(.{ .right = true, .held_dx = 1 });
     try game_state.update(.{ .held_dx = 1, .dt = 0.11 });
     try std.testing.expectEqual(@as(i32, 1), game_state.camera.tile_x);
@@ -711,6 +726,7 @@ test "blocked steps leave player and panned camera in place without walking" {
     defer game_state.deinit();
     game_state.player_pos = .{ .x = 19, .y = 0 };
     try game_state.camera.setTarget(16, 0);
+    game_state.player_animation.facing = .right;
 
     try game_state.update(.{ .right = true, .held_dx = 1 });
     try game_state.update(.{ .held_dx = 1, .dt = 0.05 });
@@ -719,6 +735,7 @@ test "blocked steps leave player and panned camera in place without walking" {
     try std.testing.expect(!game_state.player_animation.walking);
     try std.testing.expectEqual(@as(i32, 32), game_state.player_animation.frame().y);
 
+    try game_state.update(.{ .down = true });
     try game_state.update(.{ .down = true });
     try std.testing.expectEqualDeep(Location{ .x = 19, .y = 1 }, game_state.player_pos);
     try std.testing.expectEqual(@as(i32, 19), game_state.camera.tile_x);
@@ -828,7 +845,8 @@ test "menu input blocks camera and debug toggles, including transition frames" {
 
     // The next ordinary frame works again.
     try game_state.update(.{ .right = true, .toggle_grid = true });
-    try std.testing.expectEqual(@as(i32, 1), game_state.camera.tile_x);
+    try std.testing.expect(game_state.player_animation.facing == .right);
+    try std.testing.expectEqual(@as(i32, 0), game_state.camera.tile_x);
     try std.testing.expectEqual(!grid_before, game_state.settings.debug.tile_grid);
 }
 
@@ -882,7 +900,8 @@ test "menu navigation and confirm frames stay modal through Resume" {
 
     // The next ordinary frame works again.
     try game_state.update(.{ .right = true });
-    try std.testing.expectEqual(@as(i32, 1), game_state.camera.tile_x);
+    try std.testing.expect(game_state.player_animation.facing == .right);
+    try std.testing.expectEqual(@as(i32, 0), game_state.camera.tile_x);
 }
 
 test "debug menu toggles overlays independently by keyboard and pointer" {

@@ -288,6 +288,8 @@ async function runGame(flow) {
       await settleTicks();
     };
     await moveRight();
+    await expect('first tap turns without sending movement', 'gameSocketChecks.moves.length === 0');
+    await moveRight();
     await expect('committed movement reaches game socket', 'gameSocketChecks.moves.some(([x,y]) => x === 1 && y === 0)');
     const moves = await evaluate('gameSocketChecks.moves.length');
     await evaluate('gameSocketChecks.disconnect(); true');

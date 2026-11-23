@@ -3,7 +3,16 @@ const std = @import("std");
 
 pub const Tool = enum { hoe };
 pub const Action = enum { sword, pickaxe, axe, hoe, water, collapse };
-const Facing = enum { down, right, up, left };
+const Facing = enum {
+    down,
+    right,
+    up,
+    left,
+
+    fn fromInput(dx: i8, dy: i8) ?Facing {
+        return if (dx < 0) .left else if (dx > 0) .right else if (dy < 0) .up else if (dy > 0) .down else null;
+    }
+};
 
 pub const Sheet = enum { character, tools };
 pub const Frame = struct {
@@ -60,6 +69,10 @@ pub const Animation = struct {
     action: ?Action = null,
     elapsed: f64 = 0,
 
+    pub fn faces(self: Animation, dx: i8, dy: i8) bool {
+        return Facing.fromInput(dx, dy) == self.facing;
+    }
+
     pub fn update(self: *Animation, dt: f32, dx: i8, dy: i8, walking: bool, requested: ?Action) void {
         const seconds: f64 = if (std.math.isFinite(dt) and dt > 0) dt else 0;
         const was_playing = self.action != null;
@@ -69,7 +82,7 @@ pub const Animation = struct {
             if (self.elapsed < current.frame_seconds * @as(f64, @floatFromInt(current.count))) return;
         }
 
-        const facing: Facing = if (dx < 0) .left else if (dx > 0) .right else if (dy < 0) .up else if (dy > 0) .down else self.facing;
+        const facing = Facing.fromInput(dx, dy) orelse self.facing;
         if (was_playing or requested != null or walking != self.walking or facing != self.facing) {
             self.elapsed = 0;
         } else {

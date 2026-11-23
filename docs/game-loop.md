@@ -15,9 +15,10 @@ extension points.
 
 ## Player sprites
 
-WASD, arrows, and controller directions attempt a step. Accepted steps play
-the walk animation; blocked attempts face the requested direction without
-walking. Releasing movement returns to idle. Mouse drag only pans the view.
+With WASD, arrows, or a controller, the first press in a new facing direction
+turns the player in place. Press again or keep holding to step. Accepted steps
+play the walk animation; blocked steps don't. Releasing movement returns to
+idle. Mouse drag only pans the view.
 Click grass or press `Space` to aim a paid hoe cut. Keys `1`–`5` preview the
 pickaxe, axe, hoe, watering can, and collapse animations without affecting
 terrain, health, or inventory.
@@ -275,7 +276,8 @@ cache. A non-resident chunk still exists conceptually; the deterministic generat
    next due tick, if no menu/onboarding blocks it, the repeater emits
    `FrameInput{ .right = true }`. Stable holds repeat every two executed ticks;
    missed ticks are dropped, not replayed. OS direction auto-repeat is unused.
-2. `GameState.update` checks the proposed tile with `shared.movement.canStep`.
+2. If the player isn't facing right, `GameState.update` turns them without
+   moving. Otherwise it checks the proposed tile with `shared.movement.canStep`.
    If accepted, the player moves one tile and the camera follows. A diagonal
    also needs both side tiles clear. A held left mouse button takes precedence,
    resets the step cadence, and pans only the camera.

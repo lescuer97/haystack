@@ -255,7 +255,7 @@ test "quiet coalescing keeps held changes and drag release order" {
     try std.testing.expectEqual(@as(usize, 3), q.len);
 }
 
-test "120 and 144 presentation frames produce the same twenty updates and ten steps" {
+test "120 and 144 presentation frames produce twenty updates, one turn and nine steps" {
     for ([_]usize{ 120, 144 }) |fps| {
         var driver = Driver{};
         defer driver.deinit();
@@ -269,7 +269,7 @@ test "120 and 144 presentation frames produce the same twenty updates and ten st
             updates += @intFromBool(try driver.advance(@as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(fps)), &game, null, null, &privacy));
         }
         try std.testing.expectEqual(@as(usize, 20), updates);
-        try std.testing.expectEqual(@as(i32, 10), game.camera.tile_x);
+        try std.testing.expectEqual(@as(i32, 9), game.camera.tile_x);
     }
 }
 
@@ -323,7 +323,7 @@ test "no between-tick updates; initial preparation and viewport remain coherent"
     try std.testing.expect(d.viewport_w == 800);
 }
 
-test "only committed movement reaches the worker sink" {
+test "turning in place never sends movement to the worker sink" {
     const Sink = struct {
         last: ?Location = null,
         accept: bool = false,
@@ -344,12 +344,11 @@ test "only committed movement reaches the worker sink" {
     const sink: EffectSink = .{ .context = &record, .dispatch = Sink.dispatch, .commit_movement = Sink.submit };
     var privacy = false;
     const right: input.RawSample = .{ .navigation = .{ .right = true } };
-    game.player_pos = .{ .x = 19, .y = 0 }; // (20, 0) is blocked.
     driver.repeat.beginTick();
     try driver.consume(right, 0, &game, null, sink, &privacy);
     try std.testing.expect(record.last == null);
-
-    game.player_pos = .{ .x = 0, .y = 0 };
+    try std.testing.expectEqual(Location{ .x = 0, .y = 0 }, game.player_pos);
+    try std.testing.expect(game.player_animation.facing == .right);
     driver.repeat = .{};
     driver.repeat.beginTick();
     try driver.consume(right, 0, &game, null, sink, &privacy);
@@ -382,16 +381,21 @@ test "short tap survives release and many taps permit at most one step per tick"
         d.queue.push(&s);
     }
     _ = try d.advance(0, &g, null, null, &privacy);
-    try std.testing.expect(g.camera.tile_x == 1 and g.camera.tile_y == 1);
+    try std.testing.expect(g.player_animation.facing == .right);
+    try std.testing.expect(g.camera.tile_x == 0 and g.camera.tile_y == 0);
     _ = try d.advance(10, &g, null, null, &privacy);
-    try std.testing.expect(g.camera.tile_x == 1 and g.camera.tile_y == 1);
-    var held = input.RawSample{ .navigation = .{ .right = true } };
-    d.queue.push(&held);
+    try std.testing.expect(g.camera.tile_x == 0 and g.camera.tile_y == 0);
+    for (0..8) |_| {
+        var s = input.RawSample{ .navigation = .{ .right = true, .down = true } };
+        d.queue.push(&s);
+        s.navigation = .{};
+        d.queue.push(&s);
+    }
     _ = try d.advance(10.05, &g, null, null, &privacy);
-    try std.testing.expectEqual(@as(i32, 2), g.camera.tile_x);
+    try std.testing.expect(g.camera.tile_x == 1 and g.camera.tile_y == 1);
     d.skipPast(30);
     try std.testing.expect(!try d.advance(30, &g, null, null, &privacy));
-    try std.testing.expectEqual(@as(i32, 2), g.camera.tile_x);
+    try std.testing.expect(g.camera.tile_x == 1 and g.camera.tile_y == 1);
 }
 
 test "ordered Escape then WASD typing confirm cannot navigate the menu" {
