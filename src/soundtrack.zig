@@ -83,7 +83,7 @@ const Desktop = struct {
         defer self.allocator.free(full_path);
         var music = rl.loadMusicStream(full_path) catch return false;
         music.looping = false;
-        rl.setMusicVolume(music, 0.175);
+        rl.setMusicVolume(music, 0.0875);
         rl.playMusicStream(music);
         rl.updateMusicStream(music);
         self.stream = music;

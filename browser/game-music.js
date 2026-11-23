@@ -10,7 +10,7 @@ mergeInto(LibraryManager.library, {
       var track = this.track = {audio: null, enabled: true, status: 0, attempt: 0, gesture: null};
       try {
         var audio = track.audio = new Audio();
-        audio.volume = 0.175;
+        audio.volume = 0.0875;
         audio.onended = function () { self.finish(track, 1); };
         audio.onerror = function () { self.finish(track, 2); };
         audio.src = path;
