@@ -44,8 +44,13 @@ pub const Chunk = struct {
     cx: i32 = 0,
     cy: i32 = 0,
     tiles: [CT * CT]Tile = undefined,
-    // Null means unsynced; a zero bitmap is an authoritative result too.
+    // Keep the last rendered bitmap while a new session refreshes it.
     cuts: ?[protocol.chunk_bytes]u8 = null,
+    cuts_stale: bool = false,
+
+    pub fn cutsSynced(self: *const Chunk) bool {
+        return self.cuts != null and !self.cuts_stale;
+    }
 
     pub fn isCut(self: *const Chunk, index: usize) bool {
         const bits = if (self.cuts) |*value| value else return false;
@@ -268,8 +273,7 @@ pub const World = struct {
 
     pub fn invalidateCuts(self: *World) void {
         var it = self.by_key.valueIterator();
-        while (it.next()) |slot| slot.*.cuts = null;
-        self.cut_revision +%= 1;
+        while (it.next()) |slot| slot.*.cuts_stale = true;
     }
 
     pub fn applyCuts(self: *World, snapshot: *const protocol.Snapshot) void {
@@ -284,6 +288,7 @@ pub const World = struct {
             const previous: [protocol.chunk_bytes]u8 = chunk.cuts orelse @splat(0);
             if (!std.mem.eql(u8, &previous, &bits)) changed = true;
             chunk.cuts = bits;
+            chunk.cuts_stale = false;
         }
         if (changed) self.cut_revision +%= 1;
     }
@@ -312,7 +317,7 @@ pub const World = struct {
 
     fn needsCuts(self: *const World, cx: i32, cy: i32) bool {
         const chunk = self.get(cx, cy) orelse return false;
-        return chunk.cuts == null;
+        return !chunk.cutsSynced();
     }
 
     /// Number of chunks currently in memory.

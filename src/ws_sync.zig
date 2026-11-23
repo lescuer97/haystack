@@ -265,13 +265,21 @@ test "area replies reconcile before planning from the current view, with nonbloc
     try t.expect(game.world.get(first.cx0, first.cy0).?.isCut(255));
     network.session += 1;
     try t.expect(try frame.apply(network, &connection, &driver, &game) == .loading_visible);
-    try t.expect(game.world.get(first.cx0, first.cy0).?.cuts == null);
+    try t.expect(game.world.get(first.cx0, first.cy0).?.isCut(255));
+    try t.expect(!game.world.get(first.cx0, first.cy0).?.cutsSynced());
     try driver.prepare(&game, 1000, 640);
     frame.requestAreas(&connection, &driver, &game.world);
     try t.expectEqual(first, connection.area.?);
+    connection.reply = .{ .received = .{ .area = first, .count = (try protocol.areaGeometry(first)).count } };
+    connection.reply.received.chunks[0][31] = 0x80;
+    _ = try frame.apply(network, &connection, &driver, &game);
+    try t.expect(game.world.get(first.cx0, first.cy0).?.cutsSynced());
+    try t.expect(game.world.get(first.cx0, first.cy0).?.isCut(255));
 
     network.status = .authenticating;
     try t.expect((try frame.apply(network, &connection, &driver, &game)).blocksInput());
+    try t.expect(game.world.get(first.cx0, first.cy0).?.isCut(255));
+    try t.expect(!game.world.get(first.cx0, first.cy0).?.cutsSynced());
     const requests_before_auth = connection.requests;
     frame.requestAreas(&connection, &driver, &game.world);
     try t.expectEqual(requests_before_auth, connection.requests);

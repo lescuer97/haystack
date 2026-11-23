@@ -1643,7 +1643,7 @@ test "minimap keeps tile scale and stops at protocol edges" {
     }
 }
 
-test "minimap repaints cut grass and trees and clears stale cuts" {
+test "minimap preserves cut grass and trees until a refreshed snapshot changes them" {
     var w = try world.World.init(std.testing.allocator, 1);
     defer w.deinit();
     const area: world.ChunkRange = .{ .cx0 = -1, .cy0 = 0, .cx1 = -1, .cy1 = 0 };
@@ -1667,6 +1667,16 @@ test "minimap repaints cut grass and trees and clears stale cuts" {
     try std.testing.expectEqual(minimapColor(.tree), pixels[2]);
     const cut = MinimapStamp.get(&w, area);
     w.invalidateCuts();
+    try std.testing.expectEqual(cut, MinimapStamp.get(&w, area));
+    const cut_pixel = pixels[0];
+    paintMinimap(&pixels, world.CT, &w, area);
+    try std.testing.expectEqual(cut_pixel, pixels[0]);
+    try std.testing.expectEqual(cut_pixel, pixels[1]);
+
+    w.applyCuts(&snapshot);
+    try std.testing.expectEqual(cut, MinimapStamp.get(&w, area));
+    snapshot.chunks[0][0] = 0;
+    w.applyCuts(&snapshot);
     try std.testing.expect(!std.meta.eql(cut, MinimapStamp.get(&w, area)));
     paintMinimap(&pixels, world.CT, &w, area);
     try std.testing.expectEqual(minimapColor(.grass), pixels[0]);

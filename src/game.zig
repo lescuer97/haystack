@@ -349,16 +349,16 @@ pub const GameState = struct {
         if (self.selected_tool != .hoe) return null;
         const addr = cutAddress(tile);
         const chunk = self.world.get(addr.area.cx0, addr.area.cy0) orelse return null;
-        if (chunk.cuts == null or chunk.tiles[addr.index] != .grass or chunk.isCut(addr.index)) return null;
+        if (!chunk.cutsSynced() or chunk.tiles[addr.index] != .grass or chunk.isCut(addr.index)) return null;
         return tile;
     }
 
     pub fn applyHoeCut(self: *GameState, tile: Location) void {
         const addr = cutAddress(tile);
         const chunk = self.world.get(addr.area.cx0, addr.area.cy0) orelse return;
-        // If the chunk was evicted or reloaded, its next area reply supplies
-        // the full bitmap. A single tile must not make it look fully synced.
-        const bits = chunk.cuts orelse return;
+        // A cut confirmation cannot make a stale or newly loaded bitmap current.
+        if (!chunk.cutsSynced()) return;
+        const bits = chunk.cuts.?;
         var snapshot: shared.protocol.Snapshot = .{ .area = addr.area, .count = 1 };
         snapshot.chunks[0] = bits;
         snapshot.chunks[0][addr.index / 8] |= @as(u8, 1) << @as(u3, @intCast(addr.index % 8));
@@ -502,6 +502,15 @@ test "Space targets grass in front of the player only during gameplay" {
     try game.update(space);
     try t.expectEqual(tile, game.paid_hoe.target.?);
     try t.expect(!chunk.isCut(index));
+
+    game.world.invalidateCuts();
+    try game.update(space);
+    try t.expect(game.paid_hoe.target == null);
+    game.applyHoeCut(tile);
+    try t.expect(!chunk.cutsSynced());
+    game.world.applyCuts(&snapshot);
+    try game.update(space);
+    try t.expectEqual(tile, game.paid_hoe.target.?);
 
     game.menu.openWallet();
     try game.update(space);
