@@ -273,7 +273,7 @@ pub(crate) fn test_state(name: &str) -> Option<(u64, String)> {
 // `Store::default()` during provisioning.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Store {
+pub(crate) struct Store {
     version: u32,
     fingerprint: String,
     mints: HashMap<MintUrl, Option<MintInfo>>,
@@ -281,12 +281,12 @@ struct Store {
     keys: HashMap<String, KeySet>,
     mint_quotes: HashMap<String, MintQuote>,
     melt_quotes: HashMap<String, MeltQuote>,
-    proofs: HashMap<String, ProofInfo>,
+    pub(crate) proofs: HashMap<String, ProofInfo>,
     counters: HashMap<String, u32>,
     derivation_counters: HashMap<String, u32>,
     transactions: HashMap<String, Transaction>,
     sagas: HashMap<String, WalletSaga>,
-    kv: HashMap<String, Vec<u8>>,
+    pub(crate) kv: HashMap<String, Vec<u8>>,
     p2pk_keys: Vec<P2PKSigningKey>,
 }
 
@@ -510,10 +510,43 @@ impl BrowserDatabase {
         self.test_loads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    async fn write<T>(&self, f: impl FnOnce(&mut Store) -> Result<T, Error>) -> Result<T, Error> {
+    pub(crate) async fn write<T>(
+        &self,
+        f: impl FnOnce(&mut Store) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.write_inner(false, f).await
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn write_hoe_funding<T>(
+        &self,
+        f: impl FnOnce(&mut Store) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.write_inner(true, f).await
+    }
+
+    async fn write_inner<T>(
+        &self,
+        _hoe_funding: bool,
+        f: impl FnOnce(&mut Store) -> Result<T, Error>,
+    ) -> Result<T, Error> {
         let _guard = self.writes.lock().await;
         let (revision, mut store) = self.load().await.map_err(internal)?;
+        #[cfg(target_arch = "wasm32")]
+        let protected = if _hoe_funding {
+            vec![]
+        } else {
+            crate::hoe_funding::reserved_inputs(&store)?
+        };
         let result = f(&mut store)?;
+        #[cfg(target_arch = "wasm32")]
+        for (y, proof) in protected {
+            if store.proofs.get(&y) != Some(&proof) {
+                return Err(Error::Internal(
+                    "cannot overwrite a journaled hoe input".into(),
+                ));
+            }
+        }
         self.save(revision, &store)
             .await
             .map_err(|failure| match failure {
@@ -524,7 +557,7 @@ impl BrowserDatabase {
     }
 }
 
-fn kv_key(a: &str, b: &str, c: &str) -> String {
+pub(crate) fn kv_key(a: &str, b: &str, c: &str) -> String {
     format!("{a}\u{1f}{b}\u{1f}{c}")
 }
 

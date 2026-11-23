@@ -420,7 +420,10 @@ Optional advanced overrides:
   validating version 0.2.130; this option is not part of the desktop graph.
 - `-Dport=9000` changes the plain browser development-server port.
 - `BROWSER_TEST_PORT=0 zig build test-mint -Dplatform=wasm` allocates an available
-  fake-mint port. Automated browser tests always choose their own ephemeral port.
+  fake-mint port. Automated browser suites choose an ephemeral port, except for
+  the [native-server paid-hoe integration test](../browser/paid-hoe-browser-test.md).
+  Its native fixture pins the mint URL at build time, so the test uses a fixed
+  port inside a private loopback-only network namespace.
 
 Normal `run -Dplatform=wasm` only serves static assets; it never starts a fake
 mint or creates funds. Fake mint behavior is explicit and test-only.

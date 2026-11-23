@@ -7,7 +7,9 @@ mergeInto(LibraryManager.library, {
     listening: false,
     // Keep these tags aligned with Event in src/browser_ws.zig.
     event: {prepared: 1, opened: 2, message: 3, closed: 4, proof: 5, walletError: 6},
-    maxFrameBytes: 256,
+    // Match max_channel_open_with_params_bytes and max_channel_status_reply_bytes.
+    maxOutboundBytes: 7232,
+    maxInboundBytes: 61483,
     emit: function (callback, token, kind, bytes) {
       var ptr = 0, len = bytes ? bytes.length : 0;
       try {
@@ -73,7 +75,7 @@ mergeInto(LibraryManager.library, {
       ws.onopen = function () { if (self.socket === s) self.emit(callback, token, self.event.opened); };
       ws.onmessage = function (event) {
         if (self.socket !== s) return;
-        if (!(event.data instanceof ArrayBuffer) || event.data.byteLength > self.maxFrameBytes) { self.end(s); return; }
+        if (!(event.data instanceof ArrayBuffer) || event.data.byteLength > self.maxInboundBytes) { self.end(s); return; }
         self.emit(callback, token, self.event.message, new Uint8Array(event.data));
       };
       ws.onclose = ws.onerror = function () { if (self.socket === s) self.end(s); };
@@ -93,8 +95,9 @@ mergeInto(LibraryManager.library, {
     },
     send: function (token, ptr, len) {
       var s = this.socket;
-      if (!s || s.token !== token || s.ws.readyState !== WebSocket.OPEN || s.ws.bufferedAmount > this.maxFrameBytes ||
-          ptr < 0 || len <= 0 || len > this.maxFrameBytes || ptr + len > HEAPU8.length) return 0;
+      if (!s || s.token !== token || s.ws.readyState !== WebSocket.OPEN ||
+          ptr < 0 || len <= 0 || len > this.maxOutboundBytes || ptr + len > HEAPU8.length ||
+          s.ws.bufferedAmount + len > this.maxOutboundBytes) return 0;
       try { s.ws.send(HEAPU8.subarray(ptr, ptr + len)); return 1; } catch (_) { return 0; }
     },
     sign: function (token, ptr) {

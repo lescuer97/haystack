@@ -102,6 +102,9 @@ mergeInto(LibraryManager.library, {
       return import(new URL('../wallet/cdk_wallet_browser.js', scriptDirectory).href);
     },
     deliver: function (callback, generation, token, text, startup, limit) {
+      this.deliverResponse(callback, generation, token, text, startup, limit);
+    },
+    deliverResponse: function (callback, generation, token, text, startup, limit) {
       var bytes, ptr = 0, status = 0;
       try {
         if (typeof text !== 'string') throw 0;
@@ -225,6 +228,31 @@ mergeInto(LibraryManager.library, {
         if (self.session === s && !s.closing) self.deliver(callback, generation, serial, result, false, 131072);
       }).catch(function () {});
     },
+    hoeRequest: function (generation, serial, operation, ptr, len, callback) {
+      var self = this, s = self.session, argument, op;
+      try {
+        op = [null, 'inspect', 'quote', 'fund', 'open_payload', 'bind', 'prepare_cut', 'resolve_cut', 'finalize', 'resume_quote', 'resume'][operation];
+        if (!op || !s || s.closing || s.generation !== generation || len > 131072 || ptr < 0 || ptr + len > HEAPU8.length) throw 0;
+        argument = new TextDecoder('utf-8', { fatal: true }).decode(HEAPU8.subarray(ptr, ptr + len));
+      } catch (_) {
+        queueMicrotask(function () { self.deliverResponse(callback, generation, serial, null, false, 65536); });
+        return;
+      }
+      s.chain = s.chain.then(async function () {
+        var result = null;
+        try {
+          if (self.session !== s || s.closing) return;
+          // The ordinary wallet-open request is queued before game login.
+          if (s.wallet) result = await s.wallet.hoe_request(op, argument);
+        } catch (_) {}
+        if (self.session === s && !s.closing) self.deliverResponse(callback, generation, serial, result, false, 65536);
+      }).catch(function () {});
+    },
+  },
+  haystack_hoe_request__deps: ['$haystackOnboarding', 'malloc', 'free'],
+  haystack_hoe_request__sig: 'viiiiii',
+  haystack_hoe_request: function (generation, serial, operation, ptr, len, callback) {
+    haystackOnboarding.hoeRequest(generation, serial, operation, ptr, len, callback);
   },
   haystack_onboarding_start__deps: ['$haystackOnboarding', 'malloc', 'free'],
   haystack_onboarding_start__sig: 'vii',

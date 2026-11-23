@@ -755,7 +755,8 @@ export function writeWalletState(name, expectedRevision, data) {
     await new Promise((resolve, reject) => {
       let transaction;
       try {
-        transaction = database.transaction(STATE_STORE, "readwrite");
+        // Wallet checkpoints must commit before a mint or game payment can be sent.
+        transaction = database.transaction(STATE_STORE, "readwrite", { durability: "strict" });
       } catch (_) {
         reject(new Error("wallet storage is unavailable"));
         return;

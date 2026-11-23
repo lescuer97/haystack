@@ -42,6 +42,7 @@ const native_hoe = if (!builtin.cpu.arch.isWasm()) @import("native_hoe.zig") els
 };
 
 const browser_ws = @import("browser_ws.zig");
+const browser_hoe = @import("browser_hoe.zig");
 const ws_sync = @import("ws_sync.zig");
 const Location = @import("shared").protocol.Location;
 
@@ -66,6 +67,7 @@ comptime {
     _ = @import("content.zig");
     _ = @import("instance_lock.zig");
     _ = @import("browser_storage.zig");
+    _ = browser_hoe;
     _ = @import("storage_home_test.zig");
     _ = @import("onboarding.zig");
     if (builtin.os.tag != .emscripten) {
@@ -104,6 +106,9 @@ const BrowserContext = struct {
     onboarding_start_failed: bool = false,
     connection: browser_ws.Worker = .{},
     network_frame: ws_sync.Frame = .{},
+    network: ws_sync.Snapshot = .{},
+    hoe: browser_hoe.Runtime = .{},
+    unix_now: ?u64 = null,
 };
 
 var browser_context: ?*BrowserContext = null;
@@ -329,7 +334,8 @@ fn browserFrame() callconv(.c) void {
     ctx.model.expire(rl.getTime());
     const wallet_model = &ctx.game_state.menu.wallet;
     const unix = haystack_wallet_unix_time();
-    if (std.math.isFinite(unix) and unix >= 0 and unix < 253402300800) wallet_model.unix_now = @intFromFloat(unix);
+    ctx.unix_now = if (std.math.isFinite(unix) and unix >= 0 and unix < 253402300800) @intFromFloat(unix) else null;
+    if (ctx.unix_now) |now| wallet_model.unix_now = now;
     ctx.game_state.menu.paste_requested = false; // Browser reads only in the trusted gesture handler.
     if (wallet_result_serial) |serial| {
         if (wallet_model.pending and wallet_model.serial == serial) ctx.driver.invalidateInput();
@@ -342,12 +348,17 @@ fn browserFrame() callconv(.c) void {
         wallet_model.request = null;
     }
     privacy_blocked = privacy_blocked or ctx.model.isBlocking();
-    const network = ctx.connection.step(if (ctx.model.isBlocking()) null else browser_onboarding.currentGeneration());
-    const presentation = ctx.network_frame.apply(network, &ctx.connection, &ctx.driver, &ctx.game_state) catch |err| {
+    const generation = if (ctx.model.isBlocking()) null else browser_onboarding.currentGeneration();
+    ctx.network = ctx.connection.step(generation);
+    const presentation = ctx.network_frame.apply(ctx.network, &ctx.connection, &ctx.driver, &ctx.game_state) catch |err| {
         std.log.err("browser connection reconciliation failed: {s}", .{@errorName(err)});
         stopBrowser();
         return;
     };
+    if (ctx.hoe.update(&ctx.connection, ctx.network, generation, &ctx.game_state, ctx.unix_now, rl.getTime(), ctx.network_frame.area_pending)) {
+        ctx.driver.invalidateInput();
+    }
+    ctx.driver.movement_blocked = ctx.network.pending or ctx.hoe.cutPending();
     stepFrame(
         &ctx.game_state,
         &ctx.resources,
@@ -357,7 +368,7 @@ fn browserFrame() callconv(.c) void {
         null,
         browser_settings_persister,
         &ctx.model,
-        .{ .context = ctx, .dispatch = browserDispatch, .commit_movement = browserCommitMovement },
+        .{ .context = ctx, .dispatch = browserDispatch, .after_input = browserAfterInput, .commit_movement = browserCommitMovement },
         &privacy_blocked,
         presentation,
     ) catch |err| {
@@ -365,13 +376,23 @@ fn browserFrame() callconv(.c) void {
         stopBrowser();
         return;
     };
-    ctx.network_frame.requestAreas(&ctx.connection, &ctx.driver, &ctx.game_state.world);
+    if (!ctx.hoe.cutPending()) ctx.network_frame.requestAreas(&ctx.connection, &ctx.driver, &ctx.game_state.world);
     ctx.game_state.music_unavailable = ctx.soundtrack.update(ctx.game_state.music_enabled, !ctx.model.isBlocking() and !presentation.blocksInput());
 }
 
 fn browserCommitMovement(context: ?*anyopaque, destination: Location) bool {
     const ctx: *BrowserContext = @ptrCast(@alignCast(context.?));
-    return ctx.connection.submit(ctx.network_frame.session, destination);
+    if (ctx.hoe.cutPending()) return false;
+    const accepted = ctx.connection.submit(ctx.network_frame.session, destination);
+    if (accepted) ctx.network.pending = true;
+    return accepted;
+}
+
+fn browserAfterInput(context: ?*anyopaque, game: *game_mod.GameState) void {
+    const ctx: *BrowserContext = @ptrCast(@alignCast(context.?));
+    if (ctx.model.isBlocking()) return;
+    ctx.hoe.click(&ctx.connection, ctx.network, game, ctx.unix_now, rl.getTime());
+    if (ctx.hoe.cutPending()) ctx.driver.movement_blocked = true;
 }
 
 fn browserDispatch(_: ?*anyopaque, model: *onboarding.Onboarding, effect: onboarding.Effect) void {
@@ -422,6 +443,7 @@ fn stopBrowser() void {
     withdrawal_clipboard = .{};
     withdrawal_clipboard_pending = false;
 
+    ctx.hoe.stop();
     ctx.connection.stop();
     browser_onboarding.close();
     browser_storage.close();
@@ -541,11 +563,12 @@ fn stepFrame(
         },
         .disconnected => |detail| rendering.drawDisconnected(detail, driver.viewport_w, driver.viewport_h),
     }
-    if (native_hoe.enabled) {
-        const visible = !blocked and !game_state.menu.opened and !(if (model) |m| m.isBlocking() else false);
-        game_state.paid_hoe.refill_presented = visible and game_state.paid_hoe.view.can_refill and game_state.hoe_funding.canStart() and
-            game_mod.hoeStatusBounds(driver.viewport_w, driver.viewport_h) != null;
-        if (visible) native_hoe.drawStatus(game_state.paid_hoe.view, game_state.hoe_funding, driver.viewport_w, driver.viewport_h);
+    const hoe_visible = !blocked and !game_state.menu.opened and !(if (model) |m| m.isBlocking() else false);
+    game_state.paid_hoe.refill_presented = hoe_visible and game_state.paid_hoe.view.can_refill and game_state.hoe_funding.canStart() and
+        game_mod.hoeStatusBounds(driver.viewport_w, driver.viewport_h) != null;
+    if (hoe_visible) {
+        const debit_limit = if (native_hoe.enabled) native_hoe.refill_debit_limit else 0;
+        rendering.drawHoeStatus(game_state.paid_hoe.view, game_state.hoe_funding, driver.viewport_w, driver.viewport_h, debit_limit);
     }
     // Capture after drawing and before `endDrawing` swaps/presents, otherwise
     // the framebuffer read is the cleared back buffer (a black screenshot).

@@ -54,6 +54,12 @@ modules or invalid storage block setup rather than replacing wallet records. The
 browser wallet regression suites use a separate non-interactive test fixture at
 `wallet-test.html`, installed only for `test`/`test-mint`.
 
+Browser play supports Spilman-paid hoe cuts through the same local game server
+as desktop. Select the hoe, choose **Get refill quote**, then confirm the displayed
+wallet debit. Browser funding returns change in the same mint swap and caps
+the Testnut wallet debit at 55 msat. Use test funds only. See
+[paid hoe recovery and limitations](docs/browser-wallet.md#browser-paid-hoe).
+
 Host prerequisites are Zig 0.17.0, Python 3, Rustup/Cargo and a native C
 toolchain. Linux additionally needs the normal raylib/X11/OpenGL development
 libraries and libunwind. macOS requires **native Apple Silicon (arm64)**,

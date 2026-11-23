@@ -17,9 +17,10 @@ extension points.
 
 WASD, arrows, and controller directions attempt a step. Accepted steps play
 the walk animation; blocked attempts face the requested direction without
-walking. Releasing movement returns to idle. Mouse drag only pans the view. Press `Space` for the sword swing, `1` for pickaxe, `2` for axe, `3` for
-hoe, `4` for watering can, or `5` to preview the collapse. These play once and
-do not affect terrain, health, or inventory.
+walking. Releasing movement returns to idle. Mouse drag only pans the view.
+Click grass or press `Space` to aim a paid hoe cut. Keys `1`–`5` preview the
+pickaxe, axe, hoe, watering can, and collapse animations without affecting
+terrain, health, or inventory.
 
 Oaks and the player are drawn back to front using the tree roots and the
 player's feet. An oak in front of the player fades to 40% opacity if its art
@@ -208,9 +209,9 @@ the frame loop keeps running but gameplay input is gated and the onboarding
 modal (initially a loading state) is drawn on the canvas. A wallet inspection,
 creation, recovery or storage failure appears as that blocked modal, not as the
 generic startup message. Ready means the persistent `haystack-user` records were
-provisioned and validated; the JS wallet is not retained as an open
-`BrowserWallet`, and there is no gameplay wallet-operation or spending bridge, so
-completing onboarding is not end-to-end in-game spending verification. See
+provisioned and validated. The game then opens a `BrowserWallet` session for
+menu and gameplay operations. A paid hoe action still requires an authenticated
+connection and matching local and server channel state. See
 [browser-wallet.md](browser-wallet.md) for the IndexedDB records and their
 limitations.
 

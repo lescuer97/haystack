@@ -2454,6 +2454,8 @@ impl CdkWallet {
     pub(crate) async fn restore_seed(&mut self, url: &str) -> FfiResult<(u64, u64, u64)> {
         let mint = parse_mint_url(url)?;
         self.guard_prepared_withdrawal(Some(&mint))?;
+        #[cfg(target_arch = "wasm32")]
+        crate::hoe_funding::guard_seed_restore(self, &mint).await?;
         self.add_mint(url).await?;
         let wallet = self.approved_wallet(&mint).await?;
         match timeout(SEED_RESTORE_DEADLINE, wallet.restore()).await {
@@ -2557,6 +2559,39 @@ impl CdkWallet {
         )
         .await;
         self.finish_receive(mint_url, outcome)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn browser_database(&self) -> &WalletSqliteDatabase {
+        &self.db
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn browser_game_signer(&self) -> Option<crate::game_auth::GameSigner> {
+        crate::game_auth::GameSigner::derive(self.repo.seed())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn browser_funding_keyset(&self, mint: &MintUrl) -> FfiResult<String> {
+        if self.is_poisoned() {
+            return Err(crate::api::poisoned_handle());
+        }
+        self.guard_prepared_withdrawal(Some(mint))?;
+        if self.unresolved.contains(mint) {
+            return Err(FfiErr::new(
+                CdkStatus::RecoveryPending,
+                "mint recovery is pending",
+            ));
+        }
+        let wallet = self.approved_wallet(mint).await?;
+        let keyset = timeout(
+            self.network_deadline(),
+            wallet.active_keyset_with_policy(cdk_common::wallet::KeysetLoadPolicy::Refresh),
+        )
+        .await
+        .map_err(|_| FfiErr::new(CdkStatus::NetworkError, "funding keyset request timed out"))?
+        .map_err(|e| map_keyset_error(&e))?;
+        keyset_to_json(keyset)
     }
 
     /// Fetch the mint's active Msat keyset and return it as Spilman keyset JSON.
@@ -2749,6 +2784,20 @@ impl CdkWallet {
         proofs: Proofs,
         signing_keys: &[SecretKey],
     ) -> FfiResult<u64> {
+        self.prepare_receive_proofs(mint_url_str, proofs, signing_keys)
+            .await?
+            .execute()
+            .await
+    }
+
+    /// Run the wrapper's local checks without starting the CDK receive saga.
+    /// The prepared receive holds the exclusive wallet borrow until execution.
+    pub(crate) async fn prepare_receive_proofs(
+        &mut self,
+        mint_url_str: &str,
+        proofs: Proofs,
+        signing_keys: &[SecretKey],
+    ) -> FfiResult<PreparedProofReceive<'_>> {
         let mint_url = parse_mint_url(mint_url_str)?;
 
         if !self.repo.has_wallet(&mint_url, &UNIT).await {
@@ -2773,13 +2822,13 @@ impl CdkWallet {
         ensure_fits_i64(face_value, "proofs value")?;
 
         let wallet = self.approved_wallet(&mint_url).await?;
-        let deadline = self.network_deadline();
-        let outcome = timeout(
-            deadline,
-            wallet.receive_proofs(proofs, receive_options(signing_keys), None, None),
-        )
-        .await;
-        self.finish_receive(mint_url, outcome)
+        Ok(PreparedProofReceive {
+            owner: self,
+            wallet,
+            mint_url,
+            proofs,
+            options: receive_options(signing_keys),
+        })
     }
 
     /// Classify a completed `receive` attempt and apply the fail-closed policy.
@@ -3676,6 +3725,31 @@ fn map_prepare_error(e: &CdkError) -> FfiErr {
     FfiErr::new(status, format!("could not prepare send: {e}"))
 }
 
+pub(crate) struct PreparedProofReceive<'a> {
+    owner: &'a mut CdkWallet,
+    wallet: Wallet,
+    mint_url: MintUrl,
+    proofs: Proofs,
+    options: ReceiveOptions,
+}
+
+impl PreparedProofReceive<'_> {
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn owner(&self) -> &CdkWallet {
+        self.owner
+    }
+
+    pub(crate) async fn execute(self) -> FfiResult<u64> {
+        let outcome = timeout(
+            self.owner.network_deadline(),
+            self.wallet
+                .receive_proofs(self.proofs, self.options, None, None),
+        )
+        .await;
+        self.owner.finish_receive(self.mint_url, outcome)
+    }
+}
+
 /// Build [`ReceiveOptions`] carrying the caller-supplied P2PK signing keys.
 fn receive_options(signing_keys: &[SecretKey]) -> ReceiveOptions {
     ReceiveOptions {
@@ -3772,7 +3846,7 @@ fn signature_matches_output(signature: &BlindSignature, output: &BlindedMessage)
     signature.amount == output.amount && signature.keyset_id == output.keyset_id
 }
 
-fn match_swap_restore(
+pub(crate) fn match_swap_restore(
     outputs: &[BlindedMessage],
     response: RestoreResponse,
 ) -> FfiResult<Option<SwapResponse>> {

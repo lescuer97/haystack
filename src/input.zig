@@ -29,6 +29,7 @@ pub const FrameInput = struct {
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
     clicked: bool = false,
+    released: bool = false,
     right_clicked: bool = false,
     viewport_w: f32 = 1000,
     viewport_h: f32 = 640,
@@ -68,7 +69,7 @@ pub const RawSample = struct {
 
     pub fn quiet(self: RawSample) bool {
         const f = self.frame;
-        return !f.clicked and !f.right_clicked and !f.escape_clicked and !f.confirm and !f.backspace and
+        return !f.clicked and !f.released and !f.right_clicked and !f.escape_clicked and !f.confirm and !f.backspace and
             !f.paste_shortcut and !f.toggle_grid and !f.toggle_borders and
             !f.use_tool and f.action == null and f.character_count == 0 and f.drag_x == 0 and f.drag_y == 0;
     }
@@ -104,7 +105,8 @@ pub const Reader = struct {
         }
         if (builtin.os.tag == .emscripten) {
             held.dragging = rl.isMouseButtonDown(.left);
-            if (held.dragging) {
+            held.released = rl.isMouseButtonReleased(.left);
+            if (held.dragging and !held.clicked) {
                 const delta = rl.getMouseDelta();
                 held.drag_x = delta.x;
                 held.drag_y = delta.y;
@@ -112,9 +114,7 @@ pub const Reader = struct {
         }
         held.toggle_grid = rl.isKeyPressed(.g);
         held.toggle_borders = rl.isKeyPressed(.b);
-        if (rl.isKeyPressed(.space)) {
-            if (builtin.cpu.arch.isWasm()) held.action = .sword else held.use_tool = true;
-        }
+        held.use_tool = rl.isKeyPressed(.space);
         const bindings = .{
             .{ .one, .pickaxe }, .{ .two, .axe }, .{ .three, .hoe }, .{ .four, .water }, .{ .five, .collapse },
         };

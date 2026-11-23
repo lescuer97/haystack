@@ -896,6 +896,59 @@ fn drawSolidRect(rect: menu.Rect, color: rl.Color) void {
     );
 }
 
+pub fn drawHoeStatus(view: game_mod.HoeView, funding: game_mod.HoeFundingUi.Controller, vw: f32, vh: f32, debit_limit: u64) void {
+    if (view.status == .hidden) return;
+    const status: [:0]const u8 = if (funding.status) |state| state.text() else switch (view.status) {
+        .hidden => unreachable,
+        .unavailable => "No cuts loaded",
+        .checking => "Checking hoe channel...",
+        .ready => "Click nearby grass to cut",
+        .pending => "Cut pending...",
+        .recovery => "Hoe recovery required",
+        .empty => "Out of cuts",
+        .settling => "Settling previous refill...",
+        .settled => "Ready to refill",
+    };
+    const panel = game_mod.hoeStatusBounds(vw, vh) orelse return;
+    rl.drawRectangleRec(.{ .x = panel.x, .y = panel.y, .width = panel.width, .height = panel.height }, .{ .r = 30, .g = 28, .b = 24, .a = 240 });
+    const show_button = view.can_refill and funding.canStart();
+    const text_width = panel.width - (if (show_button) @as(f32, 142) else 0);
+    var buf: [64]u8 = undefined;
+    const count = if (view.offer) |offer|
+        std.mem.printSentinel(&buf, "Load {d} cuts", .{offer.cuts}, 0) catch unreachable
+    else
+        game_mod.HoeFundingUi.cutsText(view.cuts_left, &buf);
+    drawCenteredText(count, .{ .x = panel.x, .y = panel.y + 6, .width = text_width, .height = 16 }, 16, .ray_white);
+    drawCenteredText(status, .{ .x = panel.x, .y = panel.y + 27, .width = text_width, .height = 12 }, 12, .ray_white);
+    if (!show_button) return;
+    const button = game_mod.hoeRefillButton(panel);
+    const rect: rl.Rectangle = .{ .x = button.x, .y = button.y, .width = button.width, .height = button.height };
+    rl.drawRectangleRec(rect, .dark_gray);
+    rl.drawRectangleLinesEx(rect, 1, .gray);
+    if (view.close_first) {
+        drawCenteredText("Close empty hoe", button, 14, .ray_white);
+        return;
+    }
+    if (view.recovery_action) |action| {
+        drawCenteredText(switch (action) {
+            .review_funding => "Review saved refill",
+            .retry_settlement => "Retry settlement",
+        }, button, 14, .ray_white);
+        return;
+    }
+    const label: [:0]const u8 = if (view.offer) |offer| (if (offer.resume_funding) "Resume refill" else "Refill hoe") else if (debit_limit == 0) "Get refill quote" else "Refill hoe";
+    if (view.offer == null and debit_limit == 0) {
+        drawCenteredText(label, button, 14, .ray_white);
+        return;
+    }
+    drawCenteredText(label, .{ .x = button.x, .y = button.y + 3, .width = button.width, .height = 14 }, 14, .ray_white);
+    const cost = if (view.offer) |offer|
+        std.mem.printSentinel(&buf, "{d} msat incl. fees", .{offer.debit}, 0) catch unreachable
+    else
+        std.mem.printSentinel(&buf, "Up to {d} msat incl. fees", .{debit_limit}, 0) catch unreachable;
+    drawCenteredText(cost, .{ .x = button.x, .y = button.y + 17, .width = button.width, .height = 10 }, 10, .ray_white);
+}
+
 fn drawCenteredText(text: [:0]const u8, rect: menu.Rect, font_size: i32, color: rl.Color) void {
     const text_w = rl.measureText(text, font_size);
     const x = rect.x + (rect.width - @as(f32, @floatFromInt(text_w))) / 2;
@@ -1296,7 +1349,7 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
     drawWorld(&game.world, view, game.camera, game.settings.debug, game.player_pos, game.player_animation.frame(), resources, &game.cut_feedback);
     rl.endMode2D();
 
-    if (game.show_debug_hud) drawHud(&game.world, view.chunks, &game.camera, game.settings.debug, if (game_mod.HoeFundingUi.supported) game.paid_hoe.view else null);
+    if (game.show_debug_hud) drawHud(&game.world, view.chunks, &game.camera, game.settings.debug, if (game.paid_hoe.view.status != .hidden) game.paid_hoe.view else null);
     if (view.minimap) |map| {
         const layout = minimapLayout(map, game.camera, viewport_w);
         drawTerrainMinimap(game, view.chunks, layout, &resources.minimap);
@@ -1313,7 +1366,7 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
     } else if (connected and !onboarding_blocked) {
         drawToolbar(game, viewport_w, viewport_h);
         drawWalletBadge(&game.menu, viewport_w, viewport_h);
-        const channel_visible = if (game_mod.HoeFundingUi.supported) game.paid_hoe.view.status != .hidden else false;
+        const channel_visible = game.paid_hoe.view.status != .hidden;
         if (!channel_visible and game.cut_feedback.showRefillNotice()) drawRefillNotice(viewport_w, viewport_h);
     }
     if (model) |m| if (m.isBlocking()) {

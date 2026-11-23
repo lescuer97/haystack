@@ -17,6 +17,43 @@ section also documents the explicit
 that fails when the two Cargo roots disagree about a package's source, tag or
 commit.
 
+## Browser paid hoe
+
+The renderer uses the existing authenticated binary WebSocket service, not a
+separate HTTP payment API. Run the native game server and browser bundle on
+loopback as described in the [README](../README.md). Select the hoe and quote a
+refill, then approve the actual maximum debit. One cut costs 5 msat. A depleted
+channel must be closed and settled before a replacement can be quoted.
+
+The browser quotes up to ten cuts, selecting eligible active-keyset proofs and
+returning any wallet change in the same raw mint swap. The quote includes fees
+and caps the net debit at 55 msat on Testnut (50 msat in the zero-fee fixture).
+It does not use the wallet's nested online send/swap path. IndexedDB commits the
+proof reservation and exact request before mint I/O. A successful checkpoint
+marks the inputs spent, credits verified change, and saves the channel together.
+
+Recovery first checks the mint and tries to restore the saved outputs without
+posting again. If the swap is unresolved, choose **Review saved refill** and
+explicitly approve **Resume refill**. Only if every original input is still
+unspent will the wallet resend the identical saved request. The mint can spend
+those inputs only once, and either request would produce the same outputs.
+Resume never releases inputs or creates a different swap. Expired or otherwise
+ineligible swaps stay blocked; abandonment and sender refunds are not automatic.
+
+The wallet also commits one pending cut before dispatch and resolves an uncertain
+cut from an exact accepted balance after reconnect, never by replaying the cut.
+Settlement checks wallet prerequisites before committing the credit attempt. If
+preflight is blocked, clear the blocker (for example, cancel a pending withdrawal
+review) and choose **Retry settlement**. Once the attempt is recorded, a credit
+of unknown outcome blocks replacement rather than risking another credit.
+Browser storage is origin-specific, and a seed by itself does not
+restore the game channel journal. Payment and tile persistence remain separate on
+the server.
+
+See the [Chromium test guide](../browser/paid-hoe-browser-test.md) for the
+real-server funding, cut, reload, settlement and replacement checks, plus the
+wallet-only sender-change preflight regression.
+
 ## Build
 
 The browser wallet uses integer millisatoshis (`msat`). At startup it checks the
@@ -392,10 +429,10 @@ onboarding rather than being overwritten. Provisioning requests
 There is no player-facing or production deletion API.
 
 Onboarding readiness means the persistent records have been provisioned and
-validated and gameplay can proceed. The game does **not** yet retain an opened
-`BrowserWallet` or expose a gameplay wallet-operation bridge; wallet operations
-still require the explicit programmatic API below. Do not interpret modal
-completion as end-to-end verification of in-game spending.
+validated. The game then opens a separate `BrowserWallet` handle and serializes
+menu and gameplay wallet operations through its browser bridge. The hoe is
+ready to spend only after server authentication and channel reconciliation;
+onboarding completion alone does not verify either.
 
 The lower-level `provision_wallet(mnemonic, name)` validates the phrase, holds the
 wallet's Web Lock and atomically adds both records only when absent. Regression

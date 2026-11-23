@@ -8,6 +8,8 @@ mod browser_db;
 mod browser_onboarding;
 mod browser_platform;
 mod game_auth;
+mod hoe;
+mod hoe_funding;
 mod mint_policy;
 #[path = "../../../vendor/cdk-wallet-ffi/src/spilman.rs"]
 mod spilman;
@@ -363,6 +365,25 @@ pub async fn probe_persistent_storage(name: &str) -> Result<bool, JsValue> {
 impl BrowserWallet {
     pub fn startup_reports(&self) -> String {
         self.startup.clone()
+    }
+
+    /// Separate gameplay API; the renderer queues it with ordinary wallet operations.
+    pub async fn hoe_request(&mut self, operation: &str, arguments: &str) -> Result<String, JsValue> {
+        if arguments.len() > 128 * 1024 {
+            return Err(js_error("hoe arguments exceed maximum size"));
+        }
+        let args = Args::new(arguments)?;
+        let wallet = self.inner.as_mut().ok_or_else(|| js_error("wallet is closed"))?;
+        self.tasks.run_until(async {
+            let value = match hoe::request(wallet, operation, &args).await {
+                Ok(mut value) => {
+                    value["status"] = json!(0);
+                    value
+                }
+                Err(err) => failure(err),
+            };
+            Ok(value.to_string())
+        }).await
     }
 
     /// Mutable async receiver rejects overlapping calls; JS facade queues them.

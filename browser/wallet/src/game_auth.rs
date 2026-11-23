@@ -29,6 +29,21 @@ impl GameSigner {
         None
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn signing_key(&self) -> Option<cdk::nuts::SecretKey> {
+        use zeroize::Zeroizing;
+        let hex = Zeroizing::new(cdk::util::hex::encode(*self.key));
+        cdk::nuts::SecretKey::from_hex(&hex).ok()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn channel_keys(&self, receiver: &str) -> Option<(String, Zeroizing<String>)> {
+        let key = self.signing_key()?;
+        let hex = Zeroizing::new(key.to_secret_hex());
+        let secret = cdk_spilman::compute_channel_secret_from_hex(&hex, receiver).ok()?;
+        Some((key.public_key().to_hex(), Zeroizing::new(secret)))
+    }
+
     fn proof(&self, nonce: &[u8; 32], aux: &[u8; 32]) -> Option<[u8; 97]> {
         let secp = Secp256k1::new();
         let mut key = SecretKey::from_slice(&*self.key).ok()?;

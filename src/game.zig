@@ -77,8 +77,6 @@ pub fn hoeRefillButton(panel: menu.Rect) menu.Rect {
 }
 
 pub const HoeFundingUi = struct {
-    pub const supported = !builtin.cpu.arch.isWasm();
-
     pub const Status = enum {
         checking,
         quote_failed,
@@ -133,6 +131,9 @@ pub const HoeView = struct {
     client: ?HoeBalance = null,
     payment_pending: bool = false,
     can_refill: bool = false,
+    close_first: bool = false,
+    recovery_action: ?enum { review_funding, retry_settlement } = null,
+    offer: ?struct { cuts: u64, debit: u64, resume_funding: bool = false } = null,
 };
 
 pub const GameState = struct {
@@ -141,8 +142,9 @@ pub const GameState = struct {
     player_pos: Location = movement.spawn,
     player_animation: player.Animation = .{},
     cut_feedback: @import("cut_feedback.zig").Feedback = .{},
-    paid_hoe: if (builtin.cpu.arch.isWasm()) struct {} else struct {
+    paid_hoe: struct {
         target: ?Location = null,
+        click_origin: ?struct { x: f32, y: f32 } = null,
         refill_requested: bool = false,
         refill_presented: bool = false,
         view: HoeView = .{},
@@ -206,14 +208,16 @@ pub const GameState = struct {
     /// Any half-finished drag is discarded so it cannot replay when the menu
     /// closes.
     pub fn update(self: *GameState, frame: input.FrameInput) world.CoordinateError!void {
-        if (!builtin.cpu.arch.isWasm()) self.paid_hoe.target = null;
+        self.paid_hoe.target = null;
         if (self.applyHoeFundingInput(frame)) {
+            self.paid_hoe.click_origin = null;
             self.ui_press_held = frame.dragging;
             self.player_walking = false;
             self.camera.resetDrag();
             return;
         }
         if (self.menu.applyInput(frame)) {
+            self.paid_hoe.click_origin = null;
             if (self.menu.option_toggle) |action| {
                 self.menu.option_toggle = null;
                 switch (action) {
@@ -232,6 +236,7 @@ pub const GameState = struct {
 
         if (!frame.dragging or frame.clicked) self.ui_press_held = false;
         if (frame.clicked) {
+            self.paid_hoe.click_origin = null;
             if (walletBadgeBounds(frame.viewport_w, frame.viewport_h)) |bounds| {
                 if (bounds.contains(frame.pointer_x, frame.pointer_y)) {
                     self.menu.openWallet();
@@ -246,8 +251,23 @@ pub const GameState = struct {
             if (toolbar) |layout| {
                 if (layout.hoe.contains(frame.pointer_x, frame.pointer_y)) self.selected_tool = .hoe;
             }
-            if (!builtin.cpu.arch.isWasm() and !over_toolbar and !frame.dragging and !frame.right_clicked) {
-                self.paid_hoe.target = self.hoeTarget(frame);
+            if (!over_toolbar and !frame.right_clicked) {
+                if (!frame.dragging) {
+                    self.paid_hoe.target = self.hoeTarget(frame);
+                } else if (frame.drag_x == 0 and frame.drag_y == 0) {
+                    // Browser left press may become a camera pan. Only a
+                    // stationary release may turn it into a paid action.
+                    self.paid_hoe.click_origin = .{ .x = frame.pointer_x, .y = frame.pointer_y };
+                }
+            }
+        }
+        if (self.paid_hoe.click_origin) |origin| {
+            if (frame.drag_x != 0 or frame.drag_y != 0 or frame.right_clicked or
+                @abs(frame.pointer_x - origin.x) > 3 or @abs(frame.pointer_y - origin.y) > 3)
+                self.paid_hoe.click_origin = null;
+            if (!frame.dragging) {
+                if (frame.released and self.paid_hoe.click_origin != null) self.paid_hoe.target = self.hoeTarget(frame);
+                self.paid_hoe.click_origin = null;
             }
         }
 
@@ -284,7 +304,7 @@ pub const GameState = struct {
             self.camera.resetDrag();
         }
         self.player_animation.update(frame.dt, facing_dx, facing_dy, self.player_walking, frame.action);
-        if (!builtin.cpu.arch.isWasm() and frame.use_tool and !frame.dragging and self.paid_hoe.target == null) {
+        if (frame.use_tool and !frame.dragging and self.paid_hoe.target == null) {
             self.paid_hoe.target = self.facingHoeTarget();
         }
 
@@ -293,14 +313,19 @@ pub const GameState = struct {
     }
 
     fn hoeTarget(self: *const GameState, frame: input.FrameInput) ?Location {
-        if (frame.pointer_x < 0 or frame.pointer_y < 0 or frame.pointer_x >= frame.viewport_w or frame.pointer_y >= frame.viewport_h) return null;
-        const tile = camera.screenToTile(self.camera, frame.viewport_w, frame.viewport_h, .{ .x = frame.pointer_x, .y = frame.pointer_y }) orelse return null;
-        const x: i64 = self.player_pos.x;
-        const y: i64 = self.player_pos.y;
-        return self.cuttableGrass(.{
-            .x = @intCast(std.math.clamp(@as(i64, tile.x), x - 1, x + 1)),
-            .y = @intCast(std.math.clamp(@as(i64, tile.y), y - 1, y + 1)),
-        });
+        if (!(frame.pointer_x >= 0 and frame.pointer_x < frame.viewport_w and
+            frame.pointer_y >= 0 and frame.pointer_y < frame.viewport_h)) return null;
+        const center = camera.relativeTileCenter(self.player_pos.x, self.player_pos.y, self.camera.tile_x, self.camera.tile_y);
+        const half_tile: f32 = world.TILE_PX / 2;
+        const dx = frame.pointer_x - (frame.viewport_w / 2 + center.x - half_tile);
+        const dy = frame.pointer_y - (frame.viewport_h / 2 + center.y - half_tile);
+        if (!std.math.isFinite(dx) or !std.math.isFinite(dy)) return null;
+        if (dx >= -half_tile and dx < half_tile and dy >= -half_tile and dy < half_tile) return null;
+        // Aim along the dominant axis, regardless of distance or player facing.
+        return self.adjacentHoeTarget(if (@abs(dx) >= @abs(dy))
+            .{ .x = if (dx < 0) -1 else 1, .y = 0 }
+        else
+            .{ .x = 0, .y = if (dy < 0) -1 else 1 });
     }
 
     fn facingHoeTarget(self: *const GameState) ?Location {
@@ -310,6 +335,10 @@ pub const GameState = struct {
             .left => .{ .x = -1, .y = 0 },
             .right => .{ .x = 1, .y = 0 },
         };
+        return self.adjacentHoeTarget(offset);
+    }
+
+    fn adjacentHoeTarget(self: *const GameState, offset: Location) ?Location {
         return self.cuttableGrass(.{
             .x = std.math.add(i32, self.player_pos.x, offset.x) catch return null,
             .y = std.math.add(i32, self.player_pos.y, offset.y) catch return null,
@@ -346,7 +375,6 @@ pub const GameState = struct {
     }
 
     fn applyHoeFundingInput(self: *GameState, frame: input.FrameInput) bool {
-        if (!HoeFundingUi.supported) return false;
         if (self.menu.opened or self.menu.exit_requested or frame.escape_clicked or !frame.clicked or frame.right_clicked) return false;
         if (self.paid_hoe.view.status == .hidden) return false;
         const panel = hoeStatusBounds(frame.viewport_w, frame.viewport_h) orelse return false;
@@ -382,8 +410,7 @@ pub const GameState = struct {
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
-test "native clicks aim within reach from a panned camera regardless of facing" {
-    if (builtin.cpu.arch.isWasm()) return error.SkipZigTest;
+test "mouse aims one cardinal tile regardless of click distance, camera pan, or facing" {
     const t = std.testing;
     var game = try GameState.init(t.allocator, 1000, 640);
     defer game.deinit();
@@ -404,9 +431,8 @@ test "native clicks aim within reach from a panned camera regardless of facing" 
     snapshot.chunks[0][neighbor / 8] |= @as(u8, 1) << @as(u3, @intCast(neighbor % 8));
     game.world.applyCuts(&snapshot);
     const directions = [_]Location{
-        .{ .x = -1, .y = -1 }, .{ .x = 0, .y = -1 }, .{ .x = 1, .y = -1 },
-        .{ .x = -1, .y = 0 },  .{ .x = 1, .y = 0 },  .{ .x = -1, .y = 1 },
-        .{ .x = 0, .y = 1 },   .{ .x = 1, .y = 1 },
+        .{ .x = -1, .y = 0 }, .{ .x = 1, .y = 0 },
+        .{ .x = 0, .y = -1 }, .{ .x = 0, .y = 1 },
     };
     for (directions) |dir| {
         game.player_pos = .{ .x = tile.x - dir.x, .y = tile.y - dir.y };
@@ -414,12 +440,34 @@ test "native clicks aim within reach from a panned camera regardless of facing" 
         try t.expectEqual(tile, game.paid_hoe.target.?);
 
         var far_click = click;
-        far_click.pointer_x += @floatFromInt(2 * world.TILE_PX * dir.x);
-        far_click.pointer_y += @floatFromInt(2 * world.TILE_PX * dir.y);
+        far_click.pointer_x += @floatFromInt(world.TILE_PX * (3 * dir.x + dir.y));
+        far_click.pointer_y += @floatFromInt(world.TILE_PX * (3 * dir.y + dir.x));
         try game.update(far_click);
         try t.expectEqual(tile, game.paid_hoe.target.?);
     }
+    game.player_pos = tile;
+    try game.update(click);
+    try t.expect(game.paid_hoe.target == null);
+    try game.update(.{ .clicked = true, .pointer_x = 505, .pointer_y = 315 });
+    try t.expect(game.paid_hoe.target == null);
+    game.player_pos = .{ .x = tile.x - 1, .y = tile.y };
+    try game.update(.{ .clicked = true, .pointer_x = 500, .pointer_y = 352 });
+    try t.expectEqual(tile, game.paid_hoe.target.?); // Exact diagonal ties go horizontal.
     try t.expect(!chunk.isCut(index));
+
+    var press = click;
+    press.dragging = true;
+    const release: input.FrameInput = .{ .released = true, .pointer_x = 500, .pointer_y = 320 };
+    try game.update(press);
+    try t.expect(game.paid_hoe.target == null);
+    try game.update(release);
+    try t.expectEqual(tile, game.paid_hoe.target.?);
+    try game.update(release);
+    try t.expect(game.paid_hoe.target == null);
+    try game.update(press);
+    try game.update(.{ .dragging = true, .drag_x = 5, .pointer_x = 505, .pointer_y = 320 });
+    try game.update(release);
+    try t.expect(game.paid_hoe.target == null);
 
     try game.update(.{ .clicked = true, .pointer_x = 500, .pointer_y = 608 });
     try t.expect(game.paid_hoe.target == null);
@@ -435,7 +483,6 @@ test "native clicks aim within reach from a panned camera regardless of facing" 
 }
 
 test "Space targets grass in front of the player only during gameplay" {
-    if (builtin.cpu.arch.isWasm()) return error.SkipZigTest;
     const t = std.testing;
     var game = try GameState.init(t.allocator, 1000, 640);
     defer game.deinit();
@@ -504,7 +551,6 @@ test "wallet badge opens Wallet directly and consumes gameplay input" {
 }
 
 test "refill requires a click on the presented button and consumes the input" {
-    if (!HoeFundingUi.supported) return error.SkipZigTest;
     const t = std.testing;
     var game = try GameState.init(t.allocator, 320, 640);
     defer game.deinit();

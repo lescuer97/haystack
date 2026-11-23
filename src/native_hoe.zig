@@ -1,8 +1,9 @@
 //! Desktop hoe play and refill coordinators. The wallet worker handles signing
 //! and durable operations; these runtimes correlate replies and update the UI.
 const std = @import("std");
-const rl = @import("raylib");
+
 const protocol = @import("shared").protocol;
+const paid_cut = @import("paid_cut.zig");
 const game_mod = @import("game.zig");
 const ws = @import("ws_worker.zig");
 const wallet = @import("wallet_service.zig");
@@ -12,7 +13,7 @@ const Game = game_mod.GameState;
 const funding_ops = @import("hoe_funding.zig");
 const ui = game_mod.HoeFundingUi;
 const app_mint = @import("wallet.zig").cdk.app_mint;
-const refill_debit_limit = hoe.refillDebitLimit(app_mint);
+pub const refill_debit_limit = hoe.refillDebitLimit(app_mint);
 
 pub const enabled = hoe.enabled(app_mint, ws.endpoint_url);
 
@@ -499,11 +500,8 @@ fn requestId(io: std.Io) protocol.Id {
 
 fn canSend(network: Network, cut: Runtime.Cut) bool {
     // Reach is checked against the server-confirmed position, not prediction.
-    return network.status == .ready and network.session == cut.session and !network.pending and withinReach(cut.tile, network.confirmed);
-}
-
-fn withinReach(tile: protocol.Location, player: protocol.Location) bool {
-    return @abs(@as(i64, tile.x) - player.x) <= 1 and @abs(@as(i64, tile.y) - player.y) <= 1;
+    return network.status == .ready and network.session == cut.session and !network.pending and
+        paid_cut.withinReach(cut.tile, network.confirmed);
 }
 
 fn direction(target: i32, origin: i32) i8 {
@@ -513,51 +511,10 @@ fn direction(target: i32, origin: i32) i8 {
 const Verdict = enum { charged, already_cut, uncertain, not_sent };
 
 fn classify(tile: protocol.Location, outcome: protocol.Outcome(.cut)) Verdict {
-    const state = switch (outcome) {
-        .ok => |state| state,
-        .failed => |failure| switch (failure) {
-            // The paid-cut handler checks this before accepting the payment.
-            .already_cut => |state| state,
-            else => return .uncertain,
-        },
+    return switch (paid_cut.classify(tile, outcome) orelse return .uncertain) {
+        .charged => .charged,
+        .already_cut => .already_cut,
     };
-    if (state.x != tile.x or state.y != tile.y or state.terrain != .grass or !state.cut) return .uncertain;
-    return if (outcome == .ok) .charged else .already_cut;
-}
-
-pub fn drawStatus(view_state: game_mod.HoeView, funding: game_mod.HoeFundingUi.Controller, vw: f32, vh: f32) void {
-    const status: [:0]const u8 = if (funding.status) |state| state.text() else switch (view_state.status) {
-        .hidden => return,
-        .unavailable => "No cuts loaded",
-        .checking => "Checking hoe channel...",
-        .ready => "Click nearby grass to cut",
-        .pending => "Cut pending...",
-        .recovery => "Hoe recovery required",
-        .empty => "Out of cuts",
-        .settling => "Settling previous refill...",
-        .settled => "Ready to refill",
-    };
-    const panel = game_mod.hoeStatusBounds(vw, vh) orelse return;
-    rl.drawRectangleRec(.{ .x = panel.x, .y = panel.y, .width = panel.width, .height = panel.height }, .{ .r = 30, .g = 28, .b = 24, .a = 240 });
-    var buf: [64]u8 = undefined;
-    const show_button = view_state.can_refill and funding.canStart();
-    const count = game_mod.HoeFundingUi.cutsText(view_state.cuts_left, &buf);
-    const text_x = if (show_button) panel.x + (panel.width - 142) / 2 else panel.centerX();
-    centered(count, text_x, panel.y + 6, 16);
-    centered(status, text_x, panel.y + 27, 12);
-    if (show_button) {
-        const button = game_mod.hoeRefillButton(panel);
-        const rect: rl.Rectangle = .{ .x = button.x, .y = button.y, .width = button.width, .height = button.height };
-        rl.drawRectangleRec(rect, .dark_gray);
-        rl.drawRectangleLinesEx(rect, 1, .gray);
-        centered("Refill hoe", button.centerX(), button.y + 3, 14);
-        const limit = std.mem.printSentinel(&buf, "Up to {d} msat incl. fees", .{refill_debit_limit}, 0) catch unreachable;
-        centered(limit, button.centerX(), button.y + 17, 10);
-    }
-}
-
-fn centered(text: [:0]const u8, x: f32, y: f32, size: i32) void {
-    rl.drawText(text, @as(i32, @intFromFloat(x)) - @divTrunc(rl.measureText(text, size), 2), @intFromFloat(y), size, .ray_white);
 }
 
 /// Coordinates refill authorization and admission separately from cut and settlement state.
@@ -1004,8 +961,8 @@ test "only matching authoritative grass states reconcile a cut reply" {
     try t.expectEqual(Verdict.uncertain, classify(tile, .{ .failed = .server_busy }));
     state.x += 1;
     try t.expectEqual(Verdict.uncertain, classify(tile, .{ .ok = state }));
-    try t.expect(!withinReach(.{ .x = std.math.minInt(i32), .y = 8 }, .{ .x = std.math.maxInt(i32), .y = 8 }));
-    try t.expect(withinReach(tile, .{ .x = -3, .y = 9 }));
+    try t.expect(!paid_cut.withinReach(.{ .x = std.math.minInt(i32), .y = 8 }, .{ .x = std.math.maxInt(i32), .y = 8 }));
+    try t.expect(paid_cut.withinReach(tile, .{ .x = -3, .y = 9 }));
 }
 
 test "refill authorizes only a fresh affordable offer within the displayed cap" {
