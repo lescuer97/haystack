@@ -98,7 +98,7 @@ test('lazy loading, idempotent gating, and cleanup', () => {
 
   h.load(1);
   const [audio] = h.tracks;
-  assert.equal(audio.volume, 0.35);
+  assert.equal(audio.volume, 0.175);
   assert.equal(audio.plays.length, 1);
   h.enable(1);
   h.enable(0);
