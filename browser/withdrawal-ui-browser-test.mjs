@@ -49,7 +49,7 @@ async function click(x, y) {
 async function row(page, index) {
   const [count, content, extra, width] = {
     Main:[4,0,0,420], Wallet:[5,62,0,420], Deposit:[7,62,0,420],
-    Invoice:[3,340,0,760], Withdraw:[5,62,112,760], Withdrawal:[2,320,0,760],
+    Invoice:[2,340,0,760], Withdraw:[5,62,112,760], Withdrawal:[2,320,0,760],
   }[page];
   const height = Math.min(592,40+44+content+extra+count*56+(count-1)*10);
   const scale = Math.min((height-40-44)/(content+extra+count*56+(count-1)*10),1);
@@ -148,7 +148,7 @@ async function run() {
   const funding = await evaluate(`(()=>{const r=checks.replies.slice(${fundingStart.replies}).find(r=>r.operation===2&&r.value?.amount==='1000');return {serial:r.serial,id:r.value.id,amount:r.value.amount}})()`);
   await expect('actual CDK funding balance','checks.snapshot?.msats==="1000"');
   await expect('funding retains its original reply and has no duplicate create',`checks.generation===${JSON.stringify(fundingStart.generation)} && checks.requests.filter(n=>n===2).length===${fundingStart.creates+1} && checks.replies.some(r=>r.operation===2&&r.serial===${funding.serial}&&r.value?.id===${JSON.stringify(funding.id)}&&r.value.amount===${JSON.stringify(funding.amount)})`);
-  await idle();await row('Invoice',2);await openWithdraw();
+  await idle();await row('Invoice',1);await openWithdraw();
   await paste('not-a-lightning-invoice');await reviewWithdrawal();
   await expect('invalid invoice has typed feedback and cannot produce a confirmation','checks.replies.some(r=>r.operation===9&&r.value?.operation_error?.status===2)');
   if ((await counts()).melt_posts!==0) throw new Error('Invalid input submitted payment');

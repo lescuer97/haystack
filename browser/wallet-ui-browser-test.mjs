@@ -53,6 +53,7 @@ const enter = async () => {
   await key('Enter','Enter',13);
 };
 const down = () => key('ArrowDown','ArrowDown',40);
+
 const escape = () => key('Escape','Escape',27);
 async function activateRow(y) {
   // These renderer rows are measured at the fixture's fixed 1000x640 size.
@@ -62,6 +63,12 @@ async function activateRow(y) {
   await enter();
 }
 const depositRow = index => activateRow(177+65*index);
+const invoiceBack = () => activateRow(545);
+const walletHistory = () => activateRow(422); // Inside History with or without Saved invoice.
+async function startAnotherDeposit() {
+  await invoiceBack();
+  await activateRow(472); // Wallet -> Deposit (below History when an invoice is unpaid)
+}
 async function createDeposit(name, amount, priorIds=[]) {
   const start=await evaluate('({generation:walletUiChecks.generation,index:walletUiChecks.replies.length})');
   const matches=`r.operation===2 && r.value.amount===${JSON.stringify(amount)} && r.value.state==='UNPAID' && typeof r.value.id==='string' && r.value.id.length>0 && !${JSON.stringify(priorIds)}.includes(r.value.id) && typeof r.value.invoice==='string' && r.value.invoice.length>0`;
@@ -176,14 +183,14 @@ async function run() {
   await expect('paid is actually minted, then balance reread','walletUiChecks.invoice?.state==="ISSUED" && walletUiChecks.invoice.confirmed===true && walletUiChecks.snapshot?.msats==="42000" && walletUiChecks.active===0');
   counts=await depositCounts();
   if(counts.quotes!==1||counts.claims!==1)throw new Error('Deposit was not exactly once');
-   await down(); await down(); await enter(); // Invoice Back -> Wallet
-  await down(); await down(); await down(); await enter(); // History
+   await invoiceBack();
+  await walletHistory();
   await expect('history uses persisted quote state and creation metadata',`walletUiChecks.history?.rows.some(q=>q.id===${JSON.stringify(id)}&&q.direction==='In'&&q.amount==='42000'&&q.state==='ISSUED'&&q.created_at) && walletUiChecks.active===0`);
    const savedReads=await evaluate('walletUiChecks.requests.filter(n=>n===8).length');
    const savedReplyStart=await evaluate('walletUiChecks.replies.length');
    await enter(); // Selected History row -> Invoice
    await expect('selectable history row locally opens its saved invoice',`walletUiChecks.requests.filter(n=>n===8).length>${savedReads} && walletUiChecks.replies.slice(${savedReplyStart}).some(r=>r.operation===8 && r.value.id===${JSON.stringify(id)}) && walletUiChecks.active===0`);
-   await down(); await down(); await enter(); // Invoice Back -> Wallet
+   await invoiceBack();
   await escape();
    await reloadWallet();
    await expect('issued reload has real balance, no unfinished invoice','walletUiChecks.snapshot?.msats==="42000" && walletUiChecks.resumed?.invoice===null && walletUiChecks.active===0');
@@ -199,10 +206,10 @@ async function run() {
    const additionalStart=await evaluate('({generation:walletUiChecks.generation,index:walletUiChecks.replies.length})');
    await depositRow(1); // preset 21000 msat
    const first=await createDeposit('first','21000',[id]);
-  await activateRow(505); // Invoice Deposit -> form, not resume
+  await startAnotherDeposit();
   await depositRow(3); // preset 100000 msat
    const second=await createDeposit('second','100000',[id,first.id]);
-  await activateRow(505); // Invoice Deposit -> another independent quote
+  await startAnotherDeposit();
   await depositRow(1); // preset 21000 msat
    const chosen=await createDeposit('chosen','21000',[id,first.id,second.id]);
    if(new Set([first.id,second.id,chosen.id]).size!==3)throw new Error('Additional quote identities are not distinct');
@@ -236,7 +243,7 @@ async function run() {
    await reloadWallet();
   await expect('multi-deposit balance and completion survive restart','walletUiChecks.events.includes("ready") && walletUiChecks.snapshot?.msats==="184000" && walletUiChecks.resumed?.invoice===null && walletUiChecks.active===0');
   await evaluate('document.getElementById("canvas").focus()');
-  await openWallet(); await down(); await down(); await down(); await enter();
+  await openWallet(); await walletHistory();
   await expect('all additional deposit states persist in real Rust history',`[${JSON.stringify(first.id)},${JSON.stringify(second.id)},${JSON.stringify(chosen.id)}].every(id=>walletUiChecks.history?.rows.some(row=>row.id===id && row.state==='ISSUED')) && walletUiChecks.active===0`);
    counts=await depositCounts();
   if(counts.quotes!==4||counts.claims!==4)throw new Error('Restart reissued a settled multi-deposit payment');

@@ -21,7 +21,7 @@ const shared = @import("shared");
 const terrain = shared.world;
 
 /// Frame-rate target. The HUD's FPS colour thresholds are derived from it.
-pub const target_fps: i32 = 120;
+pub const target_fps: i32 = 144;
 
 const grass_asset = "assets/Tiles/Grass_Middle.png";
 const grass_sheet_width = 16;

@@ -144,6 +144,7 @@ pub const Model = struct {
     balance_dirty: bool = false,
     history_dirty: bool = true,
     history_active: bool = false,
+    history_next_expiry: ?u64 = null,
     resume_needed: bool = false,
     next_resume: f64 = 0,
     resume_backoff: f64 = 2,
@@ -226,6 +227,14 @@ pub const Model = struct {
             _ = self.message.set("Opening wallet...");
             _ = self.enqueue(.open, "");
         } else if (self.available) {
+            if (self.history_active) {
+                if (self.history_next_expiry) |expiry| {
+                    if (self.unix_now > expiry) {
+                        self.history_next_expiry = null;
+                        self.history_dirty = true;
+                    }
+                }
+            }
             if (self.reviewLive() or self.withdrawal_blocked) {
                 if (self.balance_dirty) {
                     self.balance_dirty = false;
@@ -836,6 +845,7 @@ pub const Model = struct {
         const expected = if (total == 0) 0 else @min(@as(u64, self.pending_offset), (total - 1) / 8 * 8);
         if (offset != expected or rows.array.items.len != @min(8, total - offset)) return error.Invalid;
         var rendered: [8]Row = @splat(.{});
+        var next_expiry: ?u64 = null;
         for (rows.array.items, 0..) |entry, index| {
             if (entry != .object) return error.Invalid;
             const direction = string(entry, "direction") orelse return error.Invalid;
@@ -856,10 +866,17 @@ pub const Model = struct {
             const time = if (string(entry, "created_at")) |text| formatTime(text, &time_buf) else "Time unknown";
             const mint = string(entry, "mint_url") orelse "Mint unknown";
             if (string(entry, "mint_url")) |owner| _ = rendered[index].mint.set(owner);
-            const line = std.fmt.bufPrint(&buf, "{s} | {s} {s} | {s}\n{s}{s}", .{ time, string(entry, "amount") orelse "?", string(entry, "unit") orelse "?", status, mint, if (!std.mem.eql(u8, mint, self.mint.slice())) " (not refreshed)" else "" }) catch "Quote details exceed display limit; retained in wallet";
+            if (!rendered[index].outgoing and !status.expired and std.mem.eql(u8, status.quote, "UNPAID")) {
+                if (string(entry, "quote_expiry")) |text| {
+                    const expiry = decimal(text) catch 0;
+                    if (expiry != 0 and (next_expiry == null or expiry < next_expiry.?)) next_expiry = expiry;
+                }
+            }
+            const line = std.fmt.bufPrint(&buf, "{s} | {s} {s} | {s}{s}{s}{s}\n{s}{s}", .{ time, string(entry, "amount") orelse "?", string(entry, "unit") orelse "?", status.quote, if (status.payment != null) " | " else "", status.payment orelse "", if (status.expired) " | EXPIRED" else "", mint, if (!std.mem.eql(u8, mint, self.mint.slice())) " (not refreshed)" else "" }) catch "Quote details exceed display limit; retained in wallet";
             _ = rendered[index].text.set(line);
         }
         self.rows = rendered;
+        self.history_next_expiry = next_expiry;
         self.row_count = rows.array.items.len;
         self.total_rows = @intCast(total);
         if (self.desired_offset == self.pending_offset) self.desired_offset = @intCast(offset) else self.history_dirty = true;
@@ -876,7 +893,9 @@ pub fn withdrawalErrorMessage(status: u8) []const u8 {
         else => "Withdrawal request failed; rereading CDK state before further action.",
     };
 }
-fn historyStatus(entry: std.json.Value, outgoing: bool) ![]const u8 {
+const HistoryStatus = struct { quote: []const u8, payment: ?[]const u8, expired: bool };
+
+fn historyStatus(entry: std.json.Value, outgoing: bool) !HistoryStatus {
     const expired = if (entry.object.get("expired")) |field| blk: {
         if (field != .bool) return error.Invalid;
         break :blk field.bool;
@@ -886,22 +905,19 @@ fn historyStatus(entry: std.json.Value, outgoing: bool) ![]const u8 {
         for (field.string) |c| if (c < 32 or c >= 127) return error.Invalid;
         break :blk field.string;
     } else null;
-    if (outgoing) {
-        if (payment_status) |status| {
-            const known = std.meta.stringToEnum(withdrawal.Status, status) orelse return status;
-            // Pending (and unknown outcomes) remain recoverable after deadlines.
-            if (expired and known != .pending and known != .unknown) return "EXPIRED";
-            return switch (known) {
-                .prepared => "Prepared",
-                .pending => "Pending",
-                .completed => "Completed",
-                .failed => "Failed",
-                .unsubmitted => "Unsubmitted",
-                .unknown => "Unknown",
-            };
-        }
-    }
-    return if (expired) "EXPIRED" else string(entry, "state") orelse "?";
+    const payment = if (outgoing) blk: {
+        const status = payment_status orelse break :blk null;
+        const known = std.meta.stringToEnum(withdrawal.Status, status) orelse break :blk status;
+        break :blk switch (known) {
+            .prepared => "Prepared",
+            .pending => "Pending",
+            .completed => "Completed",
+            .failed => "Failed",
+            .unsubmitted => "Unsubmitted",
+            .unknown => "Unknown",
+        };
+    } else null;
+    return .{ .quote = string(entry, "state") orelse "?", .payment = payment, .expired = expired };
 }
 fn valueError(value: std.json.Value) bool {
     const field = value.object.get("error") orelse return false;
@@ -1257,17 +1273,17 @@ test "fast empty withdrawal sweeps preserve prior deposit cadence and all three 
     }
     try std.testing.expect(deposits >= 3 and withdrawals >= 2 and withdrawals <= 6);
 }
-test "history displays authoritative payment status and expiry without inferring paid or expiring pending work" {
+test "history preserves CDK quote state alongside reported payment status and expiry" {
     const cases = [_]struct { fields: []const u8, label: []const u8 }{
-        .{ .fields = "\"direction\":\"Out\",\"state\":\"UNPAID\",\"payment_status\":\"pending\",\"expired\":false", .label = "Pending" },
-        .{ .fields = "\"direction\":\"Out\",\"state\":\"UNPAID\",\"payment_status\":\"pending\",\"expired\":true", .label = "Pending" },
-        .{ .fields = "\"direction\":\"Out\",\"state\":\"PAID\",\"payment_status\":\"completed\",\"expired\":false", .label = "Completed" },
-        .{ .fields = "\"direction\":\"Out\",\"state\":\"UNPAID\",\"payment_status\":\"unsubmitted\",\"expired\":true", .label = "EXPIRED" },
-        .{ .fields = "\"direction\":\"In\",\"state\":\"UNPAID\",\"expired\":true", .label = "EXPIRED" },
+        .{ .fields = "\"direction\":\"Out\",\"state\":\"PENDING\",\"payment_status\":\"pending\",\"expired\":false", .label = "PENDING | Pending" },
+        .{ .fields = "\"direction\":\"Out\",\"state\":\"UNPAID\",\"payment_status\":\"pending\",\"expired\":false", .label = "UNPAID | Pending" },
+        .{ .fields = "\"direction\":\"Out\",\"state\":\"PAID\",\"payment_status\":\"completed\",\"expired\":false", .label = "PAID | Completed" },
+        .{ .fields = "\"direction\":\"Out\",\"state\":\"UNPAID\",\"payment_status\":\"unsubmitted\",\"expired\":true", .label = "UNPAID | Unsubmitted | EXPIRED" },
+        .{ .fields = "\"direction\":\"In\",\"state\":\"UNPAID\",\"expired\":true", .label = "UNPAID | EXPIRED" },
         .{ .fields = "\"direction\":\"In\",\"state\":\"UNPAID\",\"expired\":false", .label = "UNPAID" },
         .{ .fields = "\"direction\":\"Out\",\"state\":\"UNPAID\"", .label = "UNPAID" },
-        .{ .fields = "\"direction\":\"Out\",\"state\":\"PAID\",\"payment_status\":\"unknown\",\"expired\":true", .label = "Unknown" },
-        .{ .fields = "\"direction\":\"Out\",\"state\":\"PAID\",\"payment_status\":\"future-status\",\"expired\":false", .label = "future-status" },
+        .{ .fields = "\"direction\":\"Out\",\"state\":\"PAID\",\"payment_status\":\"unknown\",\"expired\":false", .label = "PAID | Unknown" },
+        .{ .fields = "\"direction\":\"Out\",\"state\":\"PAID\",\"payment_status\":\"future-status\",\"expired\":false", .label = "PAID | future-status" },
     };
     for (cases) |case| {
         var model = withdrawalModel();
@@ -1278,10 +1294,32 @@ test "history displays authoritative payment status and expiry without inferring
         model.accept(model.serial, raw, 0, std.testing.allocator);
         try std.testing.expect(!model.history_error and model.row_count == 1);
         var expected: [64]u8 = undefined;
-        const state = try std.fmt.bufPrint(&expected, "| {s}\n", .{case.label});
+        const state = try std.fmt.bufPrint(&expected, "21000 msat | {s}\n", .{case.label});
         try std.testing.expect(std.mem.indexOf(u8, model.rows[0].text.slice(), state) != null);
     }
 }
+test "open history rereads local quote state after the next unpaid deposit expires" {
+    var model = withdrawalModel();
+    model.next_check = 2;
+    model.visit(true, false);
+    model.tick(true, 0);
+    try std.testing.expectEqual(Operation.history, model.request.?.operation);
+    model.request = null;
+    const prefix = "{\"offset\":\"0\",\"total\":\"1\",\"limit\":8,\"rows\":[{\"id\":\"saved\",\"direction\":\"In\",\"state\":\"UNPAID\",\"quote_expiry\":\"200\",\"expired\":";
+    model.accept(model.serial, prefix ++ "false}]}", 0, std.testing.allocator);
+    model.unix_now = 200;
+    model.tick(true, 0);
+    try std.testing.expect(model.request == null);
+    model.unix_now = 201;
+    model.tick(true, 0);
+    try std.testing.expectEqual(Operation.history, model.request.?.operation);
+    model.request = null;
+    model.accept(model.serial, prefix ++ "true}]}", 0, std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, model.rows[0].text.slice(), "| UNPAID | EXPIRED\n") != null);
+    model.tick(true, 0);
+    try std.testing.expect(model.request == null);
+}
+
 test "malformed present history projection fields fail atomically and retain previous rows" {
     const invalid = [_][]const u8{
         "\"expired\":null",        "\"expired\":1",                           "\"expired\":\"true\"",

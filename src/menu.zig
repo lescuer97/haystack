@@ -141,6 +141,14 @@ const wallet_items = [_]MenuItem{
     .{ .navigate = .History },
     .{ .navigate = .Main },
 };
+const wallet_with_invoice_items = [_]MenuItem{
+    .{ .action = .balance },
+    .{ .navigate = .Invoice },
+    .{ .navigate = .Withdraw },
+    .{ .navigate = .History },
+    .{ .navigate = .Deposit },
+    .{ .navigate = .Main },
+};
 const deposit_items = [_]MenuItem{
     .{ .text_input = .deposit_msats },
     .{ .action = .preset21 },
@@ -150,7 +158,7 @@ const deposit_items = [_]MenuItem{
     .{ .action = .deposit },
     .{ .navigate = .Wallet },
 };
-const invoice_items = [_]MenuItem{ .{ .action = .copy_invoice }, .{ .navigate = .Deposit }, .{ .navigate = .Wallet } };
+const invoice_items = [_]MenuItem{ .{ .action = .copy_invoice }, .{ .navigate = .Wallet } };
 const history_items = [_]MenuItem{ .{ .action = .previous }, .{ .action = .next }, .{ .navigate = .Wallet } };
 const history_previous_items = [_]MenuItem{ .{ .action = .previous }, .{ .navigate = .Wallet } };
 const withdraw_items = [_]MenuItem{ .{ .text_input = .withdrawal_invoice }, .{ .action = .paste_withdrawal }, .{ .action = .clear_withdrawal }, .{ .action = .review_withdrawal }, .{ .navigate = .Wallet } };
@@ -499,6 +507,7 @@ pub const Menu = struct {
         return if (self.currentPage == .History) self.wallet.row_count else 0;
     }
     pub fn items(self: *const Menu) []const MenuItem {
+        if (self.currentPage == .Wallet and self.wallet.invoice.len != 0 and !self.wallet.issued and !self.wallet.expired) return &wallet_with_invoice_items;
         if (self.currentPage == .Withdrawal) return if (self.wallet.reviewLive() or (self.wallet.pending and (self.wallet.operation == .prepare_withdrawal or self.wallet.operation == .cancel_withdrawal))) &withdrawal_review_items else &withdrawal_detail_items;
         if (self.currentPage != .History) return pageItems(self.currentPage);
         const previous = self.wallet.total_rows > 8 and self.wallet.desired_offset > 0;
@@ -581,9 +590,7 @@ pub const Menu = struct {
                     self.withdrawal_invoice.clear();
                     self.paste_requested = false;
                 }
-                if (page == .Deposit and self.wallet.invoice.len != 0 and !self.wallet.issued and !self.wallet.expired and self.currentPage == .Wallet) {
-                    self.currentPage = .Invoice;
-                } else self.currentPage = page;
+                self.currentPage = page;
                 self.wallet.visit(self.currentPage == .History, page == .Wallet);
                 self.focus = null;
                 self.selected_index = 0;
@@ -1303,7 +1310,6 @@ test "history pagination only shows existing pages and rows precede Back" {
     _ = state.applyInput(.{ .confirm = true });
     try std.testing.expectEqual(MenuPage.Wallet, state.currentPage);
     try std.testing.expectEqual(@as(usize, 5), wallet_items.len);
-    try std.testing.expectEqual(@as(usize, 3), invoice_items.len);
 }
 
 test "history keyboard and pointer selection open a saved invoice" {
@@ -1324,18 +1330,21 @@ test "history keyboard and pointer selection open a saved invoice" {
     try std.testing.expectEqual(MenuPage.Invoice, state.currentPage);
 }
 
-test "invoice Back uses third row and expired Deposit navigation returns to amount entry" {
-    var state = Menu{ .opened = true, .currentPage = .Invoice, .selected_index = 2 };
-    _ = state.applyInput(.{ .confirm = true });
-    try std.testing.expectEqual(MenuPage.Wallet, state.currentPage);
+test "invoice offers only Copy invoice and Back while Wallet can resume or start a deposit" {
+    var state = Menu{ .opened = true, .currentPage = .Invoice };
     _ = state.wallet.invoice.set("lnbc-saved");
-    state.wallet.expired = true;
-    state.activate(.{ .navigate = .Deposit });
-    try std.testing.expectEqual(MenuPage.Deposit, state.currentPage);
-    state.currentPage = .Wallet;
-    state.wallet.expired = false;
-    state.activate(.{ .navigate = .Deposit });
+    try std.testing.expectEqualSlices(MenuItem, &.{ .{ .action = .copy_invoice }, .{ .navigate = .Wallet } }, state.items());
+    _ = state.applyInput(.{ .down = true, .confirm = true });
+    try std.testing.expectEqual(MenuPage.Wallet, state.currentPage);
+    state.activateIndex(1); // Saved invoice
     try std.testing.expectEqual(MenuPage.Invoice, state.currentPage);
+    state.activateIndex(1); // Back
+    state.activateIndex(4); // Deposit while the saved invoice is still unpaid
+    try std.testing.expectEqual(MenuPage.Deposit, state.currentPage);
+    state.activate(.{ .navigate = .Wallet });
+    state.wallet.expired = true;
+    state.activateIndex(1); // Deposit replaces Saved invoice in the usual Wallet layout
+    try std.testing.expectEqual(MenuPage.Deposit, state.currentPage);
 }
 
 test "outgoing history opens only withdrawal detail and other mint activation retains History" {

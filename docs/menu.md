@@ -65,13 +65,16 @@ Pages and rows:
   pauses playback; checking resumes it. If the soundtrack is unavailable,
   uncheck and recheck `Music` to retry.
 - **Wallet**: selected-mint msat balance, `Deposit`, `Withdraw`,
-  `History`, `Back to Main`.
+  `History`, `Back to Main`. While an unpaid invoice is active, `Saved invoice`
+  reopens it and `Deposit` below `History` starts a new deposit.
 - **Deposit**: custom positive integer millisats, presets 21000/42000/100000/500000, `Deposit`, `Back`.
 - **Invoice**: cached QR, bounded invoice preview, actual quote state,
-  `Copy invoice`, new `Deposit`, `Back`.
+  `Copy invoice`, `Back`.
 - **History**: eight saved mint/melt quotes per page, `Previous`, `Next`, `Back`.
   Rows show UTC creation time (or `Time unknown`), direction, amount/unit,
-  persisted state and mint identity. Legacy mints are marked `not refreshed`;
+  CDK quote state and mint identity. Withdrawal payment status and expiry are
+  shown separately from the quote state. Unexpired unpaid deposits are included;
+  expired ones remain in history with an `EXPIRED` marker. Legacy mints are marked `not refreshed`;
   unknown melt owners stay unknown. Paid deposits are not completed deposits.
   Rows are selectable by pointer, keyboard, and gamepad; activation opens the saved
   deposit invoice or read-only withdrawal detail for this mint. Previous appears only with an earlier page, Next only with a later page;
