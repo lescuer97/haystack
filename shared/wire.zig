@@ -16,14 +16,15 @@ const Tag = enum(u8) {
     challenge = 0xf0,
     proof = 0xf1,
     reply = 0xf2,
-    channel_payment = 0x20,
     channel_requirements = 0x21,
-    channel_open = 0x22,
     channel_close = 0x23,
-    channel_payment_reply = 0xa0,
+    channel_open = 0x24,
+    channel_status = 0x25,
     channel_requirements_reply = 0xa1,
     channel_open_reply = 0xa2,
     channel_close_reply = 0xa3,
+    channel_status_reply = 0xa5,
+    channel_settled = 0xa6,
     protocol_error = 0xff,
 };
 const Field = enum(u8) {
@@ -39,6 +40,9 @@ const Field = enum(u8) {
     payment_signature = 0x22,
     tool = 0x23,
     funding_proof = 0x24,
+    channel_params = 0x25,
+    channel_capacity_msat = 0x26,
+    channel_balance_msat = 0x27,
 };
 
 pub const protocol_error = [4]u8{ @backingInt(Tag.protocol_error), 0, 0, bye };
@@ -65,7 +69,7 @@ pub const DecodeError = error{
     OverlappingBuffers,
 };
 const EncodeBufferError = error{ BufferTooSmall, OverlappingBuffers };
-pub const EncodeError = EncodeBufferError || error{InvalidSnapshot};
+pub const EncodeError = EncodeBufferError || error{ InvalidSnapshot, InvalidSenderProofLength, InvalidChannelStatus };
 
 fn overlaps(a: []const u8, b: []const u8) bool {
     if (a.len == 0 or b.len == 0) return false;
@@ -174,8 +178,8 @@ fn requestTag(kind: p.Kind) Tag {
         .update_location => .update_location,
         .channel_requirements => .channel_requirements,
         .channel_open => .channel_open,
-        .channel_payment => .channel_payment,
         .channel_close => .channel_close,
+        .channel_status => .channel_status,
     };
 }
 fn replyTag(kind: p.Kind) Tag {
@@ -185,8 +189,8 @@ fn replyTag(kind: p.Kind) Tag {
         .update_location => .update_location_reply,
         .channel_requirements => .channel_requirements_reply,
         .channel_open => .channel_open_reply,
-        .channel_payment => .channel_payment_reply,
         .channel_close => .channel_close_reply,
+        .channel_status => .channel_status_reply,
     };
 }
 
@@ -212,58 +216,86 @@ fn readState(data: []const u8) DecodeError!p.State {
     return .{ .x = get(i32, data, 0), .y = get(i32, data, 4), .terrain = std.enums.fromInt(world.Tile, data[8]) orelse return error.InvalidFieldValue, .cut = data[9] == 1 };
 }
 
-/// A channel-open proof must not overlap the bytes written to `out`.
-pub fn encodeRequest(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind)) (EncodeBufferError || error{InvalidProofLength})![]const u8 {
+const payment_tlv_bytes = 3 * header_bytes + 32 + 8 + 64;
+
+fn writePayment(writer: *Writer, payment: p.SpillmanChannelPayment) void {
+    writer.bytes(.channel_id, &payment.id);
+    put(u64, writer.field(.amount, 8), 0, payment.amount);
+    writer.bytes(.payment_signature, &payment.signature);
+}
+
+fn readPayment(reader: *Reader, fields: []const Field) DecodeError!p.SpillmanChannelPayment {
+    return .{
+        .id = (try reader.exact(fields, .channel_id, 32)).*,
+        .amount = get(u64, try reader.exact(fields, .amount, 8), 0),
+        .signature = (try reader.exact(fields, .payment_signature, 64)).*,
+    };
+}
+
+/// A channel-open proof and params must not overlap the bytes written to `out`.
+pub fn encodeRequest(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind)) (EncodeBufferError || error{ InvalidProofLength, InvalidParamsLength })![]const u8 {
     const payload_bytes: u16 = switch (kind) {
-        .cut, .update_location => header_bytes + 8,
+        .cut => header_bytes + 8 + @as(u16, if (req.payload.payment != null) payment_tlv_bytes else 0),
+        .update_location => header_bytes + 8,
         .read_area => header_bytes + 16,
         .channel_requirements => header_bytes + 1,
-        .channel_close => header_bytes + 32,
-        .channel_payment => 3 * header_bytes + 32 + 8 + 64,
+        .channel_close, .channel_status => header_bytes + 32,
         .channel_open => blk: {
-            const len = req.payload.proof.len;
-            if (len == 0 or len > p.max_channel_proof_bytes) return error.InvalidProofLength;
-            break :blk @intCast(2 * header_bytes + 32 + len);
+            const proof_len = req.payload.proof.len;
+            if (proof_len == 0 or proof_len > p.max_channel_proof_bytes) return error.InvalidProofLength;
+            const params_len = req.payload.params.len;
+            if (params_len == 0 or params_len > p.max_channel_params_bytes) return error.InvalidParamsLength;
+            break :blk @intCast(3 * header_bytes + 32 + proof_len + params_len);
         },
     };
+    const body_len = header_bytes + @sizeOf(p.Id) + payload_bytes;
+    const frame_len = envelope_bytes + @as(usize, body_len);
+    if (kind == .channel_open and out.len >= frame_len and overlaps(out[0..frame_len], req.payload.params)) return error.OverlappingBuffers;
     const source = if (kind == .channel_open) req.payload.proof else &.{};
-    var writer = try Writer.initFrom(out, requestTag(kind), header_bytes + @sizeOf(p.Id) + payload_bytes, source);
+    var writer = try Writer.initFrom(out, requestTag(kind), body_len, source);
     writer.bytes(.id, &req.request_id);
     switch (kind) {
-        .cut, .update_location => writePoint(writer.field(.payload, 8), req.payload.x, req.payload.y),
+        .cut => {
+            writePoint(writer.field(.payload, 8), req.payload.x, req.payload.y);
+            if (req.payload.payment) |payment| writePayment(&writer, payment);
+        },
+        .update_location => writePoint(writer.field(.payload, 8), req.payload.x, req.payload.y),
         .read_area => writeArea(writer.field(.payload, 16), req.payload),
         .channel_requirements => writer.field(.tool, 1)[0] = @backingInt(req.payload.tool),
-        .channel_close => writer.bytes(.channel_id, &req.payload.id),
-        .channel_payment => {
-            writer.bytes(.channel_id, &req.payload.id);
-            put(u64, writer.field(.amount, 8), 0, req.payload.amount);
-            writer.bytes(.payment_signature, &req.payload.signature);
-        },
+        .channel_close, .channel_status => writer.bytes(.channel_id, &req.payload.id),
         .channel_open => {
             writer.bytes(.channel_id, &req.payload.id);
             writer.bytes(.funding_proof, req.payload.proof);
+            writer.bytes(.channel_params, req.payload.params);
         },
     }
     return writer.finish();
 }
 
-/// A decoded channel-open proof borrows `data` until that buffer is reused.
+/// Decoded channel-open proof and params borrow `data` until that buffer is reused.
 pub fn decodeMessage(data: []const u8, binary: bool) DecodeError!p.Request {
-    const cap: usize = if (data.len > 0 and data[0] == @backingInt(Tag.channel_open)) p.max_request_bytes else p.max_gameplay_request_bytes;
+    const cap: usize = switch (if (data.len == 0) 0 else data[0]) {
+        @backingInt(Tag.channel_open) => p.max_channel_open_with_params_bytes,
+        else => p.max_gameplay_request_bytes,
+    };
     var frame = try open(data, binary, cap);
     const fields: []const Field = switch (frame.tag) {
-        .cut, .read_area, .update_location => &.{ .id, .payload },
+        .cut => &.{ .id, .payload, .channel_id, .amount, .payment_signature },
+        .read_area, .update_location => &.{ .id, .payload },
         .channel_requirements => &.{ .id, .tool },
-        .channel_open => &.{ .id, .channel_id, .funding_proof },
-        .channel_payment => &.{ .id, .channel_id, .amount, .payment_signature },
-        .channel_close => &.{ .id, .channel_id },
+        .channel_open => &.{ .id, .channel_id, .funding_proof, .channel_params },
+        .channel_close, .channel_status => &.{ .id, .channel_id },
         else => return error.UnexpectedMessageType,
     };
     const id = (try frame.body.exact(fields, .id, @sizeOf(p.Id))).*;
     const operation: @FieldType(p.Request, "operation") = switch (frame.tag) {
         .cut => blk: {
             const point = try frame.body.exact(fields, .payload, 8);
-            break :blk .{ .cut = .{ .x = get(i32, point, 0), .y = get(i32, point, 4) } };
+            break :blk .{ .cut = .{
+                .x = get(i32, point, 0),
+                .y = get(i32, point, 4),
+                .payment = if (frame.body.remaining.len == 0) null else try readPayment(&frame.body, fields),
+            } };
         },
         .update_location => blk: {
             const point = try frame.body.exact(fields, .payload, 8);
@@ -278,14 +310,13 @@ pub fn decodeMessage(data: []const u8, binary: bool) DecodeError!p.Request {
             const proof = try frame.body.next(fields) orelse return error.MissingRequiredField;
             if (proof.tag != .funding_proof) return error.OutOfOrderField;
             if (proof.bytes.len == 0 or proof.bytes.len > p.max_channel_proof_bytes) return error.InvalidFieldLength;
-            break :blk .{ .channel_open = .{ .id = channel_id, .proof = proof.bytes } };
+            const params = try frame.body.next(fields) orelse return error.MissingRequiredField;
+            if (params.tag != .channel_params) return error.OutOfOrderField;
+            if (params.bytes.len == 0 or params.bytes.len > p.max_channel_params_bytes) return error.InvalidFieldLength;
+            break :blk .{ .channel_open = .{ .id = channel_id, .proof = proof.bytes, .params = params.bytes } };
         },
-        .channel_payment => .{ .channel_payment = .{
-            .id = (try frame.body.exact(fields, .channel_id, 32)).*,
-            .amount = get(u64, try frame.body.exact(fields, .amount, 8), 0),
-            .signature = (try frame.body.exact(fields, .payment_signature, 64)).*,
-        } },
         .channel_close => .{ .channel_close = .{ .id = (try frame.body.exact(fields, .channel_id, 32)).* } },
+        .channel_status => .{ .channel_status = .{ .id = (try frame.body.exact(fields, .channel_id, 32)).* } },
         else => unreachable,
     };
     try frame.body.finish(fields);
@@ -311,13 +342,41 @@ fn validateSnapshot(data: []const u8) DecodeError!struct { area: world.ChunkRang
     return .{ .area = area, .count = count };
 }
 
-/// A snapshot source must not overlap the bytes written to `out`.
+const status_bytes = p.channel_status_reply_overhead - p.close_reply_overhead;
+
+pub const channel_settled_bytes = envelope_bytes + header_bytes + 32;
+
+pub fn encodeChannelSettled(out: []u8, id: [32]u8) EncodeBufferError![]const u8 {
+    var writer = try Writer.init(out, .channel_settled, channel_settled_bytes - envelope_bytes);
+    writer.bytes(.channel_id, &id);
+    return writer.finish();
+}
+
+pub fn decodeChannelSettled(data: []const u8, binary: bool) DecodeError![32]u8 {
+    var frame = try open(data, binary, channel_settled_bytes);
+    if (frame.tag != .channel_settled) return error.UnexpectedMessageType;
+    const fields: []const Field = &.{.channel_id};
+    const id = (try frame.body.exact(fields, .channel_id, 32)).*;
+    try frame.body.finish(fields);
+    return id;
+}
+
+/// Snapshot and sender proof sources must not overlap the bytes written to `out`.
 pub fn encodeReply(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind), outcome: p.Outcome(kind)) EncodeError![]const u8 {
     const n: u16 = switch (outcome) {
         .ok => |value| switch (kind) {
             .cut => 10,
             .channel_requirements => 49,
-            .update_location, .channel_open, .channel_payment, .channel_close => 0,
+            .channel_status => blk: {
+                if (value.balance_msat > value.capacity_msat) return error.InvalidChannelStatus;
+                const len = if (value.sender_proofs) |proofs| len: {
+                    if (value.phase != .settled) return error.InvalidChannelStatus;
+                    if (proofs.len == 0 or proofs.len > p.max_sender_change_proofs_bytes) return error.InvalidSenderProofLength;
+                    break :len proofs.len;
+                } else 0;
+                break :blk @intCast(status_bytes + len);
+            },
+            .update_location, .channel_open, .channel_close => 0,
             .read_area => blk: {
                 const geometry = p.areaGeometry(value.area) catch return error.InvalidSnapshot;
                 if (value.count != geometry.count) return error.InvalidSnapshot;
@@ -326,7 +385,11 @@ pub fn encodeReply(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind), ou
         },
         .failed => |failure| if (kind == .cut and failure == .already_cut) 12 else 2,
     };
-    const source = if (kind == .read_area and outcome == .ok) std.mem.asBytes(outcome.ok) else &.{};
+    const source: []const u8 = if (outcome == .ok) switch (kind) {
+        .read_area => std.mem.asBytes(outcome.ok),
+        .channel_status => outcome.ok.sender_proofs orelse &.{},
+        else => &.{},
+    } else &.{};
     var writer = try Writer.initFrom(out, replyTag(kind), 2 * header_bytes + @sizeOf(p.Id) + n, source);
     writer.bytes(.id, &req.request_id);
     switch (outcome) {
@@ -340,7 +403,13 @@ pub fn encodeReply(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind), ou
                     put(u64, dest, 33, value.amount);
                     put(u64, dest, 41, value.refundTime);
                 },
-                .update_location, .channel_open, .channel_payment, .channel_close => {},
+                .channel_status => {
+                    put(u64, dest, 0, value.capacity_msat);
+                    put(u64, dest, 8, value.balance_msat);
+                    dest[16] = @backingInt(value.phase);
+                    @memcpy(dest[status_bytes..], source);
+                },
+                .update_location, .channel_open, .channel_close => {},
             }
         },
         .failed => |failure| {
@@ -370,19 +439,26 @@ fn readFailure(comptime kind: p.Kind, value: []const u8) DecodeError!p.FailureFo
     };
 }
 
+fn replyCap(tag: Tag) usize {
+    return switch (tag) {
+        .channel_close_reply => p.max_channel_close_reply_bytes,
+        .channel_status_reply => p.max_channel_status_reply_bytes,
+        else => p.max_response_bytes,
+    };
+}
+
 /// On snapshot success, `snapshot` must not overlap the input frame `data`.
 pub fn decodeReply(data: []const u8, comptime kind: p.Kind, expected_id: p.Id, snapshot: *p.Snapshot) DecodeError!p.Outcome(kind) {
-    var frame = try open(data, true, p.max_response_bytes);
+    var frame = try open(data, true, replyCap(replyTag(kind)));
     if (frame.tag != replyTag(kind)) return error.UnexpectedMessageType;
     const id = try frame.body.exact(reply_fields, .id, @sizeOf(p.Id));
     if (!std.mem.eql(u8, id, &expected_id)) return error.UnexpectedRequestId;
-    return (try decodeOutcome(&frame.body, kind, snapshot, data)).?;
+    return decodeOutcome(&frame.body, kind, snapshot, data);
 }
 
 const reply_fields: []const Field = &.{ .id, .ok, .failed };
 
-// A null destination validates a late reply without touching application storage.
-fn decodeOutcome(body: *Reader, comptime kind: p.Kind, snapshot: ?*p.Snapshot, data: []const u8) DecodeError!?p.Outcome(kind) {
+fn decodeOutcome(body: *Reader, comptime kind: p.Kind, snapshot: *p.Snapshot, data: []const u8) DecodeError!p.Outcome(kind) {
     const outcome = try body.next(reply_fields) orelse return error.MissingRequiredField;
     try body.finish(reply_fields);
     if (outcome.tag == .failed) return .{ .failed = try readFailure(kind, outcome.bytes) };
@@ -390,11 +466,10 @@ fn decodeOutcome(body: *Reader, comptime kind: p.Kind, snapshot: ?*p.Snapshot, d
         .cut => try readState(outcome.bytes),
         .read_area => blk: {
             const meta = try validateSnapshot(outcome.bytes);
-            const dest = snapshot orelse return null;
-            if (overlaps(std.mem.asBytes(dest), data)) return error.OverlappingBuffers;
-            dest.* = .{ .area = meta.area, .count = meta.count };
-            @memcpy(std.mem.sliceAsBytes(dest.chunks[0..meta.count]), outcome.bytes[p.snapshot_metadata_bytes..]);
-            break :blk dest;
+            if (overlaps(std.mem.asBytes(snapshot), data)) return error.OverlappingBuffers;
+            snapshot.* = .{ .area = meta.area, .count = meta.count };
+            @memcpy(std.mem.sliceAsBytes(snapshot.chunks[0..meta.count]), outcome.bytes[p.snapshot_metadata_bytes..]);
+            break :blk snapshot;
         },
         .channel_requirements => blk: {
             if (outcome.bytes.len != 49) return error.InvalidFieldLength;
@@ -404,95 +479,35 @@ fn decodeOutcome(body: *Reader, comptime kind: p.Kind, snapshot: ?*p.Snapshot, d
                 .refundTime = get(u64, outcome.bytes, 41),
             };
         },
-        .update_location, .channel_open, .channel_payment, .channel_close => if (outcome.bytes.len != 0) return error.InvalidFieldLength,
+        .channel_status => blk: {
+            const bytes = outcome.bytes;
+            if (bytes.len < status_bytes) return error.InvalidFieldLength;
+            const phase = std.enums.fromInt(p.ChannelPhase, bytes[16]) orelse return error.InvalidFieldValue;
+            const capacity = get(u64, bytes, 0);
+            const balance = get(u64, bytes, 8);
+            const proofs = bytes[status_bytes..];
+            if (balance > capacity or (proofs.len != 0 and phase != .settled)) return error.InvalidFieldValue;
+            break :blk .{ .capacity_msat = capacity, .balance_msat = balance, .phase = phase, .sender_proofs = if (proofs.len == 0) null else proofs };
+        },
+        .update_location, .channel_open, .channel_close => if (outcome.bytes.len != 0) return error.InvalidFieldLength,
     } };
 }
 
-/// Client-side correlation only. A socket/UI integration owns logging, deadlines,
-/// and the popover; protocol errors deliberately never consume an entry.
-pub const Pending = struct {
-    pub const capacity = 8;
-    const Entry = struct { id: p.Id, kind: p.Kind };
-    pub const Received = union(enum) {
-        protocol_error,
-        unmatched_reply: p.Id,
-        reply: struct {
-            id: p.Id,
-            outcome: union(p.Kind) {
-                cut: p.Outcome(.cut),
-                read_area: p.Outcome(.read_area),
-                update_location: p.Outcome(.update_location),
-                channel_requirements: p.Outcome(.channel_requirements),
-                channel_open: p.Outcome(.channel_open),
-                channel_payment: p.Outcome(.channel_payment),
-                channel_close: p.Outcome(.channel_close),
-            },
-        },
-    };
-    entries: [capacity]?Entry = @splat(null),
+const auth_channel_reply_body_bytes = 4 * header_bytes + 8 + 32 + 2 * @sizeOf(u64);
+pub const max_auth_reply_bytes = envelope_bytes + auth_channel_reply_body_bytes;
 
-    pub fn track(self: *Pending, comptime kind: p.Kind, req: p.RequestFor(kind)) error{ DuplicateRequestId, TooManyPendingRequests }!void {
-        if (self.find(req.request_id) != null) return error.DuplicateRequestId;
-        for (&self.entries) |*entry| {
-            if (entry.* == null) {
-                entry.* = .{ .id = req.request_id, .kind = kind };
-                return;
-            }
-        }
-        return error.TooManyPendingRequests;
-    }
-
-    /// Call when the connection's owner times out or fails to send a request.
-    pub fn forget(self: *Pending, id: p.Id) void {
-        if (self.find(id)) |index| self.entries[index] = null;
-    }
-
-    fn find(self: *const Pending, id: p.Id) ?usize {
-        for (self.entries, 0..) |maybe, i| {
-            const entry = maybe orelse continue;
-            if (std.mem.eql(u8, &id, &entry.id)) return i;
-        }
-        return null;
-    }
-
-    /// A matched snapshot reply requires `snapshot` to be disjoint from `data`.
-    pub fn receive(self: *Pending, data: []const u8, binary: bool, snapshot: *p.Snapshot) DecodeError!Received {
-        var frame = try open(data, binary, p.max_response_bytes);
-        if (frame.tag == .protocol_error) {
-            try frame.body.finish(&.{});
-            return .protocol_error;
-        }
-        const kind: p.Kind = switch (frame.tag) {
-            .cut_reply => .cut,
-            .read_area_reply => .read_area,
-            .update_location_reply => .update_location,
-            .channel_requirements_reply => .channel_requirements,
-            .channel_open_reply => .channel_open,
-            .channel_payment_reply => .channel_payment,
-            .channel_close_reply => .channel_close,
-            else => return error.UnexpectedMessageType,
-        };
-        const id = (try frame.body.exact(reply_fields, .id, @sizeOf(p.Id))).*;
-        const index = self.find(id);
-        if (index) |i| {
-            if (self.entries[i].?.kind != kind) return error.UnexpectedMessageType;
-        }
-        switch (kind) {
-            inline else => |k| {
-                const outcome = try decodeOutcome(&frame.body, k, if (index != null) snapshot else null, data);
-                const i = index orelse return .{ .unmatched_reply = id };
-                self.entries[i] = null;
-                return .{ .reply = .{ .id = id, .outcome = @unionInit(@FieldType(@FieldType(Received, "reply"), "outcome"), @tagName(k), outcome.?) } };
-            },
-        }
-    }
-};
-
-pub fn encodeAuth(out: []u8, message: p.AuthMessage) error{BufferTooSmall}![]const u8 {
+pub fn encodeAuth(out: []u8, message: p.AuthMessage) error{ BufferTooSmall, InvalidChannelBalance }![]const u8 {
     const n: u16 = switch (message) {
         .challenge => header_bytes + 32,
         .proof => 2 * header_bytes + 33 + 64,
-        .reply => |outcome| header_bytes + @as(u16, if (outcome == .ok) 8 else 2),
+        .reply => |outcome| switch (outcome) {
+            .ok => header_bytes + 8,
+            .ok_with_hoe_channel => |success| if (success.hoe_channel_balance_msat > success.hoe_channel_capacity_msat)
+                return error.InvalidChannelBalance
+            else
+                auth_channel_reply_body_bytes,
+            .failed => header_bytes + 2,
+        },
     };
     var writer = try Writer.init(out, @fromBackingInt(@intCast(@backingInt(std.meta.activeTag(message)))), n);
     switch (message) {
@@ -503,6 +518,12 @@ pub fn encodeAuth(out: []u8, message: p.AuthMessage) error{BufferTooSmall}![]con
         },
         .reply => |outcome| switch (outcome) {
             .ok => |pos| writePoint(writer.field(.ok, 8), pos.x, pos.y),
+            .ok_with_hoe_channel => |success| {
+                writePoint(writer.field(.ok, 8), success.location.x, success.location.y);
+                writer.bytes(.channel_id, &success.hoe_channel_id);
+                put(u64, writer.field(.channel_capacity_msat, 8), 0, success.hoe_channel_capacity_msat);
+                put(u64, writer.field(.channel_balance_msat, 8), 0, success.hoe_channel_balance_msat);
+            },
             .failed => |code| put(u16, writer.field(.failed, 2), 0, @backingInt(code)),
         },
     }
@@ -527,13 +548,29 @@ pub fn decodeAuth(data: []const u8, binary: bool, expected: p.AuthKind) DecodeEr
             return .{ .proof = .{ .pubkey = key.*, .signature = signature.* } };
         },
         .reply => {
-            const fields = &.{ .ok, .failed };
-            const outcome = try frame.body.next(fields) orelse return error.MissingRequiredField;
-            try frame.body.finish(fields);
+            const fields = &.{ .ok, .failed, .channel_id, .channel_capacity_msat, .channel_balance_msat };
+            const outcome = try frame.body.next(&.{ .ok, .failed }) orelse return error.MissingRequiredField;
             if (outcome.tag == .ok) {
+                const optional_channel = try frame.body.next(fields);
+                if (optional_channel) |channel| {
+                    if (channel.tag != .channel_id) return error.ConflictingOutcome;
+                    if (channel.bytes.len != 32) return error.InvalidFieldLength;
+                }
                 if (outcome.bytes.len != 8) return error.InvalidFieldLength;
-                return .{ .reply = .{ .ok = .{ .x = get(i32, outcome.bytes, 0), .y = get(i32, outcome.bytes, 4) } } };
+                const pos: p.Location = .{ .x = get(i32, outcome.bytes, 0), .y = get(i32, outcome.bytes, 4) };
+                const channel = optional_channel orelse return .{ .reply = .{ .ok = pos } };
+                const capacity = get(u64, try frame.body.exact(fields, .channel_capacity_msat, 8), 0);
+                const balance = get(u64, try frame.body.exact(fields, .channel_balance_msat, 8), 0);
+                try frame.body.finish(fields);
+                if (balance > capacity) return error.InvalidFieldValue;
+                return .{ .reply = .{ .ok_with_hoe_channel = .{
+                    .location = pos,
+                    .hoe_channel_id = channel.bytes[0..32].*,
+                    .hoe_channel_capacity_msat = capacity,
+                    .hoe_channel_balance_msat = balance,
+                } } };
             }
+            try frame.body.finish(fields);
             if (outcome.bytes.len != 2) return error.InvalidFieldLength;
             const code = std.enums.fromInt(p.AuthFailure, get(u16, outcome.bytes, 0)) orelse return error.InvalidFieldValue;
             return .{ .reply = .{ .failed = code } };
@@ -545,24 +582,4 @@ pub fn decodeProtocolError(data: []const u8) DecodeError!void {
     var frame = try open(data, true, p.max_response_bytes);
     if (frame.tag != .protocol_error) return error.UnexpectedMessageType;
     try frame.body.finish(&.{});
-}
-
-test "payment request matches golden bytes and rejects truncated prefixes" {
-    const payment: p.SpillmanChannelPayment = .{ .id = @splat(0x42), .amount = 0x0102030405060708, .signature = @splat(bye) };
-    const id: p.Id = @splat(0x24);
-    var storage: [136]u8 = undefined;
-    const data = try encodeRequest(&storage, .channel_payment, .{ .request_id = id, .payload = payment });
-    const golden = [_]u8{ 0x20, 132, 0, 1, 16, 0 } ++ id ++
-        [_]u8{ 0x20, 32, 0 } ++ payment.id ++ [_]u8{ 0x21, 8, 0, 8, 7, 6, 5, 4, 3, 2, 1, 0x22, 64, 0 } ++
-        payment.signature ++ [_]u8{0x7e};
-    try std.testing.expectEqualSlices(u8, &golden, data);
-    try std.testing.expectEqualDeep(p.Request{ .request_id = id, .operation = .{ .channel_payment = payment } }, try decodeMessage(data, true));
-    for (0..data.len) |n| {
-        const err: DecodeError = if (n < header_bytes) error.TruncatedHeader else if (n == data.len - 1) error.MissingBye else error.TruncatedBody;
-        try std.testing.expectError(err, decodeMessage(data[0..n], true));
-    }
-}
-
-test {
-    _ = @import("wire_tests.zig");
 }

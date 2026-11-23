@@ -834,6 +834,31 @@ pub fn cdk_wallet_post_swap(
     mint_url: Option<char_p::Ref<'_>>,
     swap_request_json: Option<char_p::Ref<'_>>,
 ) -> CdkStringResult {
+    wallet_swap_call(handle, mint_url, swap_request_json, false)
+}
+
+/// Inspect the saved swap using NUT-07 and NUT-09; never submits a swap.
+/// Returns JSON with `input_states` in request order and `swap_response`
+/// (a NUT-03 response in request order, or null if unresolved). Null is
+/// never authorization to retry. Complete and verify using the saved Spilman
+/// material before considering the swap recovered. Does not update wallet state.
+#[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cdk_wallet_recover_swap(
+    handle: Option<&CdkWallet>,
+    mint_url: Option<char_p::Ref<'_>>,
+    swap_request_json: Option<char_p::Ref<'_>>,
+) -> CdkStringResult {
+    wallet_swap_call(handle, mint_url, swap_request_json, true)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wallet_swap_call(
+    handle: Option<&CdkWallet>,
+    mint_url: Option<char_p::Ref<'_>>,
+    swap_request_json: Option<char_p::Ref<'_>>,
+    recover: bool,
+) -> CdkStringResult {
     let poison = handle.as_ref().map(|h| h.poison_flag());
     guard_poison(
         poison,
@@ -854,7 +879,14 @@ pub fn cdk_wallet_post_swap(
                 Ok(json) => json,
                 Err(e) => return CdkStringResult::err(e.status, e.message),
             };
-            match runtime().block_on(handle.post_swap(&mint_url, &swap_request_json)) {
+            let result = runtime().block_on(async {
+                if recover {
+                    handle.recover_swap(&mint_url, &swap_request_json).await
+                } else {
+                    handle.post_swap(&mint_url, &swap_request_json).await
+                }
+            });
+            match result {
                 Ok(value) => string_ok(value),
                 Err(e) => CdkStringResult::err(e.status, e.message),
             }

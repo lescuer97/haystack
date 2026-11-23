@@ -466,6 +466,136 @@ cdk_spilman_channel_parameters_get_channel_id (
     char const * channel_secret_hex,
     char const * keyset_info_json);
 
+/** <No documentation available> */
+typedef struct CdkSpilmanClientStorage CdkSpilmanClientStorage_t;
+
+/** <No documentation available> */
+void
+cdk_spilman_client_storage_close (
+    CdkSpilmanClientStorage_t * storage);
+
+/** \brief
+ *  `&'lt [T]` but with a guaranteed `#[repr(C)]` layout.
+ *
+ *  # C layout (for some given type T)
+ *
+ *  ```c
+ *  typedef struct {
+ *  // Cannot be NULL
+ *  T * ptr;
+ *  size_t len;
+ *  } slice_T;
+ *  ```
+ *
+ *  # Nullable pointer?
+ *
+ *  If you want to support the above typedef, but where the `ptr` field is
+ *  allowed to be `NULL` (with the contents of `len` then being undefined)
+ *  use the `Option< slice_ptr<_> >` type.
+ */
+typedef struct slice_ref_uint8 {
+    /** \brief
+     *  Pointer to the first element (if any).
+     */
+    uint8_t const * ptr;
+
+    /** \brief
+     *  Element count
+     */
+    size_t len;
+} slice_ref_uint8_t;
+
+/** \brief
+ *  Return concatenated fixed-width IDs: 16 bytes each for the journal, or
+ *  32 bytes each for the supplied channel scope. Free with cdk_bytes_free.
+ */
+CdkBytesResult_t
+cdk_spilman_client_storage_list_ids (
+    CdkSpilmanClientStorage_t const * storage,
+    slice_ref_uint8_t scope_or_journal);
+
+/** <No documentation available> */
+typedef struct CdkSpilmanClientStorageOpenResult {
+    /** <No documentation available> */
+    CdkStatus_t status;
+
+    /** <No documentation available> */
+    char * error;
+
+    /** <No documentation available> */
+    CdkSpilmanClientStorage_t * handle;
+} CdkSpilmanClientStorageOpenResult_t;
+
+/** \brief
+ *  Open a pre-created, private database. The caller must verify the directory,
+ *  file and any SQLite sidecars, and hold the wallet instance lock throughout
+ *  use. Calls (including across handles for the same file) must be serialized.
+ */
+CdkSpilmanClientStorageOpenResult_t
+cdk_spilman_client_storage_open (
+    char const * path);
+
+/** <No documentation available> */
+CdkBytesResult_t
+cdk_spilman_client_storage_read_funded (
+    CdkSpilmanClientStorage_t const * storage,
+    slice_ref_uint8_t scope,
+    slice_ref_uint8_t id);
+
+/** \brief
+ *  Read an opaque application recovery record. Free bytes with cdk_bytes_free.
+ */
+CdkBytesResult_t
+cdk_spilman_client_storage_read_metadata (
+    CdkSpilmanClientStorage_t const * storage,
+    slice_ref_uint8_t namespace,
+    slice_ref_uint8_t id);
+
+/** \brief
+ *  Result of an operation that returns no payload beyond success/failure.
+ */
+typedef struct CdkStatusResult {
+    /** \brief
+     *  Call status.
+     */
+    CdkStatus_t status;
+
+    /** \brief
+     *  Human-readable error message. `NULL` on success. Free with
+     *  [`cdk_string_free`](crate::cdk_string_free).
+     */
+    char * error;
+} CdkStatusResult_t;
+
+/** <No documentation available> */
+CdkStatusResult_t
+cdk_spilman_client_storage_remove_metadata (
+    CdkSpilmanClientStorage_t const * storage,
+    slice_ref_uint8_t namespace,
+    slice_ref_uint8_t id);
+
+/** \brief
+ *  Persist verified funding using the upstream opening-to-open transition.
+ *  The caller must retain its exact swap journal until reconciliation.
+ */
+CdkStatusResult_t
+cdk_spilman_client_storage_save_funded (
+    CdkSpilmanClientStorage_t * storage,
+    slice_ref_uint8_t record,
+    slice_ref_uint8_t request);
+
+
+#include <stdbool.h>
+
+/** <No documentation available> */
+CdkStatusResult_t
+cdk_spilman_client_storage_write_metadata (
+    CdkSpilmanClientStorage_t const * storage,
+    slice_ref_uint8_t namespace,
+    slice_ref_uint8_t id,
+    slice_ref_uint8_t data,
+    bool replace);
+
 /** \brief
  *  Complete a funding swap from the mint's response and the funding secrets.
  */
@@ -652,6 +782,40 @@ cdk_spilman_prepare_sender_refund (
     uint64_t now_seconds,
     char const * derivation_context_hex);
 
+/** <No documentation available> */
+typedef struct CdkSpilmanReceiverStorage CdkSpilmanReceiverStorage_t;
+
+/** <No documentation available> */
+void
+cdk_spilman_receiver_storage_close (
+    CdkSpilmanReceiverStorage_t * storage);
+
+/** <No documentation available> */
+typedef struct CdkSpilmanReceiverStorageOpenResult {
+    /** <No documentation available> */
+    CdkStatus_t status;
+
+    /** <No documentation available> */
+    char * error;
+
+    /** <No documentation available> */
+    CdkSpilmanReceiverStorage_t * handle;
+} CdkSpilmanReceiverStorageOpenResult_t;
+
+/** \brief
+ *  Open the private database already checked by the wallet service.
+ */
+CdkSpilmanReceiverStorageOpenResult_t
+cdk_spilman_receiver_storage_open (
+    char const * path);
+
+/** <No documentation available> */
+CdkStatusResult_t
+cdk_spilman_receiver_storage_write (
+    CdkSpilmanReceiverStorage_t const * storage,
+    char const * id,
+    slice_ref_uint8_t operation);
+
 /** \brief
  *  Derive the public key for a secret key (both hex-encoded).
  */
@@ -723,22 +887,6 @@ cdk_spilman_unblind_close_swap (
     char const * swap_response_json,
     uint64_t balance,
     char const * receiver_secret_key_hex);
-
-/** \brief
- *  Result of an operation that returns no payload beyond success/failure.
- */
-typedef struct CdkStatusResult {
-    /** \brief
-     *  Call status.
-     */
-    CdkStatus_t status;
-
-    /** \brief
-     *  Human-readable error message. `NULL` on success. Free with
-     *  [`cdk_string_free`](crate::cdk_string_free).
-     */
-    char * error;
-} CdkStatusResult_t;
 
 /** \brief
  *  Verify a signed balance update against a channel's funding proofs.
@@ -841,37 +989,6 @@ cdk_wallet_get_keyset_info_json (
     CdkWallet_t const * handle,
     char const * mint_url,
     char const * keyset_id);
-
-/** \brief
- *  `&'lt [T]` but with a guaranteed `#[repr(C)]` layout.
- *
- *  # C layout (for some given type T)
- *
- *  ```c
- *  typedef struct {
- *  // Cannot be NULL
- *  T * ptr;
- *  size_t len;
- *  } slice_T;
- *  ```
- *
- *  # Nullable pointer?
- *
- *  If you want to support the above typedef, but where the `ptr` field is
- *  allowed to be `NULL` (with the contents of `len` then being undefined)
- *  use the `Option< slice_ptr<_> >` type.
- */
-typedef struct slice_ref_uint8 {
-    /** \brief
-     *  Pointer to the first element (if any).
-     */
-    uint8_t const * ptr;
-
-    /** \brief
-     *  Element count
-     */
-    size_t len;
-} slice_ref_uint8_t;
 
 /** \brief
  *  Retrieve a single pending outgoing token by its 16-byte operation id.
@@ -1168,6 +1285,19 @@ CdkRecoveryResult_t
 cdk_wallet_recover (
     CdkWallet_t * handle,
     char const * mint_url);
+
+/** \brief
+ *  Inspect the saved swap using NUT-07 and NUT-09; never submits a swap.
+ *  Returns JSON with `input_states` in request order and `swap_response`
+ *  (a NUT-03 response in request order, or null if unresolved). Null is
+ *  never authorization to retry. Complete and verify using the saved Spilman
+ *  material before considering the swap recovered. Does not update wallet state.
+ */
+CdkStringResult_t
+cdk_wallet_recover_swap (
+    CdkWallet_t const * handle,
+    char const * mint_url,
+    char const * swap_request_json);
 
 /** \brief
  *  Advisory local-state audit for a recovery-owned staged wallet.

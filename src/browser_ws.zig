@@ -37,6 +37,11 @@ pub const Worker = struct {
     const bridge_frame_bytes = 256;
     pub const area_limit = @min(protocol.max_area_chunks, (bridge_frame_bytes - protocol.area_response_overhead) / protocol.chunk_bytes);
 
+    comptime {
+        if (bridge_frame_bytes < @max(wire.max_auth_reply_bytes, wire.channel_settled_bytes))
+            @compileError("browser WebSocket bridge must fit auth replies and settlement notices");
+    }
+
     pub fn step(self: *Worker, generation: ?u32) sync.Snapshot {
         if (self.wallet_generation != generation) {
             self.stop();
@@ -166,31 +171,38 @@ pub const Worker = struct {
                 },
                 .auth_reply => {
                     const reply = (try wire.decodeAuth(bytes, true, .reply)).reply;
-                    switch (reply) {
-                        .ok => |pos| {
-                            self.stage = .play;
-                            self.state.status = .ready;
-                            self.backoff = 0.25;
-                            self.state.session +%= 1;
-                            self.state.confirmed = pos;
-                        },
-                        .failed => |failure| self.fail(if (failure == .invalid_credentials) .credentials_rejected else .retrying, now),
-                    }
+                    const pos = switch (reply) {
+                        .ok => |location| location,
+                        // The shared decoder validates channel state; browser play only restores location.
+                        .ok_with_hoe_channel => |success| success.location,
+                        .failed => |failure| return self.fail(if (failure == .invalid_credentials) .credentials_rejected else .retrying, now),
+                    };
+                    self.stage = .play;
+                    self.state.status = .ready;
+                    self.backoff = 0.25;
+                    self.state.session +%= 1;
+                    self.state.confirmed = pos;
                 },
-                .play => {
-                    const request = self.pending orelse return error.UnexpectedReply;
-                    var scratch: protocol.Snapshot = undefined;
-                    switch (try request.decode(bytes, &scratch)) {
-                        .move => |pos| if (pos) |confirmed| {
-                            self.state.confirmed = confirmed;
-                        },
-                        .area => |result| self.area.complete(result, &scratch),
-                    }
-                    self.pending = null;
-                },
+                .play => try self.receivePlay(bytes),
                 else => return error.UnexpectedReply,
             },
         }
+    }
+
+    fn receivePlay(self: *Worker, bytes: []const u8) !void {
+        // Browser play doesn't manage channels, but a notice can arrive while
+        // signed in to a wallet that has one.
+        if (wire.decodeChannelSettled(bytes, true)) |_| return else |_| {}
+
+        const request = self.pending orelse return error.UnexpectedReply;
+        var scratch: protocol.Snapshot = undefined;
+        switch (try request.decode(bytes, &scratch)) {
+            .move => |pos| if (pos) |confirmed| {
+                self.state.confirmed = confirmed;
+            },
+            .area => |result| self.area.complete(result, &scratch),
+        }
+        self.pending = null;
     }
 };
 
@@ -204,6 +216,26 @@ fn deliver(token: u32, kind: c_int, ptr: [*c]const u8, len: u32) callconv(.c) vo
         return;
     }
     self.receive(token, event, if (len == 0) "" else ptr[0..len], now) catch self.fail(.retrying, now);
+}
+
+test "browser ignores settlement notices without losing a pending move" {
+    const t = std.testing;
+    var worker: Worker = .{ .stage = .play, .state = .{ .status = .ready, .session = 1 }, .deadline = 42 };
+    var frame: [Worker.bridge_frame_bytes]u8 = undefined;
+    const notice = try wire.encodeChannelSettled(&frame, @splat(1));
+    try worker.receivePlay(notice);
+    try t.expectError(error.UnexpectedReply, worker.receivePlay(notice[0 .. notice.len - 1]));
+
+    const pos: protocol.Location = .{ .x = 1, .y = 2 };
+    const request: sync.PlayRequest = .{ .id = @splat(2), .operation = .{ .move = pos } };
+    worker.pending = request;
+    try worker.receivePlay(notice);
+    try t.expectEqualDeep(request, worker.pending.?);
+    try t.expectEqual(@as(f64, 42), worker.deadline);
+    const reply = try wire.encodeReply(&frame, .update_location, .{ .request_id = request.id, .payload = pos }, .{ .ok = {} });
+    try worker.receivePlay(reply);
+    try t.expect(worker.pending == null);
+    try t.expectEqual(pos, worker.state.confirmed);
 }
 
 test "browser area batches fit the bridge and an in-flight area does not block a queued move" {

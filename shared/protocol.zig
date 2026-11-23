@@ -1,17 +1,32 @@
 //! Typed message contract; serialization lives in wire.zig.
 const std = @import("std");
 const world = @import("world.zig");
+pub const hoe_price_msat: u64 = 5;
+pub const hoe_refill_cuts: u64 = 10;
+pub const hoe_capacity_msat = hoe_price_msat * hoe_refill_cuts;
+
+pub fn validHoeCapacity(capacity_msat: u64) bool {
+    return capacity_msat != 0 and capacity_msat <= hoe_capacity_msat and capacity_msat % hoe_price_msat == 0;
+}
+
 pub const max_area_chunks = 64;
 pub const max_gameplay_request_bytes = 256;
-// One serialized Spilman funding proof from the fixture fits with framing.
-pub const max_request_bytes = 1024;
-// Envelope, request ID TLV, channel ID TLV, proof TLV header.
-pub const max_channel_proof_bytes = max_request_bytes - (4 + 3 + @sizeOf(Id) + 3 + 32 + 3);
+pub const max_request_bytes = 8192;
+pub const max_channel_proof_bytes = 3072;
+pub const max_channel_params_bytes = 4096;
+// Envelope, four TLV headers, and the request ID, channel ID, proof and params values.
+pub const max_channel_open_with_params_bytes = 4 + 4 * 3 + @sizeOf(Id) + 32 + max_channel_proof_bytes + max_channel_params_bytes;
 pub const snapshot_metadata_bytes = 16 + 4 + 32 + 2;
 pub const chunk_bytes = 32;
 // Envelope, request ID TLV, outcome TLV header, and fixed snapshot metadata.
 pub const area_response_overhead = 4 + 3 + @sizeOf(Id) + 3 + snapshot_metadata_bytes;
 pub const max_response_bytes = area_response_overhead + max_area_chunks * chunk_bytes;
+// Separate from the gameplay buffer limit. The envelope body length is u16.
+pub const max_sender_change_proofs_bytes = 60 * 1024;
+pub const close_reply_overhead = 4 + 3 + @sizeOf(Id) + 3;
+pub const max_channel_close_reply_bytes = close_reply_overhead + @sizeOf(u16);
+pub const channel_status_reply_overhead = close_reply_overhead + 2 * @sizeOf(u64) + 1;
+pub const max_channel_status_reply_bytes = channel_status_reply_overhead + max_sender_change_proofs_bytes;
 pub const Id = [16]u8;
 pub const min_chunk: i32 = -134217728;
 pub const max_chunk: i32 = 134217727;
@@ -34,14 +49,28 @@ test "area geometry checks order, coordinate bounds, and the 64 chunk limit" {
     try std.testing.expectError(error.OutOfBounds, areaGeometry(.{ .cx0 = std.math.minInt(i32), .cy0 = 0, .cx1 = std.math.maxInt(i32), .cy1 = 0 }));
 }
 
-pub const Cut = struct { x: i32, y: i32 };
+pub const Cut = struct {
+    x: i32,
+    y: i32,
+    payment: ?SpillmanChannelPayment = null,
+};
 /// World tile coordinates; each axis spans the full signed i32 range.
 pub const Location = packed struct(u64) { x: i32, y: i32 };
 
 pub const AuthKind = enum(u8) { challenge = 0xf0, proof = 0xf1, reply = 0xf2 };
 pub const AuthProof = struct { pubkey: [33]u8, signature: [64]u8 };
 pub const AuthFailure = enum(u16) { invalid_credentials = 1, unavailable = 2 };
-pub const AuthOutcome = union(enum) { ok: Location, failed: AuthFailure };
+pub const AuthOutcome = union(enum) {
+    ok: Location,
+    failed: AuthFailure,
+    ok_with_hoe_channel: struct {
+        location: Location,
+        hoe_channel_id: [32]u8,
+        hoe_channel_capacity_msat: u64,
+        /// Cumulative balance accepted by the receiver, not the remaining capacity.
+        hoe_channel_balance_msat: u64,
+    },
+};
 pub const AuthMessage = union(AuthKind) { challenge: [32]u8, proof: AuthProof, reply: AuthOutcome };
 
 pub const tool = enum(u8) { axe = 0, hoe = 1, pickaxe = 2 };
@@ -57,16 +86,20 @@ pub const SpillmanChannelRequirementsRes = struct {
 
 pub const SpillmanChannelPayment = struct { id: [32]u8, amount: u64, signature: [64]u8 };
 pub const SpillmanChannelClosing = struct { id: [32]u8 };
-pub const SpillmanChannelFundsPayment = SpillmanChannelPayment;
-pub const SpillmanChannelClosingRequest = SpillmanChannelClosing;
-/// Funding proof bytes are opaque to the wire codec. Decoding borrows the input.
-pub const SpillmanChannelOpen = struct { id: [32]u8, proof: []const u8 };
 
-pub const Kind = enum { cut, read_area, update_location, channel_requirements, channel_open, channel_payment, channel_close };
+pub const SpillmanChannelClosingRequest = SpillmanChannelClosing;
+/// Proof and canonical CDK params JSON are opaque to the wire codec. Decoding borrows both slices.
+pub const SpillmanChannelOpen = struct {
+    id: [32]u8,
+    proof: []const u8,
+    params: []const u8,
+};
+
+pub const Kind = enum { cut, read_area, update_location, channel_requirements, channel_open, channel_close, channel_status };
 pub fn isChannel(kind: Kind) bool {
     return switch (kind) {
         .cut, .read_area, .update_location => false,
-        .channel_requirements, .channel_open, .channel_payment, .channel_close => true,
+        else => true,
     };
 }
 
@@ -78,8 +111,9 @@ pub const Request = struct {
         update_location: Location,
         channel_requirements: SpillmanChannelRequirementsReq,
         channel_open: SpillmanChannelOpen,
-        channel_payment: SpillmanChannelPayment,
+
         channel_close: SpillmanChannelClosing,
+        channel_status: SpillmanChannelClosing,
     },
 };
 
@@ -106,8 +140,26 @@ pub const AreaFailure = enum(u16) { invalid_request = 1, out_of_bounds = 6, inva
 pub const LocationFailure = enum(u16) { invalid_request = 1, server_busy = 12 };
 pub const ChannelRequirementsFailure = enum(u16) { invalid_request = 1, server_busy = 12, unavailable = 20 };
 pub const ChannelOpenFailure = enum(u16) { invalid_request = 1, server_busy = 12, unavailable = 20, invalid_proof = 21 };
-pub const ChannelPaymentFailure = enum(u16) { invalid_request = 1, server_busy = 12, unavailable = 20, payment_rejected = 22 };
-pub const ChannelCloseFailure = enum(u16) { invalid_request = 1, server_busy = 12, unavailable = 20, close_rejected = 23 };
+
+pub const ChannelCloseFailure = enum(u16) {
+    invalid_request = 1,
+    server_busy = 12,
+    unavailable = 20,
+    close_rejected = 23,
+
+    settlement_pending = 25,
+};
+
+pub const ChannelStatusFailure = enum(u16) { invalid_request = 1, server_busy = 12, unavailable = 20, not_found = 26 };
+pub const ChannelPhase = enum(u8) { active = 0, depleted = 1, settlement_pending = 2, settled = 3, sender_refund_required = 4 };
+pub const ChannelStatusSuccess = struct {
+    capacity_msat: u64,
+    /// Cumulative receiver balance; remaining capacity is capacity minus balance.
+    balance_msat: u64,
+    phase: ChannelPhase,
+    /// Sender-only proofs, borrowed from the input frame on decode.
+    sender_proofs: ?[]const u8 = null,
+};
 pub const Snapshot = struct {
     area: world.ChunkRange,
     count: u16,
@@ -121,7 +173,8 @@ pub fn Success(comptime kind: Kind) type {
         .cut => State,
         .read_area => *const Snapshot,
         .channel_requirements => SpillmanChannelRequirementsRes,
-        .update_location, .channel_open, .channel_payment, .channel_close => void,
+        .channel_status => ChannelStatusSuccess,
+        .update_location, .channel_open, .channel_close => void,
     };
 }
 
@@ -132,8 +185,9 @@ pub fn FailureFor(comptime kind: Kind) type {
         .update_location => LocationFailure,
         .channel_requirements => ChannelRequirementsFailure,
         .channel_open => ChannelOpenFailure,
-        .channel_payment => ChannelPaymentFailure,
+
         .channel_close => ChannelCloseFailure,
+        .channel_status => ChannelStatusFailure,
     };
 }
 

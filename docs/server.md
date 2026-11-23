@@ -2,7 +2,8 @@
 
 Zig 0.17.0; built-in `std.http.Server.WebSocket`, SQLite-backed gameplay with a
 bounded RAM cache, and a separate persistent native CDK wallet. The server and
-its tests use the SQLite build already bundled with the native CDK wallet, not
+its tests use the vendored `zig-sqlite` bindings for gameplay and channel data.
+CDK continues to use its own bundled SQLite for the wallet; neither depends on
 system SQLite. Native server builds require the pinned Rust/CDK toolchain
 (`zig build setup -Dgame=false`; use `-Doffline` with warmed tools/Cargo caches). The native CDK target policy applies: native Linux
 x86_64/aarch64 or Apple Silicon macOS. Server-only builds do not initialize Raylib;
@@ -12,7 +13,8 @@ installation remains opt-in.
 zig build server -Dgame=false
 zig build run-server -Dgame=false
 zig build run-server -Dgame=false -- 4194304 65536
-# executable arguments: [ws-bytes [app-bytes]]
+# executable arguments: [ws-bytes [app-bytes [provision|existing]]]
+# the last argument is accepted only in an explicit loopback fixture build
 ```
 
 Endpoint: **ws://127.0.0.1:9224/**. Saved cuts and player locations survive
@@ -52,18 +54,66 @@ without replacement or permission repair. A failed post-commit durability flush
 retains the pair and fails that run; restart validates and flushes it again,
 including standard-parent/config directory chains. Never delete retained storage
 to bypass a failure unless intentionally abandoning that identity and its funds.
-No config.json, content directory, onboarding state, UI, wallet worker, wallet
-actions or endpoints are added. Mint selection matches the native client:
+The headless wallet service does not load desktop UI or onboarding state.
+Mint selection matches the native client:
 `https://testnut.cashu.space/`, or the existing isolated `-Dapp-fixture-mint`
 override. Before opening or creating the wallet, startup fetches the mint’s live
 `/v1/keysets` and requires an active `msat` keyset. If the mint cannot be
 verified, the server logs the failure and exits without starting the listener.
-Opening does not eagerly add a mint, poll or scan for restoration.
+When the hoe receiver is enabled, startup approves only the selected test mint.
+It does not poll or scan for wallet restoration.
 
-Main owns the wallet and gameplay database; the application borrows them through
-its wallet and persistence references. Both are closed after task shutdown and
-application cleanup; the root lock is released last. CDK/Rust and SQLite memory
+Main owns the headless wallet service and gameplay database. The wallet service
+owns the CDK handle and any Spilman receiver state. Both are closed after task
+shutdown; the root lock is released last. CDK/Rust and SQLite memory
 are **outside the two reserved server budgets below**.
+
+### Hoe ledger (test funds only)
+
+`zig build run-server -Dgame=false` enables the hoe receiver for the built-in
+Testnut mint. Testnut uses fake payments; never send real funds. The game server
+still listens only on `127.0.0.1`. No real or arbitrary mint can be selected.
+
+The server creates `hoe-testnut/channels.sqlite` (`0600`) next to `wallet/`
+only if `hoe-testnut/` is absent. An existing directory requires both the
+original wallet and a valid ledger; even an empty directory is not repaired.
+The ledger pins the CDK canonical mint URL, without the optional trailing slash.
+Upstream Spilman `SqliteStorage` owns receiver funding, the latest signed
+payment, and close transitions in that file. Haystack's `receiver_channels`
+table stores only `id`, `owner`, and the optional `wallet_net_msat` credit
+confirmation. The server derives expiry and capacity from `expiry_timestamp`
+and `capacity` in the `params_json` stored inside Spilman's `funding_json`.
+The upstream close journal carries the exact recovery payload. Ledgers with
+`expiry` and `capacity` columns in `receiver_channels` are rejected without
+migration. For a fresh test setup, back up the old data and provision a new
+ledger instead.
+
+An explicit `-Dapp-fixture-mint=http://127.0.0.1:PORT` build instead keeps hoe
+funding disabled unless given `provision` or `existing`. Fixture runs must use
+isolated storage, not regular server storage. Automated server tests run
+without contacting Testnut; local mint integration tests use a fake mint.
+
+The desktop wallet worker handles Spilman funding and cut signing on
+its existing wallet thread. Upstream Spilman `SqliteClientStorage` keeps the
+funded channels in the wallet's private `spilman.sqlite`. Haystack keeps the
+CDK send links and pending swap recovery records in that same file. Older
+SQLite channel records migrate in place; older per-file recovery records are
+left intact and block opening until recovered.
+
+Fixture `provision` reserves a new private `hoe-fixture/` directory next to
+`wallet/` and creates `hoe-fixture/channels.sqlite` (`0600`). It refuses any
+existing fixture directory, even an empty one. Fixture `existing` never falls
+back to provisioning. Both paths validate the ledger's mint and receiver
+identity on reopen. The receiver key is derived from the persisted server wallet
+seed, not independently regenerated or printed. Keep secure backups of the seed,
+wallet database, and ledger together; stop the server before copying them.
+
+Startup syncs the ledger file and directory entries before serving. If
+provisioning or a sync fails, the directory is retained. If the ledger was
+committed, restart normally for Testnut or use `existing` for a fixture.
+Otherwise, investigate or restore the retained state; do not delete it to
+bypass a startup failure. The wallet service sets a seven-day channel lifetime
+and serializes channel requests and settlement under the same wallet lock.
 
 ## Authentication and ephemeral connection sessions
 
@@ -190,9 +240,9 @@ conflicting outcomes, missing or invalid BYE, and trailing bytes are rejected.
 There is no version or flags field, negotiation, or fallback to the old fixed
 header, old auth framing, or JSON.
 
-Inbound WebSocket data payloads are capped at **1 KiB (1024 bytes)**. Only a channel-open
-request can use the full cap; the application decoder keeps the **256-byte** cap
-for auth and other requests. Outbound payloads are at most **2128 bytes**.
+Inbound WebSocket data payloads are capped at **5123 bytes**. Only funded
+channel open can use the full cap; legacy open remains capped at **1024 bytes**,
+and auth and gameplay at **256 bytes**. Outbound payloads are at most **2128 bytes**.
 These sizes exclude WebSocket framing. Control frames remain limited to 125 bytes. Messages that reach the application
 decoder but fail validation, including text and unexpected message tags, receive
 the binary generic protocol error `ff 00 00 7e` (tag `0xff`, empty body). It has no request ID or error code,
@@ -240,9 +290,6 @@ checks the expected operation tag and request ID, and validates snapshot metadat
 count and rectangle. Snapshot encoding and decoding reject overlapping source and
 output storage before modifying either buffer.
 
-`wire.Pending` has eight fixed entries and matches typed replies by operation
-and request ID. It reports a validated late or unknown reply separately from a
-matched reply, and a generic protocol error does not consume any pending entry.
 
 ### Native and browser chunk streaming
 
@@ -263,31 +310,59 @@ with the usual 16-byte request `id` (`0x01`), then the following TLV fields:
 | Operation | Request / reply tags | Additional request fields, in order | Request size |
 |---|---|---|---:|
 | Requirements | `0x21` / `0xa1` | Tool (`0x23`, u8: axe=0, hoe=1, pickaxe=2) | 27 |
-| Open | `0x22` / `0xa2` | Channel ID (`0x20`, 32 bytes), funding proof (`0x24`, 1–963 bytes) | 62–1024 |
-| Payment | `0x20` / `0xa0` | Channel ID (`0x20`, 32 bytes), amount (`0x21`, u64), signature (`0x22`, 64 bytes) | 136 |
+| Funded open | `0x24` / `0xa2` | Channel ID (`0x20`, 32 bytes), funding proofs (`0x24`, 1–3072 bytes), canonical CDK params JSON (`0x25`, 1–4096 bytes) | 66–7232 |
+
 | Close | `0x23` / `0xa3` | Channel ID (`0x20`, 32 bytes) | 58 |
+| Status | `0x25` / `0xa5` | Channel ID (`0x20`, 32 bytes) | 58 |
 
-Replies echo the request ID and contain exactly one `ok` or `failed`. The
-requirements `ok` value is `pubkey:[33]u8 | amount:u64 | refund_time:u64`
-(absolute Unix seconds); the other `ok` values are empty. Failure codes are
-`1 invalid_request`, `12 server_busy`, and `20 unavailable` for all four;
-open additionally allows `21 invalid_proof`, payment `22 payment_rejected`,
-and close `23 close_rejected`. These codes do not replace structural decode errors.
+Replies echo the request ID and contain exactly one `ok` or `failed`. Requirements
+supply the receiver public key, per-cut price, and absolute Unix refund time.
+Status supplies capacity, cumulative accepted balance, phase, and optional
+sender-only proofs when settled. Close returns an empty ACK; only status can
+return proofs. `channel_settled` (`0xa6`) is an unsolicited notice containing only
+the 32-byte channel ID. The codec treats proofs and params as opaque borrowed
+slices.
 
-The cap is sized for single-proof funding. One proof from
-`src/testdata/spilman_vectors.json` takes 797–798 bytes as a one-element JSON list,
-or 858–859 bytes including the 61 bytes of channel-open framing. The full
-three-proof fixture exceeds the cap. The byte limit does not enforce proof count;
-the funding parser must enforce exactly one proof when channel handling is enabled.
+Funded open accepts capacity for 1–10 whole cuts at the reported per-cut price
+(currently 5 msat, so 5–50 msat in 5-msat increments). Channel capacity does not
+include mint fees. The desktop shows the maximum wallet debit including those
+fees before funding and opening the channel. The proof limit accommodates the
+three-proof layouts used by the supported funding fixtures.
 
-Funding proof bytes are opaque to the wire codec. Decoding borrows the receive
-buffer, so the proof slice must not outlive or survive reuse of that buffer.
-Encoding rejects a proof that overlaps the bytes it would write.
-Channel requests bypass the tick mailbox and are answered synchronously. The server
-currently replies `unavailable` to every well-formed channel request without
-closing the connection. It does not issue live quotes, verify or redeem funding,
-accept payments, or settle channels; those require a channel service and durable
-state, not just the startup wallet. Malformed messages receive `PROTOCOL_ERROR`.
+Channel negotiation bypasses the tick mailbox. Fixture builds without the
+startup opt-in do not inject a channel service, so channel requests return
+`unavailable`. When the receiver is enabled, funded open verifies the completed
+proofs for the authenticated account, commits the ledger entry, then saves the
+profile link. Retrying the same ID with byte-for-byte identical params and
+proofs can finish a failed profile link without mint I/O; a different live
+channel is not replaced. Malformed messages receive
+`PROTOCOL_ERROR`.
+
+`game_users.hoe_channel_id` is the player's single optional hoe-channel
+reference. On login or successful funding, the connection slot caches the
+wallet's loaded channel. Each valid cut reuses it, verifies the next signed
+balance, and commits the payment to upstream storage before changing the slot
+or tile. Tile saves describe the world only; they do not record payment history.
+
+A depleted channel stays open at zero remaining until its owner requests close
+or it expires. Before expiry, auth includes its channel ID and fully consumed
+balance, and a status query reports `depleted`, even during the payment cutoff
+window. It cannot be used for another cut or replaced while still open.
+
+At zero remaining, the desktop's **Refill hoe** button requests close. The
+background sweep starts new settlements only at or after the actual expiry,
+when there is an earned balance. It can still finish settlement work already
+started by an explicit close. The client looks up settlement by the saved
+channel ID, credits any sender change, and reauthenticates before funding the
+largest affordable refill up to ten whole cuts. The button displays an upper
+bound on the wallet debit including fees.
+
+At login the wallet resolves the profile reference before reporting any channel. If the ledger cannot resolve a
+stored pointer because it is busy or unavailable, login returns `unavailable`
+without waiting for mint I/O. An expired channel is no longer
+usable for play, but that does not imply its settlement succeeded. The server
+can claim the latest valid sender-signed balance if the funding proofs are
+still spendable; expiry alone does not authorize claiming the whole deposit.
 
 ## Gameplay SQLite, cache and saves
 
@@ -300,15 +375,15 @@ or `~/Library/Application Support/haystack-server/game.sqlite` on macOS.
 |---|---|
 | `game_meta` | Single row (`id = 1`) with the 32-byte public seed and generator version. |
 | `game_chunks` | `(cx, cy)` primary key in chunk coordinates and a 32-byte cut bitmap (`bits`). |
-| `game_users` | Canonical 33-byte `pubkey` primary key, signed 32-bit tile coordinates `x, y`, and a nullable 32-byte `channel_id` (no live channel service). |
+| `game_users` | Canonical 33-byte `pubkey` primary key, signed 32-bit tile coordinates `x, y`, and a nullable 32-byte `hoe_channel_id`. |
 
 Startup creates the schema for a new database. For an existing database, it
 checks that SQLite opened it for writing, then validates the seed, generator
 version, integrity, and stored gameplay rows. A read-only database, mismatch,
-or invalid data fails startup rather than resetting the world. The older
-renderer-limited player table is migrated in one transaction to allow the full
-signed `i32` tile range, preserving all player fields. The wire format is
-unchanged.
+or invalid data fails startup rather than resetting the world. Startup renames
+`game_users.channel_id` to `hoe_channel_id`, preserving existing links. The
+same transaction expands the older renderer-limited player table to the full
+signed `i32` tile range when needed. The wire format is unchanged.
 
 **No chunk rows are cached at startup or login.** On demand, connection tasks
 load missing cut/read chunks from SQLite, using an all-zero bitmap for an absent
@@ -389,7 +464,7 @@ a task or promising HTTP503. HTTP limits: 5 seconds, 8192 bytes, 32 headers.
 `server/ws_config.zig` holds the fixed production/test limits.
 
 Before listening, the buddy reserves one array of 64 slots. Each owns 8192-byte
-HTTP, 1024-byte inbound WebSocket and 512-byte output writer buffers plus stable
+HTTP, 5123-byte inbound WebSocket and 512-byte output writer buffers plus stable
 key/bookkeeping and the mailbox. The writer buffer is not the outbound payload
 limit. Socket-free capacity/reuse/tick tests check that no further managed
 allocation occurs. Insufficient startup reservation fails closed.
@@ -474,7 +549,9 @@ git diff --check
 cache and replay eviction, snapshots/extremes, capacity atomicity, startup, budget
 failures, cross-thread exclusive leasing, frozen allocator checks, session tests,
 buddy reclamation/concurrent churn, fixed-buffer transport tests, and real CDK
-wallet tests in isolated temporary storage. It never opens sockets. Wallet tests
+wallet tests in isolated temporary storage. It never opens sockets. Hoe tests
+cover ledger provisioning and reopen, mint and receiver identity checks, and
+channel message handling. Wallet tests
 retain seed hashes/inodes across reopen, borrowed ownership, locking and failure
 preservation checks. Authentication tests retain message goldens, positive/negative
 signature fixtures, parity/domain/nonce/single-hash binding, malformed keys and

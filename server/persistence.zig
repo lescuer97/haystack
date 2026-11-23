@@ -62,6 +62,20 @@ pub const Persistence = struct {
         return self.registry.claimStored(key, deadline, user);
     }
 
+    /// Called with the hoe lock held, after ledger admission. Never take that
+    /// lock from a disk-locked path. Nothing changes in memory if the write fails.
+    pub fn linkChannel(self: *Persistence, handle: sessions.Handle, previous: ?[32]u8, id: [32]u8) !void {
+        try self.disk_lock.lock(self.io);
+        defer self.disk_lock.unlock(self.io);
+        var snapshot = try self.registry.storedUser(handle);
+        if (std.meta.eql(snapshot.user.hoe_channel_id, @as(?[32]u8, id))) return;
+        if (!std.meta.eql(snapshot.user.hoe_channel_id, previous)) return error.ChannelLinkChanged;
+        snapshot.user.hoe_channel_id = id;
+        try self.db.reopenIfPoisoned();
+        try self.db.saveUser(snapshot.pubkey, snapshot.user);
+        self.registry.publishChannelLink(snapshot);
+    }
+
     pub fn prepare(self: *Persistence, request: p.Request) !Pins {
         var pins = Pins{};
         errdefer self.release(&pins);

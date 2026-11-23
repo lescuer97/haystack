@@ -72,14 +72,14 @@ test "durable movement reaches and restores the i32 edges without wrapping" {
             return error.NoWalkableBoundary;
         };
         const channel: [32]u8 = @splat(0x42);
-        try db.saveUser(key, .{ .location = from, .channel_id = channel });
+        try db.saveUser(key, .{ .location = from, .hoe_channel_id = channel });
         const handle = try registry.claimStored(key, deadline(), try db.loadUser(key));
         try std.testing.expectEqualDeep(from, registry.get(handle).?.location.?);
         try registry.update(handle, edge);
         var pending: [1]s.UserSnapshot = undefined;
         try std.testing.expectEqual(@as(usize, 1), registry.snapshotUsers(&pending));
         const updated = pending[0];
-        try std.testing.expectEqualDeep(game_db.User{ .location = edge, .channel_id = channel }, updated.user);
+        try std.testing.expectEqualDeep(game_db.User{ .location = edge, .hoe_channel_id = channel }, updated.user);
 
         const wrapped: Location = .{ .x = if (limit == low) high else low, .y = edge.y };
         try std.testing.expectError(error.BlockedMovement, registry.update(handle, wrapped));
@@ -141,6 +141,29 @@ fn deadline() std.Io.Clock.Timestamp {
     return .fromNow(std.testing.io, .{ .raw = .fromSeconds(60), .clock = .awake });
 }
 
+test "publishing a channel link preserves a newer pending move across disconnect" {
+    const t = std.testing;
+    var registry = s.Registry{ .io = t.io };
+    try registry.enablePersistence(t.allocator);
+    defer registry.disablePersistence(t.allocator);
+    const key: s.Pubkey = @splat(7);
+    const handle = try registry.claimStored(key, deadline(), .{ .location = spawn });
+    var saved = try registry.storedUser(handle);
+    saved.user.hoe_channel_id = @splat(4);
+    const moved: Location = .{ .x = 1, .y = 0 };
+    try registry.update(handle, moved);
+    registry.release(handle);
+    registry.publishChannelLink(saved);
+
+    var pending: [1]s.UserSnapshot = undefined;
+    try t.expectEqual(@as(usize, 1), registry.snapshotUsers(&pending));
+    try t.expectEqualDeep(game_db.User{ .location = moved, .hoe_channel_id = saved.user.hoe_channel_id }, pending[0].user);
+    const reconnect = try registry.claimStored(key, deadline(), saved.user);
+    defer registry.release(reconnect);
+    try t.expectEqualDeep(moved, registry.get(reconnect).?.location.?);
+    try t.expectEqual(saved.user.hoe_channel_id, registry.get(reconnect).?.hoe_channel_id);
+}
+
 test "durable users restore pending state and only acknowledge matching saved values" {
     var db = try game_db.GameDb.open(":memory:");
     defer db.close();
@@ -148,7 +171,7 @@ test "durable users restore pending state and only acknowledge matching saved va
     try registry.enablePersistence(std.testing.allocator);
     defer registry.disablePersistence(std.testing.allocator);
     const key: s.Pubkey = @splat(7);
-    const stored: game_db.User = .{ .location = spawn, .channel_id = @splat(42) };
+    const stored: game_db.User = .{ .location = spawn, .hoe_channel_id = @splat(42) };
     try db.saveUser(key, stored);
 
     const first = try registry.claimStored(key, deadline(), try db.loadUser(key));
@@ -160,7 +183,7 @@ test "durable users restore pending state and only acknowledge matching saved va
     const step: Location = .{ .x = 1, .y = 0 };
     try registry.update(first, step);
     try std.testing.expectEqual(@as(usize, 1), registry.snapshotUsers(&batch));
-    try std.testing.expectEqualDeep(game_db.User{ .location = step, .channel_id = stored.channel_id }, batch[0].user);
+    try std.testing.expectEqualDeep(game_db.User{ .location = step, .hoe_channel_id = stored.hoe_channel_id }, batch[0].user);
     const initial = batch[0];
     try registry.update(first, step);
     try std.testing.expectError(error.BlockedMovement, registry.update(first, .{ .x = 20, .y = 0 }));
@@ -176,7 +199,7 @@ test "durable users restore pending state and only acknowledge matching saved va
     registry.markUsersSaved(&.{initial});
     try std.testing.expectEqual(@as(usize, 1), registry.snapshotUsers(&batch));
 
-    try std.testing.expectEqualDeep(game_db.User{ .location = moved, .channel_id = stored.channel_id }, batch[0].user);
+    try std.testing.expectEqualDeep(game_db.User{ .location = moved, .hoe_channel_id = stored.hoe_channel_id }, batch[0].user);
 
     const legacy = try registry.claimBefore(key, deadline());
     try std.testing.expectEqualDeep(@as(?Location, spawn), registry.get(legacy).?.location);

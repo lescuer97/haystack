@@ -36,7 +36,9 @@ use crate::browser_db::BrowserDatabase as WalletSqliteDatabase;
 use crate::browser_platform::{timeout, BrowserLock as File};
 use cdk::mint_url::MintUrl;
 use cdk::nuts::{
-    CurrencyUnit, Id, MintQuoteState, PaymentMethod, Proofs, SecretKey, SwapRequest, Token,
+    BlindSignature, BlindedMessage, CheckStateRequest, CurrencyUnit, Id, MintQuoteState,
+    PaymentMethod, Proofs, PublicKey, RestoreRequest, RestoreResponse, SecretKey, State, SwapRequest,
+    SwapResponse, Token,
 };
 use cdk::wallet::{
     HttpClient, MintConnector, PreparedSend, ReceiveOptions, SendKind, SendOptions, Wallet,
@@ -2670,6 +2672,72 @@ impl CdkWallet {
         }
     }
 
+    /// Inspect a journaled raw swap without submitting it or touching wallet state.
+    pub(crate) async fn recover_swap(
+        &self,
+        mint_url_str: &str,
+        swap_request_json: &str,
+    ) -> FfiResult<String> {
+        let mint_url = parse_mint_url(mint_url_str)?;
+        if !self.repo.has_wallet(&mint_url, &UNIT).await {
+            return Err(FfiErr::new(
+                CdkStatus::MintNotRegistered,
+                "mint has not been approved",
+            ));
+        }
+        let (request, ys) = parse_raw_swap(swap_request_json)?;
+        let client = HttpClient::new(mint_url, None);
+        let evidence = timeout(self.network_deadline(), async {
+            let response = client
+                .post_check_state(CheckStateRequest { ys: ys.clone() })
+                .await
+                .map_err(|_| swap_evidence_error("could not query swap input states"))?;
+            let mut states = HashMap::with_capacity(ys.len());
+            for entry in response.states {
+                if !matches!(entry.state, State::Spent | State::Unspent | State::Pending)
+                    || states.insert(entry.y, entry.state).is_some()
+                {
+                    return Err(swap_evidence_error("invalid swap input states"));
+                }
+            }
+            if states.len() != ys.len() {
+                return Err(swap_evidence_error("wrong number of swap input states"));
+            }
+            let input_states = ys
+                .iter()
+                .map(|y| {
+                    states
+                        .get(y)
+                        .copied()
+                        .ok_or_else(|| swap_evidence_error("missing swap input state"))
+                })
+                .collect::<FfiResult<Vec<_>>>()?;
+            let swap_response = if input_states.iter().all(|state| *state == State::Spent) {
+                let restored = client
+                    .post_restore(RestoreRequest {
+                        outputs: request.outputs().clone(),
+                    })
+                    .await
+                    .map_err(|_| swap_evidence_error("could not restore swap outputs"))?;
+                match_swap_restore(request.outputs(), restored)?
+            } else {
+                None
+            };
+            Ok::<_, FfiErr>(SwapEvidence {
+                input_states,
+                swap_response,
+            })
+        })
+        .await
+        .map_err(|_| swap_evidence_error("swap recovery exceeded the network deadline"))??;
+        serde_json::to_string(&evidence).map_err(|_| {
+            FfiErr::new(
+                CdkStatus::InternalError,
+                "could not serialize swap recovery evidence",
+            )
+        })
+    }
+
     /// Receive raw proofs from a mint, returning the net Msat amount credited.
     ///
     /// Like [`receive`](Self::receive) but takes already-parsed proofs plus an
@@ -3658,6 +3726,85 @@ fn map_swap_error(e: &CdkError) -> FfiErr {
         _ => CdkStatus::ReceiveFailed,
     };
     FfiErr::new(status, format!("swap request failed: {e}"))
+}
+
+#[derive(serde::Serialize)]
+struct SwapEvidence {
+    input_states: Vec<State>,
+    swap_response: Option<SwapResponse>,
+}
+
+fn parse_raw_swap(json: &str) -> FfiResult<(SwapRequest, Vec<PublicKey>)> {
+    let invalid = |message| FfiErr::new(CdkStatus::InvalidArgument, message);
+    let request: SwapRequest =
+        serde_json::from_str(json).map_err(|_| invalid("invalid swap request JSON"))?;
+    if request.inputs().is_empty() || request.outputs().is_empty() {
+        return Err(invalid("swap requires both inputs and outputs"));
+    }
+    let ys = request
+        .inputs()
+        .iter()
+        .map(|proof| {
+            proof
+                .y()
+                .map_err(|_| invalid("could not derive swap input Y"))
+        })
+        .collect::<FfiResult<Vec<_>>>()?;
+    if ys.iter().collect::<BTreeSet<_>>().len() != ys.len()
+        || request
+            .outputs()
+            .iter()
+            .map(|output| &output.blinded_secret)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != request.outputs().len()
+    {
+        return Err(invalid("swap contains duplicate inputs or blinded outputs"));
+    }
+    Ok((request, ys))
+}
+
+fn swap_evidence_error(message: &'static str) -> FfiErr {
+    FfiErr::new(CdkStatus::NetworkError, message)
+}
+
+fn signature_matches_output(signature: &BlindSignature, output: &BlindedMessage) -> bool {
+    signature.amount == output.amount && signature.keyset_id == output.keyset_id
+}
+
+fn match_swap_restore(
+    outputs: &[BlindedMessage],
+    response: RestoreResponse,
+) -> FfiResult<Option<SwapResponse>> {
+    if response.outputs.len() != response.signatures.len() || response.outputs.len() > outputs.len()
+    {
+        return Err(swap_evidence_error("invalid swap restore counts"));
+    }
+    let positions: HashMap<_, _> = outputs
+        .iter()
+        .enumerate()
+        .map(|(i, output)| (output.blinded_secret, i))
+        .collect();
+    let mut ordered = vec![None; outputs.len()];
+    for (output, signature) in response.outputs.into_iter().zip(response.signatures) {
+        let i = *positions
+            .get(&output.blinded_secret)
+            .ok_or_else(|| swap_evidence_error("unexpected restored swap output"))?;
+        let expected = &outputs[i];
+        if output.amount != expected.amount
+            || output.keyset_id != expected.keyset_id
+            || !signature_matches_output(&signature, expected)
+            || ordered[i].replace(signature).is_some()
+        {
+            return Err(swap_evidence_error(
+                "invalid restored swap output or signature",
+            ));
+        }
+    }
+    Ok(ordered
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .map(SwapResponse::new))
 }
 
 /// Map a recovery-call failure onto a status.

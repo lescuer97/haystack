@@ -154,9 +154,10 @@ half-open tile bounds; a tile touching only the far edge is not visible.
 
 `camera.screenToTile` uses the same inverse transform as visibility: floor the
 local tile offset, then add the absolute camera origin. It returns `null` for
-points beyond the world edge or non-finite coordinates. The helper is tested,
-but gameplay input still uses the mouse to pan and interact with UI; it does not
-select world tiles yet.
+points beyond the world edge or non-finite coordinates. On desktop, a world
+click uses this tile to aim the hoe. If the tile is out of reach, the click
+selects the neighboring tile in that direction, including diagonals, regardless
+of player facing. `Space` still aims at the tile the player faces.
 
 ---
 

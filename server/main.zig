@@ -3,7 +3,7 @@ const transport = @import("transport.zig");
 const memory = @import("memory.zig");
 const app = @import("app.zig");
 const native = @import("native_storage");
-const wallet_storage = @import("wallet.zig");
+const wallet_service = native.wallet_service;
 const GameDb = @import("game_db.zig").GameDb;
 const Persistence = @import("persistence.zig").Persistence;
 const Shutdown = @import("shutdown.zig").Shutdown;
@@ -12,15 +12,19 @@ const startup_log = std.log.scoped(.server_startup);
 const Options = struct {
     websocket_budget: usize,
     application_budget: usize,
+    fixture_hoe_mode: ?wallet_service.Mode,
 
     fn parse(args: []const []const u8) !Options {
-        if (args.len > 3) return error.UsageExpectedOptionalWsAppBudgets;
+        if (args.len > 4) return error.UsageExpectedOptionalWsAppBudgetsAndHoeMode;
+        const hoe_mode = if (args.len == 4) std.meta.stringToEnum(wallet_service.Mode, args[3]) orelse return error.InvalidHoeMode else null;
+        if (hoe_mode != null and wallet_service.fixture_mint == null) return error.HoeRequiresFixtureMint;
         const websocket_budget = if (args.len >= 2) try std.fmt.parseInt(usize, args[1], 10) else memory.default_ws_budget;
         const application_budget = if (args.len >= 3) try std.fmt.parseInt(usize, args[2], 10) else app.default_budget;
         if (websocket_budget < 4096 or !std.math.isPowerOfTwo(websocket_budget)) return error.InvalidWebsocketBudget;
         return .{
             .websocket_budget = websocket_budget,
             .application_budget = application_budget,
+            .fixture_hoe_mode = hoe_mode,
         };
     }
 };
@@ -41,10 +45,12 @@ pub fn main(init: std.process.Init) !void {
     defer lock.release(init.io);
     startup_log.info("storage prepared and instance lock acquired", .{});
 
-    try native.wallet.cdk.requireAppMint();
-    var wallet = try wallet_storage.open(init.io, init.gpa, locations);
+    // Only the explicit fixture mode comes from CLI; wallet_service selects the
+    // automatic Testnut policy from the built-in mint, never from arguments.
+    var wallet = try wallet_service.Headless.open(init.io, init.gpa, locations, options.fixture_hoe_mode);
     defer wallet.close() catch {};
     startup_log.info("wallet opened", .{});
+    if (wallet.hasReceiver()) startup_log.info("hoe ledger ready (test funds only)", .{});
 
     const data_dir = std.fs.path.dirname(locations.wallet_dir) orelse return error.InvalidPath;
     const game_path = try std.fs.path.joinZ(init.gpa, &.{ data_dir, "game.sqlite" });
@@ -66,8 +72,8 @@ pub fn main(init: std.process.Init) !void {
     const application_buffer = try init.gpa.alignedAlloc(u8, .fromByteUnits(@alignOf(app.Layout)), options.application_budget);
     defer init.gpa.free(application_buffer);
     var application = try app.App.init(init.io, application_buffer);
-    application.wallet = &wallet;
     defer application.deinit();
+    application.wallet = &wallet;
     var persistence = try Persistence.init(init.io, init.gpa, &db, &application.context.state, application.registry);
     defer persistence.deinit(init.gpa);
     application.persistence = &persistence;
@@ -110,6 +116,7 @@ test "startup options defaults" {
     const options = try Options.parse(&.{"server"});
     try std.testing.expectEqual(memory.default_ws_budget, options.websocket_budget);
     try std.testing.expectEqual(app.default_budget, options.application_budget);
+    try std.testing.expectEqual(null, options.fixture_hoe_mode);
 }
 
 test "startup options explicit values and partial defaults" {
@@ -122,9 +129,21 @@ test "startup options explicit values and partial defaults" {
 }
 
 test "startup options reject excess arguments and invalid WebSocket budgets" {
-    try std.testing.expectError(error.UsageExpectedOptionalWsAppBudgets, Options.parse(&.{ "server", "4096", "1", "extra" }));
+    try std.testing.expectError(error.InvalidHoeMode, Options.parse(&.{ "server", "4096", "1", "extra" }));
+    try std.testing.expectError(error.UsageExpectedOptionalWsAppBudgetsAndHoeMode, Options.parse(&.{ "server", "4096", "1", "existing", "extra" }));
     for ([_][]const u8{ "0", "2048", "4097", "6144" }) |budget| {
         try std.testing.expectError(error.InvalidWebsocketBudget, Options.parse(&.{ "server", budget }));
+    }
+}
+
+test "explicit hoe modes remain restricted to fixture builds" {
+    for ([_]wallet_service.Mode{ .provision, .existing }) |mode| {
+        const parsed = Options.parse(&.{ "server", "4096", "131072", @tagName(mode) });
+        if (wallet_service.fixture_mint != null) {
+            try std.testing.expectEqual(mode, (try parsed).fixture_hoe_mode.?);
+        } else {
+            try std.testing.expectError(error.HoeRequiresFixtureMint, parsed);
+        }
     }
 }
 

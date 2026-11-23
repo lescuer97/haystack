@@ -13,7 +13,8 @@ const id = "\x00\x01\x02\x03\x04\x05\x06\x7e\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f";
 const id_tlv = "\x01\x10\x00" ++ id;
 const point = "\xfe\xff\xff\xff\x04\x03\x02\x01";
 const area = "\xfe\xff\xff\xff\x03\x00\x00\x00\xfe\xff\xff\xff\x03\x00\x00\x00";
-const cut_frame = "\x01\x1e\x00" ++ id_tlv ++ "\x02\x08\x00" ++ point ++ "\x7e";
+const cut_body = id_tlv ++ "\x02\x08\x00" ++ point;
+const cut_frame = "\x01\x1e\x00" ++ cut_body ++ "\x7e";
 const area_frame = "\x02\x26\x00" ++ id_tlv ++ "\x02\x10\x00" ++ area ++ "\x7e";
 const location_frame = "\x03\x1e\x00" ++ id_tlv ++ "\x02\x08\x00" ++ point ++ "\x7e";
 const cut_ok = "\x81\x20\x00" ++ id_tlv ++ "\x03\x0a\x00" ++ point ++ "\x03\x01\x7e";
@@ -88,6 +89,48 @@ test "wire golden requests and every strict prefix" {
     try checkRequest(.update_location, location_req, location_frame);
 }
 
+const cut_channel_tlv = "\x20\x20\x00" ++ repeat("\x00\x7e\x42\xa5", 8);
+const cut_amount_tlv = "\x21\x08\x00\x08\x07\x06\x05\x04\x03\x02\x01";
+const cut_signature_tlv = "\x22\x40\x00" ++ repeat("\x7e\x5a", 32);
+const cut_with_payment_frame = "\x01\x8f\x00" ++ cut_body ++ cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv ++ "\x7e";
+
+test "cut with payment uses the existing request and reply tags" {
+    var req = cut_req;
+    req.payload.payment = .{
+        .id = repeat("\x00\x7e\x42\xa5", 8),
+        .amount = 0x0102030405060708,
+        .signature = repeat("\x7e\x5a", 32),
+    };
+    try checkRequest(.cut, req, cut_with_payment_frame);
+    try checkReply(.cut, req, .{ .ok = state }, cut_ok);
+    try checkReply(.cut, req, .{ .failed = .{ .already_cut = state } }, cut_already);
+}
+
+test "cut payment requires all three fixed-length fields in order" {
+    const cases = [_]struct { want: wire.DecodeError, suffix: []const u8 }{
+        .{ .want = error.MissingRequiredField, .suffix = cut_channel_tlv },
+        .{ .want = error.MissingRequiredField, .suffix = cut_channel_tlv ++ cut_amount_tlv },
+        .{ .want = error.OutOfOrderField, .suffix = cut_amount_tlv ++ cut_signature_tlv },
+        .{ .want = error.OutOfOrderField, .suffix = cut_channel_tlv ++ cut_signature_tlv },
+        .{ .want = error.OutOfOrderField, .suffix = cut_channel_tlv ++ cut_signature_tlv ++ cut_amount_tlv },
+        .{ .want = error.InvalidFieldLength, .suffix = "\x20\x00\x00" ++ cut_amount_tlv ++ cut_signature_tlv },
+        .{ .want = error.InvalidFieldLength, .suffix = cut_channel_tlv ++ "\x21\x00\x00" ++ cut_signature_tlv },
+        .{ .want = error.InvalidFieldLength, .suffix = cut_channel_tlv ++ cut_amount_tlv ++ "\x22\x00\x00" },
+        .{ .want = error.TruncatedFieldValue, .suffix = cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv[0..66] },
+        .{ .want = error.DuplicateField, .suffix = cut_channel_tlv ++ cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv },
+        .{ .want = error.DuplicateField, .suffix = cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv ++ cut_signature_tlv },
+        .{ .want = error.UnknownField, .suffix = cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv ++ "\x23\x01\x00\x01" },
+    };
+    var body: [p.max_gameplay_request_bytes]u8 = undefined;
+    var buf: [p.max_gameplay_request_bytes]u8 = undefined;
+    @memcpy(body[0..cut_body.len], cut_body);
+    for (cases) |case| {
+        @memcpy(body[cut_body.len..][0..case.suffix.len], case.suffix);
+        try t.expectError(case.want, wire.decodeMessage(frame(&buf, 0x01, body[0 .. cut_body.len + case.suffix.len]), true));
+    }
+    try t.expectError(error.UnknownField, wire.decodeMessage(frame(&buf, 0x03, cut_body ++ cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv), true));
+}
+
 test "wire golden replies and every strict prefix" {
     var single: p.Snapshot = .{ .area = area_req.payload, .count = 1 };
     single.chunks[0] = repeat("\x7e\xa5", 16);
@@ -116,6 +159,14 @@ test "wire golden auth messages and every strict prefix" {
     try checkAuth(.{ .challenge = @splat(0x7e) }, "\xf0\x23\x00\x10\x20\x00" ++ repeat("\x7e", 32) ++ "\x7e");
     try checkAuth(.{ .proof = .{ .pubkey = "\x02".* ++ repeat("\x7e", 32), .signature = repeat("\x7e\x5a", 32) } }, proof_frame);
     try checkAuth(.{ .reply = .{ .ok = .{ .x = -2, .y = 0x12345678 } } }, "\xf2\x0b\x00\x03\x08\x00\xfe\xff\xff\xff\x78\x56\x34\x12\x7e");
+    const channel_id = repeat("\x00\x7e\x42\xa5", 8);
+    try checkAuth(.{ .reply = .{ .ok_with_hoe_channel = .{
+        .location = .{ .x = -2, .y = 0x12345678 },
+        .hoe_channel_id = channel_id,
+        .hoe_channel_capacity_msat = 0x0102030405060708,
+        .hoe_channel_balance_msat = 0x0001020304050607,
+    } } }, "\xf2\x44\x00\x03\x08\x00\xfe\xff\xff\xff\x78\x56\x34\x12\x20\x20\x00" ++ channel_id ++
+        "\x26\x08\x00\x08\x07\x06\x05\x04\x03\x02\x01" ++ "\x27\x08\x00\x07\x06\x05\x04\x03\x02\x01\x00\x7e");
     try t.expectError(error.InvalidFieldLength, wire.decodeAuth("\xf2\x03\x00\x03\x00\x00\x7e", true, .reply));
     try checkAuth(.{ .reply = .{ .failed = .invalid_credentials } }, "\xf2\x05\x00\x04\x02\x00\x01\x00\x7e");
     try checkAuth(.{ .reply = .{ .failed = .unavailable } }, "\xf2\x05\x00\x04\x02\x00\x02\x00\x7e");
@@ -127,6 +178,35 @@ fn frame(buf: []u8, tag: u8, body: []const u8) []const u8 {
     @memcpy(buf[3..][0..body.len], body);
     buf[3 + body.len] = 0x7e;
     return buf[0 .. 4 + body.len];
+}
+
+test "auth channel metadata is a complete ordered group after success only" {
+    const ok = "\x03\x08\x00" ++ point;
+    const channel = "\x20\x20\x00" ++ repeat("\x42", 32);
+    const capacity = "\x26\x08\x00\x05" ++ repeat("\x00", 7);
+    const balance = "\x27\x08\x00\x05" ++ repeat("\x00", 7);
+    const over_capacity = "\x27\x08\x00\x06" ++ repeat("\x00", 7);
+    var buf: [p.max_gameplay_request_bytes]u8 = undefined;
+    const full = (try wire.decodeAuth(frame(&buf, 0xf2, ok ++ channel ++ capacity ++ balance), true, .reply)).reply.ok_with_hoe_channel;
+    try t.expectEqual(@as(u64, 5), full.hoe_channel_balance_msat);
+    try t.expectError(error.MissingRequiredField, wire.decodeAuth(frame(&buf, 0xf2, ok ++ channel), true, .reply));
+    try t.expectError(error.MissingRequiredField, wire.decodeAuth(frame(&buf, 0xf2, ok ++ channel ++ capacity), true, .reply));
+    try t.expectError(error.OutOfOrderField, wire.decodeAuth(frame(&buf, 0xf2, ok ++ channel ++ balance ++ capacity), true, .reply));
+    try t.expectError(error.ConflictingOutcome, wire.decodeAuth(frame(&buf, 0xf2, ok ++ capacity ++ balance), true, .reply));
+    try t.expectError(error.InvalidFieldLength, wire.decodeAuth(frame(&buf, 0xf2, ok ++ channel ++ "\x26\x00\x00" ++ balance), true, .reply));
+    try t.expectError(error.InvalidFieldLength, wire.decodeAuth(frame(&buf, 0xf2, ok ++ channel ++ capacity ++ "\x27\x00\x00"), true, .reply));
+    try t.expectError(error.DuplicateField, wire.decodeAuth(frame(&buf, 0xf2, ok ++ channel ++ capacity ++ balance ++ balance), true, .reply));
+    try t.expectError(error.InvalidFieldValue, wire.decodeAuth(frame(&buf, 0xf2, ok ++ channel ++ capacity ++ over_capacity), true, .reply));
+    var invalid = full;
+    invalid.hoe_channel_balance_msat = 6;
+    try t.expectError(error.InvalidChannelBalance, wire.encodeAuth(&buf, .{ .reply = .{ .ok_with_hoe_channel = invalid } }));
+    try t.expectError(error.InvalidFieldLength, wire.decodeAuth(frame(&buf, 0xf2, ok ++ "\x20\x00\x00"), true, .reply));
+    try t.expectError(error.InvalidFieldLength, wire.decodeAuth(frame(&buf, 0xf2, ok ++ "\x20\x21\x00" ++ repeat("\x42", 33)), true, .reply));
+    try t.expectError(error.TruncatedFieldValue, wire.decodeAuth(frame(&buf, 0xf2, ok ++ channel[0..34]), true, .reply));
+    try t.expectError(error.DuplicateField, wire.decodeAuth(frame(&buf, 0xf2, ok ++ channel ++ channel), true, .reply));
+    try t.expectError(error.UnknownField, wire.decodeAuth(frame(&buf, 0xf2, channel), true, .reply));
+    try t.expectError(error.UnknownField, wire.decodeAuth(frame(&buf, 0xf2, channel ++ ok), true, .reply));
+    try t.expectError(error.ConflictingOutcome, wire.decodeAuth(frame(&buf, 0xf2, "\x04\x02\x00\x01\x00" ++ channel), true, .reply));
 }
 
 test "wire rejects malformed envelopes and field lengths" {
@@ -265,92 +345,156 @@ test "wire snapshot output stays unchanged on metadata schema and correlation fa
     try t.expectEqualDeep(sentinel, snapshot);
 }
 
-test "pending replies match both ID and type, preserve entries on errors, and ignore late replies" {
-    var pending: wire.Pending = .{};
+test "retired standalone payment tags are rejected" {
+    var buf: [p.max_gameplay_request_bytes]u8 = undefined;
     var snapshot = sentinel;
-    try pending.track(.cut, cut_req);
-    try t.expectError(error.DuplicateRequestId, pending.track(.read_area, area_req));
-    var other = location_req;
-    other.request_id = @splat(0xff);
-    try pending.track(.update_location, other);
-
-    try t.expectEqual(.protocol_error, try pending.receive(protocol_error_frame, true, &snapshot));
-    try t.expectError(error.UnexpectedMessageType, pending.receive(area_ok, true, &snapshot));
-    try t.expectError(error.MissingBye, pending.receive(cut_ok[0 .. cut_ok.len - 1], true, &snapshot));
-    try t.expectEqualDeep(sentinel, snapshot);
-
-    var buf: [p.max_response_bytes]u8 = undefined;
-    const ack = try wire.encodeReply(&buf, .update_location, other, .ok);
-    try t.expectEqual(.ok, (try pending.receive(ack, true, &snapshot)).reply.outcome.update_location);
-    try t.expectEqualDeep(state, (try pending.receive(cut_ok, true, &snapshot)).reply.outcome.cut.ok);
-    try t.expectEqualDeep(id.*, (try pending.receive(area_ok, true, &snapshot)).unmatched_reply);
-    try t.expectEqualDeep(sentinel, snapshot);
-
-    try pending.track(.read_area, area_req);
-    const received = try pending.receive(area_ok, true, &snapshot);
-    try t.expect(received.reply.outcome.read_area.ok == &snapshot);
-    try t.expectEqual(@as(u16, 1), snapshot.count);
+    try t.expectError(error.UnknownMessageType, wire.decodeMessage(frame(&buf, 0x20, id_tlv ++ cut_channel_tlv ++ cut_amount_tlv ++ cut_signature_tlv), true));
+    try t.expectError(error.UnknownMessageType, wire.decodeReply("\xa0\x16\x00" ++ id_tlv ++ "\x03\x00\x00\x7e", .cut, id.*, &snapshot));
 }
 
-test "pending capacity is fixed and timed-out entries can be removed" {
-    var pending: wire.Pending = .{};
-    var req = location_req;
-    for (0..wire.Pending.capacity) |i| {
-        req.request_id[0] = @intCast(i);
-        try pending.track(.update_location, req);
-    }
-    req.request_id[0] = 8;
-    try t.expectError(error.TooManyPendingRequests, pending.track(.update_location, req));
-    pending.forget(location_req.request_id);
-    try pending.track(.update_location, req);
-}
-
-test "channel requirements, open, payment, and close have typed pending replies" {
+test "channel requirements return a quote and close only acknowledges" {
     const requirements: p.RequestFor(.channel_requirements) = .{ .request_id = id.*, .payload = .{ .tool = .pickaxe } };
     try checkRequest(.channel_requirements, requirements, "\x21\x17\x00" ++ id_tlv ++ "\x23\x01\x00\x02\x7e");
     const quote: p.SpillmanChannelRequirementsRes = .{ .pubkey = .{2} ++ @as([32]u8, @splat(0x7e)), .amount = 9, .refundTime = 10 };
     const golden_quote = "\xa1\x47\x00" ++ id_tlv ++ "\x03\x31\x00\x02" ++ repeat("\x7e", 32) ++
         "\x09\x00\x00\x00\x00\x00\x00\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x7e";
     try checkReply(.channel_requirements, requirements, .{ .ok = quote }, golden_quote);
-    var pending: wire.Pending = .{};
-    var snapshot = sentinel;
-    try pending.track(.channel_requirements, requirements);
-    try t.expectEqualDeep(quote, (try pending.receive(golden_quote, true, &snapshot)).reply.outcome.channel_requirements.ok);
 
     const closing: p.RequestFor(.channel_close) = .{ .request_id = id.*, .payload = .{ .id = @splat(0x42) } };
     try checkRequest(.channel_close, closing, "\x23\x36\x00" ++ id_tlv ++ "\x20\x20\x00" ++ repeat("B", 32) ++ "\x7e");
     try checkReply(.channel_close, closing, .ok, "\xa3\x16\x00" ++ id_tlv ++ "\x03\x00\x00\x7e");
-    try t.expectError(error.InvalidFieldValue, wire.decodeReply("\xa3\x18\x00" ++ id_tlv ++ "\x04\x02\x00\x16\x00\x7e", .channel_close, id.*, &snapshot));
+    try checkReply(.channel_close, closing, .{ .failed = .settlement_pending }, "\xa3\x18\x00" ++ id_tlv ++ "\x04\x02\x00\x19\x00\x7e");
+    var snapshot = sentinel;
+    try t.expectError(error.InvalidFieldLength, wire.decodeReply("\xa3\x18\x00" ++ id_tlv ++ "\x03\x02\x00[]\x7e", .channel_close, id.*, &snapshot));
+    try t.expectError(error.MessageTooLarge, wire.decodeReply("\xa3\x19\x00" ++ id_tlv ++ "\x03\x03\x00[0]\x7e", .channel_close, id.*, &snapshot));
+    try t.expectError(error.InvalidFieldValue, wire.decodeReply("\xa3\x18\x00" ++ id_tlv ++ "\x04\x02\x00\x18\x00\x7e", .channel_close, id.*, &snapshot));
     try t.expectError(error.InvalidFieldValue, wire.decodeMessage("\x21\x17\x00" ++ id_tlv ++ "\x23\x01\x00\xff\x7e", true));
 }
 
-test "channel open proof length is bounded and decoded as a borrowed slice" {
-    const max = p.max_channel_proof_bytes;
-    const proof = @as([max + 1]u8, @splat(0x7e));
-    var req: p.RequestFor(.channel_open) = .{ .request_id = id.*, .payload = .{ .id = @splat(0x42), .proof = proof[0..max] } };
-    var buf: [p.max_request_bytes + 1]u8 = undefined;
+test "channel status carries sender proofs and unsolicited settlement carries only the channel ID" {
+    const request: p.RequestFor(.channel_status) = .{ .request_id = id.*, .payload = .{ .id = @splat(0x42) } };
+    try checkRequest(.channel_status, request, "\x25\x36\x00" ++ id_tlv ++ "\x20\x20\x00" ++ repeat("B", 32) ++ "\x7e");
+    const value: p.ChannelStatusSuccess = .{ .capacity_msat = 50, .balance_msat = 50, .phase = .settled, .sender_proofs = "[]" };
+    const golden = "\xa5\x29\x00" ++ id_tlv ++ "\x03\x13\x00\x32" ++ repeat("\x00", 7) ++ "\x32" ++ repeat("\x00", 7) ++ "\x03[]\x7e";
+    try checkReply(.channel_status, request, .{ .ok = value }, golden);
+
+    var snapshot = sentinel;
+    var buffer: [128]u8 = undefined;
+    const notice = try wire.encodeChannelSettled(&buffer, request.payload.id);
+    try t.expectEqualStrings("\xa6\x23\x00\x20\x20\x00" ++ repeat("B", 32) ++ "\x7e", notice);
+    try t.expectEqual(request.payload.id, try wire.decodeChannelSettled(notice, true));
+    try t.expectError(error.NonBinaryMessage, wire.decodeChannelSettled(notice, false));
+    for (0..notice.len) |n| {
+        if (wire.decodeChannelSettled(notice[0..n], true)) |_| return error.UnexpectedSuccess else |_| {}
+    }
+
+    var invalid = value;
+    invalid.phase = .depleted;
+    try t.expectError(error.InvalidChannelStatus, wire.encodeReply(&buffer, .channel_status, request, .{ .ok = invalid }));
+    @memcpy(buffer[0..golden.len], golden);
+    buffer[p.channel_status_reply_overhead - 2] = @backingInt(p.ChannelPhase.depleted);
+    try t.expectError(error.InvalidFieldValue, wire.decodeReply(buffer[0..golden.len], .channel_status, id.*, &snapshot));
+}
+
+test "status bounds sender proofs, rejects aliased sources, and borrows decoded proofs" {
+    const request: p.RequestFor(.channel_status) = .{ .request_id = id.*, .payload = .{ .id = @splat(0x42) } };
+    const oversized = @as([p.max_sender_change_proofs_bytes + 1]u8, @splat('p'));
+    var value: p.ChannelStatusSuccess = .{ .capacity_msat = 1, .balance_msat = 1, .phase = .settled, .sender_proofs = &oversized };
+    var out: [p.max_channel_status_reply_bytes + 1]u8 = undefined;
+    try t.expectError(error.InvalidSenderProofLength, wire.encodeReply(&out, .channel_status, request, .{ .ok = value }));
+    value.sender_proofs = "";
+    try t.expectError(error.InvalidSenderProofLength, wire.encodeReply(&out, .channel_status, request, .{ .ok = value }));
+    value.sender_proofs = out[0..1];
+    try t.expectError(error.OverlappingBuffers, wire.encodeReply(&out, .channel_status, request, .{ .ok = value }));
+    value.sender_proofs = oversized[0..p.max_sender_change_proofs_bytes];
+    const encoded = try wire.encodeReply(&out, .channel_status, request, .{ .ok = value });
+    try t.expectEqual(p.max_channel_status_reply_bytes, encoded.len);
+
+    var snapshot = sentinel;
+    try t.expectError(error.MessageTooLarge, wire.decodeReply(&out, .channel_status, id.*, &snapshot));
+    const decoded = (try wire.decodeReply(encoded, .channel_status, id.*, &snapshot)).ok;
+    try t.expectEqualDeep(value, decoded);
+    try t.expectEqual(encoded[p.channel_status_reply_overhead - 1 ..].ptr, decoded.sender_proofs.?.ptr);
+    try t.expectEqualDeep(sentinel, snapshot);
+}
+
+const channel_open_id_fields = id_tlv ++ "\x20\x20\x00" ++ repeat("B", 32);
+const channel_open_proof_field = "\x24\x01\x00\x7e";
+const channel_open_params_field = "\x25\x02\x00{}";
+const channel_open_with_params_frame = "\x24\x3f\x00" ++ channel_open_id_fields ++ channel_open_proof_field ++ channel_open_params_field ++ "\x7e";
+
+test "channel open golden request borrows both fields and has an empty ACK" {
+    const req: p.RequestFor(.channel_open) = .{ .request_id = id.*, .payload = .{ .id = @splat(0x42), .proof = "\x7e", .params = "{}" } };
+    try checkRequest(.channel_open, req, channel_open_with_params_frame);
+    const golden_ack = "\xa2\x16\x00" ++ id_tlv ++ "\x03\x00\x00\x7e";
+    try checkReply(.channel_open, req, .ok, golden_ack);
+    try checkReply(.channel_open, req, .{ .failed = .invalid_proof }, "\xa2\x18\x00" ++ id_tlv ++ "\x04\x02\x00\x15\x00\x7e");
+
+    const decoded = (try wire.decodeMessage(channel_open_with_params_frame, true)).operation.channel_open;
+    try t.expectEqual(channel_open_with_params_frame[60..].ptr, decoded.proof.ptr);
+    try t.expectEqual(channel_open_with_params_frame[64..].ptr, decoded.params.ptr);
+}
+
+test "channel open with params enforces independent field and frame bounds" {
+    const proof = @as([p.max_channel_proof_bytes + 1]u8, @splat('p'));
+    const params = @as([p.max_channel_params_bytes + 1]u8, @splat('a'));
+    var req: p.RequestFor(.channel_open) = .{ .request_id = id.*, .payload = .{
+        .id = @splat(0x42),
+        .proof = proof[0..p.max_channel_proof_bytes],
+        .params = params[0..p.max_channel_params_bytes],
+    } };
+    var buf: [p.max_channel_open_with_params_bytes + 1]u8 = undefined;
     const data = try wire.encodeRequest(&buf, .channel_open, req);
-    try t.expectEqual(@as(usize, p.max_request_bytes), data.len);
+    try t.expectEqual(p.max_channel_open_with_params_bytes, data.len);
     const decoded = (try wire.decodeMessage(data, true)).operation.channel_open;
-    try t.expectEqualSlices(u8, req.payload.proof, decoded.proof);
-    try t.expectEqual(data[data.len - 1 - max ..].ptr, decoded.proof.ptr);
+    try t.expectEqualDeep(req.payload, decoded);
+    try t.expectError(error.BufferTooSmall, wire.encodeRequest(buf[0 .. data.len - 1], .channel_open, req));
     try t.expectError(error.MissingBye, wire.decodeMessage(data[0 .. data.len - 1], true));
     try t.expectError(error.MessageTooLarge, wire.decodeMessage(&buf, true));
-    try t.expectError(error.MessageTooLarge, wire.decodeMessage("\x22\xff\xff\x7e", true));
-    req.payload.proof = &proof;
-    try t.expectError(error.InvalidProofLength, wire.encodeRequest(&buf, .channel_open, req));
-    req.payload.proof = "";
-    try t.expectError(error.InvalidProofLength, wire.encodeRequest(&buf, .channel_open, req));
-    const open_body = id_tlv ++ "\x20\x20\x00" ++ repeat("B", 32);
-    try t.expectError(error.InvalidFieldLength, wire.decodeMessage(frame(&buf, 0x22, open_body ++ "\x24\x00\x00"), true));
-    try t.expectError(error.TruncatedFieldValue, wire.decodeMessage(frame(&buf, 0x22, open_body ++ "\x24\xff\xff"), true));
+    var oversized_header = "\x24\x00\x00\x7e".*;
+    std.mem.writeInt(u16, oversized_header[1..3], p.max_channel_open_with_params_bytes - 3, .little);
+    try t.expectError(error.MessageTooLarge, wire.decodeMessage(&oversized_header, true));
+
+    for ([_][]const u8{ "", &proof }) |bad_proof| {
+        req.payload.proof = bad_proof;
+        try t.expectError(error.InvalidProofLength, wire.encodeRequest(&buf, .channel_open, req));
+    }
+    req.payload.proof = "p";
+    for ([_][]const u8{ "", &params }) |bad_params| {
+        req.payload.params = bad_params;
+        try t.expectError(error.InvalidParamsLength, wire.encodeRequest(&buf, .channel_open, req));
+    }
+    req.payload.params = "a";
+    try t.expectEqualDeep(req.payload, (try wire.decodeMessage(try wire.encodeRequest(&buf, .channel_open, req), true)).operation.channel_open);
+
+    var proof_header = "\x24\x00\x00".*;
+    std.mem.writeInt(u16, proof_header[1..3], proof.len, .little);
+    var params_header = "\x25\x00\x00".*;
+    std.mem.writeInt(u16, params_header[1..3], params.len, .little);
+    try t.expectError(error.InvalidFieldLength, wire.decodeMessage(frame(&buf, 0x24, channel_open_id_fields ++ proof_header ++ proof ++ channel_open_params_field), true));
+    try t.expectError(error.InvalidFieldLength, wire.decodeMessage(frame(&buf, 0x24, channel_open_id_fields ++ channel_open_proof_field ++ params_header ++ params), true));
+}
+
+test "channel open rejects the retired tag and requires both ordered fields" {
+    const body = channel_open_id_fields ++ channel_open_proof_field;
+    var buf: [p.max_gameplay_request_bytes]u8 = undefined;
+    try t.expectError(error.UnknownMessageType, wire.decodeMessage(frame(&buf, 0x22, body), true));
+    try t.expectError(error.UnknownMessageType, wire.decodeMessage(frame(&buf, 0x22, body ++ channel_open_params_field), true));
+    try t.expectError(error.MissingRequiredField, wire.decodeMessage(frame(&buf, 0x24, channel_open_id_fields), true));
+    try t.expectError(error.TruncatedFieldValue, wire.decodeMessage(frame(&buf, 0x24, channel_open_id_fields ++ "\x24\xff\xff"), true));
+    try t.expectError(error.MissingRequiredField, wire.decodeMessage(frame(&buf, 0x24, body), true));
+    try t.expectError(error.InvalidFieldLength, wire.decodeMessage(frame(&buf, 0x24, channel_open_id_fields ++ "\x24\x00\x00" ++ channel_open_params_field), true));
+    try t.expectError(error.InvalidFieldLength, wire.decodeMessage(frame(&buf, 0x24, body ++ "\x25\x00\x00"), true));
+    try t.expectError(error.TruncatedFieldValue, wire.decodeMessage(frame(&buf, 0x24, body ++ "\x25\x02\x00{"), true));
+    try t.expectError(error.DuplicateField, wire.decodeMessage(frame(&buf, 0x24, body ++ channel_open_params_field ++ channel_open_params_field), true));
+    try t.expectError(error.OutOfOrderField, wire.decodeMessage(frame(&buf, 0x24, channel_open_id_fields ++ channel_open_params_field ++ channel_open_proof_field), true));
 }
 
 test "proof encoding rejects exact and partial overlap before writing but accepts adjacent storage" {
-    const frame_len = p.max_request_bytes - p.max_channel_proof_bytes + 4;
+    const frame_len = channel_open_with_params_frame.len - 1 + 4;
     var buf: [frame_len + 4]u8 = @splat(0xa5);
     const before = buf;
-    var req: p.RequestFor(.channel_open) = .{ .request_id = id.*, .payload = .{ .id = @splat(0x42), .proof = buf[0..4] } };
+    var req: p.RequestFor(.channel_open) = .{ .request_id = id.*, .payload = .{ .id = @splat(0x42), .proof = buf[0..4], .params = "{}" } };
     try t.expectError(error.OverlappingBuffers, wire.encodeRequest(buf[0..frame_len], .channel_open, req));
     try t.expectEqualSlices(u8, &before, &buf);
     req.payload.proof = buf[frame_len - 1 ..][0..4];
@@ -360,6 +504,22 @@ test "proof encoding rejects exact and partial overlap before writing but accept
     const encoded = try wire.encodeRequest(&buf, .channel_open, req);
     try t.expectEqual(@as(usize, frame_len), encoded.len);
     try t.expectEqualSlices(u8, &.{ 0xa5, 0xa5, 0xa5, 0xa5 }, (try wire.decodeMessage(encoded, true)).operation.channel_open.proof);
+}
+
+test "channel open with params checks both input slices before writing" {
+    const frame_len = channel_open_with_params_frame.len;
+    var buf: [frame_len + 2]u8 = @splat(0xa5);
+    const before = buf;
+    var req: p.RequestFor(.channel_open) = .{ .request_id = id.*, .payload = .{ .id = @splat(0x42), .proof = "\x7e", .params = buf[frame_len - 1 ..][0..2] } };
+    try t.expectError(error.OverlappingBuffers, wire.encodeRequest(&buf, .channel_open, req));
+    try t.expectEqualSlices(u8, &before, &buf);
+    req.payload.params = buf[frame_len..];
+    req.payload.proof = buf[0..1];
+    try t.expectError(error.OverlappingBuffers, wire.encodeRequest(&buf, .channel_open, req));
+    try t.expectEqualSlices(u8, &before, &buf);
+    req.payload.proof = "\x7e";
+    const encoded = try wire.encodeRequest(&buf, .channel_open, req);
+    try t.expectEqualSlices(u8, &.{ 0xa5, 0xa5 }, (try wire.decodeMessage(encoded, true)).operation.channel_open.params);
 }
 
 test "snapshot encoding and decoding reject overlapping buffers without writing" {
@@ -386,20 +546,13 @@ test "snapshot encoding and decoding reject overlapping buffers without writing"
         @memcpy(input, area_ok);
         const unchanged = raw.*;
         try t.expectError(error.OverlappingBuffers, wire.decodeReply(input, .read_area, id.*, &snapshots[1]));
-        var pending: wire.Pending = .{};
-        try pending.track(.read_area, area_req);
-        try t.expectError(error.OverlappingBuffers, pending.receive(input, true, &snapshots[1]));
-        try t.expectError(error.DuplicateRequestId, pending.track(.read_area, area_req));
         try t.expectEqualSlices(u8, &unchanged, raw);
     }
 }
 
 fn exerciseDecoders(data: []const u8) !void {
-    var pending: wire.Pending = .{};
-    var pending_snapshot = sentinel;
-    _ = pending.receive(data, true, &pending_snapshot) catch {};
-    try t.expectEqualDeep(sentinel, pending_snapshot);
     _ = wire.decodeMessage(data, true) catch {};
+    _ = wire.decodeChannelSettled(data, true) catch {};
     inline for ([_]p.AuthKind{ .challenge, .proof, .reply }) |kind| {
         _ = wire.decodeAuth(data, true, kind) catch {};
     }
@@ -421,8 +574,8 @@ fn exerciseDecoders(data: []const u8) !void {
 test "wire decoders are panic-free on deterministic random input" {
     var prng = std.Random.DefaultPrng.init(0x16ba_d7e);
     const random = prng.random();
-    const tags = [_]u8{ 0x01, 0x02, 0x03, 0x20, 0x21, 0x22, 0x23, 0x81, 0x82, 0x83, 0xa0, 0xa1, 0xa2, 0xa3, 0xf0, 0xf1, 0xf2, 0xff };
-    const seeds = [_][]const u8{ cut_frame, area_frame, location_frame, cut_ok, cut_already, area_ok, proof_frame, protocol_error_frame };
+    const tags = [_]u8{ 0x01, 0x02, 0x03, 0x20, 0x21, 0x23, 0x24, 0x25, 0x81, 0x82, 0x83, 0xa0, 0xa1, 0xa2, 0xa3, 0xa5, 0xa6, 0xf0, 0xf1, 0xf2, 0xff };
+    const seeds = [_][]const u8{ cut_frame, cut_with_payment_frame, area_frame, location_frame, cut_ok, cut_already, area_ok, proof_frame, protocol_error_frame, channel_open_with_params_frame };
     var buf: [@max(p.max_response_bytes, p.max_request_bytes) + 16]u8 = undefined;
     for (0..2048) |i| {
         const raw = buf[0..random.intRangeAtMost(usize, 0, buf.len)];

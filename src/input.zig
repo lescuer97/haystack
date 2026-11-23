@@ -1,6 +1,7 @@
 //! Device polling only. The loop queues raw samples; modal filtering and repeat
 //! happen at consumption, never at presentation frequency.
 const std = @import("std");
+const builtin = @import("builtin");
 const rl = @import("raylib");
 const player = @import("player.zig");
 const stick_deadzone: f32 = 0.25;
@@ -17,6 +18,7 @@ pub const FrameInput = struct {
     held_dy: i8 = 0,
     dt: f32 = 0,
     action: ?player.Action = null,
+    use_tool: bool = false,
     dragging: bool = false,
     drag_x: f32 = 0,
     drag_y: f32 = 0,
@@ -27,6 +29,7 @@ pub const FrameInput = struct {
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
     clicked: bool = false,
+    right_clicked: bool = false,
     viewport_w: f32 = 1000,
     viewport_h: f32 = 640,
     backspace: bool = false,
@@ -65,9 +68,9 @@ pub const RawSample = struct {
 
     pub fn quiet(self: RawSample) bool {
         const f = self.frame;
-        return !f.clicked and !f.escape_clicked and !f.confirm and !f.backspace and
+        return !f.clicked and !f.right_clicked and !f.escape_clicked and !f.confirm and !f.backspace and
             !f.paste_shortcut and !f.toggle_grid and !f.toggle_borders and
-            f.action == null and f.character_count == 0 and f.drag_x == 0 and f.drag_y == 0;
+            !f.use_tool and f.action == null and f.character_count == 0 and f.drag_x == 0 and f.drag_y == 0;
     }
 };
 
@@ -85,6 +88,7 @@ pub const Reader = struct {
         held.pointer_x = pointer.x;
         held.pointer_y = pointer.y;
         held.clicked = rl.isMouseButtonPressed(.left);
+        if (!builtin.cpu.arch.isWasm()) held.right_clicked = rl.isMouseButtonPressed(.right);
         held.viewport_w = @floatFromInt(rl.getScreenWidth());
         held.viewport_h = @floatFromInt(rl.getScreenHeight());
         if (rl.isGamepadAvailable(gamepad)) {
@@ -98,17 +102,21 @@ pub const Reader = struct {
             nav.up = nav.up or rl.isGamepadButtonDown(gamepad, .left_face_up) or y < 0;
             nav.down = nav.down or rl.isGamepadButtonDown(gamepad, .left_face_down) or y > 0;
         }
-        held.dragging = rl.isMouseButtonDown(.left);
-        if (held.dragging) {
-            const delta = rl.getMouseDelta();
-            held.drag_x = delta.x;
-            held.drag_y = delta.y;
+        if (builtin.os.tag == .emscripten) {
+            held.dragging = rl.isMouseButtonDown(.left);
+            if (held.dragging) {
+                const delta = rl.getMouseDelta();
+                held.drag_x = delta.x;
+                held.drag_y = delta.y;
+            }
         }
         held.toggle_grid = rl.isKeyPressed(.g);
         held.toggle_borders = rl.isKeyPressed(.b);
+        if (rl.isKeyPressed(.space)) {
+            if (builtin.cpu.arch.isWasm()) held.action = .sword else held.use_tool = true;
+        }
         const bindings = .{
-            .{ .space, .sword }, .{ .one, .pickaxe }, .{ .two, .axe },
-            .{ .three, .hoe },   .{ .four, .water },  .{ .five, .collapse },
+            .{ .one, .pickaxe }, .{ .two, .axe }, .{ .three, .hoe }, .{ .four, .water }, .{ .five, .collapse },
         };
         inline for (bindings) |binding| {
             if (held.action == null and rl.isKeyPressed(binding[0])) held.action = binding[1];
@@ -143,7 +151,10 @@ pub const Repeater = struct {
         out.right = false;
         out.up = false;
         out.down = false;
-        if (modal) out.action = null;
+        if (modal) {
+            out.action = null;
+            out.use_tool = false;
+        }
         const nav = sample.navigation;
         const wasd = sample.wasd;
         const dx: i8 = @as(i8, @intFromBool(nav.right or (!modal and wasd.right))) - @as(i8, @intFromBool(nav.left or (!modal and wasd.left)));
@@ -183,6 +194,15 @@ fn stickAxis(value: f32) i8 {
     if (value <= -stick_deadzone) return -1;
     if (value >= stick_deadzone) return 1;
     return 0;
+}
+
+test "right click is an edge preserved by routing but not reconciliation" {
+    const sample: RawSample = .{ .frame = .{ .right_clicked = true } };
+    try std.testing.expect(!sample.quiet());
+    try std.testing.expect(sample.continuous().quiet());
+    try std.testing.expect(!sample.continuous().frame.right_clicked);
+    var repeat: Repeater = .{};
+    try std.testing.expect(repeat.route(sample, true).right_clicked);
 }
 
 test "held diagonals share ten steps per second; stalls cannot catch up" {

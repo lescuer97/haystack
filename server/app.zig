@@ -6,6 +6,11 @@ const WorldState = @import("world_state.zig").WorldState;
 const actions = @import("actions.zig");
 const sessions = @import("sessions.zig");
 const Persistence = @import("persistence.zig").Persistence;
+const wallet_service = @import("native_storage").wallet_service;
+const Wallet = wallet_service.Headless;
+const hoe_log = std.log.scoped(.hoe_channels);
+
+const hoe_refund_seconds = 7 * 24 * 60 * 60;
 pub const default_budget = 64 * 1024;
 
 pub const CommonFailure = enum { invalid_request, server_busy };
@@ -33,7 +38,6 @@ pub const Context = struct {
             .cut => actions.handleCut(&self.state, req),
             .read_area => actions.handleReadArea(&self.state, &self.snapshot, req),
             else => @compileError("only cut and read_area use the world context"),
-            .channel_requirements, .channel_open, .channel_payment, .channel_close => @compileError("channel requests do not use the world context"),
         };
         if (comptime std.log.logEnabled(.debug, .gameplay)) {
             const log = std.log.scoped(.gameplay);
@@ -57,8 +61,8 @@ pub const Context = struct {
 };
 pub const Layout = struct { context: Context, registry: sessions.Registry };
 pub const App = struct {
-    /// Borrowed from main, never closed here; fixtures need not provision one.
-    wallet: ?*const @import("wallet.zig").Wallet = null,
+    /// Borrowed from main. The wallet owner serializes receiver operations.
+    wallet: ?*Wallet = null,
     persistence: ?*Persistence = null,
     context: *Context,
     registry: *sessions.Registry,
@@ -72,18 +76,241 @@ pub const App = struct {
     }
     pub fn deinit(self: *App) void {
         // The server drains callbacks before destroying the application.
-        self.registry.slots = @splat(.{});
+        self.registry.clearSlots();
+    }
+    fn unixSeconds(self: *const App) ?u64 {
+        return std.math.cast(u64, std.Io.Clock.real.now(self.registry.io).toSeconds());
+    }
+    pub fn authOutcome(self: *App, handle: sessions.Handle) p.AuthOutcome {
+        const session = self.registry.get(handle) orelse return .{ .failed = .unavailable };
+        const plain: p.AuthOutcome = .{ .ok = session.location.? };
+        const id = session.hoe_channel_id orelse return plain;
+        const unavailable: p.AuthOutcome = .{ .failed = .unavailable };
+        const wallet = self.wallet orelse return unavailable;
+        // Settlement and open can hold this lock across mint I/O. Do not wait,
+        // and don't turn an unresolved pointer into a no-channel ACK.
+        const channels = wallet.tryAcquire() orelse return unavailable;
+        defer channels.release();
+        const now = self.unixSeconds() orelse return unavailable;
+        const loaded = (channels.loadLive(session.pubkey, id, now) catch |err| {
+            hoe_log.debug("login ledger lookup failed: {s}", .{@errorName(err)});
+            return unavailable;
+        }) orelse return plain;
+        self.registry.setHoeChannel(handle, loaded.live);
+        const info = loaded.info;
+        if (loaded.live == null and info.phase != .depleted) return plain;
+        return .{ .ok_with_hoe_channel = .{
+            .location = plain.ok,
+            .hoe_channel_id = id,
+            .hoe_channel_capacity_msat = info.capacity_msat,
+            .hoe_channel_balance_msat = info.balance_msat,
+        } };
+    }
+    pub fn hoeRequirements(self: *const App, tool: p.tool) p.Outcome(.channel_requirements) {
+        const unavailable: p.Outcome(.channel_requirements) = .{ .failed = .unavailable };
+        const wallet = self.wallet orelse return unavailable;
+        if (tool != .hoe) return unavailable;
+        const receiver_key = wallet.receiverPubkey(hoe_refund_seconds) orelse return unavailable;
+        const now = self.unixSeconds() orelse return unavailable;
+        return .{ .ok = .{
+            .pubkey = receiver_key,
+            .amount = p.hoe_price_msat,
+            .refundTime = now + hoe_refund_seconds,
+        } };
+    }
+    pub fn handleHoeOpen(self: *App, handle: sessions.Handle, open: p.SpillmanChannelOpen) std.Io.Cancelable!p.Outcome(.channel_open) {
+        const unavailable: p.Outcome(.channel_open) = .{ .failed = .unavailable };
+        const wallet = self.wallet orelse return unavailable;
+        if (!wallet.hasReceiver()) return unavailable;
+        const storage = self.persistence orelse return unavailable;
+
+        const channels = wallet.tryAcquire() orelse return .{ .failed = .server_busy };
+        defer channels.release();
+
+        const profile = self.registry.storedUser(handle) catch return .{ .failed = .invalid_request };
+        const previous = profile.user.hoe_channel_id;
+        const now = self.unixSeconds() orelse return unavailable;
+        if (previous) |id| {
+            if (!std.mem.eql(u8, &id, &open.id)) {
+                const info = channels.lookup(profile.pubkey, id, now) catch |err| {
+                    hoe_log.debug("open profile lookup failed: {s}", .{@errorName(err)});
+                    return unavailable;
+                };
+                if (info) |existing| switch (existing.phase) {
+                    .depleted => return .{ .failed = .invalid_request },
+                    .active, .closing_window => if (existing.remaining() >= p.hoe_price_msat) return .{ .failed = .invalid_request },
+                    .expired, .sender_refund_required, .settlement_pending, .settled => {},
+                };
+            }
+        }
+
+        // The wire carries no independent sender binding; new admissions must
+        // use the authenticated account's x-only sender key.
+        channels.acceptFunded(profile.pubkey, .{
+            .id = open.id,
+            .params_json = open.params,
+            .funding_proofs_json = open.proof,
+        }, now) catch |err| switch (err) {
+            error.InvalidChannelPayload,
+            error.InvalidChannelParameters,
+            error.InvalidChannelHex,
+            error.InvalidChannelKey,
+            error.InvalidChannelOwnerBinding,
+            error.InvalidFundingProof,
+            error.InactiveFundingKeyset,
+            error.ChannelIdMismatch,
+            error.ChannelIdConflict,
+            error.ChannelNotActive,
+            error.FundingNotUnspent,
+            => return .{ .failed = .invalid_proof },
+            error.SqliteBusy => return .{ .failed = .server_busy },
+            else => {
+                hoe_log.debug("funded open failed: {s}", .{@errorName(err)});
+                return unavailable;
+            },
+        };
+
+        const loaded = (channels.loadLive(profile.pubkey, open.id, now) catch return unavailable) orelse return unavailable;
+        var transferred = false;
+        defer if (!transferred) if (loaded.live) |live| live.deinit();
+        storage.linkChannel(handle, previous, open.id) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            // The verified ledger entry stays intact. Retrying the same open
+            // resumes the link without contacting the mint again.
+            hoe_log.debug("open profile link failed: {s}", .{@errorName(err)});
+            return unavailable;
+        };
+        self.registry.setHoeChannel(handle, loaded.live);
+        transferred = true;
+        return .{ .ok = {} };
+    }
+    /// The handler calls this only after authentication. Authorize against the
+    /// ledger, not a profile link that may have been replaced since expiry.
+    pub fn handleHoeClose(self: *App, handle: sessions.Handle, close: p.SpillmanChannelClosing) p.Outcome(.channel_close) {
+        const unavailable: p.Outcome(.channel_close) = .{ .failed = .unavailable };
+        const wallet = self.wallet orelse return unavailable;
+        if (!wallet.hasReceiver()) return unavailable;
+        const session = self.registry.get(handle) orelse return .{ .failed = .invalid_request };
+        const channels = wallet.tryAcquire() orelse return .{ .failed = .server_busy };
+        defer channels.release();
+        const now = self.unixSeconds() orelse return unavailable;
+        const closed = channels.closeChannel(session.pubkey, close.id, now) catch |err| return switch (err) {
+            error.ChannelNotFound, error.ChannelNotDepleted => .{ .failed = .close_rejected },
+            error.SqliteBusy => .{ .failed = .server_busy },
+            else => blk: {
+                hoe_log.debug("close failed: {s}", .{@errorName(err)});
+                break :blk unavailable;
+            },
+        };
+        if (closed == .pending) return .{ .failed = .settlement_pending };
+        if (closed == .newly_settled) self.registry.notifySettlement(session.pubkey, close.id);
+        return .ok;
+    }
+
+    pub fn handleHoeStatus(self: *App, handle: sessions.Handle, request: p.SpillmanChannelClosing, reply_allocator: std.mem.Allocator) p.Outcome(.channel_status) {
+        const unavailable: p.Outcome(.channel_status) = .{ .failed = .unavailable };
+        const wallet = self.wallet orelse return unavailable;
+        if (!wallet.hasReceiver()) return unavailable;
+        const session = self.registry.get(handle) orelse return .{ .failed = .invalid_request };
+        const channels = wallet.tryAcquire() orelse return .{ .failed = .server_busy };
+        defer channels.release();
+        const now = self.unixSeconds() orelse return unavailable;
+        const info = (channels.lookup(session.pubkey, request.id, now) catch |err| {
+            hoe_log.debug("status lookup failed: {s}", .{@errorName(err)});
+            return if (err == error.SqliteBusy) .{ .failed = .server_busy } else unavailable;
+        }) orelse return .{ .failed = .not_found };
+        const phase: p.ChannelPhase = switch (info.phase) {
+            .active => if (info.remaining() < p.hoe_price_msat) .settlement_pending else .active,
+            .depleted => .depleted,
+            .closing_window, .expired => if (info.balance_msat == 0) .sender_refund_required else .settlement_pending,
+            .settlement_pending => .settlement_pending,
+            .settled => if (info.wallet_redeemed) .settled else .settlement_pending,
+            .sender_refund_required => .sender_refund_required,
+        };
+        return .{ .ok = .{
+            .capacity_msat = info.capacity_msat,
+            .balance_msat = info.balance_msat,
+            .phase = phase,
+            .sender_proofs = if (phase == .settled) channels.senderProofs(session.pubkey, request.id, reply_allocator, p.max_sender_change_proofs_bytes) catch |err| {
+                hoe_log.debug("status receipt lookup failed: {s}", .{@errorName(err)});
+                return unavailable;
+            } else null,
+        } };
     }
     pub fn handleLocation(self: *App, handle: sessions.Handle, req: p.RequestFor(.update_location)) p.Outcome(.update_location) {
         self.registry.update(handle, req.payload) catch return .{ .failed = .invalid_request };
         return .{ .ok = {} };
     }
+    fn hasReceiver(self: *const App) bool {
+        return if (self.wallet) |wallet| wallet.hasReceiver() else false;
+    }
+    pub fn needsHoeCut(self: *const App, tile: p.Cut) bool {
+        const world = shared.world;
+        return tile.payment != null or (self.hasReceiver() and
+            world.sampleTile(world.public_seed, tile.x, tile.y) == .grass);
+    }
+
+    /// Run on the connection task, which owns the confirmed session and has
+    /// no other gameplay request in flight for it.
+    pub fn handleHoeCut(self: *App, handle: sessions.Handle, req: p.Request) std.Io.Cancelable!p.Outcome(.cut) {
+        const invalid: p.Outcome(.cut) = .{ .failed = .invalid_request };
+        const busy: p.Outcome(.cut) = .{ .failed = .server_busy };
+        const tile = req.operation.cut;
+        const payment = tile.payment orelse return invalid;
+        const wallet = self.wallet orelse return invalid;
+        if (!wallet.hasReceiver()) return invalid;
+        const storage = self.persistence orelse return invalid;
+        var pins = storage.prepare(req) catch |err| {
+            if (err == error.Canceled) return error.Canceled;
+            return busy;
+        };
+        defer storage.release(&pins);
+
+        // Don't wait behind mint I/O in open/settlement or behind a world cut.
+        const channels = wallet.tryAcquire() orelse return busy;
+        defer channels.release();
+        const context = self.lease() orelse return busy;
+        defer self.release(context);
+
+        const profile = self.registry.storedUser(handle) catch return invalid;
+        const location = profile.user.location;
+        if (@abs(@as(i64, tile.x) - location.x) > 1 or @abs(@as(i64, tile.y) - location.y) > 1) return invalid;
+        const prepared = switch (context.state.prepareHoeCut(tile)) {
+            .ready => |ready| ready,
+            .failed => |failure| return .{ .failed = failure },
+        };
+        const live = self.registry.hoeChannel(handle) orelse return invalid;
+        if (!std.mem.eql(u8, &live.id, &payment.id)) return invalid;
+        const now = self.unixSeconds() orelse return busy;
+        try self.registry.io.checkCancel();
+        channels.acceptPayment(live, .{
+            .balance_msat = payment.amount,
+            .signature = payment.signature,
+        }, now) catch |err| switch (err) {
+            error.ChannelNotFound,
+            error.ChannelNotActive,
+            error.InvalidPaymentStep,
+            error.InvalidPaymentSignature,
+            => return invalid,
+            else => {
+                hoe_log.debug("cut payment failed: {s}", .{@errorName(err)});
+                return busy;
+            },
+        };
+        // The row is still pinned and exclusively leased. No I/O, allocation,
+        // replay lookup or cancellation point before marking the bitmap dirty.
+        const tile_state = prepared.apply();
+        if (live.exhausted()) self.registry.setHoeChannel(handle, null);
+        return .{ .ok = tile_state };
+    }
+
     pub fn retainedCut(self: *App, req: p.Request) !?p.Outcome(.cut) {
         const storage = self.persistence orelse return null;
         const tile = switch (req.operation) {
             .cut => |tile| tile,
             else => return null,
         };
+        if (self.needsHoeCut(tile)) return null;
         try storage.world_lock.lock(storage.io);
         defer storage.world_lock.unlock(storage.io);
         return self.context.state.replayCut(.{ .request_id = req.request_id, .payload = tile });

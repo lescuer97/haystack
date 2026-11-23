@@ -15,7 +15,7 @@ pub const WorldState = struct {
     pub const cache_overflow_capacity = 512;
     pub const cache_capacity = cache_base_capacity + cache_overflow_capacity;
     pub const Chunk = struct { address: ChunkAddress, cuts: [32]u8 };
-    pub const Replay = struct { id: p.Id, tile: p.Cut, result: p.Outcome(.cut) };
+    pub const Replay = struct { id: p.Id, tile: p.Location, result: p.Outcome(.cut) };
     pub const DirtySnapshot = struct {
         address: ChunkAddress,
         bits: [32]u8,
@@ -156,6 +156,7 @@ pub const WorldState = struct {
     /// Check replay/conflict before loading or pinning the target chunk.
     pub fn replayCut(self: *const WorldState, req: p.RequestFor(.cut)) ?p.Outcome(.cut) {
         const tile = req.payload;
+        if (tile.payment != null) return null;
         for (self.replays[0..self.replay_count]) |entry| {
             if (!std.mem.eql(u8, &entry.id, &req.request_id)) continue;
             if (entry.tile.x != tile.x or entry.tile.y != tile.y)
@@ -166,6 +167,7 @@ pub const WorldState = struct {
     }
 
     pub fn cut(self: *WorldState, req: p.RequestFor(.cut)) error{CapacityExceeded}!p.Outcome(.cut) {
+        if (req.payload.payment != null) return .{ .failed = .invalid_request };
         if (self.replayCut(req)) |result| return result;
         const tile = req.payload;
         const address = ChunkAddress.fromTile(tile.x, tile.y);
@@ -174,9 +176,8 @@ pub const WorldState = struct {
         if (row) |r| if (r.pins == 0) return error.CapacityExceeded;
         const index = if (cache == null) self.findChunk(address) else null;
         const chunk = if (row) |r| &r.chunk else if (index) |i| &self.chunks[i] else null;
-        const bit: usize = @intCast(@mod(tile.y, 16) * 16 + @mod(tile.x, 16));
-        const mask = @as(u8, 1) << @as(u3, @intCast(bit % 8));
-        const already = if (chunk) |c| c.cuts[bit / 8] & mask != 0 else false;
+        const bit = CutBit.init(tile);
+        const already = if (chunk) |c| bit.isSet(c) else false;
         const result = actions.cutRule(.{ .x = tile.x, .y = tile.y, .terrain = world.sampleTile(world.public_seed, tile.x, tile.y), .cut = already });
         if (result == .ok) {
             const target = chunk orelse new: {
@@ -186,16 +187,59 @@ pub const WorldState = struct {
                 self.chunk_count += 1;
                 break :new fresh;
             };
-            target.cuts[bit / 8] |= mask;
-            if (row) |r| {
-                r.revision = cache.?.nextGeneration();
-                r.dirty = true;
-            }
+            if (row) |r| cache.?.markCut(r, bit) else bit.set(target);
         }
-        self.replays[self.replay_next] = .{ .id = req.request_id, .tile = tile, .result = result };
+        self.replays[self.replay_next] = .{ .id = req.request_id, .tile = .{ .x = tile.x, .y = tile.y }, .result = result };
         self.replay_next = (self.replay_next + 1) % capacity;
         if (self.replay_count < capacity) self.replay_count += 1;
         return result;
+    }
+
+    const CutBit = struct {
+        byte: usize,
+        mask: u8,
+
+        fn init(tile: p.Cut) CutBit {
+            const bit: usize = @intCast(@mod(tile.y, 16) * 16 + @mod(tile.x, 16));
+            return .{ .byte = bit / 8, .mask = @as(u8, 1) << @as(u3, @intCast(bit % 8)) };
+        }
+
+        fn isSet(self: CutBit, chunk: *const Chunk) bool {
+            return chunk.cuts[self.byte] & self.mask != 0;
+        }
+
+        fn set(self: CutBit, chunk: *Chunk) void {
+            chunk.cuts[self.byte] |= self.mask;
+        }
+    };
+
+    const PreparedHoeCut = struct {
+        cache: *Cache,
+        row: *Cache.Row,
+        bit: CutBit,
+        result: p.State,
+
+        /// Apply under the same world lock and pin used to prepare.
+        pub fn apply(self: PreparedHoeCut) p.State {
+            self.cache.markCut(self.row, self.bit);
+            return self.result;
+        }
+    };
+
+    /// No global request-ID lookup: the authoritative bitmap determines whether
+    /// the pinned grass tile can be cut, and the ledger authorizes the payment.
+    pub fn prepareHoeCut(self: *WorldState, tile: p.Cut) union(enum) { ready: PreparedHoeCut, failed: p.CutFailure } {
+        const cache = if (self.cache) |*cache| cache else return .{ .failed = .server_busy };
+        const row = cache.get(ChunkAddress.fromTile(tile.x, tile.y)) orelse return .{ .failed = .server_busy };
+        if (row.pins == 0) return .{ .failed = .server_busy };
+        const terrain = world.sampleTile(world.public_seed, tile.x, tile.y);
+        if (terrain != .grass) return .{ .failed = .not_cuttable };
+        const bit = CutBit.init(tile);
+        const result = actions.cutRule(.{ .x = tile.x, .y = tile.y, .terrain = terrain, .cut = bit.isSet(&row.chunk) });
+        return switch (result) {
+            .ok => |next| .{ .ready = .{ .cache = cache, .row = row, .bit = bit, .result = next } },
+            .failed => |failure| .{ .failed = failure },
+        };
     }
 
     pub fn readArea(self: *const WorldState, area: world.ChunkRange, out: *p.Snapshot) error{InvalidArea}!void {
@@ -251,6 +295,12 @@ pub const WorldState = struct {
 
         fn get(self: *Cache, address: ChunkAddress) ?*Row {
             return &self.rows[self.index.get(address) orelse return null];
+        }
+
+        fn markCut(self: *Cache, row: *Row, bit: CutBit) void {
+            bit.set(&row.chunk);
+            row.revision = self.nextGeneration();
+            row.dirty = true;
         }
 
         fn finishSave(self: *Cache, snapshot: DirtySnapshot) ?usize {

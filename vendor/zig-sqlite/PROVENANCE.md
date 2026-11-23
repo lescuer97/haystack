@@ -7,9 +7,8 @@ Downloaded the GitHub archive for that exact revision, not a mutable branch.
 Local patches: `build.zig.zon` replaces SQLite 3.49.2 with official SQLite 3.54.0;
 `build.zig` uses include/source/header paths at the root of the normalized
 dependency package, with the ZIP root directory stripped. Wrapper API source is unchanged.
-The server actually imports the wrapper module's public `c` export, using raw
-SQLite APIs for heap configuration, prepared statements and checked cleanup.
-It does not use `all`, `nextAlloc`, or wrapper reset logging.
+The server uses the wrapper module's public `c` export for database access,
+including prepared statements and checked cleanup.
 
 SQLite source: https://www.sqlite.org/2026/sqlite-amalgamation-3540000.zip
 
@@ -30,15 +29,14 @@ Translate-C dependency remains upstream's exact revision
 `cfac21f3199b2b02ce3fd7db652aa456421fe4ab`, hash
 `translate_c-2.0.2-Q_BUWvBNBwDnyehSiuAJmdFcMYHYGA-Jc3KiYdrV2Dqx`.
 
-Root build selects `memsys5=true`, `zero_malloc=true`, `omit_autoinit=true`,
-`threadsafe=1`. The resulting server does not dynamically link system sqlite3.
-No SQLite scheduling/durability options were relaxed. In particular, builds
-retain WAL, FULL synchronous commits and SQLite's default checkpoint policy.
+The root build uses the bundled SQLite amalgamation with its default memory
+configuration. The server does not dynamically link system SQLite, and database
+durability settings are set by the gameplay and channel stores.
 
 The root server opts into `server_namespace=true` (default false for other
 consumers). `c/server_namespace.h` renames all public API functions/data and the
 workaround helper before C compilation; `c/server_sqlite3_c.h` applies the same
-manifest to translation. This isolates the fixed world heap/lifecycle from the
+manifest to translation. This keeps the server SQLite symbols separate from the
 Rust CDK archive's independently bundled SQLite. sqliteext is not renamed.
 The wrapper completes the pinned version array before translation and suppresses
 its unsupported Zig const-copy alias; access that data through

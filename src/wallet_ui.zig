@@ -1,7 +1,6 @@
 //! Pure, bounded wallet presentation. Services own handles and source pagination.
 const std = @import("std");
 const qr_mod = @import("qr.zig");
-const withdrawal = @import("withdrawal_ui.zig");
 pub const Operation = enum {
     open,
     snapshot,
@@ -47,6 +46,80 @@ pub fn Text(comptime capacity: usize) type {
 }
 pub const Row = struct { outgoing: bool = false, mint: Text(256) = .{}, id: Text(1024) = .{}, text: Text(512) = .{} };
 pub const Recovery = enum { none, unknown, legacy_unknown };
+// Ephemeral withdrawal presentation. CDK owns reservations, payments and recovery.
+const withdrawal = struct {
+    pub const Status = enum { prepared, pending, completed, failed, unsubmitted, unknown };
+    pub const View = struct {
+        operation_id: Text(1024) = .{},
+        quote_id: Text(1024) = .{},
+        invoice: Text(4096) = .{},
+        amount: Text(20) = .{},
+        fee_reserve: Text(20) = .{},
+        swap_fee: Text(20) = .{},
+        input_fee: Text(20) = .{},
+        estimated_total: Text(20) = .{},
+        quote_expiry: Text(20) = .{},
+        invoice_expiry: Text(20) = .{},
+        quote_state: Text(32) = .{},
+        status: Status = .unknown,
+        expired: bool = false,
+        retry_review_allowed: bool = false,
+
+        pub fn parse(value: std.json.Value, mint: []const u8, prepared: bool) !View {
+            var result: View = .{};
+            if (!std.mem.eql(u8, try requiredString(value, "mint_url"), mint) or !std.mem.eql(u8, try requiredString(value, "unit"), "msat")) return error.Invalid;
+            try put(&result.quote_id, try requiredString(value, "quote_id"));
+            try put(&result.invoice, try requiredString(value, "invoice"));
+            try number(&result.amount, try requiredString(value, "amount"));
+            try number(&result.quote_expiry, try requiredString(value, "quote_expiry"));
+            if (prepared) {
+                try put(&result.operation_id, try requiredString(value, "operation_id"));
+                try number(&result.fee_reserve, try requiredString(value, "fee_reserve"));
+                try number(&result.swap_fee, try requiredString(value, "swap_fee"));
+                try number(&result.input_fee, try requiredString(value, "input_fee"));
+                try number(&result.estimated_total, try requiredString(value, "estimated_total"));
+                try number(&result.invoice_expiry, try requiredString(value, "invoice_expiry"));
+                _ = try boolean(value, "requires_swap");
+                result.status = .prepared;
+            } else {
+                try put(&result.quote_state, try requiredString(value, "quote_state"));
+                result.status = std.meta.stringToEnum(Status, try requiredString(value, "payment_status")) orelse return error.Invalid;
+                result.expired = try boolean(value, "expired");
+                result.retry_review_allowed = try boolean(value, "retry_review_allowed");
+                const expiry = value.object.get("invoice_expiry") orelse return error.Invalid;
+                if (expiry != .null) try number(&result.invoice_expiry, try requiredString(value, "invoice_expiry"));
+            }
+            return result;
+        }
+        pub fn deadlinePassed(self: *const View, unix: u64) bool {
+            for ([_][]const u8{ self.quote_expiry.slice(), self.invoice_expiry.slice() }) |text| {
+                if (text.len != 0 and unix >= (std.fmt.parseInt(u64, text, 10) catch return true)) return true;
+            }
+            return false;
+        }
+    };
+    fn requiredString(value: std.json.Value, key: []const u8) ![]const u8 {
+        if (value != .object) return error.Invalid;
+        const field = value.object.get(key) orelse return error.Invalid;
+        return if (field == .string) field.string else error.Invalid;
+    }
+    fn boolean(value: std.json.Value, key: []const u8) !bool {
+        const field = value.object.get(key) orelse return error.Invalid;
+        return if (field == .bool) field.bool else error.Invalid;
+    }
+    fn put(target: anytype, text: []const u8) !void {
+        if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return error.Invalid;
+        for (text) |c| if (c < 32 or c == 127) return error.Invalid;
+        if (!target.set(text)) return error.Invalid;
+    }
+    fn number(target: anytype, text: []const u8) !void {
+        if (text.len == 0 or text.len > 20) return error.Invalid;
+        for (text) |c| if (c < '0' or c > '9') return error.Invalid;
+        _ = std.fmt.parseInt(u64, text, 10) catch return error.Invalid;
+        try put(target, text);
+    }
+};
+
 pub const Model = struct {
     withdrawal: withdrawal.View = .{},
     withdrawal_selected: Text(1024) = .{},
@@ -354,7 +427,7 @@ pub const Model = struct {
         if (self.operation.isWithdrawal()) if (value.object.get("operation_error")) |detail| {
             if (detail != .object) return error.Invalid;
             const status = detail.object.get("status") orelse return error.Invalid;
-            const message = try withdrawal.string(detail, "message");
+            const message = try withdrawal.requiredString(detail, "message");
             if (status != .integer or status.integer < 1 or status.integer > 27 or message.len > 160 or !std.unicode.utf8ValidateSlice(message)) return error.Invalid;
             for (message) |c| if (c < 32 or c == 127) return error.Invalid;
             self.withdrawalOperationFailed(@intCast(status.integer), now);
@@ -424,7 +497,7 @@ pub const Model = struct {
                 _ = self.message.set("Saved withdrawal; status comes from CDK. Pending checks continue with menu closed.");
             },
             .cancel_withdrawal => {
-                const id = try withdrawal.string(value, "quote_id");
+                const id = try withdrawal.requiredString(value, "quote_id");
                 const cancelled = value.object.get("cancelled") orelse return error.Invalid;
                 if (!std.mem.eql(u8, id, self.withdrawal_request_id.slice()) or cancelled != .bool or !cancelled.bool) return error.Invalid;
                 self.withdrawal = .{};
@@ -434,7 +507,7 @@ pub const Model = struct {
                 _ = self.message.set("Unsubmitted review cancelled; rereading wallet balance.");
             },
             .poll_withdrawals => {
-                const cursor = try withdrawal.string(value, "cursor");
+                const cursor = try withdrawal.requiredString(value, "cursor");
                 var checked_cursor: Text(1024) = .{};
                 if (!checked_cursor.set(cursor)) return error.Invalid;
                 const checked = value.object.get("checked_id") orelse return error.Invalid;
@@ -464,7 +537,7 @@ pub const Model = struct {
                 if (valueError(value)) {
                     const detail = value.object.get("error").?;
                     const code = if (detail == .object) detail.object.get("status") orelse return error.Invalid else return error.Invalid;
-                    const message = try withdrawal.string(detail, "message");
+                    const message = try withdrawal.requiredString(detail, "message");
                     if (code != .integer or message.len > 256 or std.mem.indexOfScalar(u8, message, 0) != null) return error.Invalid;
                     self.withdrawalPollFailed(now);
                 } else {

@@ -28,6 +28,8 @@
 //!   and treat anything returned as sensitive.
 
 mod api;
+mod client_storage;
+mod receiver_storage;
 mod spilman;
 mod status;
 mod wallet;
@@ -46,6 +48,8 @@ mod fixtures;
 mod tests;
 
 pub use api::*;
+pub use client_storage::*;
+pub use receiver_storage::*;
 pub use spilman::*;
 pub use status::*;
 pub use wallet::CdkWallet;
@@ -62,7 +66,7 @@ pub fn header_contents() -> String {
     // Referencing every exported symbol forces the linker to keep the `api`
     // object file (and therefore the `inventory` registrations that the header
     // generator iterates over).
-    let force: [*const (); 50] = [
+    let force: &[*const ()] = &[
         cdk_wallet_open as *const (),
         cdk_wallet_close as *const (),
         cdk_wallet_check_mint_keysets as *const (),
@@ -88,6 +92,7 @@ pub fn header_contents() -> String {
         cdk_wallet_get_active_keyset_info_json as *const (),
         cdk_wallet_get_keyset_info_json as *const (),
         cdk_wallet_post_swap as *const (),
+        cdk_wallet_recover_swap as *const (),
         cdk_wallet_receive_with_keys as *const (),
         cdk_wallet_receive_proofs as *const (),
         cdk_spilman_build_cashu_b_token as *const (),
@@ -113,6 +118,17 @@ pub fn header_contents() -> String {
         cdk_spilman_unblind_close_swap as *const (),
         cdk_spilman_prepare_sender_refund as *const (),
         cdk_spilman_complete_sender_refund as *const (),
+        cdk_spilman_client_storage_open as *const (),
+        cdk_spilman_client_storage_close as *const (),
+        cdk_spilman_client_storage_save_funded as *const (),
+        cdk_spilman_client_storage_read_funded as *const (),
+        cdk_spilman_client_storage_read_metadata as *const (),
+        cdk_spilman_client_storage_write_metadata as *const (),
+        cdk_spilman_client_storage_remove_metadata as *const (),
+        cdk_spilman_client_storage_list_ids as *const (),
+        cdk_spilman_receiver_storage_open as *const (),
+        cdk_spilman_receiver_storage_close as *const (),
+        cdk_spilman_receiver_storage_write as *const (),
     ];
     std::hint::black_box(force);
 

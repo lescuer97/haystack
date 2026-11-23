@@ -1,5 +1,6 @@
 const std = @import("std");
 const shared = @import("shared");
+const sqlite = @import("sqlite").c;
 const p = shared.protocol;
 const GameDb = @import("game_db.zig").GameDb;
 const ChunkAddress = @import("chunk_address.zig").ChunkAddress;
@@ -210,19 +211,12 @@ test "persistence prepares rectangular areas in snapshot bitmap order" {
     }
 }
 
-extern "c" fn sqlite3_set_authorizer(
-    *anyopaque,
-    ?*const fn (?*anyopaque, c_int, ?[*:0]const u8, ?[*:0]const u8, ?[*:0]const u8, ?[*:0]const u8) callconv(.c) c_int,
-    ?*anyopaque,
-) c_int;
-
-fn failUserWriteAndRollback(_: ?*anyopaque, action: c_int, arg: ?[*:0]const u8, _: ?[*:0]const u8, _: ?[*:0]const u8, _: ?[*:0]const u8) callconv(.c) c_int {
-    const insert = 18; // SQLITE_INSERT
-    const transaction = 22; // SQLITE_TRANSACTION
-    const name = std.mem.span(arg orelse return 0);
-    if ((action == insert and std.mem.eql(u8, name, "game_users")) or
-        (action == transaction and std.mem.eql(u8, name, "ROLLBACK"))) return 1; // SQLITE_DENY
-    return 0;
+fn failUserWriteAndRollback(_: ?*anyopaque, action: c_int, arg: [*c]const u8, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8) callconv(.c) c_int {
+    if (arg == null) return sqlite.SQLITE_OK;
+    const name = std.mem.span(arg);
+    if ((action == sqlite.SQLITE_INSERT and std.mem.eql(u8, name, "game_users")) or
+        (action == sqlite.SQLITE_TRANSACTION and std.mem.eql(u8, name, "ROLLBACK"))) return sqlite.SQLITE_DENY;
+    return sqlite.SQLITE_OK;
 }
 
 test "persistence discards a connection that cannot roll back and retries both pending edits" {
@@ -240,7 +234,7 @@ test "persistence discards a connection that cannot roll back and retries both p
     const moved = try game.cutAndMove();
     // The chunk upsert succeeds before the authorizer denies the user upsert
     // and explicit rollback. The fault is local to that connection.
-    try t.expectEqual(0, sqlite3_set_authorizer(game.db.db.?, failUserWriteAndRollback, null));
+    try t.expectEqual(sqlite.SQLITE_OK, sqlite.sqlite3_set_authorizer(@ptrCast(game.db.db.?), failUserWriteAndRollback, null));
     try t.expectError(error.SqliteFailure, game.persistence.flush());
     try t.expectError(error.GameDatabasePoisoned, game.db.loadChunk(cut_address));
     {

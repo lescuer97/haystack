@@ -93,8 +93,23 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     if (preflight) |step| app_tests.step.dependOn(&step.step);
     app_tests.step.dependOn(&rust.step);
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
-    const wallet_storage_tests = abiTests(b, options, "src/wallet_storage_test.zig", cdk, archive, &rust.step, policy);
+    const wallet_storage_module = b.createModule(.{ .root_source_file = b.path("src/wallet_storage_test.zig"), .target = target, .optimize = options.optimize });
+    wallet_storage_module.addImport("shared", shared);
+    secp.link(wallet_storage_module);
+    wallet_storage_module.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
+    native.link(wallet_storage_module);
+    const wallet_storage_unit_tests = b.addTest(.{ .root_module = wallet_storage_module });
+    wallet_storage_unit_tests.step.dependOn(&rust.step);
+    const wallet_storage_tests = b.addRunArtifact(wallet_storage_unit_tests);
     test_step.dependOn(&wallet_storage_tests.step);
+    const spilman_module = b.createModule(.{ .root_source_file = b.path("src/hoe_wallet_ops.zig"), .target = target, .optimize = options.optimize });
+    spilman_module.addImport("shared", shared);
+    native.link(spilman_module);
+    const spilman_unit_tests = b.addTest(.{ .root_module = spilman_module });
+    spilman_unit_tests.step.dependOn(&rust.step);
+    const spilman_unit_step = b.step("test-spilman-storage", "Run offline desktop Spilman storage and funding unit tests");
+    spilman_unit_step.dependOn(&b.addRunArtifact(spilman_unit_tests).step);
+    test_step.dependOn(spilman_unit_step);
 
     const headers = common.cargo(b, options, manifest, &.{ "run", "--features", "headers", "--bin", "generate-headers", "--target", policy.rust_target, "--target-dir", "vendor/cdk-wallet-ffi/target" });
     headers.addArgs(&.{ "--", "--check" });
@@ -141,7 +156,7 @@ const linkWallet = @import("native_wallet.zig").linkWallet;
 
 fn abiTests(b: *std.Build, options: common.Options, source: []const u8, cdk: *std.Build.Module, archive: std.Build.LazyPath, rust: *std.Build.Step, policy: platform.Policy) *std.Build.Step.Run {
     const module = b.createModule(.{ .root_source_file = b.path(source), .target = options.target, .optimize = options.optimize });
-    if (std.mem.eql(u8, source, "src/wallet_storage_test.zig")) module.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
+
     linkWallet(module, cdk, archive, policy);
     const tests = b.addTest(.{ .root_module = module });
     tests.step.dependOn(rust);

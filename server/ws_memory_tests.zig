@@ -17,10 +17,11 @@ test "bounded-memory application slots reserve once reuse at capacity without up
         const used = pool.used;
         const calls = pool.allocation_calls;
         const slot_bytes = @sizeOf(transport.Slot) * config.max_connections;
-        const slot_block = 1024 * 1024;
-        // Check the raw footprint and the rounded Buddy allocation separately.
-        try std.testing.expect(slot_bytes + pool.reserved <= slot_block);
-        try std.testing.expectEqual(@as(usize, slot_block), used);
+        const slot_budget = 2 * 1024 * 1024;
+        // Keep all 64 slots in one 2 MiB Buddy block, excluding allocator metadata.
+        try std.testing.expect(slot_bytes <= slot_budget);
+        try std.testing.expectEqual(try std.math.ceilPowerOfTwo(usize, slot_bytes), used);
+        try std.testing.expect(used <= slot_budget);
         try std.testing.expect(used + pool.reserved <= size);
         // Buddy retains no upstream allocator: managed steady state cannot fall back.
         for (0..256) |_| {

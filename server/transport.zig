@@ -114,6 +114,7 @@ pub const Handler = struct {
     session: ?sessions.Handle = null,
     authenticated: bool = false,
     reported_decode_error: bool = false,
+    output_mutex: std.Io.Mutex = .init,
     dispatch: ?*ticks.Dispatcher = null,
     mailbox: ?*ticks.Mailbox = null,
     pub fn init(conn: *ws, app: *App) !Handler {
@@ -135,7 +136,7 @@ pub const Handler = struct {
     fn sendAuthReply(self: *Handler, outcome: p.AuthOutcome) !void {
         const io = self.app.registry.io;
         try checkDeadline(io, self.deadline);
-        var reply: [15]u8 = undefined;
+        var reply: [wire.max_auth_reply_bytes]u8 = undefined;
         try self.conn.writeMessage(try wire.encodeAuth(&reply, .{ .reply = outcome }), .binary);
         try checkDeadline(io, self.deadline);
     }
@@ -143,12 +144,26 @@ pub const Handler = struct {
         try self.sendAuthReply(.{ .failed = failure });
         return error.AuthenticationRejected;
     }
+    fn writeMessage(self: *Handler, bytes: []const u8, opcode: ws.Opcode) !void {
+        const io = self.app.registry.io;
+        try self.output_mutex.lock(io);
+        defer self.output_mutex.unlock(io);
+        try self.conn.writeMessage(bytes, opcode);
+    }
+    fn sendSettlements(self: *Handler, queue: *sessions.SettlementQueue) void {
+        const io = self.app.registry.io;
+        while (true) {
+            const id = queue.getOne(io) catch return;
+            var buffer: [wire.channel_settled_bytes]u8 = undefined;
+            self.writeMessage(wire.encodeChannelSettled(&buffer, id) catch unreachable, .binary) catch return;
+        }
+    }
     fn sendProtocolError(self: *Handler, err: wire.DecodeError) !void {
         if (!self.reported_decode_error) {
             std.log.scoped(.wire).debug("rejected client message: {s}", .{@errorName(err)});
             self.reported_decode_error = true;
         }
-        try self.conn.writeMessage(&wire.protocol_error, .binary);
+        try self.writeMessage(&wire.protocol_error, .binary);
     }
     pub fn clientMessage(self: *Handler, data: []const u8, tpe: ws.Opcode) !void {
         if (!self.authenticated) {
@@ -174,13 +189,20 @@ pub const Handler = struct {
                 else => return self.rejectAuth(.unavailable),
             };
             errdefer self.close();
-            const location = self.app.registry.get(self.session.?).?.location.?;
-            try self.sendAuthReply(.{ .ok = location });
+            const outcome = self.app.authOutcome(self.session.?);
+            if (outcome == .failed) return self.rejectAuth(outcome.failed);
+            try self.sendAuthReply(outcome);
             return;
         }
         const req = wire.decodeMessage(data, tpe == .binary) catch |err|
             return self.sendProtocolError(err);
-        if (p.isChannel(std.meta.activeTag(req.operation))) return self.rejectChannel(req);
+        if (p.isChannel(std.meta.activeTag(req.operation))) return self.handleChannel(req);
+        if (req.operation == .cut and self.app.needsHoeCut(req.operation.cut)) {
+            const outcome = try self.app.handleHoeCut(self.session.?, req);
+            var reply: [p.max_response_bytes]u8 = undefined;
+            const bytes = wire.encodeReply(&reply, .cut, .{ .request_id = req.request_id, .payload = req.operation.cut }, outcome) catch unreachable;
+            return self.writeMessage(bytes, .binary);
+        }
 
         const dispatch = self.dispatch orelse return error.MissingTickDispatcher;
         const box = self.mailbox.?;
@@ -194,7 +216,7 @@ pub const Handler = struct {
                 replay = try self.app.retainedCut(req);
                 if (replay != null) break :blk .{};
                 var reply: [p.max_response_bytes]u8 = undefined;
-                return self.conn.writeMessage(application.encodeCommonFailure(&reply, req, .server_busy), .binary);
+                return self.writeMessage(application.encodeCommonFailure(&reply, req, .server_busy), .binary);
             };
         }
         defer if (storage) |store| store.release(&pins);
@@ -204,7 +226,7 @@ pub const Handler = struct {
                 // A rejected publish owns no generation and must not touch the box.
                 if (storage) |store| store.release(&pins);
                 var reply: [p.max_response_bytes]u8 = undefined;
-                try self.conn.writeMessage(application.encodeCommonFailure(&reply, req, .server_busy), .binary);
+                try self.writeMessage(application.encodeCommonFailure(&reply, req, .server_busy), .binary);
                 if (err != error.RequestPending) return err;
                 return;
             },
@@ -216,16 +238,26 @@ pub const Handler = struct {
         try self.app.registry.confirmBefore(self.session.?, self.deadline);
         self.authenticated = true;
     }
-    fn rejectChannel(self: *Handler, req: p.Request) !void {
-        // Open proof bytes borrow the receive buffer until the next WebSocket read.
-        // Keep this route synchronous and never publish a channel request to the tick.
-        // No channel service or durable ledger is configured; the wallet alone is not one.
-        var reply: [28]u8 = undefined; // Envelope, ID TLV, and two-byte failure TLV.
+    fn handleChannel(self: *Handler, req: p.Request) !void {
+        var reply: [75]u8 = undefined; // Envelope, ID TLV, and quote outcome TLV.
         const bytes = switch (req.operation) {
-            inline .channel_requirements, .channel_open, .channel_payment, .channel_close => |payload, kind| try wire.encodeReply(&reply, kind, .{ .request_id = req.request_id, .payload = payload }, .{ .failed = .unavailable }),
+            .channel_requirements => |payload| try wire.encodeReply(&reply, .channel_requirements, .{ .request_id = req.request_id, .payload = payload }, self.app.hoeRequirements(payload.tool)),
+            .channel_open => |payload| try wire.encodeReply(&reply, .channel_open, .{ .request_id = req.request_id, .payload = payload }, try self.app.handleHoeOpen(self.session.?, payload)),
+            .channel_close => |payload| try wire.encodeReply(&reply, .channel_close, .{ .request_id = req.request_id, .payload = payload }, self.app.handleHoeClose(self.session.?, payload)),
+            .channel_status => |payload| return self.handleChannelStatus(.{ .request_id = req.request_id, .payload = payload }),
             .cut, .read_area, .update_location => unreachable,
         };
-        try self.conn.writeMessage(bytes, .binary);
+        try self.writeMessage(bytes, .binary);
+    }
+    fn handleChannelStatus(self: *Handler, req: p.RequestFor(.channel_status)) !void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const outcome = self.app.handleHoeStatus(self.session.?, req.payload, a);
+        const proofs = if (outcome == .ok) outcome.ok.sender_proofs else null;
+        var small: [p.channel_status_reply_overhead]u8 = undefined;
+        const reply = if (proofs) |bytes| try a.alloc(u8, p.channel_status_reply_overhead + bytes.len) else &small;
+        try self.writeMessage(try wire.encodeReply(reply, .channel_status, req, outcome), .binary);
     }
     pub fn finishReply(self: *Handler) !void {
         var pins = @import("persistence.zig").Pins{};
@@ -236,7 +268,7 @@ pub const Handler = struct {
         defer self.dispatch.?.cleanup(box);
         try box.completion.wait(self.app.registry.io);
         if (self.app.persistence) |storage| storage.release(pins);
-        try self.conn.writeMessage(box.reply[0..box.len], .binary);
+        try self.writeMessage(box.reply[0..box.len], .binary);
         if (box.close_after_reply) return error.StaleSession;
     }
 };
@@ -303,6 +335,11 @@ pub const Server = struct {
         defer group.cancel(self.io); // joins before app/slots can be freed
         try group.concurrent(self.io, tickTask, .{ self, app });
         if (app.persistence) |storage| try group.concurrent(self.io, @import("persistence.zig").Persistence.saveLoop, .{storage});
+        if (app.wallet) |wallet| {
+            if (wallet.hasReceiver()) try group.concurrent(self.io, @TypeOf(wallet.*).settlementLoop, .{
+                wallet, .{ .context = app.registry, .notify = publishSettlement },
+            });
+        }
         while (true) {
             const stream = listener.accept(self.io) catch |err| switch (acceptAction(err)) {
                 .retry => continue,
@@ -475,6 +512,39 @@ test "deadline race joins cancelled work before returning without sockets" {
     try std.testing.expect(work.finished.load(.acquire));
 }
 
+fn publishSettlement(context: *anyopaque, owner: sessions.Pubkey, id: [32]u8) void {
+    const registry: *sessions.Registry = @ptrCast(@alignCast(context));
+    registry.notifySettlement(owner, id);
+}
+
+test "settlement notice sends only the ID to the connected ledger owner" {
+    const t = std.testing;
+    var fixture = try @import("fixture.zig").Fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.application;
+    const owner: sessions.Pubkey = @splat(2);
+    const handle = try app.registry.claim(owner);
+    defer app.registry.release(handle);
+    var notices: [2][32]u8 = undefined;
+    var queue: sessions.SettlementQueue = .init(&notices);
+    app.registry.setSettlementQueue(handle, &queue);
+    defer app.registry.setSettlementQueue(handle, null);
+    const id: [32]u8 = @splat(3);
+    publishSettlement(app.registry, @splat(4), @splat(5));
+    publishSettlement(app.registry, owner, id);
+    queue.close(t.io);
+
+    var input = std.Io.Reader.fixed("");
+    var bytes: [2 + wire.channel_settled_bytes]u8 = undefined;
+    var output = std.Io.Writer.fixed(&bytes);
+    var conn = ws{ .input = &input, .output = &output, .key = "" };
+    var handler = try Handler.init(&conn, app);
+    handler.sendSettlements(&queue);
+    try t.expectEqual(bytes.len, output.buffered().len);
+    try t.expectEqualSlices(u8, &.{ 0x82, wire.channel_settled_bytes }, bytes[0..2]);
+    try t.expectEqual(id, try wire.decodeChannelSettled(bytes[2..], true));
+}
+
 fn serveConnection(server: *Server, slot: *Slot, app: *App) !void {
     const io = server.io;
     var reader = slot.stream.reader(io, &slot.http_buffer);
@@ -490,10 +560,22 @@ fn serveConnection(server: *Server, slot: *Slot, app: *App) !void {
     connection.handler.deadline = freshDeadline(io);
     try race(io, connection.handler.deadline, Connection.authenticate, .{&connection});
     try connection.handler.completeAuthentication();
+    var notices: [8][32]u8 = undefined;
+    var queue: sessions.SettlementQueue = .init(&notices);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    const handle = connection.handler.session.?;
+    defer app.registry.setSettlementQueue(handle, null);
+    if (app.wallet) |wallet| {
+        if (wallet.hasReceiver()) {
+            try group.concurrent(io, Handler.sendSettlements, .{ &connection.handler, &queue });
+            app.registry.setSettlementQueue(handle, &queue);
+        }
+    }
     while (true) {
         const message = try connection.websocket.readSmallMessage();
         if (message.opcode == .ping) {
-            try connection.websocket.writeMessage(message.data, .pong);
+            try connection.handler.writeMessage(message.data, .pong);
         } else try connection.handler.clientMessage(message.data, message.opcode);
     }
 }

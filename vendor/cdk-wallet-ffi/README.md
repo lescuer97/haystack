@@ -73,6 +73,7 @@ network-facing export with a documented deadline:
 | --- | --- |
 | `add_mint`, `receive`, `send` (prepare / cancel / confirm) | `60s` (`NETWORK_DEADLINE`) |
 | `recover` | `120s` (`RECOVERY_DEADLINE`) |
+| `post_swap`, `recover_swap` (both recovery queries combined) | `60s` (`NETWORK_DEADLINE`) |
 
 The deadline is implemented with `tokio::time::timeout` around the whole future.
 Dropping the future cancels the in-flight request (bitreq's async transport uses
@@ -80,10 +81,9 @@ Dropping the future cancels the in-flight request (bitreq's async transport uses
 timeout does **not** leave a detached blocking request behind. `BITREQ_TIMEOUT`
 is intentionally left unset.
 
-For a **mutation**, hitting the deadline is treated as **crash-equivalent**: the
-mint is marked unresolved and the caller gets `SendUncertain` / `NetworkError`.
-The operation is **never retried automatically**; recovery must be run
-explicitly. This avoids the classic "ambiguous send retried twice" bug.
+For a **CDK wallet saga**, a mutation deadline is treated as crash-equivalent:
+the mint is marked unresolved for explicit wallet recovery. A raw Spilman
+swap has a separate [caller-owned recovery contract](#raw-spilman-funding-and-close-swaps).
 
 ---
 
@@ -266,10 +266,61 @@ refused with `RECOVERY_PENDING`. Other mints are unaffected. Read-only access
 retrievable. `cdk_wallet_recover` clears the unresolved state on success; the
 caller decides when to retry.
 
-An ambiguous mutation outcome (timeout, 5xx, malformed mint response) is treated
-as **crash-equivalent**: the mint is marked unresolved and the saga is left for
-recovery. It is **never** retried automatically. A clearly-definitive failure
-(validation, 4xx, insufficient funds) does **not** wedge the mint.
+For a CDK wallet saga, an ambiguous mutation outcome (timeout, 5xx, malformed
+mint response) is treated as **crash-equivalent**: the mint is marked unresolved
+and the saga is left for recovery. It is **never** retried automatically. A
+clearly-definitive failure (validation, 4xx, insufficient funds) does **not**
+wedge the mint. Raw Spilman swaps are not CDK wallet sagas.
+
+### Raw Spilman funding and close swaps
+
+1. **Before** calling `cdk_wallet_post_swap`, durably save a pending operation
+   with the approved mint URL, exact signed swap request JSON (including
+   input secrets, witnesses and ordered blinded outputs), and the original
+   completion material. For funding, save `funding_secrets_json`, the keyset
+   information, and channel context. For cooperative close, save
+   `secrets_with_blinding`, the balance, channel parameters/secret, both
+   keysets and access to the receiver key needed by `cdk_spilman_unblind_close_swap`.
+   Protect the journal like wallet keys. Serialize operations that could spend
+   the same inputs; don't regenerate outputs or submit a competing close while
+   the operation is unresolved. This contract starts with a prepared swap; it
+   does not cover the preceding wallet send or the later deposit of close proofs.
+2. `cdk_wallet_post_swap` makes one swap submission at the connector level
+   (no NUT-19 replay). After a journaled attempt, treat a missing response or
+   a failure to complete and verify the swap as unresolved. Never retry a raw
+   swap merely because its response is missing or unusable.
+3. From the same or a reopened wallet, call
+   `cdk_wallet_recover_swap(handle, mint_url, saved_swap_request_json)`.
+   This read-only call queries input `Y`s with NUT-07 and uses NUT-09 restore
+   for the **exact** saved blinded outputs only if every input reports `SPENT`.
+   It never sends `/v1/swap`. On `CDK_STATUS_OK`, the JSON is:
+   `{"input_states":["SPENT", ...],"swap_response":{"signatures":[...]}}`.
+   States are in input order; the full response, if present, is ordered by the
+   original outputs. `swap_response` is `null` for any `UNSPENT`, `PENDING`
+   or mixed result, or if restore returned only a subset (including none).
+   Unavailable endpoints, deadlines, or inconsistent replies (e.g. duplicate
+   output, missing input state, wrong amount or keyset) return
+   `CDK_STATUS_NETWORK_ERROR` without usable evidence. Free the result strings
+   with `cdk_string_free`.
+4. Pass a non-null `swap_response` to `cdk_spilman_complete_funding_swap` or
+   `cdk_spilman_unblind_close_swap` with the saved material. These helpers
+   verify the DLEQ signatures against the original outputs and mint keys;
+   the recovery call itself only matches evidence, it does not verify DLEQ.
+   Durably commit the verified proofs and resulting channel state before
+   clearing the pending record. The recovery call can be repeated; it does not
+   import proofs, credit an account, or confirm that restored proofs are still
+   unspent.
+
+The FFI does not write a Spilman journal, enforce its locks or provide
+exactly-once settlement. Raw swaps obey existing wallet mutation gates but do
+not set them; wallet startup recovery, `cdk_wallet_recover`, and seed restore
+cannot recover this externally prepared operation. `UNSPENT` is a snapshot,
+not proof that an in-flight swap cannot commit later; `SPENT` alone does not
+identify which swap consumed the inputs. If the mint doesn't support the
+endpoints, no longer retains the signatures, or the exact material is missing,
+this path may not recover the funds. Keep unresolved records for reconciliation
+rather than automatically retrying, abandoning, reopening the channel, or
+crediting either party.
 
 ---
 

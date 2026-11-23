@@ -755,9 +755,10 @@ fn drawHud(
     vis: world.ChunkRange,
     cam: *const camera.Camera,
     settings: game_mod.DebugSettings,
+    hoe: ?game_mod.HoeView,
 ) void {
     const panel_w: i32 = 620;
-    const panel_h: i32 = 182;
+    const panel_h: i32 = if (hoe != null) 210 else 182;
     rl.drawRectangle(8, 8, panel_w, panel_h, hud_bg);
     rl.drawRectangleLines(8, 8, panel_w, panel_h, .dark_gray);
 
@@ -826,6 +827,55 @@ fn drawHud(
     hudLine(&buf, 160, "stream: {s}", .{
         if (stats.memory_pressure) "OUT OF MEMORY - incomplete, retrying visible first" else "ok",
     });
+    if (hoe) |channel| {
+        const y = 180;
+        const size = 14;
+        const left = 18;
+        const right = 8 + panel_w - 10;
+        const client_text = hoeBalanceText(&buf, "Client", channel.client, "confirmed", channel.payment_pending);
+        const client_end = left + rl.measureText(client_text, size);
+        rl.drawText(client_text, left, y, size, .light_gray);
+        const server_text = hoeBalanceText(&buf, "Server", channel.server, "accepted", false);
+        const server_start = right - rl.measureText(server_text, size);
+        rl.drawText(server_text, server_start, y, size, .light_gray);
+
+        const gap = 6;
+        const bar_width = @divTrunc(right - left - gap, 2);
+        drawHoeCapacity(left, y + 19, bar_width, channel.client);
+        drawHoeCapacity(left + bar_width + gap, y + 19, bar_width, channel.server);
+
+        if (channel.server) |server| if (channel.client) |client| {
+            const difference = @as(i128, server.accepted) - @as(i128, client.accepted);
+            if (difference != 0) {
+                const text = std.mem.printSentinel(&buf, "Delta: {d} msat{s}", .{ difference, if (server.stale or client.stale) " (stale)" else "" }, 0) catch unreachable;
+                const width = rl.measureText(text, size);
+                if (server_start - client_end >= width + 16) {
+                    rl.drawText(text, @divTrunc(client_end + server_start - width, 2), y, size, .orange);
+                }
+            }
+        };
+    }
+}
+
+fn drawHoeCapacity(x: i32, y: i32, width: i32, balance: ?game_mod.HoeBalance) void {
+    const height = 8;
+    rl.drawRectangle(x, y, width, height, .dark_gray);
+    const value = balance orelse return;
+    if (value.capacity == 0) return;
+    const remaining = value.capacity -| value.accepted;
+    const fill: i32 = @intCast(@as(u128, @intCast(width)) * remaining / value.capacity);
+    rl.drawRectangle(x, y, width, height, if (value.stale) .dark_gray else .gray);
+    rl.drawRectangle(x, y, fill, height, if (value.stale) .dark_green else .lime);
+}
+
+fn hoeBalanceText(buf: *[192]u8, side: []const u8, balance: ?game_mod.HoeBalance, label: []const u8, pending: bool) [:0]const u8 {
+    const pending_text = if (pending) " (pending)" else "";
+    return if (balance) |value|
+        std.mem.printSentinel(buf, "{s}: {d} {s} / {d} left (msat){s}{s}", .{
+            side, value.accepted, label, value.capacity -| value.accepted, if (value.stale) " (stale)" else "", pending_text,
+        }, 0) catch unreachable
+    else
+        std.mem.printSentinel(buf, "{s}: unknown{s}", .{ side, pending_text }, 0) catch unreachable;
 }
 
 fn onOff(v: bool) []const u8 {
@@ -1223,6 +1273,18 @@ fn drawWalletBadge(state: *const menu.Menu, vw: f32, vh: f32) void {
     rl.drawText(walletBadgeBalance(wallet), x, y + 20, 14, if (wallet.available) menu_text_color else menu_muted);
 }
 
+fn drawRefillNotice(viewport_w: f32, viewport_h: f32) void {
+    const message = "Hoe empty";
+    const width: f32 = @floatFromInt(rl.measureText(message, 16) + 24);
+    const height = 26;
+    const toolbar = game_mod.toolbarLayout(viewport_w, viewport_h) orelse return;
+    const above = if (game_mod.walletBadgeBounds(viewport_w, viewport_h)) |badge| @min(toolbar.bounds.y, badge.y) else toolbar.bounds.y;
+    const notice: menu.Rect = .{ .x = (viewport_w - width) / 2, .y = above - height - 8, .width = width, .height = height };
+    if (notice.x < 8 or notice.y < 8) return;
+    drawSolidRect(notice, hud_bg);
+    drawCenteredText(message, notice, 16, menu_text_color);
+}
+
 /// Draw one complete frame using only read-only state and the calculated view.
 /// The caller owns `beginDrawing`/`endDrawing` so presentation and the optional
 /// screenshot stay visible in `main`. The menu is last so its dim backdrop sits
@@ -1234,7 +1296,7 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
     drawWorld(&game.world, view, game.camera, game.settings.debug, game.player_pos, game.player_animation.frame(), resources, &game.cut_feedback);
     rl.endMode2D();
 
-    if (game.show_debug_hud) drawHud(&game.world, view.chunks, &game.camera, game.settings.debug);
+    if (game.show_debug_hud) drawHud(&game.world, view.chunks, &game.camera, game.settings.debug, if (game_mod.HoeFundingUi.supported) game.paid_hoe.view else null);
     if (view.minimap) |map| {
         const layout = minimapLayout(map, game.camera, viewport_w);
         drawTerrainMinimap(game, view.chunks, layout, &resources.minimap);
@@ -1251,6 +1313,8 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
     } else if (connected and !onboarding_blocked) {
         drawToolbar(game, viewport_w, viewport_h);
         drawWalletBadge(&game.menu, viewport_w, viewport_h);
+        const channel_visible = if (game_mod.HoeFundingUi.supported) game.paid_hoe.view.status != .hidden else false;
+        if (!channel_visible and game.cut_feedback.showRefillNotice()) drawRefillNotice(viewport_w, viewport_h);
     }
     if (model) |m| if (m.isBlocking()) {
         drawOnboarding(m, viewport_w, viewport_h);

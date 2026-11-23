@@ -49,8 +49,8 @@ url = "2"
 uuid = "1"
 # `O_NOFOLLOW` / `O_CLOEXEC` for the database open; already transitive.
 libc = "0.2"
-# Read-only marker precheck *before* upstream migrations run. Already
-# transitive through `cdk-sqlite`; no new SQL schema is introduced.
+# Wallet marker precheck and application-specific Spilman recovery metadata.
+# Already transitive through `cdk-sqlite`.
 rusqlite = { version = "0.31", features = ["bundled"] }
 # Best-effort scrubbing of stack copies of the seed. Already transitive.
 zeroize = "1"
@@ -65,7 +65,7 @@ bip39 = { version = "=2.2.2", features = ["rand", "zeroize"] }
 # stateless subset of its pure primitives plus a handful of CDK wallet
 # conversion helpers. The dependency is the upstream repository at the exact
 # release commit; no local crate copy or fork is used.
-cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels", rev = "8a5350dfd4d7c2902dc15c726a91dbfb2c793d43", default-features = false, features = ["wallet"] }
+cdk-spilman = { git = "https://github.com/SatsAndSports/cashu_spilman_channels", rev = "8a5350dfd4d7c2902dc15c726a91dbfb2c793d43", default-features = false, features = ["wallet", "client-sqlite", "configurable-host"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

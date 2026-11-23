@@ -1,25 +1,27 @@
 //! Gameplay-only SQLite storage. The caller serializes access and is responsible
 //! for passing authenticated public keys; this layer only stores their raw bytes.
 const std = @import("std");
+const sqlite = @import("native_storage").sqlite;
 const shared = @import("shared");
 const protocol = shared.protocol;
 const world = shared.world;
 const ChunkAddress = @import("chunk_address.zig").ChunkAddress;
 
-pub const User = struct { location: protocol.Location, channel_id: ?[32]u8 = null };
+pub const User = struct { location: protocol.Location, hoe_channel_id: ?[32]u8 = null };
 
 const users_ddl =
     \\CREATE TABLE {[table]s} (
     \\    pubkey BLOB NOT NULL PRIMARY KEY CHECK (typeof(pubkey) = 'blob' AND length(pubkey) = 33),
     \\    x INTEGER NOT NULL CHECK (typeof(x) = 'integer' AND x BETWEEN {[min_tile]d} AND {[max_tile]d}),
     \\    y INTEGER NOT NULL CHECK (typeof(y) = 'integer' AND y BETWEEN {[min_tile]d} AND {[max_tile]d}),
-    \\    channel_id BLOB CHECK (channel_id IS NULL OR (typeof(channel_id) = 'blob' AND length(channel_id) = 32))
+    \\    {[channel]s} BLOB CHECK ({[channel]s} IS NULL OR (typeof({[channel]s}) = 'blob' AND length({[channel]s}) = 32))
     \\) WITHOUT ROWID
 ;
 
 fn fullUsersDdl(comptime table: []const u8) [:0]const u8 {
     return std.fmt.comptimePrint(users_ddl, .{
         .table = table,
+        .channel = "hoe_channel_id",
         .min_tile = std.math.minInt(i32),
         .max_tile = std.math.maxInt(i32),
     });
@@ -28,6 +30,7 @@ fn fullUsersDdl(comptime table: []const u8) [:0]const u8 {
 // Exact sqlite_schema.sql for the unversioned, renderer-limited table.
 const narrow_users_ddl = std.fmt.comptimePrint(users_ddl, .{
     .table = "game_users",
+    .channel = "channel_id",
     .min_tile = -67108572,
     .max_tile = 67108555,
 });
@@ -37,7 +40,7 @@ pub const GameDb = struct {
     path: [:0]const u8,
 
     const load_chunk_sql = "SELECT bits FROM game_chunks WHERE cx = ?1 AND cy = ?2";
-    const load_user_sql = "SELECT x, y, channel_id FROM game_users WHERE pubkey = ?1";
+    const load_user_sql = "SELECT x, y, hoe_channel_id FROM game_users WHERE pubkey = ?1";
 
     /// Borrows path until close so a poisoned connection can be reopened.
     pub fn open(path: [:0]const u8) !GameDb {
@@ -46,28 +49,15 @@ pub const GameDb = struct {
     }
 
     fn openPath(path: [:0]const u8, create: bool) !GameDb {
-        var handle: ?*sqlite.Db = null;
-        errdefer if (handle) |db| {
-            _ = sqlite.sqlite3_close_v2(db);
-        };
-        const flags = sqlite.open_flags | if (create) sqlite.open_create else @as(c_int, 0);
-        try sqlite.check(sqlite.sqlite3_open_v2(path.ptr, &handle, flags, null), sqlite.ok);
-        const db = handle orelse return error.SqliteFailure;
-        // READWRITE can succeed by falling back to read-only on Unix.
-        switch (sqlite.sqlite3_db_readonly(db, "main")) {
-            0 => {},
-            1 => return error.SqliteReadOnly,
-            else => return error.SqliteFailure,
-        }
+        const db = sqlite.Db.open(path, .read_write_no_mutex, create) catch |err| return gameDbError(err);
         var self: GameDb = .{ .db = db, .path = path };
-        handle = null;
         errdefer self.close();
-        try self.initSchema(create);
+        self.initSchema(create) catch |err| return gameDbError(err);
         return self;
     }
 
     pub fn close(self: *GameDb) void {
-        if (self.db) |db| _ = sqlite.sqlite3_close_v2(db);
+        if (self.db) |db| db.close();
         self.* = undefined;
     }
 
@@ -93,7 +83,7 @@ pub const GameDb = struct {
         defer stmt.finalize();
         try stmt.bindBlob(1, &key);
         if (!try stmt.next()) return null;
-        const user = try stmt.user();
+        const user = try readUser(stmt);
         try stmt.finish();
         return user;
     }
@@ -108,10 +98,10 @@ pub const GameDb = struct {
 
     pub fn rollback(self: *GameDb) void {
         const db = self.db orelse return;
-        if (sqlite.sqlite3_get_autocommit(db) != 0) return;
+        if (db.autocommit()) return;
         self.exec("ROLLBACK") catch {
             // Discard the connection so nothing can later commit this failed batch.
-            _ = sqlite.sqlite3_close_v2(db);
+            db.close();
             self.db = null;
         };
     }
@@ -131,17 +121,17 @@ pub const GameDb = struct {
 
     pub fn saveUser(self: *GameDb, key: [33]u8, user: User) !void {
         const stmt = try self.prepare(
-            \\INSERT INTO game_users (pubkey, x, y, channel_id) VALUES (?1, ?2, ?3, ?4)
-            \\ON CONFLICT (pubkey) DO UPDATE SET x = excluded.x, y = excluded.y, channel_id = excluded.channel_id
+            \\INSERT INTO game_users (pubkey, x, y, hoe_channel_id) VALUES (?1, ?2, ?3, ?4)
+            \\ON CONFLICT (pubkey) DO UPDATE SET x = excluded.x, y = excluded.y, hoe_channel_id = excluded.hoe_channel_id
         );
         defer stmt.finalize();
         try stmt.bindBlob(1, &key);
         try stmt.bindInt(2, user.location.x);
         try stmt.bindInt(3, user.location.y);
-        if (user.channel_id) |*id| {
+        if (user.hoe_channel_id) |*id| {
             try stmt.bindBlob(4, id);
         } else {
-            try sqlite.check(sqlite.sqlite3_bind_null(stmt, 4), sqlite.ok);
+            try stmt.bindNull(4);
         }
         try stmt.finish();
     }
@@ -152,7 +142,7 @@ pub const GameDb = struct {
         try self.exec("BEGIN");
         errdefer self.rollback();
         if (try self.hasSchema()) {
-            try self.validateSchema();
+            const legacy = try self.validateSchema();
             const stmt = try self.prepare("SELECT id, seed, generator_version FROM game_meta");
             defer stmt.finalize();
             if (!try stmt.next() or try stmt.int(0) != 1) return error.InvalidGameDatabase;
@@ -160,8 +150,10 @@ pub const GameDb = struct {
             const version = try stmt.int(2);
             try stmt.finish();
             if (!std.mem.eql(u8, &seed, &world.public_seed) or version != world.generator_version) return error.WorldMismatch;
-            try self.validateRows();
-            try self.migrateNarrowUsers();
+            try self.validateRows(legacy);
+            if (legacy and !try self.migrateNarrowUsers()) {
+                try self.exec("ALTER TABLE game_users RENAME COLUMN channel_id TO hoe_channel_id");
+            }
         } else {
             if (!create) return error.InvalidGameDatabase;
             try self.exec(comptime std.fmt.comptimePrint(
@@ -189,12 +181,12 @@ pub const GameDb = struct {
         try self.commit();
     }
 
-    fn migrateNarrowUsers(self: *GameDb) !void {
+    fn migrateNarrowUsers(self: *GameDb) !bool {
         {
             const stmt = try self.prepare("SELECT sql FROM main.sqlite_schema WHERE type = 'table' AND name = 'game_users'");
             defer stmt.finalize();
             if (!try stmt.next()) return error.InvalidGameDatabase;
-            if (!stmt.textEquals(0, narrow_users_ddl)) return;
+            if (!stmt.textEquals(0, narrow_users_ddl)) return false;
             try stmt.finish();
         }
         {
@@ -210,18 +202,22 @@ pub const GameDb = struct {
             if (try deps.next()) return error.InvalidGameDatabase;
         }
         try self.exec(comptime fullUsersDdl("game_users_migrating") ++ ";" ++
-            \\INSERT INTO game_users_migrating (pubkey, x, y, channel_id)
+            \\INSERT INTO game_users_migrating (pubkey, x, y, hoe_channel_id)
             \\    SELECT pubkey, x, y, channel_id FROM game_users;
             \\DROP TABLE game_users;
             \\ALTER TABLE game_users_migrating RENAME TO game_users;
         );
+        return true;
     }
 
-    fn validateSchema(self: *GameDb) !void {
+    /// Returns whether the profile uses the legacy channel column name.
+    fn validateSchema(self: *GameDb) !bool {
         // A gameplay SELECT alone can compile against a view or a table without
         // the required primary key.
         const schema = try self.prepare(
-            \\WITH expected AS (VALUES
+            \\WITH legacy AS (
+            \\    SELECT EXISTS (SELECT 1 FROM pragma_table_xinfo('game_users', 'main') WHERE name = 'channel_id') AS present
+            \\), expected AS (VALUES
             \\    ('game_meta', 'id', 'INTEGER', 0, 1, 0),
             \\    ('game_meta', 'seed', 'BLOB', 1, 0, 0),
             \\    ('game_meta', 'generator_version', 'INTEGER', 1, 0, 0),
@@ -231,21 +227,23 @@ pub const GameDb = struct {
             \\    ('game_users', 'pubkey', 'BLOB', 1, 1, 0),
             \\    ('game_users', 'x', 'INTEGER', 1, 0, 0),
             \\    ('game_users', 'y', 'INTEGER', 1, 0, 0),
-            \\    ('game_users', 'channel_id', 'BLOB', 0, 0, 0)
+            \\    ('game_users', CASE (SELECT present FROM legacy) WHEN 1 THEN 'channel_id' ELSE 'hoe_channel_id' END, 'BLOB', 0, 0, 0)
             \\), actual AS (
             \\    SELECT s.name, p.name, upper(p.type), p."notnull", p.pk, p.hidden
             \\    FROM main.sqlite_master AS s CROSS JOIN pragma_table_xinfo(s.name, 'main') AS p
             \\    WHERE s.type = 'table' AND s.name IN ('game_meta', 'game_chunks', 'game_users')
             \\)
             \\SELECT NOT EXISTS (SELECT * FROM expected EXCEPT SELECT * FROM actual)
-            \\   AND NOT EXISTS (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+            \\   AND NOT EXISTS (SELECT * FROM actual EXCEPT SELECT * FROM expected), present FROM legacy
         );
         defer schema.finalize();
         if (!try schema.next() or try schema.int(0) != 1) return error.InvalidGameDatabase;
+        const legacy = try schema.int(1) != 0;
         try schema.finish();
+        return legacy;
     }
 
-    fn validateRows(self: *GameDb) !void {
+    fn validateRows(self: *GameDb, legacy: bool) !void {
         const integrity = try self.prepare("PRAGMA integrity_check(1)");
         defer integrity.finalize();
         if (!try integrity.next() or !integrity.textEquals(0, "ok")) return error.InvalidGameDatabase;
@@ -259,10 +257,13 @@ pub const GameDb = struct {
             if (!chunkCoordsValid(try chunks.int(0), try chunks.int(1))) return error.InvalidGameDatabase;
             _ = try chunks.blob(32, 2);
         }
-        const users = try self.prepare("SELECT x, y, channel_id, pubkey FROM game_users");
+        const users = try self.prepare(if (legacy)
+            "SELECT x, y, channel_id, pubkey FROM game_users"
+        else
+            "SELECT x, y, hoe_channel_id, pubkey FROM game_users");
         defer users.finalize();
         while (try users.next()) {
-            _ = try users.user();
+            _ = try readUser(users);
             _ = try users.blob(33, 3);
         }
     }
@@ -283,14 +284,12 @@ pub const GameDb = struct {
 
     fn exec(self: *GameDb, sql: [*:0]const u8) !void {
         const db = self.db orelse return error.GameDatabasePoisoned;
-        try sqlite.check(sqlite.sqlite3_exec(db, sql, null, null, null), sqlite.ok);
+        try db.exec(sql);
     }
 
     fn prepare(self: *GameDb, sql: [*:0]const u8) !*sqlite.Stmt {
         const db = self.db orelse return error.GameDatabasePoisoned;
-        var stmt: ?*sqlite.Stmt = null;
-        try sqlite.check(sqlite.sqlite3_prepare_v2(db, sql, -1, &stmt, null), sqlite.ok);
-        return stmt orelse error.SqliteFailure;
+        return db.prepare(sql);
     }
 };
 
@@ -299,111 +298,19 @@ fn chunkCoordsValid(cx: i64, cy: i64) bool {
         cy >= protocol.min_chunk and cy <= protocol.max_chunk;
 }
 
-// Small stable subset of the sqlite3.h ABI.
-const sqlite = struct {
-    const Db = opaque {};
-    const Stmt = opaque {
-        fn finalize(self: *Stmt) void {
-            // finalize can repeat a step error, which the caller already checked.
-            _ = sqlite3_finalize(self);
-        }
-
-        fn bindInt(self: *Stmt, index: c_int, value: i64) !void {
-            try check(sqlite3_bind_int64(self, index, value), ok);
-        }
-
-        fn bindBlob(self: *Stmt, index: c_int, value: []const u8) !void {
-            // SQLITE_TRANSIENT asks SQLite to copy the bound bytes immediately.
-            try check(sqlite3_bind_blob(self, index, value.ptr, @intCast(value.len), @ptrFromInt(std.math.maxInt(usize))), ok);
-        }
-
-        fn next(self: *Stmt) !bool {
-            const rc = sqlite3_step(self);
-            if (rc == row) return true;
-            try check(rc, done);
-            return false;
-        }
-
-        fn finish(self: *Stmt) !void {
-            if (try self.next()) return error.InvalidGameDatabase;
-        }
-
-        fn int(self: *Stmt, column: c_int) !i64 {
-            if (sqlite3_column_type(self, column) != integer_type) return error.InvalidGameDatabase;
-            return sqlite3_column_int64(self, column);
-        }
-
-        fn textEquals(self: *Stmt, column: c_int, expected: []const u8) bool {
-            if (sqlite3_column_type(self, column) != text_type) return false;
-            const text = sqlite3_column_text(self, column) orelse return false;
-            const len: usize = @intCast(sqlite3_column_bytes(self, column));
-            return std.mem.eql(u8, text[0..len], expected);
-        }
-
-        fn int32(self: *Stmt, column: c_int) !i32 {
-            return std.math.cast(i32, try self.int(column)) orelse error.InvalidGameDatabase;
-        }
-
-        fn user(self: *Stmt) !User {
-            return .{
-                .location = .{ .x = try self.int32(0), .y = try self.int32(1) },
-                .channel_id = if (sqlite3_column_type(self, 2) == null_type) null else try self.blob(32, 2),
-            };
-        }
-
-        fn blob(self: *Stmt, comptime len: usize, column: c_int) ![len]u8 {
-            if (sqlite3_column_type(self, column) != blob_type) return error.InvalidGameDatabase;
-            const data = sqlite3_column_blob(self, column);
-            if (sqlite3_column_bytes(self, column) != len) return error.InvalidGameDatabase;
-            return (data orelse return error.InvalidGameDatabase)[0..len].*;
-        }
+fn readUser(stmt: *sqlite.Stmt) !User {
+    return .{
+        .location = .{
+            .x = std.math.cast(i32, try stmt.int(0)) orelse return error.InvalidGameDatabase,
+            .y = std.math.cast(i32, try stmt.int(1)) orelse return error.InvalidGameDatabase,
+        },
+        .hoe_channel_id = if (stmt.isNull(2)) null else try stmt.blob(32, 2),
     };
+}
 
-    const ok = 0;
-    const row = 100;
-    const done = 101;
-    const integer_type = 1;
-    const text_type = 3;
-    const blob_type = 4;
-    const null_type = 5;
-    const open_flags = 0x02 | 0x8000; // READWRITE | NOMUTEX
-    const open_create: c_int = 0x04;
-    const Destructor = *const fn (?*anyopaque) callconv(.c) void;
-    const ExecCallback = *const fn (?*anyopaque, c_int, [*c][*c]u8, [*c][*c]u8) callconv(.c) c_int;
-
-    fn check(rc: c_int, expected: c_int) !void {
-        if (rc == expected) return;
-        // Mask extended result codes to preserve the same error categories.
-        return switch (rc & 0xff) {
-            5, 6 => error.SqliteBusy,
-            7 => error.OutOfMemory,
-            8 => error.SqliteReadOnly,
-            10 => error.SqliteIo,
-            11, 26 => error.InvalidGameDatabase,
-            13 => error.SqliteFull,
-            14 => error.SqliteCannotOpen,
-            19 => error.SqliteConstraint,
-            else => error.SqliteFailure,
-        };
-    }
-
-    extern "c" fn sqlite3_open_v2([*:0]const u8, *?*Db, c_int, ?[*:0]const u8) c_int;
-    extern "c" fn sqlite3_close_v2(*Db) c_int;
-    extern "c" fn sqlite3_db_readonly(*Db, [*:0]const u8) c_int;
-    extern "c" fn sqlite3_exec(*Db, [*:0]const u8, ?ExecCallback, ?*anyopaque, ?*?[*:0]u8) c_int;
-    extern "c" fn sqlite3_get_autocommit(*Db) c_int;
-    extern "c" fn sqlite3_prepare_v2(*Db, [*:0]const u8, c_int, *?*Stmt, ?*[*:0]const u8) c_int;
-    extern "c" fn sqlite3_finalize(*Stmt) c_int;
-    extern "c" fn sqlite3_step(*Stmt) c_int;
-    extern "c" fn sqlite3_bind_int64(*Stmt, c_int, i64) c_int;
-    extern "c" fn sqlite3_bind_blob(*Stmt, c_int, *const anyopaque, c_int, ?Destructor) c_int;
-    extern "c" fn sqlite3_bind_null(*Stmt, c_int) c_int;
-    extern "c" fn sqlite3_column_type(*Stmt, c_int) c_int;
-    extern "c" fn sqlite3_column_int64(*Stmt, c_int) i64;
-    extern "c" fn sqlite3_column_text(*Stmt, c_int) ?[*]const u8;
-    extern "c" fn sqlite3_column_blob(*Stmt, c_int) ?[*]const u8;
-    extern "c" fn sqlite3_column_bytes(*Stmt, c_int) c_int;
-};
+fn gameDbError(err: anyerror) anyerror {
+    return if (err == error.InvalidSqliteData) error.InvalidGameDatabase else err;
+}
 
 const testing = std.testing;
 
@@ -421,7 +328,7 @@ test "game database persists committed chunks and users across reopen" {
     const key: [33]u8 = @splat(0xa5);
     var other_key = key;
     other_key[32] = 0;
-    const user: User = .{ .location = .{ .x = -2, .y = std.math.maxInt(i32) }, .channel_id = @splat(0xbc) };
+    const user: User = .{ .location = .{ .x = -2, .y = std.math.maxInt(i32) }, .hoe_channel_id = @splat(0xbc) };
     const other: User = .{ .location = .{ .x = 1, .y = std.math.minInt(i32) } };
     const bits: [32]u8 = @splat(0x41);
 
@@ -528,9 +435,10 @@ test "game database rejects incomplete or invalid gameplay tables without changi
     for ([_][:0]const u8{
         "DROP TABLE game_chunks",
         "DROP TABLE game_users",
-        "ALTER TABLE game_users RENAME COLUMN channel_id TO wrong_name",
+        "ALTER TABLE game_users RENAME COLUMN hoe_channel_id TO wrong_name",
+        "ALTER TABLE game_users ADD COLUMN channel_id BLOB",
         "DROP TABLE game_chunks; CREATE TABLE game_chunks (cx INTEGER NOT NULL, cy INTEGER NOT NULL, bits BLOB NOT NULL)",
-        "DROP TABLE game_users; CREATE VIEW game_users AS SELECT zeroblob(33) AS pubkey, 0 AS x, 0 AS y, NULL AS channel_id",
+        "DROP TABLE game_users; CREATE VIEW game_users AS SELECT zeroblob(33) AS pubkey, 0 AS x, 0 AS y, NULL AS hoe_channel_id",
         "DROP TABLE game_users;" ++ narrow_users_ddl ++ "; CREATE INDEX custom_index ON game_users (x)",
         "DROP TABLE game_users;" ++ narrow_users_ddl ++ "; CREATE TABLE custom (key REFERENCES GAME_USERS(pubkey) ON DELETE CASCADE)",
     }) |sql| {
@@ -574,7 +482,7 @@ const legacy_users =
     \\  pubkey BLOB NOT NULL PRIMARY KEY CHECK (typeof(pubkey) = 'blob' AND length(pubkey) = 33),
     \\  x INTEGER NOT NULL CHECK (typeof(x) = 'integer' AND x BETWEEN -2147483648 AND 2147483647),
     \\  y INTEGER NOT NULL CHECK (typeof(y) = 'integer' AND y BETWEEN -2147483648 AND 2147483647),
-    \\  channel_id BLOB CHECK (channel_id IS NULL OR (typeof(channel_id) = 'blob' AND length(channel_id) = 32))
+    \\  hoe_channel_id BLOB CHECK (hoe_channel_id IS NULL OR (typeof(hoe_channel_id) = 'blob' AND length(hoe_channel_id) = 32))
     \\) WITHOUT ROWID;
 ;
 
@@ -607,29 +515,34 @@ test "game database migrates the narrow user table on startup and recovery open"
         defer testing.allocator.free(path);
         const key: [33]u8 = @splat(0x42);
         const other_key: [33]u8 = @splat(0x43);
-        const user: User = .{ .location = .{ .x = -67108572, .y = 67108555 }, .channel_id = @splat(0x24) };
+        const user: User = .{ .location = .{ .x = -67108572, .y = 67108555 }, .hoe_channel_id = @splat(0x24) };
         const other: User = .{ .location = .{ .x = 23, .y = -42 } };
         const address: ChunkAddress = .{ .cx = protocol.min_chunk, .cy = protocol.max_chunk };
         const bits: [32]u8 = @splat(0x81);
         {
             var old = try GameDb.open(path);
             defer old.close();
-            try old.exec("DROP TABLE game_users;" ++ narrow_users_ddl);
+            try old.exec("DROP TABLE game_users;" ++ narrow_users_ddl ++ "; ALTER TABLE game_users RENAME COLUMN channel_id TO hoe_channel_id");
             try old.saveChunk(address, bits);
             try old.saveUser(key, user);
             try old.saveUser(other_key, other);
             try testing.expectError(error.SqliteConstraint, old.saveUser(key, full_range_user));
+            try old.exec("ALTER TABLE game_users RENAME COLUMN hoe_channel_id TO channel_id");
             if (recover) {
                 // A reader can block COMMIT after the replacement table was built.
                 // The failed open must roll back both the table and its contents.
                 try old.exec("BEGIN");
-                try testing.expectEqualDeep(user, (try old.loadUser(key)).?);
+                try old.exec("SELECT channel_id FROM game_users");
                 var poisoned: GameDb = .{ .db = null, .path = path };
                 try testing.expectError(error.SqliteBusy, poisoned.reopenIfPoisoned());
                 try testing.expect(poisoned.db == null);
                 old.rollback();
-                try testing.expectError(error.SqliteConstraint, old.saveUser(key, full_range_user));
-                try testing.expectEqualDeep(user, (try old.loadUser(key)).?);
+                try testing.expectError(error.SqliteConstraint, old.exec("UPDATE game_users SET x = 2147483647"));
+                const stmt = try old.prepare("SELECT x, y, channel_id FROM game_users WHERE pubkey = ?1");
+                defer stmt.finalize();
+                try stmt.bindBlob(1, &key);
+                try testing.expect(try stmt.next());
+                try testing.expectEqualDeep(user, try readUser(stmt));
             }
         }
         {
@@ -639,13 +552,13 @@ test "game database migrates the narrow user table on startup and recovery open"
             try testing.expectEqualDeep(user, (try db.loadUser(key)).?);
             try testing.expectEqualDeep(other, (try db.loadUser(other_key)).?);
             try testing.expectEqual(bits, (try db.loadChunk(address)).?);
-            try db.saveUser(key, .{ .location = full_range_user.location, .channel_id = user.channel_id });
+            try db.saveUser(key, .{ .location = full_range_user.location, .hoe_channel_id = user.hoe_channel_id });
             try expectUserChecks(&db);
         }
         try expectOpenUnchanged(&tmp, path);
         var db = try GameDb.open(path);
         defer db.close();
-        try testing.expectEqualDeep(User{ .location = full_range_user.location, .channel_id = user.channel_id }, (try db.loadUser(key)).?);
+        try testing.expectEqualDeep(User{ .location = full_range_user.location, .hoe_channel_id = user.hoe_channel_id }, (try db.loadUser(key)).?);
     }
 }
 
@@ -657,7 +570,7 @@ test "game database retains legacy schema compatibility and enforces coordinate 
         defer testing.allocator.free(path);
         const address: ChunkAddress = .{ .cx = protocol.min_chunk, .cy = protocol.max_chunk };
         const key: [33]u8 = @splat(0);
-        const user = full_range_user;
+        const user: User = .{ .location = full_range_user.location, .hoe_channel_id = @splat(0x25) };
         const bits: [32]u8 = @splat(0xff);
         {
             var db = try GameDb.open(path);
@@ -665,9 +578,9 @@ test "game database retains legacy schema compatibility and enforces coordinate 
             if (legacy) try db.exec(legacy_chunks ++ legacy_users);
             try db.saveChunk(address, bits);
             try db.saveUser(key, user);
+            if (legacy) try db.exec("ALTER TABLE game_users RENAME COLUMN hoe_channel_id TO channel_id");
         }
 
-        try expectOpenUnchanged(&tmp, path);
         var db = try GameDb.open(path);
         defer db.close();
         try testing.expectEqual(bits, (try db.loadChunk(address)).?);
@@ -681,10 +594,11 @@ test "game database retains legacy schema compatibility and enforces coordinate 
             }
         }
         try expectUserChecks(&db);
+        try expectOpenUnchanged(&tmp, path);
     }
 }
 
-const unchecked_users = "DROP TABLE game_users; CREATE TABLE game_users (pubkey BLOB NOT NULL PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL, channel_id BLOB) WITHOUT ROWID;";
+const unchecked_users = "DROP TABLE game_users; CREATE TABLE game_users (pubkey BLOB NOT NULL PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL, hoe_channel_id BLOB) WITHOUT ROWID;";
 
 test "game database startup rejects malformed gameplay rows without rewriting" {
     for ([_][:0]const u8{

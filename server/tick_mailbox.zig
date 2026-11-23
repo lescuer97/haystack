@@ -99,6 +99,9 @@ pub const Dispatcher = struct {
         if (session == null) {
             close = true;
             box.len = application.encodeCommonFailure(&box.reply, work.request, .invalid_request).len;
+        } else if (work.request.operation == .cut and app.needsHoeCut(work.request.operation.cut)) {
+            // The tick, including copied legacy replays, cannot authorize hoe cuts.
+            box.len = application.encodeCommonFailure(&box.reply, work.request, .invalid_request).len;
         } else if (work.cut_replay) |outcome| {
             const req: p.RequestFor(.cut) = .{ .request_id = work.request.request_id, .payload = work.request.operation.cut };
             box.len = (shared.wire.encodeReply(&box.reply, .cut, req, outcome) catch unreachable).len;
@@ -110,7 +113,7 @@ pub const Dispatcher = struct {
                 const bytes = shared.wire.encodeReply(&box.reply, .update_location, req, outcome) catch unreachable;
                 box.len = bytes.len;
             },
-            .channel_requirements, .channel_open, .channel_payment, .channel_close => unreachable,
+            .channel_requirements, .channel_open, .channel_close, .channel_status => unreachable,
             inline .cut, .read_area => |payload, kind| {
                 if (app.lease()) |context| {
                     defer app.release(context);

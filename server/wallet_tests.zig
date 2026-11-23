@@ -1,7 +1,8 @@
 //! Real persistent CDK wallet and volatile world, isolated filesystem only.
 const std = @import("std");
 const native = @import("native_storage");
-const server_wallet = @import("wallet.zig");
+const wallet_service = native.wallet_service;
+const openWallet = wallet_service.Headless.testing.openOffline;
 const app = @import("app.zig");
 const t = std.testing;
 const sf = native.storage_fs;
@@ -57,13 +58,13 @@ test "headless fresh world restart preserves borrowed wallet owner" {
     defer lock.release(t.io);
     sync_home = std.fs.path.dirname(home.locations.standard_parents[0]).?;
     sync_seen = 0;
-    server_wallet.testSyncObserver = observeSync;
+    wallet_service.testSyncObserver = observeSync;
     defer {
-        server_wallet.testSyncObserver = null;
+        wallet_service.testSyncObserver = null;
         sync_home = "";
     }
     try t.expectError(error.AlreadyRunning, native.instance_lock.acquire(t.io, home.locations.config_dir));
-    var wallet = try server_wallet.open(t.io, t.allocator, home.locations);
+    var wallet = try openWallet(t.io, t.allocator, home.locations, null);
     defer wallet.close() catch {};
     try t.expectEqual(@as(u8, 31), sync_seen);
     const fingerprint = try home.seedHash();
@@ -77,13 +78,12 @@ test "headless fresh world restart preserves borrowed wallet owner" {
         defer application.deinit();
         try t.expect(application.wallet == null);
         application.wallet = &wallet;
-        try t.expectEqual(try wallet.borrowHandle(), try application.wallet.?.borrowHandle());
+        try t.expectEqual(&wallet, application.wallet.?);
         _ = try application.context.state.cut(@import("world_state.zig").request(0, 0, 0));
         try t.expectEqual(@as(usize, 1), application.context.state.replay_count);
     }
-    _ = try wallet.borrowHandle(); // App did not close its borrowed wallet.
     // Wallet remains locked and usable after application teardown.
-    try t.expectError(error.CdkFailure, server_wallet.open(t.io, t.allocator, home.locations));
+    try t.expectError(error.CdkFailure, openWallet(t.io, t.allocator, home.locations, null));
     try wallet.close();
     {
         var application = try app.App.init(t.io, buffers);
@@ -92,12 +92,11 @@ test "headless fresh world restart preserves borrowed wallet owner" {
         try t.expectEqual(@as(usize, 0), application.context.state.replay_count);
     }
     sync_seen = 0;
-    wallet = try server_wallet.open(t.io, t.allocator, home.locations);
+    wallet = try openWallet(t.io, t.allocator, home.locations, null);
     try t.expectEqual(@as(u8, 31), sync_seen);
     try t.expectEqual(fingerprint, try home.seedHash());
     try t.expectEqual(inode, (try std.Io.Dir.cwd().statFile(t.io, paths.db_path, .{})).inode);
     try wallet.close();
-    try t.expectError(error.WalletClosed, wallet.borrowHandle());
     // No client settings/content/onboarding artifacts were created.
     try t.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(t.io, home.locations.config_path, .{}));
     try t.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(t.io, home.locations.content_dir, .{}));
@@ -107,7 +106,7 @@ test "headless unknown commit and ancestor failures preserve pair for restart" {
     defer {
         native.wallet.testFailCommitSync = false;
         native.wallet.testFailAncestorSync = false;
-        server_wallet.testFailParentSyncPath = null;
+        wallet_service.testFailParentSyncPath = null;
     }
     for (0..3) |failure| {
         var home = try Home.init();
@@ -116,15 +115,15 @@ test "headless unknown commit and ancestor failures preserve pair for restart" {
         defer lock.release(t.io);
         native.wallet.testFailCommitSync = failure == 0;
         native.wallet.testFailAncestorSync = failure == 1;
-        server_wallet.testFailParentSyncPath = if (failure == 2) std.fs.path.dirname(home.locations.standard_parents[0]).? else null;
+        wallet_service.testFailParentSyncPath = if (failure == 2) std.fs.path.dirname(home.locations.standard_parents[0]).? else null;
         if (failure == 2) {
-            try t.expectError(error.SyncFailed, server_wallet.open(t.io, t.allocator, home.locations));
-        } else try t.expectError(error.WalletDurabilityUnknown, server_wallet.open(t.io, t.allocator, home.locations));
+            try t.expectError(error.SyncFailed, openWallet(t.io, t.allocator, home.locations, null));
+        } else try t.expectError(error.WalletDurabilityUnknown, openWallet(t.io, t.allocator, home.locations, null));
         const fingerprint = try home.seedHash();
         native.wallet.testFailCommitSync = false;
         native.wallet.testFailAncestorSync = false;
-        server_wallet.testFailParentSyncPath = null;
-        var wallet = try server_wallet.open(t.io, t.allocator, home.locations);
+        wallet_service.testFailParentSyncPath = null;
+        var wallet = try openWallet(t.io, t.allocator, home.locations, null);
         defer wallet.close() catch {};
         try t.expectEqual(fingerprint, try home.seedHash());
         try t.expectError(error.AlreadyRunning, native.instance_lock.acquire(t.io, home.locations.config_dir));
@@ -152,7 +151,7 @@ test "headless empty partial invalid and insecure wallets fail without repair" {
             .flags = .{ .permissions = if (kind == 3) .fromMode(0o644) else sf.mode_file },
         });
         const before = try std.Io.Dir.cwd().statFile(t.io, paths.dir, .{});
-        if (server_wallet.open(t.io, t.allocator, home.locations)) |value| {
+        if (openWallet(t.io, t.allocator, home.locations, null)) |value| {
             var unexpected = value;
             defer unexpected.close() catch {};
             return error.UnexpectedWallet;
@@ -178,4 +177,114 @@ test "headless empty partial invalid and insecure wallets fail without repair" {
             try t.expectEqual(@as(u32, if (kind == 3) 0o644 else 0o600), sf.modeOf(try std.Io.Dir.cwd().statFile(t.io, paths.db_path, .{})));
         }
     }
+}
+
+test "headless Testnut startup provisions once and reopens the same wallet and ledger offline" {
+    if (wallet_service.fixture_mint != null) return;
+    var home = try Home.init();
+    defer home.deinit();
+    var lock = try native.instance_lock.acquire(t.io, home.locations.config_dir);
+    defer lock.release(t.io);
+    const a = t.allocator;
+    const data_dir = std.fs.path.dirname(home.locations.wallet_dir).?;
+    const fixture_dir = try std.fs.path.join(a, &.{ data_dir, "hoe-fixture" });
+    defer a.free(fixture_dir);
+    try sf.ensureOwnedDir(t.io, data_dir);
+    try sf.ensureOwnedDir(t.io, fixture_dir);
+    const ledger_path = try std.fs.path.joinZ(a, &.{ data_dir, "hoe-testnut", "channels.sqlite" });
+    defer a.free(ledger_path);
+    const week = 7 * 24 * 60 * 60;
+    const receiver_key = blk: {
+        var wallet = try openWallet(t.io, a, home.locations, null);
+        defer wallet.close() catch {};
+        const db = try native.sqlite.Db.open(ledger_path, .read_write_no_follow, false);
+        defer db.close();
+        const meta = try db.prepare("SELECT mint FROM hoe_meta WHERE id=1");
+        defer meta.finalize();
+        try t.expect(try meta.next());
+        try t.expectEqualStrings("https://testnut.cashu.space", try meta.blobSlice(0));
+        break :blk wallet.receiverPubkey(week) orelse return error.TestMissingReceiver;
+    };
+    const fingerprint = try home.seedHash();
+    const inode = (try std.Io.Dir.cwd().statFile(t.io, ledger_path, .{})).inode;
+
+    var wallet = try openWallet(t.io, a, home.locations, null);
+    defer wallet.close() catch {};
+    try t.expectEqual(receiver_key, wallet.receiverPubkey(week).?);
+    try t.expectEqual(fingerprint, try home.seedHash());
+    try t.expectEqual(inode, (try std.Io.Dir.cwd().statFile(t.io, ledger_path, .{})).inode);
+}
+
+test "headless Testnut startup never repairs an existing ledger directory or creates a replacement wallet" {
+    if (wallet_service.fixture_mint != null) return;
+    var home = try Home.init();
+    defer home.deinit();
+    var lock = try native.instance_lock.acquire(t.io, home.locations.config_dir);
+    defer lock.release(t.io);
+    const a = t.allocator;
+    const data_dir = std.fs.path.dirname(home.locations.wallet_dir).?;
+    const ledger_dir = try std.fs.path.join(a, &.{ data_dir, "hoe-testnut" });
+    defer a.free(ledger_dir);
+    const ledger_path = try std.fs.path.join(a, &.{ ledger_dir, "channels.sqlite" });
+    defer a.free(ledger_path);
+    const cwd = std.Io.Dir.cwd();
+
+    // Simulate a wallet-only install whose ledger directory was then left incomplete.
+    {
+        var wallet = try openWallet(t.io, a, home.locations, null);
+        try wallet.close();
+    }
+    const fingerprint = try home.seedHash();
+    try cwd.deleteFile(t.io, ledger_path);
+    try t.expectError(error.FileNotFound, openWallet(t.io, a, home.locations, null));
+    try t.expectError(error.FileNotFound, cwd.statFile(t.io, ledger_path, .{}));
+
+    try cwd.writeFile(t.io, .{ .sub_path = ledger_path, .data = "", .flags = .{ .permissions = sf.mode_file } });
+    try t.expectError(error.InvalidChannelDatabase, openWallet(t.io, a, home.locations, null));
+    try t.expectEqual(@as(u64, 0), (try cwd.statFile(t.io, ledger_path, .{})).size);
+    try t.expectEqual(fingerprint, try home.seedHash());
+
+    try cwd.deleteTree(t.io, home.locations.wallet_dir);
+    try t.expectError(error.FileNotFound, openWallet(t.io, a, home.locations, null));
+    try t.expectError(error.FileNotFound, cwd.statFile(t.io, home.locations.wallet_dir, .{}));
+}
+
+test "headless fixture restart preserves receiver identity and pending ledger rows" {
+    var home = try Home.init();
+    defer home.deinit();
+    var lock = try native.instance_lock.acquire(t.io, home.locations.config_dir);
+    defer lock.release(t.io);
+    if (wallet_service.fixture_mint == null) {
+        try t.expectError(error.HoeRequiresFixtureMint, openWallet(t.io, t.allocator, home.locations, .provision));
+        return;
+    }
+
+    {
+        var wallet = try openWallet(t.io, t.allocator, home.locations, null);
+        defer wallet.close() catch {};
+        try t.expect(!wallet.hasReceiver());
+    }
+    try t.expectError(error.FileNotFound, openWallet(t.io, t.allocator, home.locations, .existing));
+    const a = t.allocator;
+    const ledger_path = try std.fs.path.joinZ(a, &.{ std.fs.path.dirname(home.locations.wallet_dir).?, "hoe-fixture", "channels.sqlite" });
+    defer a.free(ledger_path);
+    const week = 7 * 24 * 60 * 60;
+    const receiver_key = blk: {
+        var wallet = try openWallet(t.io, a, home.locations, .provision);
+        defer wallet.close() catch {};
+        const db = try native.sqlite.Db.open(ledger_path, .read_write_no_follow, false);
+        defer db.close();
+        try db.exec("INSERT INTO hoe_channel (id,owner,expiry,capacity,params,keyset,proofs,balance,signature,pending) VALUES (zeroblob(32),zeroblob(33),3600,100,X'00',X'00',X'00',5,zeroblob(64),X'01')");
+        break :blk wallet.receiverPubkey(week).?;
+    };
+    try t.expectError(error.PathAlreadyExists, openWallet(t.io, a, home.locations, .provision));
+
+    var wallet = try openWallet(t.io, a, home.locations, .existing);
+    defer wallet.close() catch {};
+    try t.expectEqual(receiver_key, wallet.receiverPubkey(week).?);
+    const channels = wallet.tryAcquire() orelse return error.TestWalletBusy;
+    defer channels.release();
+    const info = (try channels.lookup(@splat(0), @splat(0), 1)).?;
+    try t.expectEqual(wallet_service.ChannelPhase.settlement_pending, info.phase);
+    try t.expectEqual(@as(u64, 5), info.balance_msat);
 }

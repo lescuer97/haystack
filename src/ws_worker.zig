@@ -1,5 +1,5 @@
 //! Desktop-only connection owner. The frame thread exchanges bounded state
-//! and bounded gameplay mailboxes with the worker; it never performs socket I/O or signing.
+//! and bounded command mailboxes with the worker; it never performs socket I/O or signing.
 const std = @import("std");
 const ws = @import("websocket");
 const shared = @import("shared");
@@ -9,12 +9,111 @@ const wallet = @import("wallet.zig");
 const ws_auth = @import("ws_auth.zig");
 
 const poll_ms = 20;
+const max_ws_response_bytes = @max(protocol.max_response_bytes, protocol.max_channel_status_reply_bytes, wire.max_auth_reply_bytes, wire.channel_settled_bytes);
 const endpoint = "127.0.0.1";
 const port = 9224;
+const authority = std.fmt.comptimePrint("{s}:{d}", .{ endpoint, port });
+pub const endpoint_url = "ws://" ++ authority ++ "/";
 
 const sync = @import("ws_sync.zig");
 const Status = sync.Status;
 const Snapshot = sync.Snapshot;
+pub const HoeChannel = struct {
+    id: [32]u8,
+    capacity_msats: u64,
+    balance_msats: u64,
+    player: [33]u8,
+};
+const Restored = struct { location: protocol.Location, hoe_channel: ?HoeChannel = null, player: ?[33]u8 = null };
+pub const HoeLogin = struct { player: [33]u8, channel: ?HoeChannel };
+
+pub const ChannelStatusOutcome = union(enum) {
+    ok: struct {
+        capacity_msat: u64,
+        balance_msat: u64,
+        phase: protocol.ChannelPhase,
+        len: usize = 0,
+        bytes: [protocol.max_sender_change_proofs_bytes]u8 = undefined,
+    },
+    failed: protocol.ChannelStatusFailure,
+
+    fn init(decoded: protocol.Outcome(.channel_status)) ChannelStatusOutcome {
+        switch (decoded) {
+            .failed => |failure| return .{ .failed = failure },
+            .ok => |status| {
+                var result: ChannelStatusOutcome = .{ .ok = .{
+                    .capacity_msat = status.capacity_msat,
+                    .balance_msat = status.balance_msat,
+                    .phase = status.phase,
+                } };
+                if (status.sender_proofs) |bytes| {
+                    result.ok.len = bytes.len;
+                    @memcpy(result.ok.bytes[0..bytes.len], bytes);
+                }
+                return result;
+            },
+        }
+    }
+
+    /// The proof slice, if present, borrows only this instance's storage.
+    pub fn view(self: *const ChannelStatusOutcome) protocol.Outcome(.channel_status) {
+        return switch (self.*) {
+            .ok => |*status| .{ .ok = .{
+                .capacity_msat = status.capacity_msat,
+                .balance_msat = status.balance_msat,
+                .phase = status.phase,
+                .sender_proofs = if (status.len == 0) null else status.bytes[0..status.len],
+            } },
+            .failed => |failure| .{ .failed = failure },
+        };
+    }
+};
+
+pub const ChannelCompletion = struct {
+    request_id: protocol.Id,
+    outcome: Outcome,
+
+    pub const Outcome = union(enum) {
+        channel_requirements: protocol.Outcome(.channel_requirements),
+        channel_open: protocol.Outcome(.channel_open),
+        channel_close: protocol.Outcome(.channel_close),
+        channel_status: ChannelStatusOutcome,
+    };
+};
+
+const ChannelRequest = struct {
+    session: u64,
+    id: protocol.Id,
+    kind: protocol.Kind,
+    len: usize,
+
+    fn decode(self: ChannelRequest, bytes: []const u8, scratch: *protocol.Snapshot) !ChannelCompletion {
+        const outcome: ChannelCompletion.Outcome = switch (self.kind) {
+            inline .channel_requirements, .channel_open, .channel_close => |kind| @unionInit(ChannelCompletion.Outcome, @tagName(kind), try wire.decodeReply(bytes, kind, self.id, scratch)),
+            .channel_status => .{ .channel_status = .init(try wire.decodeReply(bytes, .channel_status, self.id, scratch)) },
+            else => unreachable,
+        };
+        return .{ .request_id = self.id, .outcome = outcome };
+    }
+};
+
+const ChannelMailbox = union(enum) { idle, queued: ChannelRequest, waiting: ChannelRequest, received: ChannelCompletion };
+const CutRequest = struct {
+    session: u64,
+    command: protocol.RequestFor(.cut),
+
+    fn encode(self: CutRequest, out: []u8) ![]const u8 {
+        return wire.encodeRequest(out, .cut, self.command);
+    }
+};
+const CutMailbox = union(enum) {
+    idle,
+    queued: CutRequest,
+    waiting: protocol.Id,
+    received: struct { id: protocol.Id, outcome: protocol.Outcome(.cut) },
+};
+const Operation = union(enum) { play: sync.PlayRequest.Operation, channel: ChannelRequest, cut: CutRequest };
+const PendingRequest = union(enum) { play: sync.PlayRequest, channel: ChannelRequest, cut: CutRequest };
 
 pub const Worker = struct {
     paths: wallet.Paths,
@@ -25,8 +124,15 @@ pub const Worker = struct {
     enabled: bool = false,
     generation: u64 = 0,
     state: Snapshot = .{},
+    auth_hoe_channel: ?HoeChannel = null,
+    auth_player: ?[33]u8 = null,
     outbox: ?protocol.Location = null,
     area: sync.AreaMailbox = .idle,
+    channel: ChannelMailbox = .idle,
+    channel_bytes: [protocol.max_request_bytes]u8 = undefined,
+    cut: CutMailbox = .idle,
+    settled_ids: [8][32]u8 = undefined,
+    settled_count: usize = 0,
 
     pub const area_limit = protocol.max_area_chunks;
 
@@ -38,6 +144,11 @@ pub const Worker = struct {
     pub fn stop(self: *Worker) void {
         self.mutex.lockUncancelable(self.io);
         self.stopping = true;
+        self.auth_hoe_channel = null;
+        self.auth_player = null;
+        self.channel = .idle;
+        self.cut = .idle;
+        self.settled_count = 0;
         self.mutex.unlock(self.io);
         if (self.thread) |thread| thread.join();
         self.thread = null;
@@ -48,17 +159,50 @@ pub const Worker = struct {
         defer self.mutex.unlock(self.io);
         if (enabled == self.enabled) return;
         self.enabled = enabled;
+        self.resetConnectionLocked();
+    }
+
+    /// Invalidate a session with an ambiguous cut outcome and fetch a fresh
+    /// authenticated balance. Never retry the old command.
+    pub fn refreshAuth(self: *Worker, session: u64) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.readyLocked(session)) self.resetConnectionLocked();
+    }
+
+    fn resetConnectionLocked(self: *Worker) void {
         self.generation +%= 1;
-        self.state.status = if (enabled) .connecting else .disabled;
+        self.state.status = if (self.enabled) .connecting else .disabled;
+        self.auth_hoe_channel = null;
+        self.auth_player = null;
         self.state.pending = false;
         self.outbox = null;
         self.area = .idle;
+        self.channel = .idle;
+        self.cut = .idle;
+        self.settled_count = 0;
     }
 
     pub fn snapshot(self: *Worker) Snapshot {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.state;
+    }
+
+    /// The identity and optional channel come from the same authenticated login.
+    pub fn hoeLogin(self: *Worker, session: u64) ?HoeLogin {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.readyLocked(session)) return null;
+        return .{ .player = self.auth_player orelse return null, .channel = self.auth_hoe_channel };
+    }
+
+    /// Login snapshot, not a live balance. Never returned for a stale session.
+    pub fn hoeChannel(self: *Worker, session: u64) ?HoeChannel {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.readyLocked(session)) return null;
+        return self.auth_hoe_channel;
     }
 
     pub fn submit(self: *Worker, session: u64, destination: protocol.Location) bool {
@@ -84,16 +228,116 @@ pub const Worker = struct {
         return self.area.take(dest);
     }
 
-    fn takeOperation(self: *Worker, generation: u64) ?sync.PlayRequest.Operation {
+    /// Queues a caller-assigned request ID. False means the session isn't ready
+    /// or the channel slot is occupied; encoding errors leave the slot idle.
+    /// All payload bytes are copied before returning. Requests are never replayed.
+    pub fn submitChannel(self: *Worker, session: u64, comptime kind: protocol.Kind, request: protocol.RequestFor(kind)) !bool {
+        comptime if (!protocol.isChannel(kind)) @compileError("expected a channel command");
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.readyLocked(session) or self.channel != .idle) return false;
+        const bytes = try wire.encodeRequest(&self.channel_bytes, kind, request);
+        self.channel = .{ .queued = .{ .session = session, .id = request.request_id, .kind = kind, .len = bytes.len } };
+        return true;
+    }
+
+    /// Consumes only the matching reply, leaving other coordinators' replies untouched.
+    /// A lost session discards the slot without implying server rejection.
+    pub fn takeChannelFor(self: *Worker, session: u64, id: protocol.Id) ?ChannelCompletion {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.readyLocked(session) or self.channel != .received or
+            !std.meta.eql(self.channel.received.request_id, id)) return null;
+        const completion = self.channel.received;
+        self.channel = .idle;
+        return completion;
+    }
+
+    /// Consumes one settlement hint for this session. Query channel_status for
+    /// authoritative state: notices may be missed on overflow or disconnect.
+    pub fn takeChannelSettled(self: *Worker, session: u64) ?[32]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.readyLocked(session) or self.settled_count == 0) return null;
+        const id = self.settled_ids[0];
+        self.settled_count -= 1;
+        std.mem.copyForwards([32]u8, self.settled_ids[0..self.settled_count], self.settled_ids[1 .. self.settled_count + 1]);
+        return id;
+    }
+
+    fn recordChannelSettled(self: *Worker, generation: u64, id: [32]u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.activeLocked(generation) or self.state.status != .ready or self.settled_count == self.settled_ids.len) return;
+        self.settled_ids[self.settled_count] = id;
+        self.settled_count += 1;
+    }
+
+    /// Queues one already-signed cut by value. False means it was not queued:
+    /// the payment is missing, the session isn't ready, or the cut slot is occupied.
+    pub fn submitCut(self: *Worker, session: u64, command: protocol.RequestFor(.cut)) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (command.payload.payment == null or !self.readyLocked(session) or self.cut != .idle) return false;
+        self.cut = .{ .queued = .{ .session = session, .command = command } };
+        return true;
+    }
+
+    /// Consumes only the matching reply. A lost session drops the slot without
+    /// replaying the cut; a missing reply is not proof that it wasn't charged.
+    pub fn takeCut(self: *Worker, session: u64, request_id: protocol.Id) ?protocol.Outcome(.cut) {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.readyLocked(session) or self.cut != .received) return null;
+        const result = self.cut.received;
+        if (!std.mem.eql(u8, &result.id, &request_id)) return null;
+        self.cut = .idle;
+        return result.outcome;
+    }
+
+    fn readyLocked(self: *const Worker, session: u64) bool {
+        return !self.stopping and self.state.status == .ready and self.state.session == session;
+    }
+
+    fn takeOperation(self: *Worker, generation: u64, out: *[protocol.max_request_bytes]u8) ?Operation {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (!self.activeLocked(generation)) return null;
         if (self.outbox) |move| {
             self.outbox = null;
-            return .{ .move = move };
+            return .{ .play = .{ .move = move } };
+        }
+        if (self.channel == .queued) {
+            const request = self.channel.queued;
+            @memcpy(out[0..request.len], self.channel_bytes[0..request.len]);
+            self.channel = .{ .waiting = request };
+            return .{ .channel = request };
+        }
+        if (self.cut == .queued) {
+            const request = self.cut.queued;
+            self.cut = .{ .waiting = request.command.request_id };
+            return .{ .cut = request };
         }
         const range = self.area.start() orelse return null;
-        return .{ .area = range };
+        return .{ .play = .{ .area = range } };
+    }
+
+    fn finishChannel(self: *Worker, generation: u64, request: ChannelRequest, completion: ChannelCompletion) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.activeLocked(generation) or !self.readyLocked(request.session)) return;
+        if (self.channel != .waiting or !std.meta.eql(self.channel.waiting, request)) return;
+        self.channel = .{ .received = completion };
+    }
+
+    fn finishCut(self: *Worker, generation: u64, request: CutRequest, bytes: []const u8, scratch: *protocol.Snapshot) !void {
+        const id = request.command.request_id;
+        const outcome = try wire.decodeReply(bytes, .cut, id, scratch);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.activeLocked(generation) or !self.readyLocked(request.session)) return;
+        if (self.cut != .waiting or !std.mem.eql(u8, &self.cut.waiting, &id)) return;
+        self.cut = .{ .received = .{ .id = id, .outcome = outcome } };
     }
 
     fn finishArea(self: *Worker, generation: u64, result: sync.AreaCompletion, reply: *const protocol.Snapshot) void {
@@ -112,7 +356,7 @@ pub const Worker = struct {
         return self.activeLocked(generation);
     }
 
-    fn status(self: *Worker, generation: u64, value: Status, location: ?protocol.Location) void {
+    fn status(self: *Worker, generation: u64, value: Status, restored: ?Restored) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (!self.activeLocked(generation)) return;
@@ -120,9 +364,14 @@ pub const Worker = struct {
         self.state.pending = false;
         self.outbox = null;
         self.area = .idle;
-        if (location) |pos| {
+        self.channel = .idle;
+        self.cut = .idle;
+        self.settled_count = 0;
+        self.auth_hoe_channel = if (restored) |success| success.hoe_channel else null;
+        self.auth_player = if (restored) |success| success.player else null;
+        if (restored) |success| {
             self.state.session +%= 1;
-            self.state.confirmed = pos;
+            self.state.confirmed = success.location;
         }
     }
 
@@ -180,11 +429,11 @@ pub const Worker = struct {
         var client = try ws.Client.init(io, std.heap.page_allocator, .{
             .host = endpoint,
             .port = port,
-            .max_size = protocol.max_response_bytes,
+            .max_size = max_ws_response_bytes,
             .connect_timeout_ms = 1000,
         });
         defer client.deinit();
-        try client.handshake("/", .{ .timeout_ms = 1500, .headers = "Host: 127.0.0.1:9224\r\n" });
+        try client.handshake("/", .{ .timeout_ms = 1500, .headers = "Host: " ++ authority ++ "\r\n" });
         try client.writeTimeout(1000);
         try client.readTimeout(poll_ms);
         self.status(generation, .authenticating, null);
@@ -193,11 +442,21 @@ pub const Worker = struct {
         if (!self.active(generation)) return;
         const proof = signer.sign(io, challenge.challenge) catch return error.WalletSigningFailed;
         if (expired(io, auth_until)) return error.AuthTimeout;
-        var out: [protocol.max_gameplay_request_bytes]u8 = undefined;
+        var out: [protocol.max_request_bytes]u8 = undefined;
         try send(&client, &out, try wire.encodeAuth(&out, .{ .proof = .{ .pubkey = proof.pubkey, .signature = proof.signature } }));
         const reply = (try self.auth(io, generation, &client, auth_until, .reply)).reply;
-        const restored = switch (reply) {
-            .ok => |pos| pos,
+        const restored: Restored = switch (reply) {
+            .ok => |pos| .{ .location = pos, .player = proof.pubkey },
+            .ok_with_hoe_channel => |success| .{
+                .location = success.location,
+                .player = proof.pubkey,
+                .hoe_channel = .{
+                    .id = success.hoe_channel_id,
+                    .capacity_msats = success.hoe_channel_capacity_msat,
+                    .balance_msats = success.hoe_channel_balance_msat,
+                    .player = proof.pubkey,
+                },
+            },
             .failed => |failure| return switch (failure) {
                 .invalid_credentials => error.CredentialsRejected,
                 .unavailable => error.SessionUnavailable,
@@ -206,29 +465,57 @@ pub const Worker = struct {
         retry_ms.* = 250;
         self.status(generation, .ready, restored);
 
-        var pending: ?struct { request: sync.PlayRequest, until: std.Io.Clock.Timestamp } = null;
+        var pending: ?struct { request: PendingRequest, until: std.Io.Clock.Timestamp } = null;
         while (self.active(generation)) {
             if (pending) |active_request| {
-                if (expired(io, active_request.until)) return error.GameplayTimeout;
-            } else if (self.takeOperation(generation)) |operation| {
-                var request: sync.PlayRequest = .{ .id = undefined, .operation = operation };
-                io.random(&request.id);
-                const until = deadline(io, 2500);
-                try send(&client, &out, try request.encode(&out));
+                if (expired(io, active_request.until)) return error.RequestTimeout;
+            } else if (self.takeOperation(generation, &out)) |operation| {
+                const until = deadline(io, if (operation == .channel) 5000 else 2500);
+                const request: PendingRequest = switch (operation) {
+                    .play => |play| blk: {
+                        var request: sync.PlayRequest = .{ .id = undefined, .operation = play };
+                        io.random(&request.id);
+                        try send(&client, &out, try request.encode(&out));
+                        break :blk .{ .play = request };
+                    },
+                    .channel => |channel| blk: {
+                        try client.writeBin(out[0..channel.len]);
+                        break :blk .{ .channel = channel };
+                    },
+                    .cut => |cut| blk: {
+                        try send(&client, &out, try cut.encode(&out));
+                        break :blk .{ .cut = cut };
+                    },
+                };
                 pending = .{ .request = request, .until = until };
             }
             const msg = try client.read() orelse continue;
             defer client.done(msg);
             if (try control(&client, msg)) continue;
-            const active_request = pending orelse return error.UnexpectedReply;
-            if (expired(io, active_request.until)) return error.GameplayTimeout;
-            var scratch: protocol.Snapshot = undefined;
-            switch (try active_request.request.decode(msg.data, &scratch)) {
+            if (pending) |active_request| {
+                if (expired(io, active_request.until)) return error.RequestTimeout;
+            }
+            if (try self.receivePlay(generation, if (pending) |p| p.request else null, msg.data)) pending = null;
+        }
+    }
+
+    // Returns true only when the pending request was answered.
+    fn receivePlay(self: *Worker, generation: u64, pending: ?PendingRequest, bytes: []const u8) !bool {
+        if (wire.decodeChannelSettled(bytes, true)) |id| {
+            self.recordChannelSettled(generation, id);
+            return false;
+        } else |_| {}
+
+        var scratch: protocol.Snapshot = undefined;
+        switch (pending orelse return error.UnexpectedReply) {
+            .play => |play| switch (try play.decode(bytes, &scratch)) {
                 .move => |pos| self.finishMove(generation, pos),
                 .area => |result| self.finishArea(generation, result, &scratch),
-            }
-            pending = null;
+            },
+            .channel => |channel| self.finishChannel(generation, channel, try channel.decode(bytes, &scratch)),
+            .cut => |cut| try self.finishCut(generation, cut, bytes, &scratch),
         }
+        return true;
     }
 
     fn auth(self: *Worker, io: std.Io, generation: u64, client: *ws.Client, until: std.Io.Clock.Timestamp, kind: protocol.AuthKind) !protocol.AuthMessage {
@@ -278,23 +565,24 @@ fn sleep(io: std.Io) void {
 test "area mailbox rejects stale sessions and serializes with moves" {
     const t = std.testing;
     var worker: Worker = .{ .io = t.io, .paths = undefined };
+    var out: [protocol.max_request_bytes]u8 = undefined;
     const area: shared.world.ChunkRange = .{ .cx0 = -4, .cy0 = 2, .cx1 = -4, .cy1 = 2 };
     const pos = shared.movement.spawn;
     worker.setEnabled(true);
     try t.expect(!worker.requestArea(0, area));
-    worker.status(1, .ready, pos);
+    worker.status(1, .ready, .{ .location = pos });
     try t.expect(worker.requestArea(1, area));
     try t.expect(!worker.requestArea(1, area));
     try t.expect(worker.submit(1, pos));
-    try t.expectEqual(pos, worker.takeOperation(1).?.move);
+    try t.expectEqual(pos, worker.takeOperation(1, &out).?.play.move);
     worker.finishMove(1, pos);
-    try t.expectEqual(area, worker.takeOperation(1).?.area);
+    try t.expectEqual(area, worker.takeOperation(1, &out).?.play.area);
     var dest: protocol.Snapshot = undefined;
     worker.finishArea(1, .server_busy, &dest);
     try t.expect(!worker.requestArea(1, area));
     try t.expectEqual(sync.AreaCompletion.server_busy, worker.takeArea(1, &dest).?);
     try t.expect(worker.requestArea(1, area));
-    try t.expectEqual(area, worker.takeOperation(1).?.area);
+    try t.expectEqual(area, worker.takeOperation(1, &out).?.play.area);
     const reply: protocol.Snapshot = .{ .area = area, .count = 1 };
     worker.finishArea(1, .snapshot, &reply);
     try t.expect(worker.takeArea(0, &dest) == null);
@@ -302,8 +590,8 @@ test "area mailbox rejects stale sessions and serializes with moves" {
     try t.expectEqualDeep(reply, dest);
     try t.expect(worker.requestArea(1, area));
     worker.status(1, .retrying, null);
-    worker.status(1, .ready, pos);
-    try t.expect(worker.takeOperation(1) == null);
+    worker.status(1, .ready, .{ .location = pos });
+    try t.expect(worker.takeOperation(1, &out) == null);
     try t.expect(!worker.requestArea(1, area));
     try t.expect(worker.requestArea(2, area));
 }
@@ -311,15 +599,19 @@ test "area mailbox rejects stale sessions and serializes with moves" {
 test "movement mailbox waits for auth and holds only one move per session" {
     const t = std.testing;
     var worker: Worker = .{ .io = t.io, .paths = undefined };
+    var out: [protocol.max_request_bytes]u8 = undefined;
     const pos: protocol.Location = .{ .x = 1, .y = 0 };
     try t.expect(!worker.submit(0, pos));
     worker.setEnabled(true);
     worker.status(1, .authenticating, null);
     try t.expect(!worker.submit(0, pos));
     const restored: protocol.Location = .{ .x = -38, .y = 211 };
-    worker.status(1, .ready, restored);
+    const channel: HoeChannel = .{ .id = @splat(0x42), .capacity_msats = 100, .balance_msats = 15, .player = @splat(7) };
+    worker.status(1, .ready, .{ .location = restored, .hoe_channel = channel });
+    try t.expectEqual(channel, worker.hoeChannel(worker.snapshot().session).?);
+    try t.expect(worker.hoeChannel(0) == null);
     try t.expect(worker.submit(1, pos));
-    try t.expectEqual(pos, worker.takeOperation(1).?.move);
+    try t.expectEqual(pos, worker.takeOperation(1, &out).?.play.move);
     try t.expect(!worker.submit(1, pos));
     worker.finishMove(1, null);
     try t.expectEqual(restored, worker.snapshot().confirmed);
@@ -328,12 +620,306 @@ test "movement mailbox waits for auth and holds only one move per session" {
     try t.expectEqual(pos, worker.snapshot().confirmed);
     worker.status(1, .retrying, null);
     try t.expect(!worker.submit(1, pos));
-    worker.status(1, .ready, restored);
+    try t.expect(worker.hoeChannel(1) == null);
+    worker.status(1, .ready, .{ .location = restored });
+    try t.expect(worker.hoeChannel(2) == null);
     try t.expectEqual(restored, worker.snapshot().confirmed);
     try t.expect(!worker.submit(1, pos));
     try t.expect(worker.submit(2, pos));
     worker.setEnabled(false);
-    worker.status(1, .ready, restored);
+    worker.status(1, .ready, .{ .location = restored, .hoe_channel = channel });
+    try t.expect(worker.hoeChannel(2) == null);
     try t.expectEqual(Status.disabled, worker.snapshot().status);
     try t.expect(!worker.snapshot().pending);
+}
+
+test "plain authenticated login exposes the player without a channel" {
+    const t = std.testing;
+    var worker: Worker = .{ .io = t.io, .paths = undefined };
+    const player: [33]u8 = @splat(2);
+    worker.setEnabled(true);
+    worker.status(1, .ready, .{ .location = shared.movement.spawn, .player = player });
+    try t.expectEqual(player, worker.hoeLogin(1).?.player);
+    try t.expect(worker.hoeLogin(1).?.channel == null);
+    try t.expect(worker.hoeLogin(0) == null);
+    worker.refreshAuth(1);
+    try t.expect(worker.hoeLogin(1) == null);
+}
+
+test "channel open queues owned bytes without changing movement or area mailboxes" {
+    const t = std.testing;
+    var worker: Worker = .{ .io = t.io, .paths = undefined };
+    var out: [protocol.max_request_bytes]u8 = undefined;
+    const pos = shared.movement.spawn;
+    const area: shared.world.ChunkRange = .{ .cx0 = 0, .cy0 = 0, .cx1 = 0, .cy1 = 0 };
+    const expected_proof: [protocol.max_channel_proof_bytes]u8 = @splat(0x41);
+    var proof = expected_proof;
+    const expected_params: [protocol.max_channel_params_bytes]u8 = @splat(0x42);
+    var params = expected_params;
+    const open: protocol.RequestFor(.channel_open) = .{
+        .request_id = @splat(1),
+        .payload = .{ .id = @splat(2), .proof = &proof, .params = &params },
+    };
+
+    worker.setEnabled(true);
+    try t.expect(!try worker.submitChannel(0, .channel_open, open));
+    worker.status(1, .ready, .{ .location = pos });
+    try t.expect(!try worker.submitChannel(0, .channel_open, open));
+    try t.expect(try worker.submitChannel(1, .channel_open, open));
+    @memset(&proof, 0);
+    @memset(&params, 0);
+    try t.expect(!try worker.submitChannel(1, .channel_open, open));
+    try t.expect(worker.takeChannelFor(1, open.request_id) == null);
+    try t.expect(worker.requestArea(1, area));
+    try t.expect(worker.submit(1, pos));
+    try t.expectEqual(pos, worker.takeOperation(1, &out).?.play.move);
+    worker.finishMove(1, pos);
+
+    const request = worker.takeOperation(1, &out).?.channel;
+    try t.expect(!try worker.submitChannel(1, .channel_open, open));
+    const decoded = try wire.decodeMessage(out[0..request.len], true);
+    try t.expectEqual(open.request_id, decoded.request_id);
+    try t.expectEqual(open.payload.id, decoded.operation.channel_open.id);
+    try t.expectEqual(protocol.max_channel_open_with_params_bytes, request.len);
+    try t.expectEqualSlices(u8, &expected_proof, decoded.operation.channel_open.proof);
+    try t.expectEqualSlices(u8, &expected_params, decoded.operation.channel_open.params);
+
+    const reply = try wire.encodeReply(&out, .channel_open, open, .{ .failed = .invalid_proof });
+    var scratch: protocol.Snapshot = undefined;
+    worker.finishChannel(1, request, try request.decode(reply, &scratch));
+    try t.expect(!try worker.submitChannel(1, .channel_open, open));
+    try t.expect(worker.takeChannelFor(0, open.request_id) == null);
+    const completion = worker.takeChannelFor(1, open.request_id).?;
+    try t.expectEqual(open.request_id, completion.request_id);
+    try t.expectEqual(protocol.ChannelOpenFailure.invalid_proof, completion.outcome.channel_open.failed);
+    try t.expect(worker.takeChannelFor(1, open.request_id) == null);
+    try t.expectEqual(area, worker.takeOperation(1, &out).?.play.area);
+}
+
+test "channel commands check bounds, reply kind and ID, and discard stale sessions" {
+    const t = std.testing;
+    var worker: Worker = .{ .io = t.io, .paths = undefined };
+    var out: [protocol.max_request_bytes]u8 = undefined;
+    var scratch: protocol.Snapshot = undefined;
+    const pos = shared.movement.spawn;
+    worker.setEnabled(true);
+    worker.status(1, .ready, .{ .location = pos });
+
+    const id: protocol.Id = @splat(1);
+    const channel_id: [32]u8 = @splat(2);
+    const too_large: [protocol.max_request_bytes]u8 = @splat(3);
+    try t.expectError(error.InvalidProofLength, worker.submitChannel(1, .channel_open, .{
+        .request_id = id,
+        .payload = .{ .id = channel_id, .proof = &too_large, .params = "params" },
+    }));
+    try t.expectError(error.InvalidParamsLength, worker.submitChannel(1, .channel_open, .{
+        .request_id = id,
+        .payload = .{ .id = channel_id, .proof = "proof", .params = &too_large },
+    }));
+    const requirements: protocol.RequestFor(.channel_requirements) = .{ .request_id = id, .payload = .{ .tool = .hoe } };
+    try t.expect(try worker.submitChannel(1, .channel_requirements, requirements));
+    const request = worker.takeOperation(1, &out).?.channel;
+    try t.expectEqualDeep(requirements.payload, (try wire.decodeMessage(out[0..request.len], true)).operation.channel_requirements);
+
+    const terms: protocol.SpillmanChannelRequirementsRes = .{ .pubkey = @splat(3), .amount = 42, .refundTime = 1000 };
+    const wrong_id = try wire.encodeReply(&out, .channel_requirements, .{ .request_id = @splat(0), .payload = requirements.payload }, .{ .ok = terms });
+    try t.expectError(error.UnexpectedRequestId, request.decode(wrong_id, &scratch));
+    const close: protocol.RequestFor(.channel_close) = .{ .request_id = id, .payload = .{ .id = channel_id } };
+    const wrong_kind = try wire.encodeReply(&out, .channel_close, close, .{ .ok = {} });
+    try t.expectError(error.UnexpectedMessageType, request.decode(wrong_kind, &scratch));
+    try t.expect(worker.takeChannelFor(1, id) == null);
+    const reply = try wire.encodeReply(&out, .channel_requirements, requirements, .{ .ok = terms });
+    const completion = try request.decode(reply, &scratch);
+    try t.expectEqualDeep(terms, completion.outcome.channel_requirements.ok);
+
+    // A transport retry stays in the same enable generation but starts a new session.
+    worker.status(1, .retrying, null);
+    worker.status(1, .ready, .{ .location = pos });
+    try t.expect(worker.takeOperation(1, &out) == null);
+    try t.expect(!try worker.submitChannel(1, .channel_close, close));
+    try t.expect(try worker.submitChannel(2, .channel_requirements, requirements));
+    const new_request = worker.takeOperation(1, &out).?.channel;
+    worker.finishChannel(1, request, completion);
+    try t.expect(worker.takeChannelFor(2, id) == null);
+    worker.finishChannel(1, new_request, completion);
+    try t.expectEqualDeep(completion, worker.takeChannelFor(2, id).?);
+
+    for ([_]protocol.Outcome(.channel_close){ .{ .ok = {} }, .{ .failed = .settlement_pending } }) |outcome| {
+        try t.expect(try worker.submitChannel(2, .channel_close, close));
+        const pending = worker.takeOperation(1, &out).?.channel;
+        const decoded = try wire.decodeMessage(out[0..pending.len], true);
+        try t.expectEqualDeep(close.payload, decoded.operation.channel_close);
+        const bytes = try wire.encodeReply(&out, .channel_close, close, outcome);
+        worker.finishChannel(1, pending, try pending.decode(bytes, &scratch));
+        try t.expectEqualDeep(outcome, worker.takeChannelFor(2, id).?.outcome.channel_close);
+    }
+
+    try t.expect(try worker.submitChannel(2, .channel_close, close));
+    worker.setEnabled(false);
+    worker.setEnabled(true);
+    worker.status(3, .ready, .{ .location = pos });
+    try t.expect(worker.takeOperation(3, &out) == null);
+    try t.expect(worker.takeChannelFor(2, id) == null);
+    worker.stop();
+    try t.expect(!try worker.submitChannel(3, .channel_close, close));
+}
+
+test "settlement notices leave status pending and status proofs survive frame reuse and copying" {
+    const t = std.testing;
+    var worker: Worker = .{ .io = t.io, .paths = undefined };
+    var out: [protocol.max_request_bytes]u8 = undefined;
+    var frame: [max_ws_response_bytes]u8 = undefined;
+    const command: protocol.RequestFor(.channel_status) = .{ .request_id = @splat(1), .payload = .{ .id = @splat(2) } };
+    const idle_id: [32]u8 = @splat(3);
+    const proofs: [protocol.max_sender_change_proofs_bytes]u8 = @splat('p');
+    const status: protocol.Outcome(.channel_status) = .{ .ok = .{
+        .capacity_msat = 100,
+        .balance_msat = 50,
+        .phase = .settled,
+        .sender_proofs = &proofs,
+    } };
+
+    worker.setEnabled(true);
+    worker.status(1, .ready, .{ .location = shared.movement.spawn });
+    try t.expect(!try worker.receivePlay(1, null, try wire.encodeChannelSettled(&frame, idle_id)));
+    try t.expect(try worker.submitChannel(1, .channel_status, command));
+    const pending: PendingRequest = .{ .channel = worker.takeOperation(1, &out).?.channel };
+    const notice = try wire.encodeChannelSettled(&frame, command.payload.id);
+    try t.expect(!try worker.receivePlay(1, pending, notice));
+    try t.expect(worker.takeChannelFor(1, command.request_id) == null);
+    try t.expect(worker.takeChannelSettled(0) == null);
+    try t.expectEqual(idle_id, worker.takeChannelSettled(1).?);
+    try t.expectEqual(command.payload.id, worker.takeChannelSettled(1).?);
+    try t.expect(worker.takeChannelSettled(1) == null);
+
+    const reply = try wire.encodeReply(&frame, .channel_status, command, status);
+    try t.expectEqual(protocol.max_channel_status_reply_bytes, reply.len);
+    try t.expect(try worker.receivePlay(1, pending, reply));
+    @memset(frame[0..reply.len], 0);
+    try t.expect(worker.takeChannelFor(1, @splat(9)) == null);
+    try t.expect(worker.takeChannelFor(0, command.request_id) == null);
+    var completion = worker.takeChannelFor(1, command.request_id).?;
+    const copy = completion;
+    completion.outcome.channel_status.ok.bytes[0] = 'x';
+    try t.expectEqual(@as(u8, 'x'), completion.outcome.channel_status.view().ok.sender_proofs.?[0]);
+    try t.expectEqualDeep(status, copy.outcome.channel_status.view());
+
+    try t.expect(try worker.submitChannel(1, .channel_status, command));
+    const next: PendingRequest = .{ .channel = worker.takeOperation(1, &out).?.channel };
+    const failure: protocol.Outcome(.channel_status) = .{ .failed = .not_found };
+    try t.expect(try worker.receivePlay(1, next, try wire.encodeReply(&frame, .channel_status, command, failure)));
+    const failed = worker.takeChannelFor(1, command.request_id).?;
+    try t.expectEqualDeep(failure, failed.outcome.channel_status.view());
+
+    try t.expect(!try worker.receivePlay(1, null, try wire.encodeChannelSettled(&frame, idle_id)));
+    worker.status(1, .retrying, null);
+    worker.status(1, .ready, .{ .location = shared.movement.spawn });
+    try t.expect(worker.takeChannelSettled(1) == null);
+    try t.expect(worker.takeChannelSettled(2) == null);
+}
+
+const test_cut: protocol.RequestFor(.cut) = .{
+    .request_id = @splat(1),
+    .payload = .{ .x = -4, .y = 5, .payment = .{ .id = @splat(2), .amount = 5, .signature = @splat(3) } },
+};
+
+test "signed cut queues alongside play and channel and yields only a matched reply" {
+    const t = std.testing;
+    var worker: Worker = .{ .io = t.io, .paths = undefined };
+    var out: [protocol.max_request_bytes]u8 = undefined;
+    var scratch: protocol.Snapshot = undefined;
+    const pos = shared.movement.spawn;
+    const area: shared.world.ChunkRange = .{ .cx0 = 0, .cy0 = 0, .cx1 = 0, .cy1 = 0 };
+    const close: protocol.RequestFor(.channel_close) = .{ .request_id = test_cut.request_id, .payload = .{ .id = @splat(2) } };
+
+    worker.setEnabled(true);
+    try t.expect(!worker.submitCut(0, test_cut));
+    worker.status(1, .ready, .{ .location = pos });
+    try t.expect(!worker.submitCut(0, test_cut));
+    var command = test_cut;
+    command.payload.payment = null;
+    try t.expect(!worker.submitCut(1, command));
+    command = test_cut;
+    try t.expect(worker.submitCut(1, command));
+    command.payload.payment.?.signature = @splat(0);
+    try t.expect(!worker.submitCut(1, command));
+    try t.expect(worker.takeCut(1, command.request_id) == null);
+
+    try t.expect(worker.requestArea(1, area));
+    try t.expect(worker.submit(1, pos));
+    try t.expect(try worker.submitChannel(1, .channel_close, close));
+    try t.expectEqual(pos, worker.takeOperation(1, &out).?.play.move);
+    worker.finishMove(1, pos);
+    const channel = worker.takeOperation(1, &out).?.channel;
+    const close_reply = try wire.encodeReply(&out, .channel_close, close, .{ .ok = {} });
+    worker.finishChannel(1, channel, try channel.decode(close_reply, &scratch));
+
+    const cut = worker.takeOperation(1, &out).?.cut;
+    try t.expect(!worker.submitCut(1, test_cut));
+    const decoded = try wire.decodeMessage(try cut.encode(&out), true);
+    try t.expectEqual(test_cut.request_id, decoded.request_id);
+    try t.expectEqualDeep(test_cut.payload, decoded.operation.cut);
+
+    const wrong_kind = try wire.encodeReply(&out, .channel_close, close, .{ .ok = {} });
+    try t.expectError(error.UnexpectedMessageType, worker.finishCut(1, cut, wrong_kind, &scratch));
+    command.request_id = @splat(0);
+    const wrong_id = try wire.encodeReply(&out, .cut, command, .{ .failed = .not_cuttable });
+    try t.expectError(error.UnexpectedRequestId, worker.finishCut(1, cut, wrong_id, &scratch));
+    try t.expect(worker.takeCut(1, test_cut.request_id) == null);
+
+    const tile: protocol.State = .{ .x = test_cut.payload.x, .y = test_cut.payload.y, .terrain = .grass, .cut = true };
+    const outcome: protocol.Outcome(.cut) = .{ .ok = tile };
+    const reply = try wire.encodeReply(&out, .cut, test_cut, outcome);
+    try worker.finishCut(1, cut, reply, &scratch);
+    try t.expect(!worker.submitCut(1, test_cut));
+    try t.expect(worker.takeCut(0, test_cut.request_id) == null);
+    try t.expect(worker.takeCut(1, command.request_id) == null);
+    try t.expectEqualDeep(outcome, worker.takeCut(1, test_cut.request_id).?);
+    try t.expect(worker.takeCut(1, test_cut.request_id) == null);
+    const completion = worker.takeChannelFor(1, close.request_id).?;
+    try t.expect(completion.outcome.channel_close == .ok);
+    try t.expectEqual(area, worker.takeOperation(1, &out).?.play.area);
+}
+
+test "signed cut is not replayed and stale completions cannot replace the current result" {
+    const t = std.testing;
+    var worker: Worker = .{ .io = t.io, .paths = undefined };
+    var out: [protocol.max_request_bytes]u8 = undefined;
+    var scratch: protocol.Snapshot = undefined;
+    const pos = shared.movement.spawn;
+    const id = test_cut.request_id;
+    worker.setEnabled(true);
+    worker.status(1, .ready, .{ .location = pos });
+    try t.expect(worker.submitCut(1, test_cut));
+    const stale = worker.takeOperation(1, &out).?.cut;
+
+    worker.status(1, .retrying, null);
+    worker.status(1, .ready, .{ .location = pos });
+    try t.expect(worker.takeOperation(1, &out) == null);
+    try t.expect(!worker.submitCut(1, test_cut));
+    try t.expect(worker.submitCut(2, test_cut));
+    const current = worker.takeOperation(1, &out).?.cut;
+    const outcome: protocol.Outcome(.cut) = .{ .failed = .not_cuttable };
+    const reply = try wire.encodeReply(&out, .cut, test_cut, outcome);
+    try worker.finishCut(1, stale, reply, &scratch);
+    try worker.finishCut(0, current, reply, &scratch);
+    try t.expect(worker.takeCut(2, id) == null);
+    try worker.finishCut(1, current, reply, &scratch);
+    try t.expectEqualDeep(outcome, worker.takeCut(2, id).?);
+
+    try t.expect(worker.submitCut(2, test_cut));
+    worker.refreshAuth(1);
+    try t.expectEqual(Status.ready, worker.snapshot().status);
+    worker.refreshAuth(2);
+    try t.expectEqual(Status.connecting, worker.snapshot().status);
+    try t.expect(worker.hoeChannel(2) == null);
+    try t.expect(!worker.submitCut(2, test_cut));
+    worker.status(2, .ready, .{ .location = pos });
+    try t.expect(worker.takeOperation(2, &out) == null);
+    try t.expect(worker.submitCut(3, test_cut));
+    const last = worker.takeOperation(2, &out).?.cut;
+    try worker.finishCut(2, last, reply, &scratch);
+    worker.stop();
+    try t.expect(worker.takeCut(3, id) == null);
+    try t.expect(!worker.submitCut(3, test_cut));
 }

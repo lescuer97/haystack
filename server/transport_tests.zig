@@ -98,7 +98,7 @@ test "thin frame guard rejects RSV mask FIN opcode noncanonical control and over
         var websocket = ws{ .input = &guard.interface, .output = &output, .key = "" };
         try std.testing.expectError(error.ReadFailed, websocket.readSmallMessage());
     }
-    try std.testing.expectEqual(@as(usize, 1024), config.max_payload);
+    try std.testing.expectEqual(p.max_channel_open_with_params_bytes, config.max_payload);
     try std.testing.expectEqual(@as(usize, 256), p.max_gameplay_request_bytes);
     for ([_]usize{ 0, 125, 126, p.max_gameplay_request_bytes, p.max_gameplay_request_bytes + 1, config.max_payload }) |length| {
         var bytes: [config.max_payload + 8]u8 = @splat(0);
@@ -445,18 +445,12 @@ test "Spilman messages require authentication and reject without touching tick o
     var slots: [1]transport.Slot = .{.{}};
     const slot = &slots[0];
     var dispatch: ticks.Dispatcher = .{ .io = std.testing.io, .stopping = true };
-    var frame_storage: [2 * config.max_payload + 1024]u8 = undefined;
+    var frame_storage: [2 * config.max_payload + 4096]u8 = undefined;
     var frames = std.Io.Writer.fixed(&frame_storage);
     var request_storage: [config.max_payload]u8 = undefined;
 
-    const payment_id: p.Id = @splat(0x20);
-    const payment_request: p.RequestFor(.channel_payment) = .{
-        .request_id = payment_id,
-        .payload = .{ .id = @splat(3), .amount = 42, .signature = @splat(0x7e) },
-    };
-    const payment = try wire.encodeRequest(&request_storage, .channel_payment, payment_request);
-    try std.testing.expectEqual(@as(u8, 0x20), payment[0]);
-    try writeClientFrame(&frames, payment); // before authentication
+    const close_request: p.RequestFor(.channel_close) = .{ .request_id = @splat(0x23), .payload = .{ .id = @splat(3) } };
+    try writeClientFrame(&frames, try wire.encodeRequest(&request_storage, .channel_close, close_request)); // before authentication
 
     var key: [33]u8 = undefined;
     _ = try std.fmt.hexToBytes(&key, test_pubkey_hex);
@@ -468,37 +462,32 @@ test "Spilman messages require authentication and reject without touching tick o
     const vectors = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("spilman_vectors.json"), .{});
     defer vectors.deinit();
     const funding_json = vectors.value.object.get("funding_proofs_json").?.string;
-    try std.testing.expectError(error.InvalidProofLength, wire.encodeRequest(&request_storage, .channel_open, .{
-        .request_id = open_id,
-        .payload = .{ .id = @splat(3), .proof = funding_json },
-    }));
-    const funding = try std.json.parseFromSlice([]std.json.Value, std.testing.allocator, funding_json, .{});
-    defer funding.deinit();
-    const open_proof = try std.json.Stringify.valueAlloc(std.testing.allocator, funding.value[0..1], .{});
-    defer std.testing.allocator.free(open_proof);
+
     const open = try wire.encodeRequest(&request_storage, .channel_open, .{
         .request_id = open_id,
-        .payload = .{ .id = @splat(3), .proof = open_proof },
+        .payload = .{ .id = @splat(3), .proof = funding_json, .params = "{}" },
     });
-    try std.testing.expectEqual(@as(u8, 0x22), open[0]);
-    try std.testing.expectEqual(open_proof.len + 61, open.len);
+    try std.testing.expectEqual(@as(u8, 0x24), open[0]);
+    try std.testing.expectEqual(funding_json.len + 66, open.len);
     try std.testing.expect(open.len > p.max_gameplay_request_bytes);
     try writeClientFrame(&frames, open[0 .. open.len - 1]); // missing envelope terminator
     try writeClientFrame(&frames, open);
+    const modern_open_id: p.Id = @splat(0x25);
+    const modern = try wire.encodeRequest(&request_storage, .channel_open, .{
+        .request_id = modern_open_id,
+        .payload = .{ .id = @splat(3), .proof = &@as([p.max_channel_proof_bytes]u8, @splat('p')), .params = &@as([p.max_channel_params_bytes]u8, @splat('a')) },
+    });
+    try std.testing.expectEqual(config.max_payload, modern.len);
+    try writeClientFrame(&frames, modern);
 
-    try writeClientFrame(&frames, try wire.encodeRequest(&request_storage, .channel_payment, payment_request));
     const requirements_id: p.Id = @splat(0x21);
     const requirements = try wire.encodeRequest(&request_storage, .channel_requirements, .{
         .request_id = requirements_id,
-        .payload = .{ .tool = .axe },
+        .payload = .{ .tool = .hoe },
     });
     try std.testing.expectEqual(@as(u8, 0x21), requirements[0]);
     try writeClientFrame(&frames, requirements);
-    const close_id: p.Id = @splat(0x23);
-    const close = try wire.encodeRequest(&request_storage, .channel_close, .{
-        .request_id = close_id,
-        .payload = .{ .id = @splat(3) },
-    });
+    const close = try wire.encodeRequest(&request_storage, .channel_close, close_request);
     try std.testing.expectEqual(@as(u8, 0x23), close[0]);
     try writeClientFrame(&frames, close);
     const location: p.RequestFor(.update_location) = .{ .request_id = @splat(3), .payload = east };
@@ -527,9 +516,9 @@ test "Spilman messages require authentication and reject without touching tick o
     try handleNextFrame(&handler);
     try std.testing.expectEqualSlices(u8, protocol_error_frame, output.buffered());
     try expectChannelUnavailable(&handler, &output, .channel_open, open_id, 0xa2);
-    try expectChannelUnavailable(&handler, &output, .channel_payment, payment_id, 0xa0);
+    try expectChannelUnavailable(&handler, &output, .channel_open, modern_open_id, 0xa2);
     try expectChannelUnavailable(&handler, &output, .channel_requirements, requirements_id, 0xa1);
-    try expectChannelUnavailable(&handler, &output, .channel_close, close_id, 0xa3);
+    try expectChannelUnavailable(&handler, &output, .channel_close, close_request.request_id, 0xa3);
 
     try std.testing.expect(handler.authenticated);
     try std.testing.expectEqualDeep(session, handler.session.?);
@@ -549,6 +538,343 @@ test "Spilman messages require authentication and reject without touching tick o
     var snapshot: p.Snapshot = undefined;
     try std.testing.expectEqualDeep(p.Outcome(.update_location){ .ok = {} }, try wire.decodeReply(output.buffered()[2..], .update_location, location.request_id, &snapshot));
     try std.testing.expectEqualDeep(location.payload, fixture.application.registry.get(session).?.location.?);
+}
+
+test "headless wallet exposes owned spendable and depleted channels and quotes unit price" {
+    const t = std.testing;
+    const native = @import("native_storage");
+    const wallet_service = native.wallet_service;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const wallet_path = try std.fs.path.joinZ(a, &.{ dir, "wallet.sqlite" });
+    const channel_path = try std.fs.path.joinZ(a, &.{ dir, "hoe.sqlite" });
+    var wallet = try wallet_service.Headless.testing.openWithLedger(t.io, t.allocator, wallet_path, channel_path);
+    defer wallet.close() catch {};
+    const channel_sql = try native.sqlite.Db.open(channel_path, .read_write_no_follow, false);
+    defer channel_sql.close();
+    const week = 7 * 24 * 60 * 60;
+
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.application;
+    const game_path = try std.fs.path.joinZ(a, &.{ dir, "game.sqlite" });
+    var db = try GameDb.open(game_path);
+    defer db.close();
+    const game_sql = try native.sqlite.Db.open(game_path, .read_write_no_mutex, false);
+    defer game_sql.close();
+    var persistence = try Persistence.init(t.io, t.allocator, &db, &app.context.state, app.registry);
+    defer persistence.deinit(t.allocator);
+    app.persistence = &persistence;
+    try t.expect(app.wallet == null);
+    app.wallet = &wallet;
+
+    var key: [33]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&key, test_pubkey_hex);
+    var signature: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&signature, test_signature_hex);
+    var proof_buffer: [107]u8 = undefined;
+    const proof = try wire.encodeAuth(&proof_buffer, .{ .proof = .{ .pubkey = key, .signature = signature } });
+    const location = spawn;
+    const now: u64 = @intCast(std.Io.Clock.real.now(t.io).toSeconds());
+    const before = stateCount(&fixture);
+    var input = std.Io.Reader.fixed("");
+    var bytes: [128]u8 = undefined;
+    var output = std.Io.Writer.fixed(&bytes);
+    var socket = ws{ .input = &input, .output = &output, .key = "" };
+
+    // Valid, sufficiently funded capacities reach proof validation; invalid
+    // capacities and underfunding are rejected before proof validation or mint I/O.
+    {
+        const channels = wallet.tryAcquire() orelse return error.TestWalletBusy;
+        defer channels.release();
+        const receiver_hex = std.fmt.bytesToHex(wallet.receiverPubkey(week).?, .lower);
+        const price = p.hoe_price_msat;
+        const rejected = [_]struct { capacity: u64, funding: u64 }{
+            .{ .capacity = 0, .funding = 64 },
+            .{ .capacity = price - 1, .funding = 64 },
+            .{ .capacity = price + 1, .funding = 64 },
+            .{ .capacity = p.hoe_capacity_msat + price, .funding = 64 },
+            .{ .capacity = 2 * price, .funding = price },
+        };
+        for (0..p.hoe_refill_cuts + rejected.len) |i| {
+            const valid = i < p.hoe_refill_cuts;
+            const invalid = if (valid) null else rejected[i - p.hoe_refill_cuts];
+            const params_json = try std.json.Stringify.valueAlloc(a, .{
+                .capacity = if (invalid) |row| row.capacity else (i + 1) * price,
+                .expiry_timestamp = now + 3600,
+                .funding_token_amount = if (invalid) |row| row.funding else 64,
+                .input_fee_ppk = 0,
+                .keyset_id = "test",
+                .maximum_amount = 64,
+                .mint = "https://mint.example.com",
+                .receiver_pubkey = receiver_hex[0..],
+                .sender_pubkey = test_pubkey_hex,
+                .setup_timestamp = now,
+                .unit = "msat",
+            }, .{});
+            try t.expectError(if (valid) error.InvalidFundingProof else error.InvalidChannelParameters, channels.acceptFunded(key, .{
+                .id = @splat(88),
+                .params_json = params_json,
+                .funding_proofs_json = "[]",
+            }, now));
+            try t.expectEqual(null, try channels.lookup(key, @splat(88), now));
+        }
+    }
+
+    // Seed trusted ledger metadata directly so these transport tests need no mint.
+    // No mint calls are needed to exercise exact open and close retries or read saved receipts.
+    const ChannelId = @FieldType(p.SpillmanChannelOpen, "id");
+    const active: ChannelId = @splat(1);
+    const settled: ChannelId = @splat(6);
+    const orphan: ChannelId = @splat(8);
+    const exhausted: ChannelId = @splat(9);
+    const dust: ChannelId = @splat(10);
+    const unredeemed: ChannelId = @splat(11);
+    const exhausted_in_cutoff: ChannelId = @splat(12);
+    const expired_exhausted: ChannelId = @splat(13);
+    const active_capacity = 3 * p.hoe_price_msat;
+    const active_balance = 2 * p.hoe_price_msat;
+    const exhausted_capacity = p.hoe_price_msat;
+    const open_proofs = "[{\"trusted_fixture_proof\":true}]";
+    const sender_proofs = "[{\"sender\":true}]";
+    const cases = [_]struct { id: ChannelId, owner: [33]u8, expiry: u64, phase: wallet_service.ChannelPhase }{
+        .{ .id = active, .owner = key, .expiry = now + 3600, .phase = .active },
+        .{ .id = @splat(2), .owner = key, .expiry = now, .phase = .expired },
+        .{ .id = @splat(3), .owner = key, .expiry = now + 120, .phase = .closing_window },
+        .{ .id = @splat(4), .owner = @splat(0x02), .expiry = now + 3600, .phase = .active },
+        .{ .id = @splat(5), .owner = key, .expiry = now + 3600, .phase = .settlement_pending },
+        .{ .id = settled, .owner = key, .expiry = now + 3600, .phase = .settled },
+        .{ .id = orphan, .owner = key, .expiry = now + 3600, .phase = .active },
+        .{ .id = exhausted, .owner = key, .expiry = now + 3600, .phase = .depleted },
+        .{ .id = dust, .owner = key, .expiry = now + 3600, .phase = .active },
+        .{ .id = unredeemed, .owner = key, .expiry = now + 3600, .phase = .settled },
+        .{ .id = exhausted_in_cutoff, .owner = key, .expiry = now + 60, .phase = .depleted },
+        .{ .id = expired_exhausted, .owner = key, .expiry = now, .phase = .expired },
+    };
+    var active_params: ?[]const u8 = null;
+    var orphan_params: ?[]const u8 = null;
+    for (cases) |row| {
+        const single_cut = std.meta.eql(row.id, exhausted) or std.meta.eql(row.id, settled) or
+            std.meta.eql(row.id, exhausted_in_cutoff) or std.meta.eql(row.id, expired_exhausted);
+        const capacity: u64 = if (single_cut) exhausted_capacity else if (std.meta.eql(row.id, active)) active_capacity else if (row.phase == .settled) p.hoe_capacity_msat else if (std.meta.eql(row.id, dust)) 14 else 100;
+        const params_json = try std.json.Stringify.valueAlloc(a, .{
+            .sender_pubkey = test_pubkey_hex,
+            .expiry_timestamp = row.expiry,
+            .capacity = capacity,
+        }, .{});
+        // Exact open retries must send the same bytes as the seeded funding row.
+        if (std.meta.eql(row.id, active)) active_params = params_json;
+        if (std.meta.eql(row.id, orphan)) orphan_params = params_json;
+        {
+            const stmt = try channel_sql.prepare("INSERT INTO receiver_channels (id,owner,wallet_net_msat) VALUES (?1,?2,?3)");
+            defer stmt.finalize();
+            try stmt.bindBlob(1, &row.id);
+            try stmt.bindBlob(2, &row.owner);
+            if (row.phase == .settled and !std.meta.eql(row.id, unredeemed)) try stmt.bindUInt(3, 5);
+            try stmt.finish();
+        }
+        const terminal = row.phase == .settlement_pending or row.phase == .settled;
+        const balance: u64 = if (single_cut or row.phase == .settled) capacity else if (std.meta.eql(row.id, active)) active_balance else if (std.meta.eql(row.id, dust)) 10 else if (terminal) 5 else 0;
+        {
+            const stmt = try channel_sql.prepare(
+                \\INSERT INTO spilman_channels (channel_id,funding_json,balance,signature,state,closed_json)
+                \\VALUES(lower(hex(?1)),json_object('params_json',CAST(?2 AS TEXT),'keyset_info_json','{}','funding_proofs_json',CAST(?3 AS TEXT)),
+                \\  ?4,lower(hex(?5)),CAST(?6 AS TEXT),CAST(?7 AS TEXT))
+            );
+            defer stmt.finalize();
+            try stmt.bindBlob(1, &row.id);
+            try stmt.bindBlob(2, params_json);
+            try stmt.bindBlob(3, open_proofs);
+            try stmt.bindUInt(4, balance);
+            if (balance != 0) try stmt.bindBlob(5, &signature);
+            try stmt.bindBlob(6, switch (row.phase) {
+                .settlement_pending => "Closing",
+                .settled => "Closed",
+                else => "Open",
+            });
+            if (row.phase == .settled) try stmt.bindBlob(7, "{\"receiver_sum\":5,\"sender_sum\":95,\"receiver_proofs_json\":\"[{\\\"receiver\\\":true}]\",\"sender_proofs_json\":\"[{\\\"sender\\\":true}]\"}");
+            try stmt.finish();
+        }
+        if (row.phase == .settlement_pending) {
+            const stmt = try channel_sql.prepare("INSERT INTO spilman_close_journals VALUES(lower(hex(?1)), 'journal')");
+            defer stmt.finalize();
+            try stmt.bindBlob(1, &row.id);
+            try stmt.finish();
+        }
+    }
+
+    const active_open: p.SpillmanChannelOpen = .{ .id = active, .proof = open_proofs, .params = active_params.? };
+    const orphan_open: p.SpillmanChannelOpen = .{ .id = orphan, .proof = open_proofs, .params = orphan_params.? };
+    for ([_]?ChannelId{ active, @splat(2), @splat(3), @splat(4), @splat(5), @splat(6), @splat(7), null, active, active, exhausted, exhausted_in_cutoff, expired_exhausted }, 0..) |id, i| {
+        try db.saveUser(key, .{ .location = location, .hoe_channel_id = id });
+        output.end = 0;
+        var handler = try Handler.init(&socket, app);
+        defer handler.close();
+        handler.nonce = @splat(7);
+        handler.deadline = transport.freshDeadline(t.io);
+        // Model settlement holding the wallet lock during mint I/O.
+        const busy = i == 8;
+        {
+            const held = if (busy) wallet.tryAcquire() orelse return error.TestWalletBusy else null;
+            defer if (held) |channels| channels.release();
+            if (i == 9) try channel_sql.exec("UPDATE spilman_channels SET state='offline' WHERE state='Open'");
+            defer if (i == 9) channel_sql.exec("UPDATE spilman_channels SET state='Open' WHERE state='offline'") catch unreachable;
+            if (busy or i == 9) {
+                try t.expectError(error.AuthenticationRejected, handler.clientMessage(proof, .binary));
+                try expectAuthFailure(output.buffered(), .unavailable);
+                try t.expect(handler.session == null and !handler.authenticated);
+                try t.expectEqual(id, (try db.loadUser(key)).?.hoe_channel_id);
+                continue;
+            }
+            try handler.clientMessage(proof, .binary);
+        }
+        try handler.completeAuthentication();
+        const ack = output.buffered();
+        const depleted = std.meta.eql(id, @as(?ChannelId, exhausted)) or std.meta.eql(id, @as(?ChannelId, exhausted_in_cutoff));
+        const spendable = std.meta.eql(id, @as(?ChannelId, active));
+        const with_channel = spendable or depleted;
+        try t.expectEqualSlices(u8, &.{ 0x82, if (with_channel) 72 else 15 }, ack[0..2]);
+        const expected: p.AuthOutcome = if (with_channel) .{ .ok_with_hoe_channel = .{
+            .location = location,
+            .hoe_channel_id = id.?,
+            .hoe_channel_capacity_msat = if (depleted) exhausted_capacity else active_capacity,
+            .hoe_channel_balance_msat = if (depleted) exhausted_capacity else active_balance,
+        } } else .{ .ok = location };
+        try t.expectEqualDeep(expected, (try wire.decodeAuth(ack[2..], true, .reply)).reply);
+        try t.expectEqual(id, (try db.loadUser(key)).?.hoe_channel_id);
+
+        try t.expectEqual(spendable, app.registry.hoeChannel(handler.session.?) != null);
+        var req_bytes: [p.max_request_bytes]u8 = undefined;
+        var snapshot: p.Snapshot = undefined;
+        const req_id: p.Id = @splat(0x21);
+        if (depleted) {
+            output.end = 0;
+            try handler.clientMessage(try wire.encodeRequest(&req_bytes, .channel_status, .{ .request_id = req_id, .payload = .{ .id = id.? } }), .binary);
+            try t.expectEqualDeep(p.Outcome(.channel_status){ .ok = .{
+                .phase = .depleted,
+                .capacity_msat = exhausted_capacity,
+                .balance_msat = exhausted_capacity,
+            } }, try wire.decodeReply(output.buffered()[2..], .channel_status, req_id, &snapshot));
+            try expectOpen(&handler, &output, orphan_open, .{ .failed = .invalid_request });
+            try t.expectEqual(id, (try db.loadUser(key)).?.hoe_channel_id);
+        }
+        if (!spendable) continue;
+        for ([_]p.tool{ .hoe, .axe, .pickaxe }) |tool| {
+            output.end = 0;
+            const request = try wire.encodeRequest(&req_bytes, .channel_requirements, .{ .request_id = req_id, .payload = .{ .tool = tool } });
+            const quote_before: u64 = @intCast(std.Io.Clock.real.now(t.io).toSeconds());
+            try handler.clientMessage(request, .binary);
+            const quote_after: u64 = @intCast(std.Io.Clock.real.now(t.io).toSeconds());
+            const outcome = try wire.decodeReply(output.buffered()[2..], .channel_requirements, req_id, &snapshot);
+            if (tool == .hoe) {
+                try t.expect(outcome == .ok);
+                try t.expectEqual(wallet.receiverPubkey(week).?, outcome.ok.pubkey);
+                try t.expectEqual(p.hoe_price_msat, outcome.ok.amount); // Price per cut, not channel capacity.
+                try t.expect(outcome.ok.refundTime >= quote_before + week and outcome.ok.refundTime <= quote_after + week);
+            } else try t.expectEqual(p.ChannelRequirementsFailure.unavailable, outcome.failed);
+        }
+
+        try expectOpen(&handler, &output, .{ .id = active, .proof = "[]", .params = active_open.params }, .{ .failed = .invalid_proof });
+        try expectOpen(&handler, &output, orphan_open, .{ .failed = .invalid_request });
+        try expectOpen(&handler, &output, active_open, .{ .ok = {} });
+        try t.expectEqual(@as(?ChannelId, active), (try db.loadUser(key)).?.hoe_channel_id);
+
+        const closes = [_]struct { id: ChannelId, outcome: p.Outcome(.channel_close) }{
+            .{ .id = active, .outcome = .{ .failed = .close_rejected } }, // one cut remaining
+            .{ .id = dust, .outcome = .{ .failed = .close_rejected } }, // less than one unit, but not zero
+            .{ .id = @splat(4), .outcome = .{ .failed = .close_rejected } }, // foreign
+            .{ .id = @splat(7), .outcome = .{ .failed = .close_rejected } }, // missing
+            .{ .id = @splat(2), .outcome = .{ .failed = .close_rejected } }, // expired, zero earned
+            .{ .id = settled, .outcome = .ok }, // settled one-cut channel, different profile link
+            .{ .id = settled, .outcome = .ok }, // lost ACK retry
+        };
+        for (closes) |close| {
+            output.end = 0;
+            try handler.clientMessage(try wire.encodeRequest(&req_bytes, .channel_close, .{ .request_id = req_id, .payload = .{ .id = close.id } }), .binary);
+            try t.expectEqualDeep(close.outcome, try wire.decodeReply(output.buffered()[2..], .channel_close, req_id, &snapshot));
+        }
+        // The sender reads the receipt via status, even after retrying close.
+        const statuses = [_]struct { id: ChannelId, outcome: p.Outcome(.channel_status) }{
+            .{ .id = active, .outcome = .{ .ok = .{ .phase = .active, .capacity_msat = active_capacity, .balance_msat = active_balance } } },
+            .{ .id = exhausted, .outcome = .{ .ok = .{ .phase = .depleted, .capacity_msat = exhausted_capacity, .balance_msat = exhausted_capacity } } },
+            .{ .id = expired_exhausted, .outcome = .{ .ok = .{ .phase = .settlement_pending, .capacity_msat = exhausted_capacity, .balance_msat = exhausted_capacity } } },
+            .{ .id = @splat(2), .outcome = .{ .ok = .{ .phase = .sender_refund_required, .capacity_msat = 100, .balance_msat = 0 } } },
+            .{ .id = @splat(4), .outcome = .{ .failed = .not_found } }, // foreign
+            .{ .id = @splat(5), .outcome = .{ .ok = .{ .phase = .settlement_pending, .capacity_msat = 100, .balance_msat = 5 } } },
+            .{ .id = settled, .outcome = .{ .ok = .{ .phase = .settled, .capacity_msat = exhausted_capacity, .balance_msat = exhausted_capacity, .sender_proofs = sender_proofs } } },
+            .{ .id = @splat(7), .outcome = .{ .failed = .not_found } }, // missing
+            .{ .id = unredeemed, .outcome = .{ .ok = .{ .phase = .settlement_pending, .capacity_msat = 50, .balance_msat = 50 } } },
+        };
+        for (statuses) |status| {
+            output.end = 0;
+            try handler.clientMessage(try wire.encodeRequest(&req_bytes, .channel_status, .{ .request_id = req_id, .payload = .{ .id = status.id } }), .binary);
+            try t.expectEqualDeep(status.outcome, try wire.decodeReply(output.buffered()[2..], .channel_status, req_id, &snapshot));
+        }
+
+        try t.expect(app.registry.hoeChannel(handler.session.?) != null);
+        const channels = wallet.tryAcquire() orelse return error.TestWalletBusy;
+        defer channels.release();
+        try t.expectEqual(wallet_service.ChannelPhase.expired, (try channels.lookup(key, @splat(2), now)).?.phase);
+        try t.expectEqual(wallet_service.ChannelPhase.depleted, (try channels.lookup(key, exhausted, now)).?.phase);
+        try t.expectEqual(wallet_service.ChannelPhase.depleted, (try channels.lookup(key, exhausted_in_cutoff, now)).?.phase);
+        try t.expectEqual(@as(?ChannelId, active), (try db.loadUser(key)).?.hoe_channel_id);
+    }
+    // The orphan models a committed admission with no committed profile link.
+    // Force a profile write failure, then retry from a fresh authenticated session.
+    const expired: ChannelId = @splat(2);
+    try db.saveUser(key, .{ .location = location, .hoe_channel_id = expired });
+
+    for (0..3) |i| {
+        output.end = 0;
+        var handler = try Handler.init(&socket, app);
+        defer handler.close();
+        handler.nonce = @splat(7);
+        handler.deadline = transport.freshDeadline(t.io);
+        try handler.clientMessage(proof, .binary);
+        try handler.completeAuthentication();
+        const handle = handler.session.?;
+        if (i == 2) {
+            try t.expectEqualDeep(p.AuthOutcome{ .ok_with_hoe_channel = .{
+                .location = east,
+                .hoe_channel_id = orphan,
+                .hoe_channel_capacity_msat = 100,
+                .hoe_channel_balance_msat = 0,
+            } }, (try wire.decodeAuth(output.buffered()[2..], true, .reply)).reply);
+            break;
+        }
+        if (i == 0) {
+            try expectOpen(&handler, &output, .{ .id = exhausted, .proof = open_proofs, .params = "{}" }, .{ .failed = .invalid_proof });
+            try game_sql.exec("CREATE TRIGGER reject_link BEFORE UPDATE OF hoe_channel_id ON game_users BEGIN SELECT raise(ABORT, 'test write failure'); END");
+            try expectOpen(&handler, &output, orphan_open, .{ .failed = .unavailable });
+            try game_sql.exec("DROP TRIGGER reject_link");
+            try t.expectEqual(@as(?ChannelId, expired), app.registry.get(handle).?.hoe_channel_id);
+            try t.expectEqual(@as(?ChannelId, expired), (try db.loadUser(key)).?.hoe_channel_id);
+        } else {
+            try app.registry.update(handle, east);
+            try expectOpen(&handler, &output, orphan_open, .{ .ok = {} });
+            try expectOpen(&handler, &output, orphan_open, .{ .ok = {} });
+            try t.expectEqualDeep(@as(?p.Location, east), app.registry.get(handle).?.location);
+            try t.expectEqual(@as(?ChannelId, orphan), app.registry.get(handle).?.hoe_channel_id);
+            try t.expectEqualDeep(@import("game_db.zig").User{ .location = east, .hoe_channel_id = orphan }, (try db.loadUser(key)).?);
+        }
+    }
+    const channels = wallet.tryAcquire() orelse return error.TestWalletBusy;
+    defer channels.release();
+    try t.expectEqual(active_balance, (try channels.lookup(key, active, now)).?.balance_msat);
+    try t.expectEqual(before, stateCount(&fixture));
+}
+
+fn expectOpen(handler: *Handler, output: *std.Io.Writer, payload: p.SpillmanChannelOpen, expected: p.Outcome(.channel_open)) !void {
+    const request_id: p.Id = @splat(0x22);
+    var bytes: [config.max_payload]u8 = undefined;
+    output.end = 0;
+    try handler.clientMessage(try wire.encodeRequest(&bytes, .channel_open, .{ .request_id = request_id, .payload = payload }), .binary);
+    var snapshot: p.Snapshot = undefined;
+    try std.testing.expectEqualDeep(expected, try wire.decodeReply(output.buffered()[2..], .channel_open, request_id, &snapshot));
 }
 
 fn runOneTickRequest(dispatch: *ticks.Dispatcher, app: *transport.App, slots: *[1]transport.Slot) void {

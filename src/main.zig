@@ -37,6 +37,10 @@ const native_wallet = if (builtin.os.tag != .emscripten) @import("wallet.zig") e
 const wallet_ui = @import("wallet_ui.zig");
 const wallet_service = if (builtin.os.tag != .emscripten) @import("wallet_service.zig") else struct {};
 const ws_worker = if (builtin.os.tag != .emscripten) @import("ws_worker.zig") else struct {};
+const native_hoe = if (!builtin.cpu.arch.isWasm()) @import("native_hoe.zig") else struct {
+    const enabled = false;
+};
+
 const browser_ws = @import("browser_ws.zig");
 const ws_sync = @import("ws_sync.zig");
 const Location = @import("shared").protocol.Location;
@@ -67,6 +71,9 @@ comptime {
     if (builtin.os.tag != .emscripten) {
         _ = @import("ws_worker.zig");
         _ = @import("ws_auth.zig");
+        _ = native_hoe;
+        _ = wallet_service;
+        _ = @import("wallet_commands.zig");
     }
 }
 
@@ -534,6 +541,12 @@ fn stepFrame(
         },
         .disconnected => |detail| rendering.drawDisconnected(detail, driver.viewport_w, driver.viewport_h),
     }
+    if (native_hoe.enabled) {
+        const visible = !blocked and !game_state.menu.opened and !(if (model) |m| m.isBlocking() else false);
+        game_state.paid_hoe.refill_presented = visible and game_state.paid_hoe.view.can_refill and game_state.hoe_funding.canStart() and
+            game_mod.hoeStatusBounds(driver.viewport_w, driver.viewport_h) != null;
+        if (visible) native_hoe.drawStatus(game_state.paid_hoe.view, game_state.hoe_funding, driver.viewport_w, driver.viewport_h);
+    }
     // Capture after drawing and before `endDrawing` swaps/presents, otherwise
     // the framebuffer read is the cleared back buffer (a black screenshot).
     // The 2D overlay (HUD/minimap) is still batched at this point;
@@ -756,6 +769,9 @@ const NativeEffects = struct {
     native: native_onboarding.Native,
     scan_job: *?*ScanJob,
     connection: *ws_worker.Worker,
+    hoe: *native_hoe.Runtime,
+    wallet_worker: *?*wallet_service.Worker,
+    unix_now: ?u64 = null,
     session: u64 = 0,
 
     fn commitMovement(context: ?*anyopaque, destination: Location) bool {
@@ -811,7 +827,11 @@ const NativeEffects = struct {
         }
     }
 
-    fn afterInput(_: ?*anyopaque, game: *game_mod.GameState) void {
+    fn afterInput(context: ?*anyopaque, game: *game_mod.GameState) void {
+        const self: *NativeEffects = @ptrCast(@alignCast(context.?));
+        if (native_hoe.enabled) {
+            self.hoe.click(self.connection, self.wallet_worker.*, game, self.unix_now);
+        }
         if (game.menu.paste_requested) pasteWithdrawal(&game.menu);
         if (game.menu.wallet.copy_requested) {
             game.menu.wallet.copy_requested = false;
@@ -950,19 +970,32 @@ pub fn main() anyerror!void {
     var connection: ws_worker.Worker = .{ .io = io, .paths = wallet_paths };
     try connection.start();
     defer connection.stop();
-    var effects = NativeEffects{ .allocator = allocator, .native = native, .scan_job = &scan_job, .connection = &connection };
+    var hoe: native_hoe.Runtime = .{};
+    var funding: native_hoe.FundingRuntime = .{};
+    var effects = NativeEffects{
+        .allocator = allocator,
+        .native = native,
+        .scan_job = &scan_job,
+        .connection = &connection,
+        .hoe = &hoe,
+        .wallet_worker = &wallet_worker,
+    };
     var network_frame: ws_sync.Frame = .{};
     var onboarding_hand_cursor = false;
 
     while (!rl.windowShouldClose()) {
         var privacy_blocked = model.isBlocking();
         const unix = std.Io.Clock.real.now(io).toSeconds();
-        if (unix >= 0) game_state.menu.wallet.unix_now = @intCast(unix);
+        effects.unix_now = if (unix >= 0) @intCast(unix) else null;
+        if (effects.unix_now) |now| game_state.menu.wallet.unix_now = now;
         if (!model.isBlocking() and game_state.menu.paste_requested) {
             driver.invalidateInput();
             pasteWithdrawal(&game_state.menu);
         }
         game_state.menu.wallet.tick(!model.isBlocking(), rl.getTime());
+        if (native_hoe.enabled and !model.isBlocking() and wallet_worker == null) {
+            wallet_worker = try wallet_service.Worker.start(wallet_paths);
+        }
         if (game_state.menu.wallet.pending and game_state.menu.wallet.request != null and wallet_worker == null) {
             wallet_worker = wallet_service.Worker.start(wallet_paths) catch blk: {
                 game_state.menu.wallet.fail(game_state.menu.wallet.serial, rl.getTime());
@@ -987,8 +1020,20 @@ pub fn main() anyerror!void {
         };
         // Reconcile server output before capturing or consuming new input.
         connection.setEnabled(!model.isBlocking());
-        const presentation = try network_frame.apply(connection.snapshot(), &connection, &driver, &game_state);
+        const network = connection.snapshot();
+        const presentation = try network_frame.apply(network, &connection, &driver, &game_state);
         effects.session = network_frame.session;
+        if (native_hoe.enabled) {
+            hoe.update(&connection, network, wallet_worker, &game_state, network_frame.area_pending, effects.unix_now);
+            if (funding.update(&connection, network, &hoe, wallet_worker, &game_state.hoe_funding, effects.unix_now)) {
+                driver.invalidateInput();
+            }
+            if (funding.wallet_dirty) {
+                funding.wallet_dirty = false;
+                game_state.menu.wallet.balance_dirty = true;
+                game_state.menu.wallet.history_dirty = true;
+            }
+        }
         // Capture on the last requested frame, inside stepFrame's drawing pass.
         privacy_blocked = privacy_blocked or model.isBlocking();
         try stepFrame(

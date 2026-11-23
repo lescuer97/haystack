@@ -33,6 +33,7 @@
     // internet connectivity.
     .dependencies = .{
         .websocket = .{ .path = "vendor/websocket", .lazy = true },
+        .zig_sqlite = .{ .path = "vendor/zig-sqlite", .lazy = true },
         .secp256k1 = .{
             .url = "https://github.com/bitcoin-core/secp256k1/releases/download/v0.8.0/libsecp256k1-0.8.0.tar.gz",
             .hash = "N-V-__8AAFwQbQAc-L8ZUw4rqyk_OWdYX4-V8crqiWlJ1dhl",
@@ -125,5 +126,6 @@
         "vendor/cdk-wallet-ffi/examples",
         "vendor/qrcodegen",
         "vendor/websocket",
+        "vendor/zig-sqlite",
     },
 }
