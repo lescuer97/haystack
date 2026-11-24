@@ -2886,6 +2886,27 @@ impl CdkWallet {
         amount_msats: u64,
         max_sender_fee_msats: u64,
     ) -> FfiResult<SendOutcome> {
+        self.send_inner(mint_url_str, amount_msats, max_sender_fee_msats, None)
+            .await
+    }
+
+    pub(crate) async fn send_bounded(
+        &mut self,
+        mint_url_str: &str,
+        amount_msats: u64,
+        max_token_bytes: usize,
+    ) -> FfiResult<SendOutcome> {
+        self.send_inner(mint_url_str, amount_msats, 0, Some(max_token_bytes))
+            .await
+    }
+
+    async fn send_inner(
+        &mut self,
+        mint_url_str: &str,
+        amount_msats: u64,
+        max_sender_fee_msats: u64,
+        max_token_bytes: Option<usize>,
+    ) -> FfiResult<SendOutcome> {
         let mint_url = parse_mint_url(mint_url_str)?;
 
         // Validate every caller-provided value locally, before any network use.
@@ -2919,7 +2940,11 @@ impl CdkWallet {
             .map_err(|e| FfiErr::new(CdkStatus::InternalError, format!("{e}")))?;
 
         let opts = SendOptions {
-            send_kind: SendKind::OnlineExact,
+            send_kind: if max_token_bytes.is_some() {
+                SendKind::OfflineExact
+            } else {
+                SendKind::OnlineExact
+            },
             include_fee: false,
             ..SendOptions::default()
         };
@@ -2990,6 +3015,36 @@ impl CdkWallet {
                     ),
                 )
                 .await);
+        }
+
+        if let Some(limit) = max_token_bytes {
+            let refusal = if !prepared.proofs_to_swap().is_empty() {
+                Some("bounded send requires exact proofs without a swap")
+            } else {
+                // With no swap, no memo, and the default Swap (not SignAndSend)
+                // policy, CDK confirms with these same proofs and token fields.
+                // Keyset group ordering can vary, but not the encoded length.
+                let token = Token::new(
+                    wallet.mint_url.clone(),
+                    prepared.proofs_to_send().clone(),
+                    None,
+                    wallet.unit.clone(),
+                )
+                .to_string();
+                (token.len() > limit).then_some("serialized token exceeds the byte limit")
+            };
+            if let Some(message) = refusal {
+                return Err(self
+                    .cancel_prepared(
+                        prepared,
+                        &mint_url,
+                        operation_id,
+                        total_fee,
+                        CdkStatus::SendFailed,
+                        message.to_string(),
+                    )
+                    .await);
+            }
         }
 
         match timeout(deadline, prepared.confirm(None)).await {

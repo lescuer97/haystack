@@ -990,7 +990,9 @@ fn drawMenuItem(rect: menu.Rect, item: menu.MenuItem, game: *const game_mod.Game
         return;
     }
     if (item == .action and item.action == .balance) {
-        drawCenteredText(if (state.wallet.balance.len > 0) state.wallet.balance.z() else "Balance unavailable", rect, 20, menu_text_color);
+        var buf: [32]u8 = undefined;
+        const balance = if (state.wallet.balance.len > 0) state.wallet.balance.z() else "Balance unavailable";
+        drawCenteredText(walletAnimatedBalance(&state.wallet, rl.getTime(), &buf) orelse balance, rect, 20, menu_text_color);
         return;
     }
     const text_field = menu.itemField(item);
@@ -1247,7 +1249,9 @@ fn drawWalletContent(state: *const menu.Menu, rect: menu.Rect) void {
     }
     rl.drawText(model.message.z(), x, y, 13, menu_muted);
     if (state.currentPage != .Invoice) {
-        rl.drawText(model.mint.z(), x, y + 23, 13, menu_muted);
+        if (state.currentPage == .Wallet and model.prize_notice != null) {
+            drawWrapped(model.prize_notice.?, .{ .x = rect.x, .y = rect.y + 20, .width = rect.width, .height = @max(1, rect.height - 20) }, 13, false);
+        } else rl.drawText(model.mint.z(), x, y + 23, 13, menu_muted);
         return;
     }
     if (model.selection_loading) {
@@ -1363,6 +1367,13 @@ fn walletBadgeBalance(wallet: *const wallet_ui.Model) [:0]const u8 {
     return "Balance unavailable";
 }
 
+fn walletAnimatedBalance(wallet: *const wallet_ui.Model, now: f64, buf: *[32]u8) ?[:0]const u8 {
+    if (wallet.available) if (wallet.displayedBalance(now)) |balance| {
+        if (balance != wallet.balance_msat) return std.fmt.bufPrintSentinel(buf, "{d} msat", .{balance}, 0) catch unreachable;
+    };
+    return null;
+}
+
 fn drawWalletBadge(state: *const menu.Menu, vw: f32, vh: f32) void {
     const bounds = game_mod.walletBadgeBounds(vw, vh) orelse return;
     const wallet = &state.wallet;
@@ -1372,12 +1383,19 @@ fn drawWalletBadge(state: *const menu.Menu, vw: f32, vh: f32) void {
 
     const x: i32 = @intFromFloat(bounds.x + 10);
     const y: i32 = @intFromFloat(bounds.y + 8);
+    const now = rl.getTime();
+    const pulse = wallet.rewardPulse(now);
+    if (pulse > 0) {
+        const spread = 2 + pulse * 3;
+        rl.drawRectangleRec(.{ .x = @as(f32, @floatFromInt(x)) - spread, .y = @as(f32, @floatFromInt(y)) - spread, .width = 18 + 2 * spread, .height = 14 + 2 * spread }, rl.fade(menu_accent, pulse * 0.5));
+    }
     rl.drawRectangle(x + 2, y, 13, 3, menu_accent);
     rl.drawRectangle(x, y + 3, 17, 11, menu_accent);
     rl.drawRectangle(x + 2, y + 5, 13, 7, menu_item_focus);
     rl.drawRectangle(x + 11, y + 7, 7, 3, menu_accent);
-    rl.drawText("Wallet", x + 25, y, 16, menu_title_color);
-    rl.drawText(walletBadgeBalance(wallet), x, y + 20, 14, if (wallet.available) menu_text_color else menu_muted);
+    rl.drawText(if (wallet.prize_notice != null) "Wallet !" else "Wallet", x + 25, y, 16, menu_title_color);
+    var buf: [32]u8 = undefined;
+    rl.drawText(walletAnimatedBalance(wallet, now, &buf) orelse walletBadgeBalance(wallet), x, y + 20, 14, if (wallet.available) menu_text_color else menu_muted);
 }
 
 fn drawRefillNotice(viewport_w: f32, viewport_h: f32) void {

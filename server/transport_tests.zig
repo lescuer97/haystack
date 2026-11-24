@@ -263,6 +263,121 @@ test "fixed buffer authentication challenge proof ACK claims and failure cleanup
     try std.testing.expect(auth_deadline.compare(.gt, handler.deadline));
     try transport.checkDeadline(std.testing.io, auth_deadline);
 }
+test "pending prize notices replay exact tokens only to the confirmed owner until ACK" {
+    const t = std.testing;
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const app = &fixture.application;
+    var db = try GameDb.open(":memory:");
+    defer db.close();
+    var persistence = try Persistence.init(t.io, t.allocator, &db, &app.context.state, app.registry);
+    defer persistence.deinit(t.allocator);
+    app.persistence = &persistence;
+
+    var owner: sessions.Pubkey = undefined;
+    _ = try std.fmt.hexToBytes(&owner, test_pubkey_hex);
+    const stranger: sessions.Pubkey = @splat(0x44);
+    const Prize = @import("game_db.zig").Prize;
+    const first: Prize = .{ .x = std.math.minInt(i32), .y = std.math.minInt(i32), .owner = owner };
+    const second: Prize = .{ .x = first.x, .y = first.y + 2, .owner = owner };
+    const oversized: Prize = .{ .x = first.x, .y = first.y + 1, .owner = owner };
+    const owed: Prize = .{ .x = 10, .y = 0, .owner = owner };
+    const oversized_token: [p.max_prize_token_bytes + 1]u8 = @splat('x');
+    var large_token: [p.max_prize_token_bytes]u8 = @splat('a');
+    @memcpy(large_token[0..6], "cashuB");
+    const tokens = [_][]const u8{ "cashu-exact-first", &large_token, "cashu-stranger", &oversized_token };
+    for ([_]Prize{ first, second, .{ .x = 0, .y = 0, .owner = stranger }, oversized }, tokens) |prize, token| {
+        try db.commitPrizeCut(prize, @splat(0xff), @import("prize.zig").amount_msat);
+        try db.recordPrizeSend(prize, .intent);
+        try db.recordPrizeSend(prize, .{ .issued = .{ .operation_id = @splat(7), .token = token } });
+    }
+    try db.commitPrizeCut(owed, @splat(0xff), @import("prize.zig").amount_msat);
+
+    var signature: [64]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&signature, test_signature_hex);
+    var proof_bytes: [107]u8 = undefined;
+    const proof = try wire.encodeAuth(&proof_bytes, .{ .proof = .{ .pubkey = owner, .signature = signature } });
+    var ack_bytes: [wire.prize_ack_bytes]u8 = undefined;
+    const ack = try wire.encodePrizeAck(&ack_bytes, .{ .x = first.x, .y = first.y });
+    var input = std.Io.Reader.fixed("");
+    const LockCheckingOutput = struct {
+        lock: *std.Io.Mutex,
+        writer: std.Io.Writer,
+        fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            const self: *@This() = @fieldParentPtr("writer", writer);
+            if (!self.lock.tryLock()) return error.WriteFailed;
+            self.lock.unlock(t.io);
+        }
+    };
+    var bytes: [wire.max_prize_notice_bytes + 256]u8 = undefined;
+    var checked = LockCheckingOutput{ .lock = &persistence.disk_lock, .writer = .{
+        .buffer = &bytes,
+        .vtable = &.{ .drain = std.Io.Writer.fixedDrain, .flush = LockCheckingOutput.flush },
+    } };
+    const output = &checked.writer;
+    var websocket = ws{ .input = &input, .output = output, .key = "" };
+    var handler = try Handler.init(&websocket, app);
+    defer handler.close();
+    handler.nonce = @splat(7);
+    handler.deadline = transport.freshDeadline(t.io);
+    try handler.clientMessage(ack, .binary);
+    try t.expectEqualSlices(u8, protocol_error_frame, output.buffered());
+
+    handler.session = try persistence.claim(stranger, handler.deadline);
+    output.end = 0;
+    try handler.completeAuthentication();
+    var notice: [wire.max_prize_notice_bytes]u8 = undefined;
+    const stranger_notice = try wire.encodePrizeNotice(&notice, .{ .x = 0, .y = 0 }, tokens[2]);
+    try t.expectEqualSlices(u8, &.{ 0x82, @intCast(stranger_notice.len) }, output.buffered()[0..2]);
+    try t.expectEqualSlices(u8, stranger_notice, output.buffered()[2..]);
+    output.end = 0;
+    try handler.clientMessage(ack, .binary);
+    try t.expectEqual(@as(usize, 0), output.buffered().len);
+    handler.close();
+
+    for (0..3) |connection| {
+        output.end = 0;
+        handler.deadline = transport.freshDeadline(t.io);
+        try handler.clientMessage(proof, .binary);
+        const auth_len = output.buffered().len;
+        try t.expectEqualSlices(u8, &.{ 0x82, @intCast(auth_len - 2) }, output.buffered()[0..2]);
+        try t.expect((try wire.decodeAuth(output.buffered()[2..], true, .reply)).reply == .ok);
+        try handler.completeAuthentication();
+        var frames = output.buffered()[auth_len..];
+        for ([_]Prize{ first, second }, tokens[0..2], 0..) |prize, token, i| {
+            if (connection == 2 and i == 0) continue;
+            const expected = try wire.encodePrizeNotice(&notice, .{ .x = prize.x, .y = prize.y }, token);
+            const header_len: usize = if (expected.len < 126) 2 else 4;
+            try t.expect(frames.len >= header_len + expected.len);
+            try t.expectEqual(@as(u8, 0x82), frames[0]);
+            if (header_len == 2) {
+                try t.expectEqual(@as(u8, @intCast(expected.len)), frames[1]);
+            } else {
+                try t.expectEqual(@as(u8, 126), frames[1]);
+                try t.expectEqual(@as(u16, @intCast(expected.len)), std.mem.readInt(u16, frames[2..4], .big));
+            }
+            try t.expectEqualSlices(u8, expected, frames[header_len..][0..expected.len]);
+            frames = frames[header_len + expected.len ..];
+        }
+        try t.expectEqual(@as(usize, 0), frames.len);
+        if (connection == 0) {
+            const before = output.buffered().len;
+            try handler.clientMessage(ack, .text);
+            try t.expectEqualSlices(u8, protocol_error_frame, output.buffered()[before..]);
+        }
+        if (connection == 1) {
+            const before = output.buffered().len;
+            try handler.clientMessage(ack, .binary);
+            try handler.clientMessage(ack, .binary);
+            var owed_ack: [wire.prize_ack_bytes]u8 = undefined;
+            try handler.clientMessage(try wire.encodePrizeAck(&owed_ack, .{ .x = owed.x, .y = owed.y }), .binary);
+            try t.expectEqual(before, output.buffered().len);
+            try db.recordPrizeSend(owed, .intent); // The ACK did not delete unpaid debt.
+        }
+        handler.close();
+    }
+}
+
 test "durable auth ACK stays provisional until the outer deadline check passes" {
     const t = std.testing;
     var fixture = try Fixture.init();
@@ -935,6 +1050,155 @@ test "headless wallet exposes owned spendable and depleted channels and quotes u
     defer channels.release();
     try t.expectEqual(active_balance, (try channels.lookup(key, active, now)).?.balance_msat);
     try t.expectEqual(before, stateCount(&fixture));
+}
+
+test "signed winning cuts for all tools persist independently of channel payment" {
+    const t = std.testing;
+    const native = @import("native_storage");
+    const c = native.wallet.cdk.c;
+    const prizes = @import("prize.zig");
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dir = try tmp.dir.realPathFileAlloc(t.io, ".", a);
+    const game_path = try std.fs.path.joinZ(a, &.{ dir, "game.sqlite" });
+    var db = try GameDb.open(game_path);
+    defer db.close();
+    const game_sql = try native.sqlite.Db.open(game_path, .read_write_no_mutex, false);
+    defer game_sql.close();
+    const vector = try std.json.parseFromSliceLeaky(struct {
+        alice_pubkey: []const u8,
+        alice_secret: [:0]const u8,
+        channel_secret: [:0]const u8,
+        expiry_timestamp: u64,
+        funding_proofs_json: [:0]const u8,
+        keyset_json: [:0]const u8,
+        params_json: []const u8,
+    }, a, @embedFile("spilman_vectors.json"), .{ .ignore_unknown_fields = true });
+    var owner: [33]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&owner, vector.alice_pubkey);
+    const seed: [32]u8 = @splat(0xb9);
+    const now: u64 = @intCast(std.Io.Clock.real.now(t.io).toSeconds());
+    const params = try a.dupeSentinel(u8, try std.mem.replaceOwned(u8, a, vector.params_json, try std.fmt.allocPrint(a, "\"expiry_timestamp\":{d}", .{vector.expiry_timestamp}), try std.fmt.allocPrint(a, "\"expiry_timestamp\":{d}", .{now + 3600})), 0);
+    const id_result = c.cdk_spilman_channel_parameters_get_channel_id(params, vector.channel_secret, vector.keyset_json);
+    defer c.cdk_string_free(id_result.@"error");
+    defer c.cdk_string_free(id_result.value);
+    try t.expectEqual(c.CDK_STATUS_OK, id_result.status);
+    const channel_hex = std.mem.span(id_result.value);
+    var id: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&id, channel_hex);
+
+    for ([_]p.tool{ .hoe, .axe, .pickaxe, .hoe, .hoe }, 0..) |tool, i| {
+        const fail_prize_commit = i == 3;
+        const disabled = i == 4;
+        var pos: p.Location = .{ .x = 0, .y = -@as(i32, @intCast(i)) };
+        while (pos.x > -1000000) : (pos.x -= 1) {
+            if (shared.world.sampleTile(shared.world.public_seed, pos.x, pos.y) == tool.terrain() and
+                prizes.wins(seed, shared.world.public_seed, pos.x, pos.y)) break;
+        } else return error.TestWinningTileNotFound;
+        const channel_path = try std.fmt.allocPrintSentinel(a, "{s}/channel-{d}.sqlite", .{ dir, i }, 0);
+        const wallet_path = try std.fmt.allocPrintSentinel(a, "{s}/wallet-{d}.sqlite", .{ dir, i }, 0);
+        var wallet = try native.wallet_service.Headless.testing.openWithLedger(t.io, t.allocator, wallet_path, channel_path);
+        defer wallet.close() catch {};
+        const channel_sql = try native.sqlite.Db.open(channel_path, .read_write_no_follow, false);
+        defer channel_sql.close();
+        {
+            const stmt = try channel_sql.prepare("INSERT INTO receiver_channels (id,owner,price_msat) VALUES (?1,?2,?3)");
+            defer stmt.finalize();
+            try stmt.bindBlob(1, &id);
+            try stmt.bindBlob(2, &owner);
+            try stmt.bindUInt(3, tool.priceMsat());
+            try stmt.finish();
+            const fund = try channel_sql.prepare(
+                \\INSERT INTO spilman_channels (channel_id,funding_json,balance,state)
+                \\VALUES(lower(hex(?1)), json_object('params_json',CAST(?2 AS TEXT),'keyset_info_json',CAST(?3 AS TEXT),
+                \\    'funding_proofs_json',CAST(?4 AS TEXT),'channel_secret_hex',CAST(?5 AS TEXT)),0,'Open')
+            );
+            defer fund.finalize();
+            try fund.bindBlob(1, &id);
+            try fund.bindBlob(2, params);
+            try fund.bindBlob(3, vector.keyset_json);
+            try fund.bindBlob(4, vector.funding_proofs_json);
+            try fund.bindBlob(5, vector.channel_secret);
+            try fund.finish();
+        }
+        var user: @import("game_db.zig").User = .{ .location = pos };
+        user.setChannelId(tool, id);
+        try db.saveUser(owner, user);
+        var fixture = try Fixture.init();
+        defer fixture.deinit();
+        const app = &fixture.application;
+        var storage = try Persistence.init(t.io, t.allocator, &db, &app.context.state, app.registry);
+        defer storage.deinit(t.allocator);
+        app.persistence = &storage;
+        app.wallet = &wallet;
+        if (!disabled) app.prize_seed = seed;
+        const signed = c.cdk_spilman_create_signed_balance_update(params, vector.keyset_json, vector.alice_secret, vector.funding_proofs_json, tool.priceMsat());
+        defer c.cdk_string_free(signed.@"error");
+        defer c.cdk_string_free(signed.value);
+        try t.expectEqual(c.CDK_STATUS_OK, signed.status);
+        const update = try std.json.parseFromSliceLeaky(struct { signature: []const u8 }, a, std.mem.span(signed.value), .{ .ignore_unknown_fields = true });
+        var signature: [64]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&signature, update.signature);
+        var input = std.Io.Reader.fixed("");
+        var reply: [p.max_response_bytes]u8 = undefined;
+        var output = std.Io.Writer.fixed(&reply);
+        var socket = ws{ .input = &input, .output = &output, .key = "" };
+        var handler = try Handler.init(&socket, app);
+        defer handler.close();
+        handler.session = try storage.claim(owner, transport.freshDeadline(t.io));
+        handler.authenticated = true;
+        _ = app.authOutcome(handler.session.?);
+        try t.expect(app.registry.toolChannel(handler.session.?, tool) != null);
+        var request: p.RequestFor(.cut) = .{ .request_id = @splat(9), .payload = .{
+            .x = pos.x,
+            .y = pos.y,
+            .tool = tool,
+            .payment = .{ .id = id, .amount = tool.priceMsat(), .signature = signature },
+        } };
+        var request_buffer: [p.max_request_bytes]u8 = undefined;
+        var snapshot: p.Snapshot = undefined;
+        request.payload.payment.?.amount += 1;
+        try handler.clientMessage(try wire.encodeRequest(&request_buffer, .cut, request), .binary);
+        try t.expectEqual(.invalid_request, (try wire.decodeReply(output.buffered()[2..], .cut, request.request_id, &snapshot)).failed);
+        request.payload.payment.?.amount -= 1;
+        output.end = 0;
+        if (fail_prize_commit) try game_sql.exec("CREATE TRIGGER reject_prize BEFORE INSERT ON pending_prizes BEGIN SELECT raise(ABORT, 'test'); END");
+        defer if (fail_prize_commit) game_sql.exec("DROP TRIGGER reject_prize") catch unreachable;
+        try handler.clientMessage(try wire.encodeRequest(&request_buffer, .cut, request), .binary);
+        const outcome = try wire.decodeReply(output.buffered()[2..], .cut, request.request_id, &snapshot);
+        if (fail_prize_commit) {
+            try t.expectEqual(.server_busy, outcome.failed);
+            try t.expect(!app.context.state.isCleared(pos));
+        } else {
+            try t.expect(outcome.ok.cut and outcome.ok.prize_token == null);
+            output.end = 0;
+            try handler.clientMessage(try wire.encodeRequest(&request_buffer, .cut, request), .binary);
+            const repeat = try wire.decodeReply(output.buffered()[2..], .cut, request.request_id, &snapshot);
+            try t.expect(repeat.failed.already_cut.prize_token == null);
+        }
+        const channels = wallet.tryAcquire().?;
+        defer channels.release();
+        try t.expectEqual(tool.priceMsat(), (try channels.lookup(owner, id, now)).?.balance_msat);
+        const row = try game_sql.prepare("SELECT owner, state FROM pending_prizes WHERE x = ?1 AND y = ?2");
+        defer row.finalize();
+        try row.bindInt(1, pos.x);
+        try row.bindInt(2, pos.y);
+        if (fail_prize_commit or disabled) {
+            try t.expect(!try row.next());
+        } else {
+            try t.expect(try row.next());
+            try t.expectEqual(owner, try row.blob(33, 0));
+            // The isolated wallet's non-policy mint must never be contacted.
+            try t.expect(row.textEquals(1, "sending"));
+            const address = @import("chunk_address.zig").ChunkAddress.fromTile(pos.x, pos.y);
+            const bits = (try db.loadChunk(address)).?;
+            const bit: usize = @intCast(@mod(pos.y, 16) * 16 + @mod(pos.x, 16));
+            try t.expect(bits[bit / 8] & (@as(u8, 1) << @as(u3, @intCast(bit % 8))) != 0);
+        }
+    }
 }
 
 fn expectOpen(handler: *Handler, output: *std.Io.Writer, payload: p.SpillmanChannelOpen, expected: p.Outcome(.channel_open)) !void {

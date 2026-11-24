@@ -30,11 +30,16 @@ function openDatabase() {
       reject(new Error("IndexedDB could not be opened"));
       return;
     }
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = event => {
+      if (event.oldVersion !== 0) {
+        // The aborted open rejects through onerror without changing the database.
+        request.transaction.abort();
+        return;
+      }
       const database = request.result;
-      if (!database.objectStoreNames.contains(MNEMONIC_STORE)) database.createObjectStore(MNEMONIC_STORE);
-      if (!database.objectStoreNames.contains(STATE_STORE)) database.createObjectStore(STATE_STORE);
-      if (!database.objectStoreNames.contains(ONBOARDING_STORE)) database.createObjectStore(ONBOARDING_STORE);
+      database.createObjectStore(MNEMONIC_STORE);
+      database.createObjectStore(STATE_STORE);
+      database.createObjectStore(ONBOARDING_STORE);
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(new Error("IndexedDB could not be opened"));

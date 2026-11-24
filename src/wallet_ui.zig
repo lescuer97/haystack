@@ -16,6 +16,7 @@ pub const Operation = enum {
     cancel_withdrawal,
     saved_withdrawal,
     poll_withdrawals,
+    receive_prize,
 
     pub fn isWithdrawal(self: Operation) bool {
         return switch (self) {
@@ -44,6 +45,33 @@ pub fn Text(comptime capacity: usize) type {
         }
     };
 }
+const protocol = @import("shared").protocol;
+pub const PrizeToken = Text(protocol.max_prize_token_bytes);
+pub const PrizeNotice = struct { tile: protocol.Location, token: PrizeToken };
+const PrizeKey = struct { player: [33]u8, tile: protocol.Location };
+const PendingPrize = struct { key: PrizeKey, token: PrizeToken };
+const PrizeReceipt = struct { key: PrizeKey, credited: bool };
+const pending_prize_limit = 4;
+const prize_receipt_limit = 256;
+const prize_deferred: [:0]const u8 = "Some prizes deferred until the next connection.";
+const prize_receipts_full: [:0]const u8 = "Prize collection paused. Contact the game server operator.";
+
+comptime {
+    if (protocol.max_prize_token_bytes >= @sizeOf(@FieldType(@FieldType(Request, "argument"), "bytes")))
+        @compileError("wallet request must fit a maximum-size prize token and terminator");
+}
+
+const Reward = struct {
+    from: u64,
+    to: u64,
+    start: f64,
+    const duration = 0.65;
+
+    fn progress(self: Reward, now: f64) f64 {
+        return std.math.clamp((now - self.start) / duration, 0, 1);
+    }
+};
+
 pub const Row = struct { outgoing: bool = false, mint: Text(256) = .{}, id: Text(1024) = .{}, text: Text(512) = .{} };
 pub const Recovery = enum { none, unknown, legacy_unknown };
 // Ephemeral withdrawal presentation. CDK owns reservations, payments and recovery.
@@ -155,6 +183,19 @@ pub const Model = struct {
     recovery: Recovery = .none,
     balance: Text(100) = .{},
     balance_msat: ?u64 = null,
+    pending_prizes: [pending_prize_limit]PendingPrize = undefined,
+    pending_prize_count: usize = 0,
+    // Neither an ACK send nor a failed receive proves what happened remotely.
+    // Keep terminal receipts for this game instance; never evict one to retry.
+    prize_receipts: [prize_receipt_limit]PrizeReceipt = undefined,
+    prize_receipt_count: usize = 0,
+    prize_acks_due: std.StaticBitSet(prize_receipt_limit) = .empty,
+    prize_player: ?[33]u8 = null,
+    prize_in_flight: ?usize = null,
+    prize_refresh: bool = false,
+    reward: ?Reward = null,
+    prize_chime: bool = false,
+    prize_notice: ?[:0]const u8 = null,
     mint: Text(256) = .{},
     message: Text(160) = .{},
     invoice: Text(4096) = .{},
@@ -177,6 +218,123 @@ pub const Model = struct {
     total_rows: usize = 0,
     history_error: bool = false,
     rows: [8]Row = @splat(.{}),
+
+    pub fn clearPendingPrizes(self: *Model) void {
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.pending_prizes[0..self.pending_prize_count]));
+        self.pending_prize_count = 0;
+        self.prize_in_flight = null;
+    }
+
+    pub fn queuePrize(self: *Model, player: [33]u8, tile: protocol.Location, token: PrizeToken) void {
+        if (token.len == 0) return;
+        const key: PrizeKey = .{ .player = player, .tile = tile };
+        for (self.prize_receipts[0..self.prize_receipt_count], 0..) |*receipt, i| {
+            if (!std.meta.eql(receipt.key, key)) continue;
+            if (receipt.credited) self.prize_acks_due.set(i);
+            return;
+        }
+        for (self.pending_prizes[0..self.pending_prize_count]) |*prize| {
+            if (std.meta.eql(prize.key, key)) return;
+        }
+        if (self.prize_receipt_count == prize_receipt_limit) {
+            self.prize_notice = prize_receipts_full;
+        } else if (self.pending_prize_count == pending_prize_limit) {
+            self.noteDeferredPrize();
+        } else {
+            self.pending_prizes[self.pending_prize_count] = .{ .key = key, .token = token };
+            self.pending_prize_count += 1;
+        }
+    }
+
+    fn noteDeferredPrize(self: *Model) void {
+        if (self.prize_notice == null) self.prize_notice = prize_deferred;
+    }
+
+    fn removePendingPrize(self: *Model, i: usize) void {
+        self.pending_prize_count -= 1;
+        std.mem.copyForwards(PendingPrize, self.pending_prizes[i..self.pending_prize_count], self.pending_prizes[i + 1 .. self.pending_prize_count + 1]);
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.pending_prizes[self.pending_prize_count]));
+        if (self.prize_in_flight) |active| {
+            if (active > i) self.prize_in_flight = active - 1;
+        }
+    }
+
+    pub fn syncPrizes(self: *Model, connection: anytype, session: u64) void {
+        self.prize_player = null;
+        const login = connection.hoeLogin(session) orelse return;
+        self.prize_player = login.player;
+        // An unattempted prize for a different key can be redelivered by the server.
+        // Keep the in-flight slot until its result is recorded for the original key.
+        var i: usize = 0;
+        while (i < self.pending_prize_count) {
+            if (self.prize_in_flight != i and !std.mem.eql(u8, &self.pending_prizes[i].key.player, &login.player)) {
+                self.removePendingPrize(i);
+            } else i += 1;
+        }
+        for (0..pending_prize_limit) |_| {
+            if (self.pending_prize_count == pending_prize_limit) break;
+            const notice = connection.takePrizeNotice(session) orelse break;
+            self.queuePrize(login.player, notice.tile, notice.token);
+        }
+        if (connection.takeDeferredPrizes(session)) self.noteDeferredPrize();
+        var due = self.prize_acks_due.iterator(.{});
+        while (due.next()) |index| {
+            const key = self.prize_receipts[index].key;
+            if (!std.mem.eql(u8, &key.player, &login.player)) continue;
+            if (!connection.ackPrize(session, key.player, key.tile)) break;
+            self.prize_acks_due.unset(index);
+        }
+    }
+
+    fn startPrize(self: *Model) bool {
+        const player = self.prize_player orelse return false;
+        if (self.prize_in_flight != null or self.prize_receipt_count == prize_receipt_limit) return false;
+        for (self.pending_prizes[0..self.pending_prize_count], 0..) |*prize, i| {
+            if (!std.mem.eql(u8, &prize.key.player, &player)) continue;
+            if (!self.enqueue(.receive_prize, prize.token.slice())) return false;
+            self.prize_in_flight = i;
+            return true;
+        }
+        return false;
+    }
+
+    fn finishPrize(self: *Model, result: enum { blocked, credited, failed }) void {
+        const i = self.prize_in_flight orelse return;
+        self.prize_in_flight = null;
+        if (result == .blocked) return;
+        const receipt = self.prize_receipt_count;
+        self.prize_receipts[receipt] = .{ .key = self.pending_prizes[i].key, .credited = result == .credited };
+        self.prize_receipt_count += 1;
+        if (result == .credited) self.prize_acks_due.set(receipt);
+        self.removePendingPrize(i);
+        if (self.prize_receipt_count == prize_receipt_limit and self.pending_prize_count != 0) {
+            self.clearPendingPrizes();
+            self.prize_notice = prize_receipts_full;
+        }
+    }
+
+    fn prizeFailed(self: *Model, uncertain: bool) void {
+        self.prize_notice = if (uncertain) "Prize collection unconfirmed. Contact the game server operator." else "Prize not collected. Contact the game server operator.";
+        if (uncertain) {
+            self.balance_dirty = true;
+            self.history_dirty = true;
+        }
+    }
+
+    pub fn displayedBalance(self: *const Model, now: f64) ?u64 {
+        const actual = self.balance_msat orelse return null;
+        const reward = self.reward orelse return actual;
+        if (reward.to != actual or reward.progress(now) >= 1) return actual;
+        const delta: u64 = @intFromFloat(@as(f64, @floatFromInt(reward.to - reward.from)) * reward.progress(now));
+        return reward.from + delta;
+    }
+
+    pub fn rewardPulse(self: *const Model, now: f64) f32 {
+        const reward = self.reward orelse return 0;
+        const progress = reward.progress(now);
+        if (reward.to != self.balance_msat or progress >= 1) return 0;
+        return @floatCast(@sin(std.math.pi * progress));
+    }
 
     pub fn enqueue(self: *Model, operation: Operation, argument: []const u8) bool {
         if (self.reviewLive() and operation != .confirm_withdrawal and operation != .cancel_withdrawal and operation != .snapshot and operation != .history and operation != .saved_withdrawal and operation != .saved_invoice) return false;
@@ -247,11 +405,16 @@ pub const Model = struct {
                 }
                 return;
             }
-            if (self.recover_needed and now >= self.next_recover) {
+            if (self.prize_refresh) {
+                self.balance_dirty = false;
+                _ = self.enqueue(.snapshot, "");
+            } else if (self.recover_needed and now >= self.next_recover) {
                 if (self.enqueue(.recover, "")) self.recover_needed = false;
             } else if (self.balance_dirty) {
                 self.balance_dirty = false;
                 _ = self.enqueue(.snapshot, "");
+            } else if (!self.recovery_pending and self.startPrize()) {
+                return;
             } else if (self.resume_needed and now >= self.next_resume) {
                 self.resume_needed = false;
                 _ = self.enqueue(.resume_saved, "");
@@ -396,7 +559,12 @@ pub const Model = struct {
                 _ = self.message.set("Recovery read failed; retrying automatically.");
             },
             .snapshot => {
+                self.prize_refresh = false;
                 _ = self.message.set("Balance read failed; last balance retained. Reopen Wallet to retry.");
+            },
+            .receive_prize => {
+                self.finishPrize(.failed);
+                self.prizeFailed(true);
             },
             .create => {
                 self.recovery = .unknown;
@@ -564,6 +732,34 @@ pub const Model = struct {
                 self.selection_loading = false;
                 self.next_check = now;
             },
+            .receive_prize => {
+                const status = value.object.get("status") orelse return error.Invalid;
+                if (status != .integer) return error.Invalid;
+                switch (status.integer) {
+                    0 => {
+                        const net = try decimal(string(value, "net_msats") orelse return error.Invalid);
+                        self.finishPrize(if (net > 0) .credited else .failed);
+                        self.prize_refresh = net > 0;
+                        self.balance_dirty = true;
+                        self.history_dirty = true;
+                    },
+                    // CDK's receive recovery gate rejects before any swap.
+                    19 => {
+                        self.finishPrize(.blocked);
+                        self.recovery_pending = true;
+                        self.setRecovery(self.recovery, now);
+                    },
+                    // Neither a definitive rejection nor an ambiguous attempt
+                    // is evidence that this wallet received anything.
+                    else => {
+                        self.finishPrize(.failed);
+                        self.prizeFailed(switch (status.integer) {
+                            2, 14, 16...18 => false,
+                            else => true,
+                        });
+                    },
+                }
+            },
             .open, .snapshot => {
                 const mint = string(value, "mint_url") orelse return error.Invalid;
                 if (self.mint.len != 0 and !std.mem.eql(u8, mint, self.mint.slice())) return error.Invalid;
@@ -577,7 +773,16 @@ pub const Model = struct {
                 if (mint.len > 256) return error.Invalid;
                 var buf: [100]u8 = undefined;
                 _ = self.balance.set(try std.fmt.bufPrint(&buf, "{s} msat", .{msats}));
+                if (balance_msat != self.balance_msat) {
+                    const previous = self.displayedBalance(now);
+                    self.reward = null;
+                    if (self.prize_refresh and balance_msat > (self.balance_msat orelse balance_msat)) {
+                        self.reward = .{ .from = previous.?, .to = balance_msat, .start = now };
+                        self.prize_chime = true;
+                    }
+                }
                 self.balance_msat = balance_msat;
+                self.prize_refresh = false;
                 _ = self.mint.set(mint);
                 self.setRecovery(recovery, now);
                 self.available = true;
@@ -974,11 +1179,229 @@ test "operation withdrawal classification preserves wire ordinals" {
         .{ .operation = .cancel_withdrawal, .withdrawal = true },
         .{ .operation = .saved_withdrawal, .withdrawal = true },
         .{ .operation = .poll_withdrawals, .withdrawal = true },
+        .{ .operation = .receive_prize, .withdrawal = false },
     };
     try std.testing.expectEqual(@typeInfo(Operation).@"enum".field_names.len, cases.len);
     for (cases, 0..) |case, ordinal| {
         try std.testing.expectEqual(ordinal, @as(usize, @backingInt(case.operation)));
         try std.testing.expectEqual(case.withdrawal, case.operation.isWithdrawal());
+    }
+}
+
+test "prizes wait for the wallet, collect once in FIFO order, and animate only confirmed gains" {
+    const t = std.testing;
+    var model: Model = .{ .started = true, .available = true, .balance_msat = 10, .serial = 1, .pending = true, .operation = .snapshot };
+    defer model.clearPendingPrizes();
+    var token: PrizeToken = .{};
+    try t.expect(token.set("cashuBfirst"));
+    model.prize_player = @splat(1);
+    model.queuePrize(model.prize_player.?, .{ .x = 1, .y = 2 }, token);
+    try t.expect(token.set("cashuBsecond"));
+    model.queuePrize(model.prize_player.?, .{ .x = 3, .y = 4 }, token);
+    model.tick(true, 0);
+    try t.expect(model.request == null);
+    model.accept(1, "{\"mint_url\":\"fixture\",\"msats\":\"10\",\"creation_recovery\":\"none\"}", 0, t.allocator);
+
+    model.tick(true, 1);
+    try t.expectEqual(Operation.receive_prize, model.operation);
+    try t.expectEqualStrings("cashuBfirst", model.request.?.argument.slice());
+    model.request = null;
+    model.accept(model.serial, "{\"status\":0,\"net_msats\":\"6\"}", 1, t.allocator);
+    try t.expectEqual(@as(?u64, 10), model.balance_msat);
+    try t.expect(!model.prize_chime);
+    model.tick(true, 2);
+    try t.expectEqual(Operation.snapshot, model.operation);
+    model.request = null;
+    model.accept(model.serial, "{\"mint_url\":\"fixture\",\"msats\":\"16\",\"creation_recovery\":\"none\"}", 2, t.allocator);
+    try t.expectEqual(@as(?u64, 16), model.balance_msat);
+    try t.expectEqual(@as(?u64, 10), model.displayedBalance(2));
+    try t.expect(model.displayedBalance(2.4).? > 10 and model.displayedBalance(2.4).? < 16);
+    try t.expectEqual(@as(?u64, 16), model.displayedBalance(3));
+    try t.expect(model.prize_chime);
+    model.prize_chime = false;
+
+    model.tick(true, 3);
+    try t.expectEqualStrings("cashuBsecond", model.request.?.argument.slice());
+    model.request = null;
+    model.fail(model.serial, 3);
+    try t.expect(model.prize_notice != null);
+    try t.expect(!model.prize_refresh and !model.prize_chime);
+    model.tick(true, 4);
+    try t.expectEqual(Operation.snapshot, model.operation);
+    try t.expectEqual(0, model.pending_prize_count);
+    try t.expectEqual(2, model.prize_receipt_count);
+    try t.expect(model.prize_receipts[0].credited and !model.prize_receipts[1].credited);
+}
+
+test "prize redelivery deduplicates collection and re-ACKs only for its owner" {
+    const t = std.testing;
+    const player: [33]u8 = @splat(1);
+    const tile: protocol.Location = .{ .x = -2, .y = 5 };
+    const Connection = struct {
+        player: [33]u8 = player,
+        notice: ?PrizeNotice = null,
+        sent: usize = 0,
+        blocked: bool = false,
+
+        fn hoeLogin(self: *@This(), _: u64) ?struct { player: [33]u8 } {
+            return .{ .player = self.player };
+        }
+        fn takePrizeNotice(self: *@This(), _: u64) ?PrizeNotice {
+            defer self.notice = null;
+            return self.notice;
+        }
+        fn takeDeferredPrizes(_: *@This(), _: u64) bool {
+            return false;
+        }
+        fn ackPrize(self: *@This(), session: u64, owner: [33]u8, location: protocol.Location) bool {
+            if (self.blocked) return false;
+            t.expect(session >= 2) catch unreachable;
+            t.expectEqual(player, owner) catch unreachable;
+            t.expectEqual(owner, self.player) catch unreachable;
+            t.expectEqualDeep(tile, location) catch unreachable;
+            self.sent += 1;
+            return true;
+        }
+    };
+    var model: Model = .{ .started = true, .available = true };
+    defer model.clearPendingPrizes();
+    var token: PrizeToken = .{};
+    try t.expect(token.set("cashuBfirst"));
+    var connection: Connection = .{ .notice = .{ .tile = tile, .token = token } };
+    model.queuePrize(player, tile, token); // Immediate cut reply.
+    model.syncPrizes(&connection, 1);
+    try t.expectEqual(1, model.pending_prize_count);
+    try t.expectEqual(0, connection.sent);
+    try t.expect(model.startPrize());
+    model.request = null;
+    connection.notice = .{ .tile = tile, .token = token };
+    model.syncPrizes(&connection, 1);
+    try t.expectEqual(0, connection.sent);
+    try t.expectEqual(1, model.pending_prize_count);
+
+    connection.player = @splat(2);
+    model.syncPrizes(&connection, 2);
+    model.accept(model.serial, "{\"status\":0,\"net_msats\":\"6\"}", 1, t.allocator);
+    model.syncPrizes(&connection, 2);
+    try t.expectEqual(0, connection.sent);
+    connection.player = player;
+    connection.blocked = true;
+    model.syncPrizes(&connection, 3);
+    try t.expectEqual(0, connection.sent);
+    connection.blocked = false;
+    model.syncPrizes(&connection, 3);
+    try t.expectEqual(1, connection.sent);
+    connection.notice = .{ .tile = tile, .token = token };
+    model.syncPrizes(&connection, 4);
+    try t.expectEqual(2, connection.sent);
+    try t.expect(!model.startPrize());
+}
+
+test "a pre-swap recovery gate retains the prize but an uncertain result does not retry" {
+    const t = std.testing;
+    var model: Model = .{ .started = true, .available = true, .prize_player = @splat(1) };
+    defer model.clearPendingPrizes();
+    const tile: protocol.Location = .{ .x = 0, .y = 0 };
+    var token: PrizeToken = .{};
+    try t.expect(token.set("cashuBfirst"));
+    model.queuePrize(model.prize_player.?, tile, token);
+    model.tick(true, 0);
+    try t.expectEqual(Operation.receive_prize, model.operation);
+    model.request = null;
+    model.accept(model.serial, "{\"status\":19}", 0, t.allocator);
+    try t.expect(model.recovery_pending and model.recover_needed);
+    try t.expectEqual(0, model.prize_acks_due.count());
+    try t.expectEqual(1, model.pending_prize_count);
+    try t.expect(model.prize_in_flight == null);
+    model.tick(true, model.next_recover);
+    try t.expectEqual(Operation.recover, model.operation);
+    model.request = null;
+    model.accept(model.serial, "{\"wallet_changed\":false,\"recovery_pending\":false,\"creation_recovery\":\"none\",\"invoice\":null}", 2, t.allocator);
+    model.tick(true, 2);
+    try t.expectEqual(Operation.receive_prize, model.operation);
+    try t.expectEqualStrings(token.slice(), model.request.?.argument.slice());
+    model.request = null;
+    model.fail(model.serial, 2);
+    model.queuePrize(model.prize_player.?, tile, token);
+    try t.expect(!model.startPrize());
+    try t.expectEqual(0, model.pending_prize_count);
+    try t.expectEqual(1, model.prize_receipt_count);
+    try t.expectEqual(0, model.prize_acks_due.count());
+}
+
+test "pending prize capacity defers new tokens without ACKing them" {
+    const t = std.testing;
+    const player: [33]u8 = @splat(1);
+    var model: Model = .{ .available = true, .prize_player = player };
+    defer model.clearPendingPrizes();
+    var token: PrizeToken = .{};
+    const full_token: [protocol.max_prize_token_bytes]u8 = @splat('x');
+    try t.expect(token.set(&full_token));
+    for (0..pending_prize_limit) |i| model.queuePrize(player, .{ .x = @intCast(i), .y = 0 }, token);
+    const deferred: protocol.Location = .{ .x = pending_prize_limit, .y = 0 };
+    model.queuePrize(player, deferred, token);
+    try t.expectEqual(pending_prize_limit, model.pending_prize_count);
+    try t.expectEqualStrings(prize_deferred, model.prize_notice.?);
+    try t.expectEqual(0, model.prize_acks_due.count());
+
+    try t.expect(model.startPrize());
+    try t.expectEqualStrings(&full_token, model.request.?.argument.z());
+    model.request = null;
+    model.accept(model.serial, "{\"status\":0,\"net_msats\":\"1\"}", 0, t.allocator);
+    try t.expectEqual(1, model.prize_acks_due.count());
+    try t.expectEqual(@as(i32, 0), model.prize_receipts[0].key.tile.x);
+    model.queuePrize(player, deferred, token); // The server redelivers after a slot opens.
+    try t.expectEqual(pending_prize_limit, model.pending_prize_count);
+    try t.expectEqual(deferred, model.pending_prizes[pending_prize_limit - 1].key.tile);
+}
+
+test "a full terminal receipt table never evicts uncertain attempts or starts new ones" {
+    const t = std.testing;
+    const player: [33]u8 = @splat(1);
+    var model: Model = .{ .available = true, .prize_player = player };
+    defer model.clearPendingPrizes();
+    var token: PrizeToken = .{};
+    try t.expect(token.set("cashuBtest"));
+    for (0..prize_receipt_limit) |i| {
+        model.queuePrize(player, .{ .x = @intCast(i), .y = 0 }, token);
+        try t.expect(model.startPrize());
+        model.request = null;
+        if (i == 0) {
+            model.accept(model.serial, "{\"status\":0,\"net_msats\":\"1\"}", 0, t.allocator);
+        } else {
+            model.fail(model.serial, 0);
+        }
+    }
+    try t.expectEqual(prize_receipt_limit, model.prize_receipt_count);
+    try t.expectEqual(0, model.pending_prize_count);
+    try t.expectEqual(1, model.prize_acks_due.count());
+    model.prize_acks_due.unset(0); // Transport accepted the first ACK; it may have been lost.
+    model.queuePrize(player, .{ .x = 0, .y = 0 }, token);
+    model.queuePrize(player, .{ .x = 1, .y = 0 }, token);
+    try t.expectEqual(1, model.prize_acks_due.count());
+    try t.expect(model.prize_acks_due.isSet(0));
+    model.queuePrize(player, .{ .x = prize_receipt_limit, .y = 0 }, token);
+    try t.expectEqualStrings(prize_receipts_full, model.prize_notice.?);
+    try t.expect(!model.startPrize());
+    try t.expectEqual(0, model.pending_prize_count);
+}
+
+test "prize rejection and zero net credit never schedule a reward" {
+    const t = std.testing;
+    for ([_][]const u8{ "{\"status\":16}", "{\"status\":0,\"net_msats\":\"0\"}" }) |reply| {
+        const player: [33]u8 = @splat(1);
+        var model: Model = .{ .available = true, .balance_msat = 10, .prize_player = player };
+        defer model.clearPendingPrizes();
+        var token: PrizeToken = .{};
+        try t.expect(token.set("cashuBtest"));
+        model.queuePrize(player, .{ .x = 0, .y = 0 }, token);
+        try t.expect(model.startPrize());
+        model.request = null;
+        model.accept(model.serial, reply, 1, t.allocator);
+        try t.expectEqual(0, model.prize_acks_due.count());
+        try t.expectEqual(@as(?u64, 10), model.balance_msat);
+        try t.expect(!model.prize_refresh and !model.prize_chime);
+        try t.expect(model.reward == null);
     }
 }
 

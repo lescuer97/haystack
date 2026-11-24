@@ -342,11 +342,6 @@ fn browserFrame() callconv(.c) void {
         if (wallet_result_ok) wallet_model.accept(serial, wallet_mailbox.slice(), rl.getTime(), std.heap.c_allocator) else wallet_model.fail(serial, rl.getTime());
         wallet_result_serial = null;
     }
-    wallet_model.tick(!ctx.model.isBlocking(), rl.getTime());
-    if (wallet_model.request) |request| {
-        haystack_wallet_request(browser_onboarding.currentGeneration(), request.serial, @intCast(@backingInt(request.operation)), request.argument.slice().ptr, @intCast(request.argument.len), walletCallback);
-        wallet_model.request = null;
-    }
     privacy_blocked = privacy_blocked or ctx.model.isBlocking();
     const generation = if (ctx.model.isBlocking()) null else browser_onboarding.currentGeneration();
     ctx.network = ctx.connection.step(generation);
@@ -355,6 +350,12 @@ fn browserFrame() callconv(.c) void {
         stopBrowser();
         return;
     };
+    wallet_model.syncPrizes(&ctx.connection, ctx.network.session);
+    wallet_model.tick(!ctx.model.isBlocking(), rl.getTime());
+    if (wallet_model.request) |request| {
+        haystack_wallet_request(browser_onboarding.currentGeneration(), request.serial, @intCast(@backingInt(request.operation)), request.argument.slice().ptr, @intCast(request.argument.len), walletCallback);
+        wallet_model.request = null;
+    }
     if (ctx.hoe.update(&ctx.connection, ctx.network, generation, &ctx.game_state, ctx.unix_now, rl.getTime(), ctx.network_frame.area_pending)) {
         ctx.driver.invalidateInput();
     }
@@ -554,7 +555,10 @@ fn stepFrame(
     if (advanced) driver.skipPast(rl.getTime());
 
     // Feedback advances on presentation frames, independently of input ticks.
-    soundtrack.playCutCues(game_state.cut_feedback.update(rl.getFrameTime()));
+    var cues = game_state.cut_feedback.update(rl.getFrameTime());
+    cues.reward = game_state.menu.wallet.prize_chime;
+    game_state.menu.wallet.prize_chime = false;
+    soundtrack.playCutCues(cues);
 
     // 5. Prepare GPU resources, then draw read-only state.
     resources.prepareMinimap(&game_state.world, driver.view.?.minimap);
@@ -1016,6 +1020,17 @@ pub fn main() anyerror!void {
             driver.invalidateInput();
             pasteWithdrawal(&game_state.menu);
         }
+        model.expire(rl.getTime());
+        if (scan_job) |job| if (job.done.load(.acquire)) {
+            job.thread.join();
+            job.deliver(&model);
+            driver.invalidateInput();
+            job.destroy();
+            scan_job = null;
+        };
+        connection.setEnabled(!model.isBlocking());
+        const network = connection.snapshot();
+        game_state.menu.wallet.syncPrizes(&connection, network.session);
         game_state.menu.wallet.tick(!model.isBlocking(), rl.getTime());
         if (native_hoe.enabled and !model.isBlocking() and wallet_worker == null) {
             wallet_worker = try wallet_service.Worker.start(wallet_paths);
@@ -1034,17 +1049,7 @@ pub fn main() anyerror!void {
             game_state.menu.wallet.copy_requested = false;
             if (game_state.menu.wallet.canCopyInvoice()) rl.setClipboardText(game_state.menu.wallet.invoice.z());
         }
-        model.expire(rl.getTime());
-        if (scan_job) |job| if (job.done.load(.acquire)) {
-            job.thread.join();
-            job.deliver(&model);
-            driver.invalidateInput();
-            job.destroy();
-            scan_job = null;
-        };
         // Reconcile server output before capturing or consuming new input.
-        connection.setEnabled(!model.isBlocking());
-        const network = connection.snapshot();
         const presentation = try network_frame.apply(network, &connection, &driver, &game_state);
         effects.session = network_frame.session;
         if (native_hoe.enabled) {

@@ -5,6 +5,7 @@ const shared = @import("shared");
 const protocol = shared.protocol;
 const wire = shared.wire;
 const sync = @import("ws_sync.zig");
+const OwnedCutReply = @import("paid_cut.zig").OwnedReply;
 
 const Callback = *const fn (u32, c_int, [*c]const u8, u32) callconv(.c) void;
 extern "c" fn haystack_ws_prepare(token: u32, wallet_generation: u32, callback: Callback) void;
@@ -99,7 +100,7 @@ const CutMailbox = union(enum) {
     idle,
     queued: CutRequest,
     waiting,
-    received: struct { id: protocol.Id, outcome: protocol.Outcome(.cut) },
+    received: struct { id: protocol.Id, reply: OwnedCutReply },
 };
 
 pub const Worker = struct {
@@ -121,11 +122,12 @@ pub const Worker = struct {
     cut: CutMailbox = .idle,
     settled_ids: [8][32]u8 = undefined,
     settled_count: usize = 0,
+    prize_inbox: sync.PrizeInbox = .{},
 
     // Keep the bridge limits in sync with browser/game-ws.js. Larger paid
     // channel messages do not change the existing movement/area budget.
     const max_outbound_bytes = protocol.max_channel_open_with_params_bytes;
-    const max_inbound_bytes = protocol.max_channel_status_reply_bytes;
+    const max_inbound_bytes = @max(protocol.max_channel_status_reply_bytes, wire.max_prize_notice_bytes);
     const play_frame_bytes = 256;
     pub const area_limit = @min(protocol.max_area_chunks, (play_frame_bytes - protocol.area_response_overhead) / protocol.chunk_bytes);
 
@@ -168,6 +170,7 @@ pub const Worker = struct {
             self.close();
             haystack_ws_clear_signer();
         }
+        self.prize_inbox.clear();
         const session = self.state.session;
         self.* = .{};
         self.state.session = session;
@@ -185,6 +188,7 @@ pub const Worker = struct {
         self.channel = .idle;
         self.cut = .idle;
         self.settled_count = 0;
+        self.prize_inbox.clear();
         if (token) |id| haystack_ws_close(id);
     }
 
@@ -267,6 +271,22 @@ pub const Worker = struct {
         return completion;
     }
 
+    pub fn takePrizeNotice(self: *Worker, session: u64) ?@import("wallet_ui.zig").PrizeNotice {
+        if (!self.ready(session)) return null;
+        return self.prize_inbox.take();
+    }
+
+    pub fn takeDeferredPrizes(self: *Worker, session: u64) bool {
+        return self.ready(session) and self.prize_inbox.takeDeferred();
+    }
+
+    pub fn ackPrize(self: *Worker, session: u64, player: [33]u8, tile: protocol.Location) bool {
+        const login = self.hoeLogin(session) orelse return false;
+        if (!std.mem.eql(u8, &login.player, &player)) return false;
+        var frame: [wire.prize_ack_bytes]u8 = undefined;
+        return self.send(wire.encodePrizeAck(&frame, tile) catch unreachable);
+    }
+
     /// Settlement notifications are hints; query channel_status for authoritative state.
     pub fn takeChannelSettled(self: *Worker, session: u64) ?[32]u8 {
         if (!self.ready(session) or self.settled_count == 0) return null;
@@ -282,12 +302,12 @@ pub const Worker = struct {
         return true;
     }
 
-    pub fn takeCut(self: *Worker, session: u64, request_id: protocol.Id) ?protocol.Outcome(.cut) {
+    pub fn takeCut(self: *Worker, session: u64, request_id: protocol.Id) ?OwnedCutReply {
         if (!self.ready(session) or self.cut != .received or
             !std.mem.eql(u8, &self.cut.received.id, &request_id)) return null;
-        const outcome = self.cut.received.outcome;
+        const reply = self.cut.received.reply;
         self.cut = .idle;
-        return outcome;
+        return reply;
     }
 
     fn nextRequest(self: *Worker) ?PendingRequest {
@@ -379,6 +399,11 @@ pub const Worker = struct {
     }
 
     fn receivePlay(self: *Worker, bytes: []const u8) !void {
+        if (wire.decodePrizeNotice(bytes, true)) |notice| {
+            if (self.auth_player == null) return error.UnexpectedReply;
+            try self.prize_inbox.push(notice.tile, notice.token);
+            return;
+        } else |_| {}
         if (wire.decodeChannelSettled(bytes, true)) |id| {
             if (self.settled_count < self.settled_ids.len) {
                 self.settled_ids[self.settled_count] = id;
@@ -403,7 +428,7 @@ pub const Worker = struct {
             .cut => |cut| {
                 const outcome = try wire.decodeReply(bytes, .cut, cut.request_id, &scratch);
                 sync.applyCutBalance(&self.auth_tool_channels, cut.payload, outcome);
-                self.cut = .{ .received = .{ .id = cut.request_id, .outcome = outcome } };
+                self.cut = .{ .received = .{ .id = cut.request_id, .reply = .init(outcome) } };
             },
         }
         self.pending = null;
@@ -420,6 +445,29 @@ fn deliver(token: u32, kind: c_int, ptr: [*c]const u8, len: u32) callconv(.c) vo
         return;
     }
     self.receive(token, event, if (len == 0) "" else ptr[0..len], now) catch self.fail(.retrying, now);
+}
+
+test "browser defers a prize burst without losing its session or pending move" {
+    const t = std.testing;
+    var worker: Worker = .{ .stage = .play, .state = .{ .status = .ready, .session = 1 }, .auth_player = @splat(1) };
+    defer worker.prize_inbox.clear();
+    const request: sync.PlayRequest = .{ .id = @splat(2), .operation = .{ .move = .{ .x = 1, .y = 2 } } };
+    worker.pending = .{ .play = request };
+    var frame: [wire.max_prize_notice_bytes]u8 = undefined;
+    const token: [protocol.max_prize_token_bytes]u8 = @splat('x');
+    const capacity = worker.prize_inbox.notices.len;
+    for (0..capacity + 1) |i| {
+        const notice = try wire.encodePrizeNotice(&frame, .{ .x = @intCast(i), .y = 0 }, &token);
+        try worker.receivePlay(notice);
+    }
+    try t.expect(!worker.takeDeferredPrizes(0));
+    try t.expect(worker.takeDeferredPrizes(1));
+    try t.expect(!worker.takeDeferredPrizes(1));
+    try t.expectEqualDeep(request, worker.pending.?.play);
+    for (0..capacity) |i| {
+        try t.expectEqual(@as(i32, @intCast(i)), worker.takePrizeNotice(1).?.tile.x);
+    }
+    try t.expect(worker.takePrizeNotice(1) == null);
 }
 
 test "browser queues settlement notices without losing a pending move" {
@@ -558,8 +606,18 @@ test "browser serializes move, owned channel open, signed cut and area" {
     try worker.receivePlay(try wire.encodeReply(&frame, .cut, cut, failed));
     try t.expect(worker.takeCut(0, cut.request_id) == null);
     try t.expect(worker.takeCut(1, reply_cut.request_id) == null);
-    try t.expectEqualDeep(failed, worker.takeCut(1, cut.request_id).?);
+    try t.expectEqualDeep(failed, worker.takeCut(1, cut.request_id).?.outcome);
     try t.expect(worker.takeCut(1, cut.request_id) == null);
+
+    cut.request_id = @splat(5);
+    try t.expect(worker.submitCut(1, cut));
+    worker.pending = worker.nextRequest();
+    const state: protocol.State = .{ .x = cut.payload.x, .y = cut.payload.y, .terrain = .grass, .cut = true, .prize_token = "cashuBtest" };
+    try worker.receivePlay(try wire.encodeReply(&frame, .cut, cut, .{ .ok = state }));
+    @memset(&frame, 0);
+    const owned = worker.takeCut(1, cut.request_id).?;
+    try t.expect(owned.outcome.ok.prize_token == null);
+    try t.expectEqualStrings("cashuBtest", owned.prize.slice());
     try t.expectEqual(area, worker.nextRequest().?.play.operation.area);
 }
 

@@ -15,7 +15,22 @@ pub const WorldState = struct {
     pub const cache_overflow_capacity = 512;
     pub const cache_capacity = cache_base_capacity + cache_overflow_capacity;
     pub const Chunk = struct { address: ChunkAddress, cuts: [32]u8 };
-    pub const Replay = struct { id: p.Id, tile: p.Location, result: p.Outcome(.cut) };
+    // The legacy free-hoe replay cannot carry a bearer token. Keep its
+    // retained result compact instead of storing a borrowed wire state.
+    pub const Replay = struct {
+        id: p.Id,
+        tile: p.Location,
+        result: enum { ok, already_cut, not_cuttable },
+
+        pub fn outcome(self: Replay) p.Outcome(.cut) {
+            const state: p.State = .{ .x = self.tile.x, .y = self.tile.y, .terrain = .grass, .cut = true };
+            return switch (self.result) {
+                .ok => .{ .ok = state },
+                .already_cut => .{ .failed = .{ .already_cut = state } },
+                .not_cuttable => .{ .failed = .not_cuttable },
+            };
+        }
+    };
     pub const DirtySnapshot = struct {
         address: ChunkAddress,
         bits: [32]u8,
@@ -170,7 +185,7 @@ pub const WorldState = struct {
             if (!std.mem.eql(u8, &entry.id, &req.request_id)) continue;
             if (entry.tile.x != tile.x or entry.tile.y != tile.y)
                 return .{ .failed = .request_id_conflict };
-            return entry.result;
+            return entry.outcome();
         }
         return null;
     }
@@ -198,7 +213,18 @@ pub const WorldState = struct {
             };
             if (row) |r| cache.?.markCut(r, bit) else bit.set(target);
         }
-        self.replays[self.replay_next] = .{ .id = req.request_id, .tile = .{ .x = tile.x, .y = tile.y }, .result = result };
+        self.replays[self.replay_next] = .{
+            .id = req.request_id,
+            .tile = .{ .x = tile.x, .y = tile.y },
+            .result = switch (result) {
+                .ok => .ok,
+                .failed => |failure| switch (failure) {
+                    .already_cut => .already_cut,
+                    .not_cuttable => .not_cuttable,
+                    else => unreachable,
+                },
+            },
+        };
         self.replay_next = (self.replay_next + 1) % capacity;
         if (self.replay_count < capacity) self.replay_count += 1;
         return result;
@@ -228,10 +254,25 @@ pub const WorldState = struct {
         bit: CutBit,
         result: p.State,
 
+        pub fn bitmapAfter(self: PreparedToolCut) [32]u8 {
+            var chunk = self.row.chunk;
+            self.bit.set(&chunk);
+            return chunk.cuts;
+        }
+
         /// Apply under the same world lock and pin used to prepare.
         pub fn apply(self: PreparedToolCut) p.State {
             self.cache.markCut(self.row, self.bit);
             return self.result;
+        }
+
+        /// The full bitmap, including any older edits, was committed under
+        /// the disk lock; there cannot be a concurrent flush snapshot.
+        pub fn applySaved(self: PreparedToolCut) p.State {
+            std.debug.assert(self.row.save_token == 0);
+            const result = self.apply();
+            self.row.dirty = false;
+            return result;
         }
     };
 

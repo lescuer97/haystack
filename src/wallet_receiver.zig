@@ -161,14 +161,14 @@ pub const Ledger = struct {
             try insert.finish();
             try db.exec("COMMIT");
         }
+        if (mode == .existing and try hasTable(db, "hoe_channel")) return error.OutdatedChannelDatabase;
         {
             const meta = try db.prepare("SELECT version,mint,receiver FROM hoe_meta WHERE id=1");
             defer meta.finalize();
             if (!try meta.next() or try meta.uint(0) != 1 or !eql(try meta.blobSlice(1), mint) or
                 !eql(&(try meta.blob(33, 2)), &pubkey)) return error.ChannelDatabaseIdentityMismatch;
         }
-        const legacy = try hasTable(db, "hoe_channel");
-        if (mode == .existing and !legacy) {
+        if (mode == .existing) {
             if (!try hasColumn(db, "receiver_channels", "price_msat") or
                 try hasColumn(db, "receiver_channels", "expiry") or try hasColumn(db, "receiver_channels", "capacity"))
                 return error.OutdatedChannelDatabase;
@@ -182,9 +182,7 @@ pub const Ledger = struct {
         const store = opened.handle orelse return error.InvalidChannelDatabase;
         errdefer c.cdk_spilman_receiver_storage_close(store);
         const ledger: Ledger = .{ .db = db, .store = store, .allocator = allocator, .wallet = wallet, .mint = mint, .receiver_key = key, .receiver_pubkey = pubkey, .limits = limits };
-        if (legacy) {
-            try migrateLegacy(&ledger);
-        } else if (mode == .create) {
+        if (mode == .create) {
             try db.exec("BEGIN IMMEDIATE");
             errdefer db.exec("ROLLBACK") catch {};
             try db.exec(metadata_schema ++ receiver_view);
@@ -595,7 +593,7 @@ pub const Ledger = struct {
 };
 
 fn hasTable(db: *Db, name: [:0]const u8) !bool {
-    const stmt = try db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=CAST(?1 AS TEXT)");
+    const stmt = try db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=CAST(?1 AS TEXT) COLLATE NOCASE");
     defer stmt.finalize();
     try stmt.bindBlob(1, name);
     return stmt.next();
@@ -607,62 +605,6 @@ fn hasColumn(db: *Db, table: []const u8, column: []const u8) !bool {
     try stmt.bindBlob(1, table);
     try stmt.bindBlob(2, column);
     return stmt.next();
-}
-
-fn migrateLegacy(self: *const Ledger) !void {
-    const db = self.db;
-    try db.exec("BEGIN IMMEDIATE");
-    errdefer db.exec("ROLLBACK") catch {};
-    if (!try hasColumn(db, "hoe_channel", "wallet_net_msat")) try db.exec("ALTER TABLE hoe_channel ADD COLUMN wallet_net_msat INTEGER; ALTER TABLE hoe_channel ADD COLUMN refund_only INTEGER NOT NULL DEFAULT 0;");
-    try db.exec(metadata_schema ++ receiver_view);
-    {
-        const rows = try db.prepare("SELECT id,CAST(json_extract(CAST(params AS TEXT),'$.sender_pubkey') AS BLOB) FROM hoe_channel");
-        defer rows.finalize();
-        while (try rows.next()) {
-            const id = try rows.blob(32, 0);
-            const sender = try decodeHex(33, try rows.blobSlice(1));
-            const secret = try self.channelSecret(sender);
-            defer free(@constCast(secret.ptr));
-            // Import the pinned upstream schema in one transaction with the
-            // ownership metadata. Normal writes use SpilmanStorage's API.
-            const write = try db.prepare(
-                \\INSERT INTO spilman_channels(channel_id,funding_json,balance,signature,state,closing_json,closed_json)
-                \\SELECT lower(hex(id)),json_object('params_json',CAST(params AS TEXT),'keyset_info_json',CAST(keyset AS TEXT),
-                \\  'funding_proofs_json',CAST(proofs AS TEXT),'channel_secret_hex',CAST(?2 AS TEXT)),
-                \\  balance,lower(hex(signature)),
-                \\  CASE WHEN receipt IS NOT NULL THEN 'Closed' WHEN pending IS NOT NULL OR refund_only=1 THEN 'Closing' ELSE 'Open' END,
-                \\  CASE WHEN pending IS NOT NULL OR refund_only=1 THEN json_object(
-                \\    'expiry_timestamp',expiry,'balance',balance,'signature',lower(hex(signature))) END,
-                \\  CASE WHEN receipt IS NOT NULL THEN json_object('expiry_timestamp',expiry,'closed_amount',balance,
-                \\    'value_after_stage1',json_extract(CAST(receipt AS TEXT),'$.receiver_msat')+json_extract(CAST(receipt AS TEXT),'$.sender_msat'),
-                \\    'receiver_sum',json_extract(CAST(receipt AS TEXT),'$.receiver_msat'),'sender_sum',json_extract(CAST(receipt AS TEXT),'$.sender_msat'),
-                \\    'receiver_proofs_json',json_extract(CAST(receipt AS TEXT),'$.receiver_proofs_json'),
-                \\    'sender_proofs_json',json_extract(CAST(receipt AS TEXT),'$.sender_proofs_json')) END
-                \\FROM hoe_channel WHERE id=?1
-            );
-            defer write.finalize();
-            try write.bindBlob(1, &id);
-            try write.bindBlob(2, secret);
-            try write.finish();
-        }
-    }
-    try db.exec(
-        \\INSERT INTO receiver_channels (id,owner,wallet_net_msat)
-        \\  SELECT id,owner,wallet_net_msat FROM hoe_channel;
-        \\INSERT INTO spilman_close_journals (channel_id,journal)
-        \\  SELECT lower(hex(id)),CASE WHEN refund_only=1 THEN 'refund_only' ELSE CAST(pending AS TEXT) END
-        \\  FROM hoe_channel WHERE pending IS NOT NULL OR refund_only=1;
-    );
-    {
-        const check = try db.prepare(
-            \\SELECT 1 FROM hoe_channel m JOIN receiver_state s ON s.id=m.id
-            \\WHERE typeof(s.expiry)<>'integer' OR typeof(s.capacity)<>'integer'
-            \\   OR s.expiry IS NOT m.expiry OR s.capacity IS NOT m.capacity LIMIT 1
-        );
-        defer check.finalize();
-        if (try check.next()) return error.ChannelFundingMetadataMismatch;
-    }
-    try db.exec("DROP TABLE hoe_channel; COMMIT;");
 }
 
 /// Verified mint close receipt. Receiver proofs must stay on the trusted side.
@@ -912,7 +854,36 @@ test "funded channel price survives reopen and controls retries and signed payme
     }
 }
 
-test "legacy receiver channels migrate in place without reopening a pending close" {
+test "legacy receiver database is rejected without rewriting funded records" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try tmpPath(a, &tmp, "channels.sqlite");
+    const wallet = try openWallet(try tmpPath(a, &tmp, "wallet.sqlite"), 0x42);
+    defer closeWallet(wallet);
+    const mint = "https://mint.example.com";
+    {
+        var ledger = try Ledger.open(a, path, .create, wallet, mint, bob_key, .{});
+        defer ledger.close();
+        try ledger.db.exec(
+            \\DROP VIEW receiver_state; DROP TABLE receiver_channels;
+            \\DROP TABLE spilman_channels; DROP TABLE spilman_close_journals;
+            \\PRAGMA journal_mode=DELETE;
+            \\CREATE TABLE hoe_channel (id BLOB,owner BLOB,expiry INTEGER,capacity INTEGER,params BLOB,keyset BLOB,proofs BLOB,
+            \\  balance INTEGER,signature BLOB,pending BLOB,receipt BLOB);
+            \\INSERT INTO hoe_channel VALUES (zeroblob(32),zeroblob(33),3600,100,
+            \\  X'7b7d', X'7b7d', X'5b5d', 5, zeroblob(64), CAST('exact submitted request' AS BLOB), NULL);
+        );
+    }
+    const before = try tmp.dir.readFileAlloc(t.io, "channels.sqlite", a, .limited(1024 * 1024));
+    try t.expectError(error.OutdatedChannelDatabase, Ledger.open(a, path, .existing, wallet, mint, bob_key, .{}));
+    const after = try tmp.dir.readFileAlloc(t.io, "channels.sqlite", a, .limited(1024 * 1024));
+    try t.expectEqualSlices(u8, before, after);
+}
+
+test "current receiver ledger reopens without losing pending closes or receipts" {
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(t.allocator);
@@ -926,36 +897,54 @@ test "legacy receiver channels migrate in place without reopening a pending clos
     {
         var ledger = try Ledger.open(a, path, .create, wallet, mint, bob_key, .{});
         defer ledger.close();
-        try ledger.db.exec(
-            \\DROP VIEW receiver_state; DROP TABLE receiver_channels;
-            \\DROP TABLE spilman_channels; DROP TABLE spilman_close_journals;
-            \\CREATE TABLE hoe_channel (id BLOB,owner BLOB,expiry INTEGER,capacity INTEGER,params BLOB,keyset BLOB,proofs BLOB,
-            \\  balance INTEGER,signature BLOB,pending BLOB,receipt BLOB,wallet_net_msat INTEGER,refund_only INTEGER);
-        );
         for ([_]u8{ 1, 2, 3, 4 }) |i| {
-            const stmt = try ledger.db.prepare(
-                \\INSERT INTO hoe_channel VALUES (?1,?2,3600,100,
-                \\  CAST('{"sender_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","capacity":100,"expiry_timestamp":3600}' AS BLOB),
-                \\  X'7b7d', X'5b5d', ?3, ?4, ?5, ?6, ?7, ?8)
-            );
-            defer stmt.finalize();
-            try bindRef(stmt, @splat(i), owner);
-            const has_balance = i == 2 or i == 3;
-            try stmt.bindUInt(3, if (has_balance) 5 else 0);
-            if (has_balance) try stmt.bindBlob(4, &@as(Signature, @splat(0x81)));
-            try stmt.bindUInt(8, @intFromBool(i == 4));
-            if (i == 2) try stmt.bindBlob(5, "exact submitted request");
-            if (i == 3) {
-                try stmt.bindBlob(6, "{\"receiver_msat\":5,\"sender_msat\":95,\"receiver_proofs_json\":\"[]\",\"sender_proofs_json\":\"[]\"}");
-                try stmt.bindUInt(7, 4);
+            const id: Id = @splat(i);
+            try ledger.bindPrice(owner, id, hoe_price_msat);
+            try ledger.persist(a, id, .{ .op = "fund", .funding = .{
+                .params_json = "{\"sender_pubkey\":\"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\",\"capacity\":100,\"expiry_timestamp\":3600}",
+                .channel_secret_hex = "test",
+                .keyset_info_json = "{}",
+                .funding_proofs_json = "[]",
+            } });
+            if (i == 1) continue;
+            if (i == 4) {
+                try ledger.persist(a, id, .{
+                    .op = "freeze",
+                    .expiry = @as(u64, 3600),
+                    .expected = .{ .balance = @as(u64, 0), .signature = "" },
+                    .journal = "refund_only",
+                });
+                continue;
             }
-            try stmt.finish();
+            const sig = hexZ(64, @splat(0x81));
+            try ledger.persist(a, id, .{
+                .op = "pay",
+                .expected = .{ .balance = @as(u64, 0), .signature = "" },
+                .payment = .{ .balance = @as(u64, 5), .signature = sig[0..128] },
+            });
+            const info = (try ledger.lookup(owner, id, 1)).?;
+            const journal = "exact submitted request";
+            try ledger.freeze(a, id, info, @splat(0x81), journal);
+            if (i == 3) {
+                try ledger.persist(a, id, .{ .op = "finish", .expected = journal, .payout = .{
+                    .expiry_timestamp = info.expiry,
+                    .closed_amount = info.balance_msat,
+                    .value_after_stage1 = @as(u64, 100),
+                    .receiver_sum = @as(u64, 5),
+                    .sender_sum = @as(u64, 95),
+                    .receiver_proofs_json = "[]",
+                    .sender_proofs_json = "[]",
+                } });
+                const credit = try ledger.db.prepare("UPDATE receiver_channels SET wallet_net_msat=4 WHERE id=?1");
+                defer credit.finalize();
+                try credit.bindBlob(1, &id);
+                try credit.finish();
+            }
         }
     }
     for (0..2) |run| {
         var ledger = try Ledger.open(a, path, .existing, wallet, mint, bob_key, .{});
         defer ledger.close();
-        try t.expect(!try hasTable(ledger.db, "hoe_channel"));
         try t.expectEqual(.sender_refund_required, (try ledger.lookup(owner, @splat(4), 1)).?.phase);
         const paid = (try ledger.lookup(owner, @splat(2), 1)).?;
         try t.expectEqual(.settlement_pending, paid.phase);
@@ -980,7 +969,7 @@ test "legacy receiver channels migrate in place without reopening a pending clos
             const accepted = (try ledger.lookup(owner, id, 1)).?;
             try t.expectEqual(null, try ledger.nextDue(null, accepted.expiry - 1));
             try t.expectEqual(id, (try ledger.nextDue(null, accepted.expiry)).?.id);
-            // Legacy dust and exactly zero remaining both stay open until expiry.
+            // Dust and exactly zero remaining both stay open until expiry.
             for ([_]u64{ 9, 5 }) |capacity| {
                 const update = try ledger.db.prepare(
                     \\UPDATE spilman_channels SET funding_json=json_set(funding_json,'$.params_json',

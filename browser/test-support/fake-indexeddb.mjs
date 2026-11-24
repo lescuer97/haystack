@@ -12,7 +12,8 @@
 //   * an error or an explicit `abort()` rolls every store back to the snapshot
 //     taken when the transaction opened, then fires `onabort`; request errors
 //     bubble to `onerror` before the default abort unless canceled;
-//   * opens upgrade, report `VersionError`, notify `onversionchange` and block
+//   * opens report version-change events and roll back schema changes on
+//     upgrade abort, report `VersionError`, notify `onversionchange` and block
 //     while another connection is still open;
 //   * `Uint8Array` payloads are copied on write; plain records are stored by
 //     reference rather than fully structured-cloned.
@@ -282,7 +283,6 @@ export class FakeIndexedDB {
         return;
       }
       let record = this.records.get(name);
-      let upgrade = false;
       if (!record) {
         record = {version: 0, stores: new Map()};
         this.records.set(name, record);
@@ -294,20 +294,42 @@ export class FakeIndexedDB {
         if (request.onerror) request.onerror();
         return;
       }
-      if (version > record.version) {
+      const oldVersion = record.version;
+      const upgrade = version > oldVersion;
+      if (upgrade) {
         // Another connection must close before this upgrade can proceed.
         for (const db of [...record.connections]) if (db.onversionchange) db.onversionchange();
         if (record.connections.size) {
           if (request.onblocked) request.onblocked();
           return;
         }
-        upgrade = true;
-        record.version = version;
       }
       const database = new FakeDatabase(record, this);
       this.instances.push(database);
       request.result = database;
-      if (upgrade && request.onupgradeneeded) request.onupgradeneeded();
+      if (upgrade) {
+        const stores = new Map(record.stores);
+        record.version = version;
+        let aborted = false;
+        request.transaction = {abort() { aborted = true; }};
+        try {
+          request.onupgradeneeded?.({type: "upgradeneeded", target: request, oldVersion, newVersion: version});
+        } catch (_) {
+          aborted = true;
+        }
+        request.transaction = null;
+        if (aborted) {
+          database.close();
+          record.version = oldVersion;
+          record.stores = stores;
+          if (oldVersion === 0) this.records.delete(name);
+          request.result = undefined;
+          request.error = new Error("AbortError");
+          request.error.name = "AbortError";
+          if (request.onerror) request.onerror();
+          return;
+        }
+      }
       if (request.onsuccess) request.onsuccess();
     });
     return request;

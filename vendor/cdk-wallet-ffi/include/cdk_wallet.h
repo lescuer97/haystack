@@ -1423,6 +1423,20 @@ cdk_wallet_send (
     uint64_t amount_msats,
     uint64_t max_sender_fee_msats);
 
+/** \brief
+ *  Send using exact local proofs, without a swap or sender fee. The serialized
+ *  bearer token must fit `max_token_bytes` (excluding the C string terminator).
+ *  If exact proofs are unavailable or the token exceeds the limit, no token is
+ *  issued. A failed cancellation is reported separately and requires recovery.
+ *  Free a successful result's token with [`cdk_string_free`].
+ */
+CdkSendResult_t
+cdk_wallet_send_bounded (
+    CdkWallet_t * handle,
+    char const * mint_url,
+    uint64_t amount_msats,
+    size_t max_token_bytes);
+
 
 #ifdef __cplusplus
 } /* extern \"C\" */

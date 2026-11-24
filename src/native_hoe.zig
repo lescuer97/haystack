@@ -558,8 +558,8 @@ pub const Runtime = struct {
             .sent => {
                 // First consume any queued area snapshot that might predate the cut.
                 if (area_pending) return;
-                const outcome = connection.takeCut(cut.session, cut.id) orelse return;
-                const verdict = classify(cut.tool, cut.tile, outcome);
+                const reply = connection.takeCut(cut.session, cut.id) orelse return;
+                const verdict = classify(cut.tool, cut.tile, reply.outcome);
                 if (verdict == .uncertain) {
                     self.payment_pending = true;
                     self.markStale();
@@ -567,18 +567,16 @@ pub const Runtime = struct {
                     self.phase = .recovery;
                     self.cut = null;
                 } else {
-                    if (verdict == .charged) self.server.?.accepted += cut.tool.priceMsat();
+                    if (verdict == .charged) {
+                        self.server.?.accepted += cut.tool.priceMsat();
+                        if (connection.hoeLogin(cut.session)) |login|
+                            game.menu.wallet.queuePrize(login.player, cut.tile, reply.prize);
+                    }
                     cut.phase = .{ .resolve = verdict };
+                    self.resolveCut(worker, verdict);
                 }
             },
-            .resolve => |verdict| if (worker.submitHoe(.{ .resolve_cut = .{
-                .session = cut.session,
-                .tool = cut.tool,
-                .id = cut.id,
-                .resolution = if (verdict == .charged) .charged else .not_charged,
-            } })) {
-                cut.phase = .{ .resolving = verdict };
-            },
+            .resolve => |verdict| self.resolveCut(worker, verdict),
             .resolving => |verdict| {
                 if (current and verdict != .not_sent and area_pending) return;
                 const result = worker.takeHoe() orelse return;
@@ -607,6 +605,16 @@ pub const Runtime = struct {
                 }
             },
         }
+    }
+
+    fn resolveCut(self: *Runtime, worker: *wallet.Worker, verdict: Verdict) void {
+        const cut = &self.cut.?;
+        if (worker.submitHoe(.{ .resolve_cut = .{
+            .session = cut.session,
+            .tool = cut.tool,
+            .id = cut.id,
+            .resolution = if (verdict == .charged) .charged else .not_charged,
+        } })) cut.phase = .{ .resolving = verdict };
     }
 
     fn view(self: *const Runtime, now: ?u64) game_mod.HoeView {
@@ -1467,7 +1475,7 @@ test "clicking the hoe after a paid cut starts keeps the session and the origina
 
     const state: protocol.State = .{ .x = req.tile.x, .y = req.tile.y, .terrain = tool.terrain(), .cut = true };
     try t.expectEqual(Verdict.uncertain, classify(.pickaxe, req.tile, .{ .ok = state }));
-    connection.cut = .{ .received = .{ .id = req.id, .outcome = .{ .ok = state } } };
+    connection.cut = .{ .received = .{ .id = req.id, .reply = .init(.{ .ok = state }) } };
     rt.update(&connection, network, &worker, &game, false, 100);
     try t.expectEqual(tool.priceMsat(), rt.server.?.accepted);
     rt.update(&connection, network, &worker, &game, false, 100);

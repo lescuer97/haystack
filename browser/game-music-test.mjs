@@ -7,11 +7,12 @@ import vm from 'node:vm';
 const source = await readFile(new URL('./game-music.js', import.meta.url), 'utf8');
 const paths = new Map([[1, 'assets/music/cozy-1.ogg'], [2, 'assets/music/cozy-2.ogg']]);
 
-function setup() {
+function setup(AudioContext) {
   const tracks = [];
   const requests = [];
   const listeners = new Map();
   const window = {
+    AudioContext,
     addEventListener(type, listener, capture) {
       assert.equal(capture, true);
       assert.ok(!listeners.has(type));
@@ -68,15 +69,47 @@ function setup() {
     UTF8ToString: ptr => paths.get(ptr), Audio, window});
   vm.runInContext(source, context);
   context.haystackMusic = library.$haystackMusic;
+  context.haystackRewardAudio = library.$haystackRewardAudio;
   return {
     tracks, requests, listeners,
     load: library.haystack_music_load,
     enable: library.haystack_music_set_enabled,
     status: library.haystack_music_status,
     close: library.haystack_music_close,
+    reward: library.haystack_reward_audio,
     gesture(type, properties = {}) { listeners.get(type)?.({type, isTrusted: true, ...properties}); },
   };
 }
+
+test('reward chime unlocks on a trusted gesture and plays two short notes without music', () => {
+  const notes = [];
+  let opened = 0, closed = 0;
+  class Context {
+    state = 'suspended';
+    currentTime = 1;
+    constructor() { opened++; }
+    async resume() { this.state = 'running'; }
+    async close() { closed++; }
+    createGain() {
+      return {gain: {setValueAtTime() {}, linearRampToValueAtTime() {}, exponentialRampToValueAtTime() {}}, connect() {}};
+    }
+    createOscillator() {
+      return {frequency: {}, connect() {}, start() { notes.push(this.frequency.value); }, stop() {}};
+    }
+  }
+  const h = setup(Context);
+  h.reward(1);
+  h.gesture('click', {isTrusted: false});
+  h.reward(2);
+  assert.equal(opened, 0);
+  h.gesture('click');
+  assert.deepEqual(notes, []);
+  h.reward(2);
+  assert.deepEqual(notes, [660, 880]);
+  h.reward(0);
+  assert.equal(closed, 1);
+  assert.equal(h.listeners.size, 0);
+});
 
 function assertReleased(audio) {
   assert.equal(audio.paused, true);

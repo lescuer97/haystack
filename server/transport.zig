@@ -194,12 +194,24 @@ pub const Handler = struct {
             try self.sendAuthReply(outcome);
             return;
         }
+        if (data.len == wire.prize_ack_bytes) {
+            if (wire.decodePrizeAck(data, tpe == .binary)) |tile| {
+                if (self.app.persistence) |storage| {
+                    const owner = (self.app.registry.get(self.session.?) orelse return error.StaleSession).pubkey;
+                    try storage.disk_lock.lock(storage.io);
+                    defer storage.disk_lock.unlock(storage.io);
+                    try storage.db.acknowledgePrize(.{ .x = tile.x, .y = tile.y, .owner = owner });
+                }
+                return;
+            } else |_| {} // Not a valid ACK; leave normal decoding in charge.
+        }
         const req = wire.decodeMessage(data, tpe == .binary) catch |err|
             return self.sendProtocolError(err);
         if (p.isChannel(std.meta.activeTag(req.operation))) return self.handleChannel(req);
         if (req.operation == .cut and self.app.requiresPaidCut(req.operation.cut)) {
-            const outcome = try self.app.handlePaidCut(self.session.?, req);
-            var reply: [p.max_response_bytes]u8 = undefined;
+            var token: [p.max_prize_token_bytes]u8 = undefined;
+            const outcome = try self.app.handlePaidCut(self.session.?, req, &token);
+            var reply: [p.max_cut_reply_bytes]u8 = undefined;
             const bytes = wire.encodeReply(&reply, .cut, .{ .request_id = req.request_id, .payload = req.operation.cut }, outcome) catch unreachable;
             return self.writeMessage(bytes, .binary);
         }
@@ -240,6 +252,23 @@ pub const Handler = struct {
     pub fn completeAuthentication(self: *Handler) !void {
         try self.app.registry.confirmBefore(self.session.?, self.deadline);
         self.authenticated = true;
+        try self.sendPendingPrizes();
+    }
+    fn sendPendingPrizes(self: *Handler) !void {
+        const storage = self.app.persistence orelse return;
+        const owner = (self.app.registry.get(self.session.?) orelse return error.StaleSession).pubkey;
+        var after: ?p.Location = null;
+        var token: [p.max_prize_token_bytes]u8 = undefined;
+        var frame: [wire.max_prize_notice_bytes]u8 = undefined;
+        while (true) {
+            const prize = blk: {
+                try storage.disk_lock.lock(storage.io);
+                defer storage.disk_lock.unlock(storage.io);
+                break :blk (try storage.db.nextIssuedPrize(owner, after, &token)) orelse return;
+            };
+            try self.writeMessage(try wire.encodePrizeNotice(&frame, prize.tile, prize.token), .binary);
+            after = prize.tile;
+        }
     }
     fn handleChannel(self: *Handler, req: p.Request) !void {
         var reply: [75]u8 = undefined; // Envelope, ID TLV, and quote outcome TLV.

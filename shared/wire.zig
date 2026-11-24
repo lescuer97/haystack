@@ -10,9 +10,11 @@ const Tag = enum(u8) {
     cut = 0x01,
     read_area = 0x02,
     update_location = 0x03,
+    prize_ack = 0x04,
     cut_reply = 0x81,
     read_area_reply = 0x82,
     update_location_reply = 0x83,
+    prize_notice = 0x84,
     challenge = 0xf0,
     proof = 0xf1,
     reply = 0xf2,
@@ -69,8 +71,8 @@ pub const DecodeError = error{
     UnexpectedRequestId,
     OverlappingBuffers,
 };
-const EncodeBufferError = error{ BufferTooSmall, OverlappingBuffers };
-pub const EncodeError = EncodeBufferError || error{ InvalidSnapshot, InvalidSenderProofLength, InvalidChannelStatus };
+pub const EncodeBufferError = error{ BufferTooSmall, OverlappingBuffers };
+pub const EncodeError = EncodeBufferError || error{ InvalidSnapshot, InvalidSenderProofLength, InvalidChannelStatus, InvalidPrizeToken };
 
 fn overlaps(a: []const u8, b: []const u8) bool {
     if (a.len == 0 or b.len == 0) return false;
@@ -392,11 +394,55 @@ pub fn decodeChannelSettled(data: []const u8, binary: bool) DecodeError![32]u8 {
     return id;
 }
 
-/// Snapshot and sender proof sources must not overlap the bytes written to `out`.
+pub const prize_ack_bytes = envelope_bytes + header_bytes + @sizeOf(p.Location);
+pub const max_prize_notice_bytes = prize_ack_bytes + p.max_prize_token_bytes;
+const prize_fields: []const Field = &.{.payload};
+
+pub fn encodePrizeNotice(out: []u8, tile: p.Location, token: []const u8) (EncodeBufferError || error{InvalidPrizeToken})![]const u8 {
+    if (token.len == 0 or token.len > p.max_prize_token_bytes) return error.InvalidPrizeToken;
+    const len: u16 = @intCast(@sizeOf(p.Location) + token.len);
+    var writer = try Writer.initFrom(out, .prize_notice, header_bytes + len, token);
+    const data = writer.field(.payload, len);
+    writePoint(data, tile.x, tile.y);
+    @memcpy(data[@sizeOf(p.Location)..], token);
+    return writer.finish();
+}
+
+/// The bearer token borrows the input frame.
+pub fn decodePrizeNotice(data: []const u8, binary: bool) DecodeError!struct { tile: p.Location, token: []const u8 } {
+    var frame = try open(data, binary, max_prize_notice_bytes);
+    if (frame.tag != .prize_notice) return error.UnexpectedMessageType;
+    const field = try frame.body.next(prize_fields) orelse return error.MissingRequiredField;
+    try frame.body.finish(prize_fields);
+    if (field.bytes.len <= @sizeOf(p.Location)) return error.InvalidFieldLength;
+    return .{
+        .tile = .{ .x = get(i32, field.bytes, 0), .y = get(i32, field.bytes, 4) },
+        .token = field.bytes[@sizeOf(p.Location)..],
+    };
+}
+
+pub fn encodePrizeAck(out: []u8, tile: p.Location) EncodeBufferError![]const u8 {
+    var writer = try Writer.init(out, .prize_ack, prize_ack_bytes - envelope_bytes);
+    writePoint(writer.field(.payload, @sizeOf(p.Location)), tile.x, tile.y);
+    return writer.finish();
+}
+
+pub fn decodePrizeAck(data: []const u8, binary: bool) DecodeError!p.Location {
+    var frame = try open(data, binary, prize_ack_bytes);
+    if (frame.tag != .prize_ack) return error.UnexpectedMessageType;
+    const point = try frame.body.exact(prize_fields, .payload, @sizeOf(p.Location));
+    try frame.body.finish(prize_fields);
+    return .{ .x = get(i32, point, 0), .y = get(i32, point, 4) };
+}
+
+/// Snapshot, sender proof and prize token sources must not overlap the bytes written to `out`.
 pub fn encodeReply(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind), outcome: p.Outcome(kind)) EncodeError![]const u8 {
     const n: u16 = switch (outcome) {
         .ok => |value| switch (kind) {
-            .cut => 10,
+            .cut => if (value.prize_token) |token| blk: {
+                if (!value.cut or token.len == 0 or token.len > p.max_prize_token_bytes) return error.InvalidPrizeToken;
+                break :blk @intCast(10 + token.len);
+            } else 10,
             .channel_requirements => 49,
             .channel_status => blk: {
                 if (value.balance_msat > value.capacity_msat) return error.InvalidChannelStatus;
@@ -414,9 +460,13 @@ pub fn encodeReply(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind), ou
                 break :blk snapshotSize(value.count);
             },
         },
-        .failed => |failure| if (kind == .cut and failure == .already_cut) 12 else 2,
+        .failed => |failure| if (kind == .cut and failure == .already_cut) blk: {
+            if (failure.already_cut.prize_token != null) return error.InvalidPrizeToken;
+            break :blk 12;
+        } else 2,
     };
     const source: []const u8 = if (outcome == .ok) switch (kind) {
+        .cut => outcome.ok.prize_token orelse &.{},
         .read_area => std.mem.asBytes(outcome.ok),
         .channel_status => outcome.ok.sender_proofs orelse &.{},
         else => &.{},
@@ -427,7 +477,10 @@ pub fn encodeReply(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind), ou
         .ok => |value| {
             const dest = writer.field(.ok, n);
             switch (kind) {
-                .cut => writeState(dest, value),
+                .cut => {
+                    writeState(dest, value);
+                    @memcpy(dest[10..], source);
+                },
                 .read_area => writeSnapshot(dest, value),
                 .channel_requirements => {
                     @memcpy(dest[0..33], &value.pubkey);
@@ -472,6 +525,7 @@ fn readFailure(comptime kind: p.Kind, value: []const u8) DecodeError!p.FailureFo
 
 fn replyCap(tag: Tag) usize {
     return switch (tag) {
+        .cut_reply => p.max_cut_reply_bytes,
         .channel_close_reply => p.max_channel_close_reply_bytes,
         .channel_status_reply => p.max_channel_status_reply_bytes,
         else => p.max_response_bytes,
@@ -494,7 +548,16 @@ fn decodeOutcome(body: *Reader, comptime kind: p.Kind, snapshot: *p.Snapshot, da
     try body.finish(reply_fields);
     if (outcome.tag == .failed) return .{ .failed = try readFailure(kind, outcome.bytes) };
     return .{ .ok = switch (kind) {
-        .cut => try readState(outcome.bytes),
+        .cut => blk: {
+            const bytes = outcome.bytes;
+            if (bytes.len < 10 or bytes.len > 10 + p.max_prize_token_bytes) return error.InvalidFieldLength;
+            var state = try readState(bytes[0..10]);
+            if (bytes.len > 10) {
+                if (!state.cut) return error.InvalidFieldValue;
+                state.prize_token = bytes[10..];
+            }
+            break :blk state;
+        },
         .read_area => blk: {
             const meta = try validateSnapshot(outcome.bytes);
             if (overlaps(std.mem.asBytes(snapshot), data)) return error.OverlappingBuffers;

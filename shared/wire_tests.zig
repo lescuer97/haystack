@@ -106,6 +106,47 @@ test "cut with payment uses the existing request and reply tags" {
     try checkReply(.cut, req, .{ .failed = .{ .already_cut = state } }, cut_already);
 }
 
+test "successful cut optionally carries a bounded borrowed Cashu token" {
+    var prize = state;
+    prize.prize_token = "cashuB";
+    const golden = "\x81\x26\x00" ++ id_tlv ++ "\x03\x10\x00" ++ point ++ "\x03\x01cashuB\x7e";
+    try checkReply(.cut, cut_req, .{ .ok = prize }, golden);
+    var buf: [p.max_cut_reply_bytes + 1]u8 = undefined;
+    var snapshot = sentinel;
+    const decoded = try wire.decodeReply(golden, .cut, id.*, &snapshot);
+    try t.expect(decoded.ok.prize_token.?.ptr == golden[golden.len - 7 ..].ptr);
+    try t.expectError(error.InvalidPrizeToken, wire.encodeReply(&buf, .cut, cut_req, .{ .failed = .{ .already_cut = prize } }));
+    prize.prize_token = "";
+    try t.expectError(error.InvalidPrizeToken, wire.encodeReply(&buf, .cut, cut_req, .{ .ok = prize }));
+    const oversized: [p.max_prize_token_bytes + 1]u8 = @splat('x');
+    prize.prize_token = oversized[0..p.max_prize_token_bytes];
+    const max_reply = try wire.encodeReply(&buf, .cut, cut_req, .{ .ok = prize });
+    try t.expectEqual(p.max_cut_reply_bytes, max_reply.len);
+    try t.expectEqualStrings(prize.prize_token.?, (try wire.decodeReply(max_reply, .cut, id.*, &snapshot)).ok.prize_token.?);
+    prize.prize_token = &oversized;
+    try t.expectError(error.InvalidPrizeToken, wire.encodeReply(&buf, .cut, cut_req, .{ .ok = prize }));
+    buf[max_reply.len] = 0;
+    try t.expectError(error.MessageTooLarge, wire.decodeReply(&buf, .cut, id.*, &snapshot));
+}
+
+test "pending prize notice and redemption ACK have separate bounded frames" {
+    const tile: p.Location = .{ .x = -2, .y = 0x01020304 };
+    var out: [wire.max_prize_notice_bytes]u8 = undefined;
+    const notice = try wire.encodePrizeNotice(&out, tile, "cashuB");
+    try t.expectEqualSlices(u8, "\x84\x11\x00\x02\x0e\x00" ++ point ++ "cashuB\x7e", notice);
+    const decoded = try wire.decodePrizeNotice(notice, true);
+    try t.expectEqual(tile, decoded.tile);
+    try t.expectEqualStrings("cashuB", decoded.token);
+    try t.expect(decoded.token.ptr == notice[14..].ptr);
+    try t.expectError(error.NonBinaryMessage, wire.decodePrizeNotice(notice, false));
+    try t.expectError(error.InvalidPrizeToken, wire.encodePrizeNotice(&out, tile, ""));
+    const ack = try wire.encodePrizeAck(&out, tile);
+    try t.expectEqualSlices(u8, "\x04\x0b\x00\x02\x08\x00" ++ point ++ "\x7e", ack);
+    try t.expectEqual(tile, try wire.decodePrizeAck(ack, true));
+    try t.expectError(error.UnexpectedMessageType, wire.decodePrizeNotice(ack, true));
+    try t.expectError(error.NonBinaryMessage, wire.decodePrizeAck(ack, false));
+}
+
 test "cut payment requires all three fixed-length fields in order" {
     const cases = [_]struct { want: wire.DecodeError, suffix: []const u8 }{
         .{ .want = error.MissingRequiredField, .suffix = cut_channel_tlv },

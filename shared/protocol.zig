@@ -23,6 +23,9 @@ pub const chunk_bytes = 32;
 // Envelope, request ID TLV, outcome TLV header, and fixed snapshot metadata.
 pub const area_response_overhead = 4 + 3 + @sizeOf(Id) + 3 + snapshot_metadata_bytes;
 pub const max_response_bytes = area_response_overhead + max_area_chunks * chunk_bytes;
+// Match the wallet receive bridge limit. Cut prizes bypass the gameplay mailbox.
+pub const max_prize_token_bytes = 4096;
+pub const max_cut_reply_bytes = close_reply_overhead + 10 + max_prize_token_bytes;
 // Separate from the gameplay buffer limit. The envelope body length is u16.
 pub const max_sender_change_proofs_bytes = 60 * 1024;
 pub const close_reply_overhead = 4 + 3 + @sizeOf(Id) + 3;
@@ -175,7 +178,14 @@ pub fn RequestFor(comptime kind: Kind) type {
     };
 }
 
-pub const State = struct { x: i32, y: i32, terrain: world.Tile, cut: bool };
+pub const State = struct {
+    x: i32,
+    y: i32,
+    terrain: world.Tile,
+    cut: bool,
+    /// Cashu bearer token, successful cuts only. Borrowed from the frame on decode.
+    prize_token: ?[]const u8 = null,
+};
 pub const CutFailure = union(enum(u16)) {
     invalid_request: void = 1,
     not_cuttable: void = 9,

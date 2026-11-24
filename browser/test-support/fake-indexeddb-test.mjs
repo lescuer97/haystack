@@ -15,7 +15,7 @@ const test = (name, fn) => tests.push({name, fn});
 function openDatabase(indexedDB, name = "fixture", version = 1, upgrade) {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(name, version);
-    request.onupgradeneeded = () => { if (upgrade) upgrade(request.result); };
+    request.onupgradeneeded = event => { if (upgrade) upgrade(request.result, event); };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
     request.onblocked = () => reject(new Error("upgrade was blocked"));
@@ -191,6 +191,28 @@ test("open reports VersionError, versionchange and blocking", async () => {
   assert.equal(indexedDB.records.get("fixture").version, 3);
   assert.equal(indexedDB.records.get("fixture").stores.has("extra"), true);
   database.close();
+});
+
+test("upgrade events report versions and abort rolls back schema", async () => {
+  const indexedDB = new FakeIndexedDB({database: "fixture"});
+  const openAndAbort = version => {
+    let versions;
+    const result = openDatabase(indexedDB, "fixture", version, (db, event) => {
+      versions = [event.oldVersion, event.newVersion];
+      db.createObjectStore("extra");
+      event.target.transaction.abort();
+    });
+    return assert.rejects(result, {name: "AbortError"}).then(() => versions);
+  };
+  assert.deepEqual(await openAndAbort(1), [0, 1]);
+  assert.equal(indexedDB.records.has("fixture"), false);
+
+  indexedDB.seed("s", "k", "original", {create: true});
+  assert.deepEqual(await openAndAbort(2), [1, 2]);
+  const record = indexedDB.records.get("fixture");
+  assert.equal(record.version, 1);
+  assert.deepEqual(record.stores, new Map([["s", new Map([["k", "original"]])]]));
+  assert.equal(record.connections.size, 0);
 });
 
 test("an injected open failure reaches onerror without creating a database", async () => {

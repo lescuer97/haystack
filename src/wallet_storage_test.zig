@@ -49,6 +49,24 @@ test "application worker owns one locked handle across reads and joins before re
         }
         try testing.expect(model.available and !model.pending);
         try testing.expectEqual(@as(usize, 0), model.total_rows);
+
+        // An invalid token exercises the ordinary receive ABI without mint I/O.
+        defer model.clearPendingPrizes();
+        var token: ui.PrizeToken = .{};
+        try testing.expect(token.set("not-a-cashu-token"));
+        model.prize_player = @splat(1);
+        model.queuePrize(model.prize_player.?, .{ .x = 0, .y = 0 }, token);
+        model.tick(true, 0);
+        try testing.expectEqual(ui.Operation.receive_prize, model.operation);
+        for (0..250) |_| {
+            _ = worker.step(&model, 0);
+            if (!model.pending) break;
+            try testing.io.sleep(.fromMilliseconds(20), .awake);
+        }
+        try testing.expect(!model.pending);
+        try testing.expectEqualStrings("Prize not collected. Contact the game server operator.", model.prize_notice.?);
+        try testing.expect(!model.prize_chime and !model.prize_refresh and !model.balance_dirty);
+        try testing.expectEqualStrings("0 msat", model.balance.slice());
     }
     var reopened = try wallet.inspect(testing.io, testing.allocator, h.paths, true);
     defer reopened.close() catch {};

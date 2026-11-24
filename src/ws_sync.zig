@@ -181,6 +181,88 @@ pub const PlayRequest = struct {
     }
 };
 
+const PrizeNotice = @import("wallet_ui.zig").PrizeNotice;
+pub const PrizeInbox = struct {
+    const capacity = 4;
+    notices: [capacity]PrizeNotice = undefined,
+    head: usize = 0,
+    count: usize = 0,
+    deferred: bool = false,
+
+    pub fn push(self: *PrizeInbox, tile: protocol.Location, bytes: []const u8) !void {
+        if (bytes.len == 0 or bytes.len > protocol.max_prize_token_bytes or std.mem.indexOfScalar(u8, bytes, 0) != null)
+            return error.InvalidPrizeToken;
+        if (self.count == capacity) {
+            // Do not disconnect before the accepted batch can be collected and ACKed.
+            // These unacknowledged prizes remain eligible for server redelivery.
+            self.deferred = true;
+            return;
+        }
+        const notice = &self.notices[(self.head + self.count) % capacity];
+        notice.* = .{ .tile = tile, .token = .{} };
+        _ = notice.token.set(bytes);
+        self.count += 1;
+    }
+
+    pub fn take(self: *PrizeInbox) ?PrizeNotice {
+        if (self.count == 0) return null;
+        const notice = self.notices[self.head];
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.notices[self.head]));
+        self.head = (self.head + 1) % capacity;
+        self.count -= 1;
+        return notice;
+    }
+
+    pub fn takeDeferred(self: *PrizeInbox) bool {
+        defer self.deferred = false;
+        return self.deferred;
+    }
+
+    pub fn clear(self: *PrizeInbox) void {
+        for (0..self.count) |i| std.crypto.secureZero(u8, std.mem.asBytes(&self.notices[(self.head + i) % capacity]));
+        self.head = 0;
+        self.count = 0;
+        self.deferred = false;
+    }
+};
+
+test "prize inbox owns borrowed frame bytes and clears on disconnect" {
+    const t = std.testing;
+    var inbox: PrizeInbox = .{};
+    defer inbox.clear();
+    const tile: protocol.Location = .{ .x = -1, .y = 2 };
+    var token = "cashuBtest".*;
+    try inbox.push(tile, &token);
+    @memset(&token, 0);
+    const notice = inbox.take().?;
+    try t.expectEqual(tile, notice.tile);
+    try t.expectEqualStrings("cashuBtest", notice.token.slice());
+    try inbox.push(tile, notice.token.slice());
+    inbox.clear();
+    try t.expect(inbox.take() == null);
+}
+
+test "prize inbox keeps a bounded FIFO batch and defers the excess until reconnect" {
+    const t = std.testing;
+    var inbox: PrizeInbox = .{};
+    defer inbox.clear();
+    const token: [protocol.max_prize_token_bytes]u8 = @splat('x');
+    for (0..PrizeInbox.capacity + 1) |i| try inbox.push(.{ .x = @intCast(i), .y = 0 }, &token);
+    try t.expect(inbox.takeDeferred());
+    try t.expect(!inbox.takeDeferred());
+    for (0..PrizeInbox.capacity) |i| {
+        const notice = inbox.take().?;
+        try t.expectEqual(@as(i32, @intCast(i)), notice.tile.x);
+        try t.expectEqualStrings(&token, notice.token.slice());
+    }
+    try t.expect(inbox.take() == null);
+    inbox.clear();
+    const deferred: protocol.Location = .{ .x = PrizeInbox.capacity, .y = 0 };
+    try inbox.push(deferred, &token);
+    try t.expectEqual(deferred, inbox.take().?.tile);
+    try t.expect(!inbox.takeDeferred());
+}
+
 pub const Status = enum { disabled, connecting, authenticating, ready, retrying, wallet_error, credentials_rejected };
 pub const Snapshot = struct {
     status: Status = .disabled,

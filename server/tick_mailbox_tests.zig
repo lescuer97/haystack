@@ -44,7 +44,7 @@ test "owned requests wait for tick; cut read and location copy replies before re
     try t.expectEqualDeep(location.operation.update_location, app.registry.get(session).?.location.?);
     var snapshot: p.Snapshot = undefined;
     const cut_outcome = try reply(&slots[0].mailbox, .cut, cut.request_id, &snapshot);
-    try t.expectEqualDeep(app.context.state.replays[0].result, cut_outcome);
+    try t.expectEqualDeep(app.context.state.replays[0].outcome(), cut_outcome);
     try t.expect((try reply(&slots[2].mailbox, .update_location, location.request_id, &snapshot)) == .ok);
     const area_reply = &slots[1].mailbox;
     const saved = (try reply(area_reply, .read_area, read.request_id, &snapshot)).ok.*;

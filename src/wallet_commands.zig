@@ -22,6 +22,13 @@ pub fn executeScreen(io: std.Io, paths: wallet.Paths, owner: *?wallet.Wallet, re
         owner.* = inspection.wallet orelse return error.Unavailable;
     }
     const handle = if (owner.*) |*w| try w.borrowHandle() else return error.Unavailable;
+    if (request.operation == .receive_prize) {
+        const c = wallet.cdk.c;
+        const result = c.cdk_wallet_receive(handle, request.argument.z().ptr);
+        defer c.cdk_string_free(result.@"error");
+        var buf: [80]u8 = undefined;
+        return output.set(try std.fmt.bufPrint(&buf, "{{\"status\":{d},\"net_msats\":\"{d}\"}}", .{ result.status, result.net_msats }));
+    }
     if (request.operation == .create) {
         var added = wallet.cdk.c.cdk_wallet_add_mint(handle, wallet.cdk.app_mint.ptr);
         try wallet.check(&added);
@@ -38,6 +45,7 @@ pub fn executeScreen(io: std.Io, paths: wallet.Paths, owner: *?wallet.Wallet, re
         .cancel_withdrawal => "cancel_withdrawal",
         .saved_withdrawal => "saved_withdrawal",
         .poll_withdrawals => "poll_withdrawals",
+        .receive_prize => unreachable,
     };
     const args = if (request.operation == .check or request.operation == .poll or request.operation == .recover)
         try std.json.Stringify.valueAlloc(allocator, .{ wallet.cdk.app_mint, @tagName(request.operation), request.argument.slice() }, .{})

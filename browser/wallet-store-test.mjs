@@ -85,44 +85,36 @@ for (const module of [undefined, {}, {onHaystackStartup() { throw new Error("cos
   assert.deepEqual(results, ["ready", "error"]);
   check();
 }
-// Exercise both independent openers against fresh, v1, and newer databases.
+// Both independent openers create fresh v2, reopen v2 and refuse v1/v3.
 for (const [label, load] of [
   ["platform", async suffix => (await import(`./wallet/platform.js?${suffix}`)).loadWallet],
   ["helper", async suffix => (await import(`./wallet-store.js?${suffix}`)).readWallet],
 ]) {
-  for (const scenario of ["fresh", "upgrade", "newer"]) {
+  for (const version of [0, 1, 2, 3]) {
     const isolated = new FakeIndexedDB();
-    const state = {revision: 17, data: '{ "version": 1, "contents": [1,2] }', extra: "preserve"};
-    if (scenario !== "fresh") {
-      isolated.records.set(DATABASE, {
-        version: scenario === "upgrade" ? 1 : 3,
-        stores: new Map([
-          [MNEMONIC_STORE, new Map([["existing", MNEMONIC]])],
-          [STATE_STORE, new Map([["existing", state]])],
-        ]),
-      });
+    const state = {revision: 17, data: '{ "version": 1, "contents": [1,2] }'};
+    const stores = new Map([
+      [MNEMONIC_STORE, new Map([["existing", MNEMONIC]])],
+      [STATE_STORE, new Map([["existing", state]])],
+    ]);
+    if (version >= 2) stores.set(ONBOARDING_STORE, new Map([["existing", {version: 1}]]));
+    if (version !== 0) {
+      isolated.records.set(DATABASE, {version, stores: structuredClone(stores)});
     }
-    Object.defineProperty(globalThis, "indexedDB", {value: isolated, configurable: true});
-    const read = await load(`${label}-${scenario}`);
-    if (scenario === "newer") {
+    setIndexedDB(isolated);
+    const read = await load(`${label}-v${version}`);
+    if (version === 1 || version === 3) {
       await assert.rejects(read("existing"), /IndexedDB could not be opened/);
-      assert.equal(isolated.records.get(DATABASE).version, 3);
-      assert.equal(isolated.records.get(DATABASE).stores.has(ONBOARDING_STORE), false);
     } else {
-      if (label === "platform" && scenario === "upgrade") {
-        await assert.rejects(read("existing"), /wallet state record is malformed/);
-      } else {
-        await read("existing");
-      }
-      assert.equal(isolated.records.get(DATABASE).version, 2);
-      assert.deepEqual([...isolated.records.get(DATABASE).stores.keys()].sort(),
-        [MNEMONIC_STORE, ONBOARDING_STORE, STATE_STORE].sort());
-      assert.equal(isolated.store(ONBOARDING_STORE).size, 0);
-      if (scenario === "upgrade") {
-        assert.equal(isolated.peek(MNEMONIC_STORE, "existing"), MNEMONIC);
-        assert.deepEqual(isolated.peek(STATE_STORE, "existing"), state);
-      }
+      const wallet = await read("existing");
+      assert.deepEqual(label === "platform" ? parse(wallet) : wallet,
+        version === 0 ? {mnemonic: null, state: null} : {mnemonic: MNEMONIC, state});
     }
+    const record = isolated.records.get(DATABASE);
+    assert.equal(record.version, version || 2);
+    assert.deepEqual(record.stores, version === 0
+      ? new Map([MNEMONIC_STORE, STATE_STORE, ONBOARDING_STORE].map(name => [name, new Map()]))
+      : stores);
     check();
   }
 }
@@ -622,8 +614,8 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
     await second;
     let aborted = false, created = false;
     requests[0].transaction = {abort() { aborted = true; }};
-    requests[0].result = {objectStoreNames: {contains() { created = true; return false; }}};
-    requests[0].onupgradeneeded();
+    requests[0].result = {createObjectStore() { created = true; }};
+    requests[0].onupgradeneeded({oldVersion: 0, newVersion: 2});
     assert.equal(aborted, true);
     assert.equal(created, false);
     const late = {close() { this.closed = true; }};
@@ -659,8 +651,8 @@ for (const [type, handler] of originalListeners) listeners.set(type, handler);
   await flush();
   let aborted = false;
   requests[0].transaction = {abort() { aborted = true; }};
-  requests[0].result = {objectStoreNames: {contains() { throw new Error(MNEMONIC); }}};
-  requests[0].onupgradeneeded();
+  requests[0].result = {createObjectStore() { throw new Error(MNEMONIC); }};
+  requests[0].onupgradeneeded({oldVersion: 0, newVersion: 2});
   await assert.rejects(pending, /^Error: IndexedDB could not be opened$/);
   assert.equal(aborted, true);
   setIndexedDB(fake);

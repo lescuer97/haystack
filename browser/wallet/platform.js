@@ -65,17 +65,18 @@ function openDatabase() {
     return promise;
   }
 
-  request.onupgradeneeded = () => {
-    if (attempt.abandoned) {
-      // Nobody owns this attempt any more; do not create schema for it.
+  request.onupgradeneeded = event => {
+    if (attempt.abandoned || event.oldVersion !== 0) {
+      // Only a live attempt opening a fresh database may create schema.
       abortUpgrade(request);
+      rejectOnce(new Error(OPEN_ERROR));
       return;
     }
     try {
       const database = request.result;
-      if (!database.objectStoreNames.contains(MNEMONIC_STORE)) database.createObjectStore(MNEMONIC_STORE);
-      if (!database.objectStoreNames.contains(STATE_STORE)) database.createObjectStore(STATE_STORE);
-      if (!database.objectStoreNames.contains(ONBOARDING_STORE)) database.createObjectStore(ONBOARDING_STORE);
+      database.createObjectStore(MNEMONIC_STORE);
+      database.createObjectStore(STATE_STORE);
+      database.createObjectStore(ONBOARDING_STORE);
     } catch (_) {
       attempt.abandoned = true;
       abortUpgrade(request);
@@ -171,7 +172,7 @@ function transactionGuard(transaction, errorMessage, {resolve, reject}) {
 }
 
 // Wallet records are exactly `{revision, data}`: extra envelope fields are
-// rejected rather than silently dropped, so a migration never reinterprets an
+// rejected rather than silently dropped, so a write never reinterprets an
 // unknown record as compatible. `revision` is a non-negative safe integer and
 // -0 is malformed (JSON.stringify cannot round-trip it losslessly). The
 // serialized store stays the raw string owned by the Rust side.

@@ -11,6 +11,7 @@ pub const ConfirmedCut = struct {
 pub const Cues = struct {
     snip: bool = false,
     fail: bool = false,
+    reward: bool = false,
 };
 
 pub const burst_seconds: f32 = 0.42;

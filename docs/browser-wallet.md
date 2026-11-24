@@ -421,6 +421,13 @@ same-origin script, and are not encrypted.
 | --- | --- | --- | --- |
 | `haystack-wallet` | `mnemonics` | wallet name | plaintext English BIP-39 words |
 | `haystack-wallet` | `states` | wallet name | `{"revision": n, "data": "<Store v1 JSON>"}` |
+| `haystack-wallet` | `onboarding` | `haystack-user` or a retired-attempt key | onboarding marker |
+
+A new `haystack-wallet` database is created directly at IndexedDB version 2
+with all three stores. Existing v2 databases reopen without schema changes.
+Older and newer database versions are refused without modifying their schema or
+records. There is no migration from IndexedDB v1 or from localStorage. The
+IndexedDB version is separate from the serialized `Store v1` format.
 
 Opening never creates records. Both records absent reports that the wallet is
 not initialized, exactly one reports incomplete storage, and both present are
@@ -432,10 +439,9 @@ rejected rather than tolerated because this writer cannot preserve them: serde
 would drop them on the next mutation. A write whose expected revision is stale is
 rejected with a concurrent-update error.
 
-The game uses the fixed persistent user wallet `haystack-user`. Its IndexedDB v2
-onboarding records use atomic transitions, with migration from v1 to v2; this is
-not a migration from the previous localStorage layout. Startup inspection is
-read-only and makes no network request. Incomplete or unknown records block
+The game uses the fixed persistent user wallet `haystack-user`. Its onboarding
+records use atomic transitions. Startup inspection is read-only and makes no
+network request. Incomplete or unknown records block
 onboarding rather than being overwritten. Provisioning requests
 `navigator.storage.persist()`; denial only warns and the wallet remains stored.
 There is no player-facing or production deletion API.

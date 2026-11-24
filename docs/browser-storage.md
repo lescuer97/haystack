@@ -1,8 +1,11 @@
 # Browser settings and content storage
 
 The browser build keeps the single-tab Web Lock and both persistent stores in
-one IndexedDB database, `haystack-game` (version `1`). The browser wallet uses a
-separate database, `haystack-wallet`; see
+one IndexedDB database, `haystack-game` (version `1`). Fresh game databases
+create both stores directly at version 1. The browser wallet uses a separate
+version 2 database, `haystack-wallet`: it creates its stores only for a fresh
+database, reopens existing v2 databases, and refuses other versions without
+changing their schema or records. See
 [browser wallet](browser-wallet.md#wallet-storage-and-provisioning).
 
 | Object store | Contents |

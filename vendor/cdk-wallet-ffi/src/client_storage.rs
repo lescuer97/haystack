@@ -9,7 +9,6 @@ use safer_ffi::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
-use zeroize::Zeroizing;
 
 use crate::api::{guard, opt_cstr_to_string};
 use crate::wallet::{FfiErr, FfiResult};
@@ -20,6 +19,28 @@ const JOURNAL: &[u8] = b"journal";
 const WALLET: &[u8] = b"wallet";
 const HOE_LIFECYCLE: &[u8] = b"hoe-lifecycle";
 const TOOL_TOP_UP: &[u8] = b"tool_top_up_v1";
+
+const APP_SCHEMA: &[(&str, &str)] = &[
+    (
+        "records",
+        "CREATE TABLE records (
+            namespace BLOB NOT NULL, id BLOB NOT NULL, data BLOB NOT NULL,
+            PRIMARY KEY(namespace,id)
+         ) WITHOUT ROWID",
+    ),
+    (
+        "haystack_channel_links",
+        "CREATE TABLE haystack_channel_links (
+            id BLOB PRIMARY KEY CHECK(length(id)=32),
+            scope BLOB NOT NULL CHECK(length(scope)=32),
+            operation_id BLOB NOT NULL CHECK(length(operation_id)=16)
+         ) WITHOUT ROWID",
+    ),
+    (
+        "haystack_channel_scope",
+        "CREATE INDEX haystack_channel_scope ON haystack_channel_links(scope)",
+    ),
+];
 
 #[derive_ReprC]
 #[repr(opaque)]
@@ -36,7 +57,7 @@ pub struct CdkSpilmanClientStorageOpenResult {
     pub handle: Option<repr_c::Box<CdkSpilmanClientStorage>>,
 }
 
-// v1 desktop transfer envelope (also the legacy SQLite record format).
+// v1 desktop transfer envelope.
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ChannelRecord {
@@ -151,7 +172,7 @@ impl CdkSpilmanClientStorage {
         if !Path::new(path).is_absolute() {
             return Err(err(CdkStatus::InvalidPath, "storage path must be absolute"));
         }
-        let app = Connection::open_with_flags(
+        let mut app = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
@@ -161,54 +182,55 @@ impl CdkSpilmanClientStorage {
             "PRAGMA trusted_schema=OFF; PRAGMA synchronous=EXTRA; PRAGMA fullfsync=ON;",
         )
         .map_err(db)?;
+        let fresh: bool = app
+            .query_row("SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema)", [], |r| {
+                r.get(0)
+            })
+            .map_err(db)?;
+        if fresh {
+            let tx = app.transaction().map_err(db)?;
+            for &(_, ddl) in APP_SCHEMA {
+                tx.execute_batch(ddl).map_err(db)?;
+            }
+            tx.commit().map_err(db)?;
+        } else {
+            Self::validate_app_schema(&app)?;
+        }
         let client = SqliteClientStorage::open(path).map_err(db)?;
-        app.execute_batch(
-            "CREATE TABLE IF NOT EXISTS records (
-                namespace BLOB NOT NULL, id BLOB NOT NULL, data BLOB NOT NULL,
-                PRIMARY KEY(namespace,id)
-             ) WITHOUT ROWID;
-             CREATE TABLE IF NOT EXISTS haystack_channel_links (
-                id BLOB PRIMARY KEY CHECK(length(id)=32),
-                scope BLOB NOT NULL CHECK(length(scope)=32),
-                operation_id BLOB NOT NULL CHECK(length(operation_id)=16)
-             ) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS haystack_channel_scope ON haystack_channel_links(scope);",
-        )
-        .map_err(db)?;
-        let mut storage = Self { app, client };
-        storage.migrate_channels()?;
-        Ok(storage)
+        Ok(Self { app, client })
     }
 
-    fn migrate_channels(&mut self) -> FfiResult<()> {
-        loop {
-            let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = self
-                .app
-                .query_row(
-                    "SELECT namespace,id,data FROM records WHERE namespace NOT IN (?1,?2,?3,?4) LIMIT 1",
-                    params![JOURNAL, WALLET, HOE_LIFECYCLE, TOOL_TOP_UP],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
+    fn validate_app_schema(app: &Connection) -> FfiResult<()> {
+        let unsupported = |message| err(CdkStatus::UnsupportedDatabase, message);
+        // Check records first, including databases left by an interrupted import.
+        let mut schema = app
+            .prepare("SELECT sql FROM sqlite_schema WHERE name=?1")
+            .map_err(db)?;
+        for &(name, ddl) in APP_SCHEMA {
+            let actual: Option<String> = schema
+                .query_row([name], |r| r.get(0))
                 .optional()
                 .map_err(db)?;
-            let Some((scope, id, json)) = row else {
-                return Ok(());
-            };
-            let json = Zeroizing::new(json);
-            let record = parse_channel(&json)?;
-            if scope != record.scope || id != record.channel.id {
-                return Err(invalid_record());
+            // SQLite strips IF NOT EXISTS from the stored app DDL.
+            if !actual.is_some_and(|sql| sql.split_whitespace().eq(ddl.split_whitespace())) {
+                return Err(unsupported("unsupported Spilman application schema"));
             }
-            // The legacy record is already funded and may no longer have its
-            // journal. Keep it until the upstream replacement is committed.
-            self.save_channel(record, String::new())?;
-            self.app
-                .execute(
-                    "DELETE FROM records WHERE namespace=?1 AND id=?2",
-                    params![scope, id],
-                )
-                .map_err(db)?;
+            if name == "records" {
+                let legacy: bool = app
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM records WHERE namespace NOT IN (?1,?2,?3,?4))",
+                        params![JOURNAL, WALLET, HOE_LIFECYCLE, TOOL_TOP_UP],
+                        |r| r.get(0),
+                    )
+                    .map_err(db)?;
+                if legacy {
+                    return Err(unsupported(
+                        "legacy Spilman channel records are not supported",
+                    ));
+                }
+            }
         }
+        Ok(())
     }
 
     fn link(&self, id: &[u8]) -> FfiResult<Option<(Vec<u8>, [u8; 16])>> {
@@ -237,7 +259,7 @@ impl CdkSpilmanClientStorage {
             }
             // This is deliberately the first commit. Every completed upstream
             // row has a recoverable link. If interrupted before set_open, the
-            // funding journal (or legacy row) is still authoritative on retry.
+            // funding journal is still authoritative on retry.
             self.app
                 .execute(
                     "INSERT INTO haystack_channel_links(id,scope,operation_id) VALUES(?1,?2,?3)",
@@ -618,7 +640,7 @@ pub fn cdk_spilman_client_storage_list_ids(
 mod tests {
     use super::*;
 
-    fn legacy_record() -> ChannelRecord {
+    fn funded_record() -> ChannelRecord {
         let sender = "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa";
         let receiver = "02466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f27";
         let mint = "https://mint.example";
@@ -656,8 +678,9 @@ mod tests {
     #[test]
     fn discovery_leaves_an_interrupted_funding_link_to_its_journal() {
         let tempfile = tempfile::NamedTempFile::new().unwrap();
-        let mut store = CdkSpilmanClientStorage::open(tempfile.path().to_str().unwrap()).unwrap();
-        let record = legacy_record();
+        let path = tempfile.path().to_str().unwrap();
+        let store = CdkSpilmanClientStorage::open(path).unwrap();
+        let record = funded_record();
         let scope = record.scope;
         let id = record.channel.id;
         let op = record.channel.operation_id;
@@ -679,6 +702,8 @@ mod tests {
                 params![JOURNAL, op, b"funding journal"],
             )
             .unwrap();
+        drop(store);
+        let mut store = CdkSpilmanClientStorage::open(path).unwrap();
         let incomplete = list(&store);
         assert_eq!(incomplete.status, CdkStatus::Ok);
         assert!(incomplete.bytes.is_empty());
@@ -689,97 +714,76 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_legacy_migration_reopens_through_upstream_storage() {
-        let tempfile = tempfile::NamedTempFile::new().unwrap();
-        let path = tempfile.path().to_str().unwrap();
-        let record = legacy_record();
-        let id = hex(&record.channel.id);
-        let canonical = serde_json::to_vec(&record).unwrap();
+    fn legacy_channel_records_are_rejected_without_touching_the_database() {
+        let record = funded_record();
         let mut legacy = serde_json::to_value(&record).unwrap();
         legacy["scope"] = String::from_utf8(record.scope.to_vec()).unwrap().into();
         legacy["channel"]["operation_id"] = String::from_utf8(record.channel.operation_id.to_vec())
             .unwrap()
             .into();
         let legacy = serde_json::to_vec(&legacy).unwrap();
-        let app = Connection::open(path).unwrap();
-        app.execute_batch("CREATE TABLE records(namespace BLOB NOT NULL, id BLOB NOT NULL, data BLOB NOT NULL, PRIMARY KEY(namespace,id)) WITHOUT ROWID;").unwrap();
-        let metadata = b"exact application recovery bytes";
-        app.execute(
-            "INSERT INTO records VALUES(?1,?2,?3)",
-            params![JOURNAL, record.channel.operation_id, metadata],
-        )
-        .unwrap();
-        app.execute(
-            "INSERT INTO records VALUES(?1,?2,?3)",
-            params![record.scope, record.channel.id, legacy],
-        )
-        .unwrap();
-        let upstream = SqliteClientStorage::open(path).unwrap();
-        app.execute_batch("CREATE TRIGGER block_completion BEFORE UPDATE OF funding_json ON spilman_client_channels BEGIN SELECT RAISE(ABORT, 'test interruption'); END;").unwrap();
+        for payload in [legacy.as_slice(), b"malformed recovery record"] {
+            for mixed in [false, true] {
+                let tempfile = tempfile::NamedTempFile::new().unwrap();
+                let path = tempfile.path().to_str().unwrap();
+                if mixed {
+                    drop(CdkSpilmanClientStorage::open(path).unwrap());
+                }
+                let app = Connection::open(path).unwrap();
+                app.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+                if !mixed {
+                    app.execute_batch(APP_SCHEMA[0].1).unwrap();
+                }
+                app.execute(
+                    "INSERT INTO records VALUES(?1,?2,?3)",
+                    params![
+                        JOURNAL,
+                        record.channel.operation_id,
+                        b"exact application recovery bytes"
+                    ],
+                )
+                .unwrap();
+                app.execute(
+                    "INSERT INTO records VALUES(?1,?2,?3)",
+                    params![record.scope, record.channel.id, payload],
+                )
+                .unwrap();
+                drop(app);
 
-        assert_eq!(
-            CdkSpilmanClientStorage::open(path).err().unwrap().status,
-            CdkStatus::DatabaseError
-        );
-        assert_eq!(
-            upstream.get_state(&id),
-            Some(ClientChannelState::OpeningFromSwap)
-        );
-        let still_saved: Vec<u8> = app
-            .query_row(
-                "SELECT data FROM records WHERE namespace=?1",
-                [record.scope],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(still_saved, legacy);
-        app.execute_batch("DROP TRIGGER block_completion").unwrap();
-
-        let store = CdkSpilmanClientStorage::open(path).unwrap();
-        assert_eq!(upstream.get_state(&id), Some(ClientChannelState::Open));
-        assert_eq!(
-            upstream.get_funding(&id).unwrap().funding_proofs_json,
-            record.channel.funding_proofs_json
-        );
-        assert_eq!(
-            store.read_channel(record.scope, record.channel.id).unwrap(),
-            canonical
-        );
-        let records: i64 = app
-            .query_row("SELECT count(*) FROM records", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(records, 1);
-        let still_saved: Vec<u8> = app
-            .query_row(
-                "SELECT data FROM records WHERE namespace=?1",
-                [JOURNAL],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(still_saved, metadata);
+                let before = std::fs::read(path).unwrap();
+                assert_eq!(
+                    CdkSpilmanClientStorage::open(path).err().unwrap().status,
+                    CdkStatus::UnsupportedDatabase
+                );
+                assert_eq!(std::fs::read(path).unwrap(), before);
+            }
+        }
     }
 
     #[test]
-    fn malformed_legacy_record_is_not_discarded() {
+    fn fresh_client_schema_reopens_without_app_ddl_and_is_not_repaired() {
         let tempfile = tempfile::NamedTempFile::new().unwrap();
         let path = tempfile.path().to_str().unwrap();
         let store = CdkSpilmanClientStorage::open(path).unwrap();
-        let payload = b"malformed recovery record";
-        store
+        let schema_version = |app: &Connection| -> i64 {
+            app.query_row("PRAGMA schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        let created = schema_version(&store.app);
+        drop(store);
+        let reopened = CdkSpilmanClientStorage::open(path).unwrap();
+        assert_eq!(schema_version(&reopened.app), created);
+        reopened
             .app
-            .execute(
-                "INSERT INTO records VALUES(?1,?2,?3)",
-                params![[1u8; 32], [2u8; 32], payload],
-            )
+            .execute_batch("DROP INDEX haystack_channel_scope")
             .unwrap();
+        drop(reopened);
+
+        let before = std::fs::read(path).unwrap();
         assert_eq!(
             CdkSpilmanClientStorage::open(path).err().unwrap().status,
             CdkStatus::UnsupportedDatabase
         );
-        let saved: Vec<u8> = store
-            .app
-            .query_row("SELECT data FROM records", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(saved, payload);
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 }

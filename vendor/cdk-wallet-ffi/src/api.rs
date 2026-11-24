@@ -591,6 +591,33 @@ pub fn cdk_wallet_send(
     amount_msats: u64,
     max_sender_fee_msats: u64,
 ) -> CdkSendResult {
+    wallet_send(handle, mint_url, amount_msats, max_sender_fee_msats, None)
+}
+
+/// Send using exact local proofs, without a swap or sender fee. The serialized
+/// bearer token must fit `max_token_bytes` (excluding the C string terminator).
+/// If exact proofs are unavailable or the token exceeds the limit, no token is
+/// issued. A failed cancellation is reported separately and requires recovery.
+/// Free a successful result's token with [`cdk_string_free`].
+#[ffi_export]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn cdk_wallet_send_bounded(
+    handle: Option<&mut crate::wallet::CdkWallet>,
+    mint_url: Option<char_p::Ref<'_>>,
+    amount_msats: u64,
+    max_token_bytes: usize,
+) -> CdkSendResult {
+    wallet_send(handle, mint_url, amount_msats, 0, Some(max_token_bytes))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn wallet_send(
+    handle: Option<&mut crate::wallet::CdkWallet>,
+    mint_url: Option<char_p::Ref<'_>>,
+    amount_msats: u64,
+    max_sender_fee_msats: u64,
+    max_token_bytes: Option<usize>,
+) -> CdkSendResult {
     let poison = handle.as_ref().map(|h| h.poison_flag());
     guard_poison(
         poison,
@@ -607,11 +634,13 @@ pub fn cdk_wallet_send(
                 Ok(u) => u,
                 Err(e) => return send_error(e),
             };
-            match crate::wallet::runtime().block_on(handle.send(
-                &url,
-                amount_msats,
-                max_sender_fee_msats,
-            )) {
+            let outcome = crate::wallet::runtime().block_on(async {
+                match max_token_bytes {
+                    Some(limit) => handle.send_bounded(&url, amount_msats, limit).await,
+                    None => handle.send(&url, amount_msats, max_sender_fee_msats).await,
+                }
+            });
+            match outcome {
                 Ok(outcome) => CdkSendResult {
                     status: CdkStatus::Ok,
                     error: None,

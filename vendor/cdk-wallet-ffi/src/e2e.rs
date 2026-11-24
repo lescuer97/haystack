@@ -489,6 +489,88 @@ fn e2e_fee_limit_cancels_and_preserves_balance() {
 }
 
 #[test]
+fn e2e_bounded_send_requires_exact_proofs_and_checks_size_before_issuance() {
+    let mint_url = block_on(start_fake_mint(0));
+    let (_dir, path) = temp_db();
+    let seed = [34u8; 64];
+    let mut handle = open_wallet(seed, &path);
+    block_on(handle.add_mint(&mint_url)).unwrap();
+    let wallet = block_on(fund_wallet(
+        &path,
+        seed,
+        &mint_url,
+        512,
+        SplitTarget::Values(vec![Amount::from(512u64)]),
+    ));
+
+    // A generic zero-fee send could swap the single 512-msat proof for 300;
+    // the bounded send must refuse instead, even with ample token space.
+    let err = block_on(handle.send_bounded(&mint_url, 300, 4096)).unwrap_err();
+    assert_eq!(err.status, CdkStatus::InsufficientFunds);
+    assert!(block_on(handle.list_pending_tokens()).unwrap().is_empty());
+
+    let expected = block_on(async {
+        let prepared = wallet
+            .prepare_send(
+                Amount::from(512u64),
+                SendOptions {
+                    send_kind: SendKind::OfflineExact,
+                    ..SendOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let token = Token::new(
+            wallet.mint_url.clone(),
+            prepared.proofs_to_send().clone(),
+            None,
+            wallet.unit.clone(),
+        )
+        .to_string();
+        prepared.cancel().await.unwrap();
+        token
+    });
+
+    let err = block_on(handle.send_bounded(&mint_url, 512, expected.len() - 1)).unwrap_err();
+    assert_eq!(err.status, CdkStatus::SendFailed);
+    assert!(err.operation_id.is_some());
+    assert!(block_on(handle.list_pending_tokens()).unwrap().is_empty());
+    assert_eq!(block_on(handle.list_balances()).unwrap()[0].1, 512);
+
+    let outcome = block_on(handle.send_bounded(&mint_url, 512, expected.len())).unwrap();
+    assert_eq!(outcome.sender_fee_msats, 0);
+    assert_eq!(outcome.token, expected);
+    let pending = block_on(handle.get_pending_token(&outcome.operation_id)).unwrap();
+    assert_eq!(pending.token, expected);
+}
+
+#[test]
+fn e2e_bounded_send_cancellation_failure_requires_recovery() {
+    let mint_url = block_on(start_fake_mint(0));
+    let (_dir, path) = temp_db();
+    let seed = [35u8; 64];
+    let mut handle = open_wallet(seed, &path);
+    block_on(handle.add_mint(&mint_url)).unwrap();
+    block_on(fund_wallet(&path, seed, &mint_url, 512, SplitTarget::None));
+
+    // Reserve normally, but fail when cancellation tries to release the proof.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_release BEFORE UPDATE OF state ON proof
+             WHEN OLD.state = 'RESERVED' AND NEW.state = 'UNSPENT'
+             BEGIN SELECT RAISE(FAIL, 'injected cancellation failure'); END;",
+        )
+        .unwrap();
+    let err = block_on(handle.send_bounded(&mint_url, 512, 1)).unwrap_err();
+    assert_eq!(err.status, CdkStatus::CancellationFailed);
+    assert!(err.operation_id.is_some());
+    assert!(block_on(handle.list_pending_tokens()).unwrap().is_empty());
+    let err = block_on(handle.send_bounded(&mint_url, 512, 4096)).unwrap_err();
+    assert_eq!(err.status, CdkStatus::RecoveryPending);
+}
+
+#[test]
 fn e2e_pending_token_is_retrievable() {
     let mint_url = block_on(start_fake_mint(1000));
     let (_dir, path) = temp_db();

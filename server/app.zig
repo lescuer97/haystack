@@ -9,6 +9,8 @@ const Persistence = @import("persistence.zig").Persistence;
 const wallet_service = @import("native_storage").wallet_service;
 const Wallet = wallet_service.Headless;
 const hoe_log = std.log.scoped(.hoe_channels);
+const prizes = @import("prize.zig");
+const prize_log = std.log.scoped(.prizes);
 
 const hoe_refund_seconds = 7 * 24 * 60 * 60;
 pub const default_budget = 64 * 1024;
@@ -64,6 +66,7 @@ pub const App = struct {
     /// Borrowed from main. The wallet owner serializes receiver operations.
     wallet: ?*Wallet = null,
     persistence: ?*Persistence = null,
+    prize_seed: ?[32]u8 = null,
     context: *Context,
     registry: *sessions.Registry,
     pub fn init(io: std.Io, buffers: []align(@alignOf(Layout)) u8) !App {
@@ -287,7 +290,7 @@ pub const App = struct {
 
     /// Run on the connection task, which owns the confirmed session and has
     /// no other gameplay request in flight for it.
-    pub fn handlePaidCut(self: *App, handle: sessions.Handle, req: p.Request) std.Io.Cancelable!p.Outcome(.cut) {
+    pub fn handlePaidCut(self: *App, handle: sessions.Handle, req: p.Request, token: *[p.max_prize_token_bytes]u8) std.Io.Cancelable!p.Outcome(.cut) {
         const invalid: p.Outcome(.cut) = .{ .failed = .invalid_request };
         const busy: p.Outcome(.cut) = .{ .failed = .server_busy };
         const tile = req.operation.cut;
@@ -298,6 +301,8 @@ pub const App = struct {
         const profile = self.registry.storedUser(handle) catch return invalid;
         const location = profile.user.location;
         if (@abs(@as(i64, tile.x) - location.x) > 1 or @abs(@as(i64, tile.y) - location.y) > 1) return invalid;
+        const prize: @import("game_db.zig").Prize = .{ .x = tile.x, .y = tile.y, .owner = profile.pubkey };
+        var won = false;
         var pins = storage.prepare(req) catch |err| {
             if (err == error.Canceled) return error.Canceled;
             return busy;
@@ -307,35 +312,55 @@ pub const App = struct {
         // Don't wait behind mint I/O in open/settlement or behind a world cut.
         const channels = wallet.tryAcquire() orelse return busy;
         defer channels.release();
-        const context = self.lease() orelse return busy;
-        defer self.release(context);
+        var tile_state = blk: {
+            // Keep disk -> world ordering without revealing the roll through
+            // lock contention to callers that haven't paid for the cut.
+            const prizes_enabled = self.prize_seed != null;
+            if (prizes_enabled and !storage.disk_lock.tryLock()) return busy;
+            defer if (prizes_enabled) storage.disk_lock.unlock(storage.io);
+            const context = self.lease() orelse return busy;
+            defer self.release(context);
 
-        const prepared = switch (context.state.prepareToolCut(tile)) {
-            .ready => |ready| ready,
-            .failed => |failure| return .{ .failed = failure },
+            const prepared = switch (context.state.prepareToolCut(tile)) {
+                .ready => |ready| ready,
+                .failed => |failure| return .{ .failed = failure },
+            };
+            const live = self.registry.toolChannel(handle, tile.tool) orelse return invalid;
+            if (!std.mem.eql(u8, &live.id, &payment.id)) return invalid;
+            const now = self.unixSeconds() orelse return busy;
+            try self.registry.io.checkCancel();
+            channels.acceptPayment(live, .{
+                .balance_msat = payment.amount,
+                .signature = payment.signature,
+            }, now) catch |err| switch (err) {
+                error.ChannelNotFound,
+                error.ChannelNotActive,
+                error.InvalidPaymentStep,
+                error.InvalidPaymentSignature,
+                => return invalid,
+                else => {
+                    hoe_log.debug("cut payment failed: {s}", .{@errorName(err)});
+                    return busy;
+                },
+            };
+            if (live.exhausted()) self.registry.setToolChannel(handle, tile.tool, null);
+            won = if (self.prize_seed) |seed| prizes.wins(seed, shared.world.public_seed, tile.x, tile.y) else false;
+            if (won) {
+                storage.db.commitPrizeCut(prize, prepared.bitmapAfter(), prizes.amount_msat) catch |err| {
+                    prize_log.warn("paid cut needs manual reconciliation at ({d},{d}): channel={s}, balance_msat={d}, error={s}", .{
+                        tile.x, tile.y, std.fmt.bytesToHex(payment.id, .lower), payment.amount, @errorName(err),
+                    });
+                    return busy;
+                };
+                break :blk prepared.applySaved();
+            }
+            break :blk prepared.apply();
         };
-        const live = self.registry.toolChannel(handle, tile.tool) orelse return invalid;
-        if (!std.mem.eql(u8, &live.id, &payment.id)) return invalid;
-        const now = self.unixSeconds() orelse return busy;
-        try self.registry.io.checkCancel();
-        channels.acceptPayment(live, .{
-            .balance_msat = payment.amount,
-            .signature = payment.signature,
-        }, now) catch |err| switch (err) {
-            error.ChannelNotFound,
-            error.ChannelNotActive,
-            error.InvalidPaymentStep,
-            error.InvalidPaymentSignature,
-            => return invalid,
-            else => {
-                hoe_log.debug("cut payment failed: {s}", .{@errorName(err)});
-                return busy;
-            },
+        storage.release(&pins);
+        if (won) tile_state.prize_token = prizes.deliver(storage, prize, channels, token) catch |err| {
+            prize_log.warn("prize journal needs manual reconciliation at ({d},{d}): {s}", .{ tile.x, tile.y, @errorName(err) });
+            return .{ .ok = tile_state };
         };
-        // The row is still pinned and exclusively leased. No I/O, allocation,
-        // replay lookup or cancellation point before marking the bitmap dirty.
-        const tile_state = prepared.apply();
-        if (live.exhausted()) self.registry.setToolChannel(handle, tile.tool, null);
         return .{ .ok = tile_state };
     }
 

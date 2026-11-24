@@ -89,7 +89,10 @@ pub const Worker = struct {
             }
             switch (self.request) {
                 .hoe => |request| self.hoe_result = spilman.execute(io, self.paths, &owner, request) catch |err| .{ .failed = err },
-                .screen => |*request| self.ok = commands.executeScreen(io, self.paths, &owner, request, &self.result) catch false,
+                .screen => |*request| {
+                    self.ok = commands.executeScreen(io, self.paths, &owner, request, &self.result) catch false;
+                    if (request.operation == .receive_prize) std.crypto.secureZero(u8, &request.argument.bytes);
+                },
             }
             self.state.store(.result, .release);
         }
@@ -215,6 +218,24 @@ pub const Headless = struct {
         return self.ledger != null;
     }
 
+    // Reuse the world PRF from this module root; the server cannot import a
+    // sibling source tree directly.
+    pub const privateYield = @import("world.zig").privateYield;
+
+    pub const PrizeSend = struct {
+        outcome: enum { token, no_funds, uncertain },
+        operation_id: [16]u8 = @splat(0),
+        owned_token: ?[*:0]u8 = null,
+
+        pub fn bytes(self: PrizeSend) ?[]const u8 {
+            return if (self.owned_token) |token| std.mem.span(token) else null;
+        }
+
+        pub fn deinit(self: PrizeSend) void {
+            if (self.owned_token) |token| cdk.c.cdk_string_free(token);
+        }
+    };
+
     /// Immutable quote data: reading it does not contend with mint I/O.
     pub fn receiverPubkey(self: *const Headless, lifetime_seconds: u64) ?receiver.Pubkey {
         const ledger = if (self.ledger) |*ledger| ledger else return null;
@@ -262,6 +283,31 @@ pub const Headless = struct {
 
         pub fn acceptPayment(self: Locked, live: *LiveHoeChannel, payment: receiver.Payment, now: u64) !void {
             try self.ledger().acceptPayment(live, payment, now);
+        }
+
+        /// Only send from the test mint selected by Headless.open. Never log
+        /// the FFI diagnostic, which is not part of the payout contract.
+        pub fn sendPrize(self: Locked, amount_msat: u64) Headless.PrizeSend {
+            const mint = self.ledger().mint;
+            const allowed = for ([_]?[:0]const u8{ fixture_mint, testnut_mint }) |candidate| {
+                if (candidate) |url| if (std.mem.eql(u8, mint, url)) break true;
+            } else false;
+            if (!allowed) return .{ .outcome = .uncertain };
+            const p = protocol;
+            const result = cdk.c.cdk_wallet_send_bounded(self.ledger().wallet, mint.ptr, amount_msat, p.max_prize_token_bytes);
+            defer if (result.@"error") |message| cdk.c.cdk_string_free(message);
+            const token: ?[*:0]u8 = if (result.token == null) null else @ptrCast(result.token);
+            const outcome: Headless.PrizeSend = .{
+                .outcome = switch (result.status) {
+                    cdk.c.CDK_STATUS_OK => if (token != null and result.sender_fee_msats == 0) .token else .uncertain,
+                    cdk.c.CDK_STATUS_INSUFFICIENT_FUNDS, cdk.c.CDK_STATUS_FEE_LIMIT_EXCEEDED, cdk.c.CDK_STATUS_SEND_FAILED => .no_funds,
+                    // A failed cancellation is not a definitive refusal.
+                    else => .uncertain,
+                },
+                .operation_id = result.operation_id.idx,
+                .owned_token = token,
+            };
+            return outcome;
         }
 
         pub const Close = enum { pending, already_settled, newly_settled };

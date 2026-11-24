@@ -33,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
     // Parse and validate configuration before acquiring persistent resources.
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const options = try Options.parse(args);
+    const prize_seed = try @import("prize.zig").parseSeed(init.environ_map.get("HAYSTACK_PRIZE_SEED"));
     startup_log.info("configuration parsed: websocket_budget={d}, application_budget={d}", .{
         options.websocket_budget, options.application_budget,
     });
@@ -74,6 +75,7 @@ pub fn main(init: std.process.Init) !void {
     var application = try app.App.init(init.io, application_buffer);
     defer application.deinit();
     application.wallet = &wallet;
+    application.prize_seed = prize_seed;
     var persistence = try Persistence.init(init.io, init.gpa, &db, &application.context.state, application.registry);
     defer persistence.deinit(init.gpa);
     application.persistence = &persistence;

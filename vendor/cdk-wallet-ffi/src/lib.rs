@@ -75,6 +75,7 @@ pub fn header_contents() -> String {
         cdk_wallet_list_balances as *const (),
         cdk_wallet_receive as *const (),
         cdk_wallet_send as *const (),
+        cdk_wallet_send_bounded as *const (),
         cdk_wallet_list_pending_tokens as *const (),
         cdk_wallet_get_pending_token as *const (),
         cdk_wallet_recover as *const (),

@@ -20,7 +20,7 @@ zig build run-server -Dgame=false -- 4194304 65536
 Endpoint: **ws://127.0.0.1:9224/**. Saved cuts and player locations survive
 restart; request replay history does not. Gameplay requests target a global 20 Hz
 tick; wallet startup, authentication and SQLite I/O remain outside the tick.
-Rewards, private gameplay, regrowth and inventory are not implemented.
+Regrowth and inventory are not implemented.
 Terrain generator v2 adds water; its region checksum is
 `0x2beaf359deeea5bb` (see [world.md](world.md)).
 
@@ -83,10 +83,10 @@ payment, and close transitions in that file. Haystack's `receiver_channels`
 table stores only `id`, `owner`, and the optional `wallet_net_msat` credit
 confirmation. The server derives expiry and capacity from `expiry_timestamp`
 and `capacity` in the `params_json` stored inside Spilman's `funding_json`.
-The upstream close journal carries the exact recovery payload. Ledgers with
-`expiry` and `capacity` columns in `receiver_channels` are rejected without
-migration. For a fresh test setup, back up the old data and provision a new
-ledger instead.
+The upstream close journal carries the exact recovery payload. Old ledgers
+with `hoe_channel` or with `expiry` and `capacity` columns in `receiver_channels`
+are rejected without changes. For a fresh test setup, back up the old data and
+provision a new ledger instead.
 
 An explicit `-Dapp-fixture-mint=http://127.0.0.1:PORT` build instead keeps hoe
 funding disabled unless given `provision` or `existing`. Fixture runs must use
@@ -97,8 +97,8 @@ The desktop wallet worker handles Spilman funding and cut signing on
 its existing wallet thread. Upstream Spilman `SqliteClientStorage` keeps the
 funded channels in the wallet's private `spilman.sqlite`. Haystack keeps the
 CDK send links and pending swap recovery records in that same file. Older
-SQLite channel records migrate in place; older per-file recovery records are
-left intact and block opening until recovered.
+SQLite channel records and older per-file recovery records block opening and
+are left intact for recovery.
 
 Fixture `provision` reserves a new private `hoe-fixture/` directory next to
 `wallet/` and creates `hoe-fixture/channels.sqlite` (`0600`). It refuses any
@@ -114,6 +114,39 @@ committed, restart normally for Testnut or use `existing` for a fixture.
 Otherwise, investigate or restore the retained state; do not delete it to
 bypass a startup failure. The wallet service sets a seven-day channel lifetime
 and serializes channel requests and settlement under the same wallet lock.
+
+## Paid-cut prizes (test funds only)
+
+To enable prizes, supply `HAYSTACK_PRIZE_SEED` as 64 hex characters from an
+independently generated 32-byte secret. Keep it stable across restarts, backed
+up privately, and out of source control and logs. Omitting it disables prizes;
+a malformed value prevents startup. The public world seed is unchanged.
+
+Each newly successful paid axe, hoe, or pickaxe cut independently has a
+1-in-2,000 chance of awarding 500 msat. The result is deterministic for the
+tile and seeds. The award is an ordinary serialized Cashu bearer token, which
+may contain multiple proofs, not a channel credit. The server attempts immediate
+payout from exact proofs held by its test wallet, without a swap or sender fee.
+Before issuing it, the wallet checks that the serialized token fits the 4,096-byte
+delivery limit. If it cannot issue a fitting token, the prize remains a debt.
+Both clients automatically import the exact token bytes.
+Prizes require a server and client that understand the extended cut reply,
+reconnect notices, and redemption acknowledgments.
+
+A winning tile and its debt commit together in `game.sqlite`. The private
+`pending_prizes` table records the tile, winner's authenticated public key,
+`unit` (always `msat`), `amount_msat`, state, and any wallet operation ID and
+issued token. An `unfunded` row records the amount owed with a `NULL` token.
+Older prize schemas are not migrated. After the winner reconnects and
+authenticates, the server resends the exact saved `issued` tokens within the
+delivery limit. An already-issued oversized token needs manual delivery.
+The client acknowledges positive wallet credit; the server then
+removes the corresponding row for that key. Reconnects do not create new
+tokens. `owed` and `unfunded` still require manual payment; `sending` requires
+reconciliation before any new send. Treat the database and its backups as
+bearer-cash storage; never log tokens. A
+failed game database write after an accepted cut payment requires separate
+manual reconciliation of that channel payment.
 
 ## Authentication and ephemeral connection sessions
 
@@ -241,7 +274,8 @@ header, old auth framing, or JSON.
 
 Inbound WebSocket data payloads are capped at **5123 bytes**. Only funded
 channel open can use the full cap; legacy open remains capped at **1024 bytes**,
-and auth and gameplay at **256 bytes**. Outbound payloads are at most **2128 bytes**.
+and auth and gameplay at **256 bytes**. Gameplay replies are at most **2128 bytes**,
+except a prize-bearing cut reply can reach **4132 bytes**.
 These sizes exclude WebSocket framing. Control frames remain limited to 125 bytes. Messages that reach the application
 decoder but fail validation, including text and unexpected message tags, receive
 the binary generic protocol error `ff 00 00 7e` (tag `0xff`, empty body). It has no request ID or error code,
@@ -254,13 +288,15 @@ exactly one of `ok` (`0x03`) or `failed` (`0x04`).
 
 | Operation | Request tag | Payload value | Request bytes | Reply tag | `ok` value (total reply bytes) |
 |---|---|---|---:|---|---|
-| `cut` | `0x01` | x:i32, y:i32 | 34 | `0x81` | Tile state (36) |
+| `cut` | `0x01` | x:i32, y:i32 | 34 | `0x81` | Tile state with optional prize token (36–4132) |
 | `read_area` | `0x02` | cx0:i32, cy0:i32, cx1:i32, cy1:i32 | 42 | `0x82` | Snapshot (112–2128) |
 | `update_location` | `0x03` | x:i32, y:i32 | 34 | `0x83` | Empty (26) |
 
 Tile state is `x:i32, y:i32, terrain:u8, cut:u8` (10 bytes). Terrain values are
-grass=0, dirt=1, rock=2, tree=3, water=4; booleans are strictly 0/1. A `failed` value is a
-u16 code (28-byte reply), except `already_cut` appends the current tile state
+grass=0, dirt=1, rock=2, tree=3, water=4; booleans are strictly 0/1. On a
+successful cut, the bytes after the 10-byte state are an optional bearer token
+(1–4,096 bytes). A `failed` value is a u16 code (28-byte reply), except
+`already_cut` appends the current tile state
 (38-byte reply). Failure codes are scoped to the operation:
 
 | Reply | Allowed failure codes |
@@ -269,6 +305,11 @@ u16 code (28-byte reply), except `already_cut` appends the current tile state
 | `read_area` | `1 invalid_request`, `6 out_of_bounds`, `7 invalid_area`, `8 area_too_large`, `12 server_busy` |
 | `update_location` | `1 invalid_request`, `12 server_busy` |
 
+
+After authentication the server can send a standalone prize notice (`0x84`) with
+one `payload` field: `x:i32, y:i32, token[1–4096]`. After confirmed wallet
+credit, the client sends a standalone prize ACK (`0x04`) with one `payload`
+field containing only `x:i32, y:i32`. The server sends no reply to a valid ACK.
 
 Snapshots contain **every chunk**, including empty chunks, in increasing cy then
 cx. The rectangle is inclusive and covers 1–64 chunks. Offsets within the `ok`
@@ -387,14 +428,13 @@ or `~/Library/Application Support/haystack-server/game.sqlite` on macOS.
 | `game_meta` | Single row (`id = 1`) with the 32-byte public seed and generator version. |
 | `game_chunks` | `(cx, cy)` primary key in chunk coordinates and a 32-byte cut bitmap (`bits`). |
 | `game_users` | Canonical 33-byte `pubkey` primary key, signed 32-bit tile coordinates `x, y`, and three nullable 32-byte channel IDs (`hoe_channel_id`, `axe_channel_id`, `pickaxe_channel_id`). |
+| `pending_prizes` | Prize debts and undelivered tokens, keyed by world tile and bound to the winner's public key. |
 
-Startup creates the schema for a new database. For an existing database, it
-checks that SQLite opened it for writing, then validates the seed, generator
-version, integrity, and stored gameplay rows. A read-only database, mismatch,
-or invalid data fails startup rather than resetting the world. There is no
-migration to the three-tool schema. For development, use a fresh server data
-root or back up and provision new stores; old gameplay and receiver databases
-are not automatically upgraded or reset.
+Startup creates the current schema only for a new database. On reopen it
+requires the current schema, including the prize table and index, and validates
+the seed, generator version, integrity, and gameplay rows. A read-only or
+incompatible database fails startup without an upgrade or reset. For a fresh
+test setup, keep a backup of the old stores and use a separate data root.
 
 **No chunk rows are cached at startup or login.** On demand, connection tasks
 load missing cut, read-area, and collision-dependent movement chunks from

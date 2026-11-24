@@ -152,7 +152,7 @@ service.open_ready_wallet = async () => {
   assert.equal(requestHeld, false, 'temporary Ready request lock must have dropped');
   walletCalls.push('open');
   return {
-    async call(op,args) { walletCalls.push(op); walletArgs.push([op,JSON.parse(args)]); const status=walletStatus; await walletBlocked; return JSON.stringify({status,value:status===0?'{}':null,error:'untrusted secret invoice/proofs must not escape'}); },
+    async call(op,args) { walletCalls.push(op); walletArgs.push([op,JSON.parse(args)]); const status=walletStatus; await walletBlocked; return JSON.stringify({status,value:status===0?'{}':null,net_msats:op==='receive'&&status===0?'5':undefined,error:'untrusted secret invoice/proofs must not escape'}); },
     async close() { walletCalls.push('close'); },
     free() { walletCalls.push('free'); },
   };
@@ -196,6 +196,16 @@ for(const [operation,status] of [[9,2],[10,14],[11,19],[12,13],[13,23]]) {
   bridge.walletRequest(5,operation,operation,0,0,callback);await tick();
   assert.equal(events.at(-1)[0],1,'definite withdrawal errors are successful bounded JSON deliveries');
   assert.deepEqual(JSON.parse(events.at(-1).at(-1)),{operation_error:{status,message:'Withdrawal request failed'}});
+}
+for (const status of [0, 16, 13]) {
+  walletStatus = status;
+  const token = 'cashuBfixture';
+  heap.set(new TextEncoder().encode(token), 200);
+  bridge.walletRequest(5, 14, 14, 200, token.length, callback);
+  heap.fill(0, 200, 200 + token.length);
+  await tick();
+  assert.deepEqual(walletArgs.at(-1), ['receive', [token]]);
+  assert.deepEqual(JSON.parse(events.at(-1).at(-1)), status === 0 ? {status, net_msats:'5'} : {status});
 }
 walletStatus=14;
 bridge.walletRequest(5,40,1,0,0,callback);await tick();

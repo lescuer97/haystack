@@ -218,10 +218,14 @@ mergeInto(LibraryManager.library, {
             case 11: op = 'cancel_withdrawal'; args = [s.mint, argument]; break;
             case 12: op = 'saved_withdrawal'; args = [s.mint, argument]; break;
             case 13: op = 'poll_withdrawals'; args = [s.mint, argument]; break;
+            case 14:
+              if (s.closing) return;
+              op = 'receive'; args = [argument]; break;
             default: throw 0;
           }
           var response = JSON.parse(await s.wallet.call(op, JSON.stringify(args)));
-          if (response.status === 0 && typeof response.value === 'string') result = response.value;
+          if (operation === 14) result = JSON.stringify({status: response.status, net_msats: response.net_msats});
+          else if (response.status === 0 && typeof response.value === 'string') result = response.value;
           else if (operation >= 9 && operation <= 13 && Number.isInteger(response.status) && response.status >= 1 && response.status <= 27)
             result = JSON.stringify({operation_error:{status:response.status,message:'Withdrawal request failed'}});
         } catch (_) {}

@@ -111,12 +111,12 @@ const rawKeys = (database, storeName) => new Promise((resolve, reject) => {
   transaction.onabort = () => reject(new Error('raw keys aborted'));
   transaction.onerror = () => {};
 });
-const requestOutcome = request => {
-  if (request.readyState === 'done') return Promise.resolve(request.error ? 'error' : 'success');
+// readyState can already be 'done' during upgradeneeded, before the open settles.
+const waitForOpen = ({request, success, error}) => {
+  if (success || error) return Promise.resolve();
   return new Promise(resolve => {
-    const finish = () => resolve(request.error ? 'error' : 'success');
-    request.addEventListener('success', finish, {once: true});
-    request.addEventListener('error', finish, {once: true});
+    request.addEventListener('success', resolve, {once: true});
+    request.addEventListener('error', resolve, {once: true});
   });
 };
 const rawStoreNames = database => Array.from(database.objectStoreNames);
@@ -202,22 +202,59 @@ const freshPlatform = label => `await import('/platform.js?case=' + ${JSON.strin
 
 // --- Scenario bodies -------------------------------------------------------
 
-const migrationBody = `
+const freshSchemaBody = `
+const platform = ${freshPlatform('fresh-schema')};
+eq(JSON.parse(await platform.loadWallet('hardening-fresh')), {mnemonic: null, state: null}, 'fresh wallet not empty');
+const database = await rawOpen(DB);
+eq(database.version, 2, 'fresh database version');
+eq(rawStoreNames(database), ['mnemonics', 'onboarding', 'states'], 'fresh stores');
+for (const store of rawStoreNames(database)) eq(await rawKeys(database, store), [], 'fresh store not empty');
+database.close();
+return true;
+`;
+
+const olderVersionBody = `
 const seed = await rawOpen(DB, 1, database => {
   database.createObjectStore('mnemonics');
   database.createObjectStore('states');
+});
+await rawPut(seed, 'mnemonics', MNEMONIC, 'hardening-legacy');
+await rawPut(seed, 'states', {revision: 2, data: 'legacy-state'}, 'hardening-legacy');
+seed.close();
+const platform = ${freshPlatform('older')};
+const before = __hardening.opens.length;
+await rejects(platform.loadWallet('hardening-legacy'), 'older version accepted');
+const record = __hardening.opens[before];
+await waitForOpen(record);
+truth(record.upgraded && !record.blocked && !record.success && record.error === 'AbortError', 'open did not abort');
+const database = await rawOpen(DB);
+eq(database.version, 1, 'older version changed');
+eq(rawStoreNames(database), ['mnemonics', 'states'], 'older schema changed');
+eq(await rawGet(database, 'mnemonics', 'hardening-legacy'), MNEMONIC, 'legacy mnemonic changed');
+eq(await rawGet(database, 'states', 'hardening-legacy'), {revision: 2, data: 'legacy-state'}, 'legacy state changed');
+database.close();
+return true;
+`;
+
+const currentVersionBody = `
+const seed = await rawOpen(DB, 2, database => {
+  database.createObjectStore('mnemonics');
+  database.createObjectStore('states');
+  database.createObjectStore('onboarding');
 });
 await rawPut(seed, 'mnemonics', MNEMONIC, 'hardening-valid');
 await rawPut(seed, 'states', {revision: 3, data: '{"raw":true}'}, 'hardening-valid');
 await rawPut(seed, 'mnemonics', MNEMONIC, 'hardening-extra');
 await rawPut(seed, 'states', {revision: 0, data: 'unknown', extra: 1}, 'hardening-extra');
 seed.close();
-const platform = ${freshPlatform('migration')};
+const platform = ${freshPlatform('current')};
+const before = __hardening.opens.length;
 const wallet = JSON.parse(await platform.loadWallet('hardening-valid'));
 eq(wallet, {mnemonic: MNEMONIC, state: {revision: 3, data: '{"raw":true}'}}, 'valid record not read');
 const database = await rawOpen(DB);
-truth(database.version === 2, 'database not upgraded');
-truth(rawStoreNames(database).includes('onboarding'), 'onboarding store missing');
+truth(__hardening.opens[before].success && !__hardening.opens[before].upgraded, 'v2 did not reopen without upgrade');
+eq(database.version, 2, 'v2 version changed');
+eq(rawStoreNames(database), ['mnemonics', 'onboarding', 'states'], 'v2 schema changed');
 eq(await rawGet(database, 'mnemonics', 'hardening-valid'), MNEMONIC, 'mnemonic changed');
 eq(await rawGet(database, 'states', 'hardening-valid'), {revision: 3, data: '{"raw":true}'}, 'state changed');
 await rejects(platform.loadWallet('hardening-extra'), 'malformed state accepted');
@@ -255,29 +292,26 @@ await rawPut(legacy, 'mnemonics', MNEMONIC, 'hardening-legacy');
 await rawPut(legacy, 'states', {revision: 2, data: 'legacy-state'}, 'hardening-legacy');
 const platform = ${freshPlatform('blocked')};
 const before = __hardening.opens.length;
-await rejects(platform.loadWallet('hardening-legacy'), 'blocked open accepted');
+const error = await rejects(platform.loadWallet('hardening-legacy'), 'blocked open accepted');
+truth(error.message === 'IndexedDB is blocked by another connection', 'blocked error not reported');
 const record = __hardening.opens[before];
 truth(record && record.blocked, 'blocked event missing');
-const outcomePromise = requestOutcome(record.request);
+const openFinished = waitForOpen(record);
 legacy.close();
-const outcome = await outcomePromise;
-await new Promise(resolve => setTimeout(resolve, 0));
-truth(outcome === 'error', 'abandoned open did not abort');
-const database = await rawOpen(DB);
-truth(database.version === 1, 'abandoned open migrated');
-truth(!rawStoreNames(database).includes('onboarding'), 'abandoned migration ran');
-eq(await rawGet(database, 'states', 'hardening-legacy'), {revision: 2, data: 'legacy-state'}, 'legacy state changed');
-database.close();
+await openFinished;
+truth(record.upgraded && !record.success && record.error === 'AbortError', 'abandoned open did not abort');
 const beforeRetry = __hardening.opens.length;
-const wallet = JSON.parse(await platform.loadWallet('hardening-legacy'));
-eq(wallet, {mnemonic: MNEMONIC, state: {revision: 2, data: 'legacy-state'}}, 'legitimate upgrade lost data');
+await rejects(platform.loadWallet('hardening-legacy'), 'retry accepted older database');
 const retry = __hardening.opens[beforeRetry];
-truth(retry && retry.success && retry.blocked === false, 'retry did not own the cache');
-const upgraded = await rawOpen(DB);
-truth(upgraded.version === 2, 'legitimate upgrade missing');
-eq(await rawGet(upgraded, 'states', 'hardening-legacy'), {revision: 2, data: 'legacy-state'}, 'upgrade changed state');
-eq(await rawGet(upgraded, 'mnemonics', 'hardening-legacy'), MNEMONIC, 'upgrade changed mnemonic');
-upgraded.close();
+truth(retry && retry !== record, 'retry did not open a new request');
+await waitForOpen(retry);
+truth(retry.upgraded && !retry.blocked && !retry.success && retry.error === 'AbortError', 'unblocked retry did not abort');
+const database = await rawOpen(DB);
+eq(database.version, 1, 'blocked path changed older version');
+eq(rawStoreNames(database), ['mnemonics', 'states'], 'blocked path changed older schema');
+eq(await rawGet(database, 'states', 'hardening-legacy'), {revision: 2, data: 'legacy-state'}, 'legacy state changed');
+eq(await rawGet(database, 'mnemonics', 'hardening-legacy'), MNEMONIC, 'legacy mnemonic changed');
+database.close();
 return true;
 `;
 
@@ -558,21 +592,25 @@ return true;
 
 // --- Scenario groups -------------------------------------------------------
 
-async function migrationCase() {
-  const context = await newContext();
-  const tab = await openTab(context, 'migration');
-  await runCase('migration-v1-additive-preserves-records', () => evaluate(tab.sessionId, migrationBody, 'migration'));
-  await runCase('migration-v3-refused-without-downgrade', async () => {
-    const futureContext = await newContext();
-    const future = await openTab(futureContext, 'future');
-    await evaluate(future.sessionId, futureVersionBody, 'future');
-  });
+async function schemaCase() {
+  for (const [label, body] of [
+    ['schema-fresh-creates-v2', freshSchemaBody],
+    ['schema-v1-refused-without-mutation', olderVersionBody],
+    ['schema-v2-reopens-without-upgrade', currentVersionBody],
+    ['schema-v3-refused-without-downgrade', futureVersionBody],
+  ]) {
+    await runCase(label, async () => {
+      const context = await newContext();
+      const tab = await openTab(context, label);
+      await evaluate(tab.sessionId, body, label);
+    });
+  }
 }
 
 async function blockedCase() {
   const context = await newContext();
   const tab = await openTab(context, 'blocked');
-  await runCase('blocked-open-aborts-before-migration', () => evaluate(tab.sessionId, blockedOpenBody, 'blocked'));
+  await runCase('blocked-open-aborts-without-mutation', () => evaluate(tab.sessionId, blockedOpenBody, 'blocked'));
 }
 
 async function revisionCase() {
@@ -632,7 +670,7 @@ async function lockCase() {
 }
 
 async function runScenarios() {
-  await migrationCase();
+  await schemaCase();
   await blockedCase();
   await revisionCase();
   await captureCase();
@@ -678,7 +716,7 @@ try {
 }
 
 for (const [label, ok] of results) console.log(`${ok ? 'PASS' : 'FAIL'} ${label}`);
-if (results.length !== 15) incomplete = true;
+if (results.length !== 17) incomplete = true;
 if (incomplete) console.log('INCOMPLETE platform hardening browser test');
 if (cleanupFailure) console.log('FAIL platform-cleanup');
 const failed = results.filter(([, ok]) => !ok).length;

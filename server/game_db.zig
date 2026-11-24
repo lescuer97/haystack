@@ -30,6 +30,12 @@ pub const User = struct {
     }
 };
 
+pub const Prize = struct {
+    x: i32,
+    y: i32,
+    owner: [33]u8,
+};
+
 pub const GameDb = struct {
     db: ?*sqlite.Db,
     path: [:0]const u8,
@@ -48,6 +54,8 @@ pub const GameDb = struct {
         const db = sqlite.Db.open(path, .read_write_no_mutex, create) catch |err| return gameDbError(err);
         var self: GameDb = .{ .db = db, .path = path };
         errdefer self.close();
+        // With a rollback journal, also sync its directory after the commit unlink.
+        self.exec("PRAGMA synchronous = EXTRA") catch |err| return gameDbError(err);
         self.initSchema(create) catch |err| return gameDbError(err);
         return self;
     }
@@ -137,6 +145,88 @@ pub const GameDb = struct {
         try stmt.finish();
     }
 
+    /// Caller holds the disk lock. Neither the bitmap nor the debt may commit alone.
+    pub fn commitPrizeCut(self: *GameDb, prize: Prize, bits: [32]u8, amount_msat: u64) !void {
+        try self.reopenIfPoisoned();
+        try self.begin();
+        errdefer self.rollback();
+        try self.saveChunk(ChunkAddress.fromTile(prize.x, prize.y), bits);
+        const stmt = try self.prepare("INSERT INTO pending_prizes (x, y, owner, amount_msat, state) VALUES (?1, ?2, ?3, ?4, 'owed')");
+        defer stmt.finalize();
+        try bindPrize(stmt, prize);
+        try stmt.bindUInt(4, amount_msat);
+        try stmt.finish();
+        try self.commit();
+    }
+
+    /// Every transition is its own durable write. An interrupted send remains
+    /// in 'sending' for manual reconciliation, even when no operation ID made it back.
+    pub fn recordPrizeSend(self: *GameDb, prize: Prize, change: union(enum) {
+        intent,
+        no_token: [16]u8,
+        uncertain: [16]u8,
+        issued: struct { operation_id: [16]u8, token: []const u8 },
+    }) !void {
+        try self.reopenIfPoisoned();
+        const stmt = try self.prepare(switch (change) {
+            .intent => "UPDATE pending_prizes SET state = 'sending' WHERE x = ?1 AND y = ?2 AND owner = ?3 AND state = 'owed'",
+            .no_token => "UPDATE pending_prizes SET state = 'unfunded', operation_id = ?4 WHERE x = ?1 AND y = ?2 AND owner = ?3 AND state = 'sending'",
+            .uncertain => "UPDATE pending_prizes SET operation_id = ?4 WHERE x = ?1 AND y = ?2 AND owner = ?3 AND state = 'sending'",
+            .issued => "UPDATE pending_prizes SET state = 'issued', operation_id = ?4, token = ?5 WHERE x = ?1 AND y = ?2 AND owner = ?3 AND state = 'sending'",
+        });
+        defer stmt.finalize();
+        try bindPrize(stmt, prize);
+        switch (change) {
+            .intent => {},
+            .no_token, .uncertain => |id| try stmt.bindBlob(4, &id),
+            .issued => |issued| {
+                try stmt.bindBlob(4, &issued.operation_id);
+                try stmt.bindBlob(5, issued.token);
+            },
+        }
+        try stmt.finish();
+        if (self.db.?.changes() != 1) return error.PrizeStateConflict;
+    }
+
+    /// Caller holds the disk lock. The returned token borrows only the caller's buffer.
+    pub fn nextIssuedPrize(self: *GameDb, owner: [33]u8, after: ?protocol.Location, out: *[protocol.max_prize_token_bytes]u8) !?struct { tile: protocol.Location, token: []const u8 } {
+        try self.reopenIfPoisoned();
+        const stmt = try self.prepare(
+            \\SELECT x, y, token FROM pending_prizes
+            \\WHERE owner = ?1 AND state = 'issued' AND (x, y) > (?2, ?3)
+            \\  AND length(token) BETWEEN 1 AND ?4
+            \\ORDER BY x, y LIMIT 1
+        );
+        defer stmt.finalize();
+        try stmt.bindBlob(1, &owner);
+        try stmt.bindInt(2, if (after) |tile| tile.x else @as(i64, std.math.minInt(i32)) - 1);
+        try stmt.bindInt(3, if (after) |tile| tile.y else 0);
+        try stmt.bindUInt(4, out.len);
+        if (!try stmt.next()) return null;
+        const tile: protocol.Location = .{
+            .x = std.math.cast(i32, try stmt.int(0)) orelse return error.InvalidGameDatabase,
+            .y = std.math.cast(i32, try stmt.int(1)) orelse return error.InvalidGameDatabase,
+        };
+        const bytes = try stmt.blobSlice(2);
+        @memcpy(out[0..bytes.len], bytes);
+        return .{ .tile = tile, .token = out[0..bytes.len] };
+    }
+
+    /// Caller holds the disk lock. A repeated ACK or one from another owner is a no-op.
+    pub fn acknowledgePrize(self: *GameDb, prize: Prize) !void {
+        try self.reopenIfPoisoned();
+        const stmt = try self.prepare("DELETE FROM pending_prizes WHERE x = ?1 AND y = ?2 AND owner = ?3 AND state = 'issued'");
+        defer stmt.finalize();
+        try bindPrize(stmt, prize);
+        try stmt.finish();
+    }
+
+    fn bindPrize(stmt: *sqlite.Stmt, prize: Prize) !void {
+        try stmt.bindInt(1, prize.x);
+        try stmt.bindInt(2, prize.y);
+        try stmt.bindBlob(3, &prize.owner);
+    }
+
     fn initSchema(self: *GameDb, create: bool) !void {
         // Check compatibility before writing. Keep inspection and any schema
         // changes in one transaction; a normal reopen only reads.
@@ -144,6 +234,7 @@ pub const GameDb = struct {
         errdefer self.rollback();
         if (try self.hasSchema()) {
             try self.validateSchema();
+            try self.validatePrizeSchema();
             const stmt = try self.prepare("SELECT id, seed, generator_version FROM game_meta");
             defer stmt.finalize();
             if (!try stmt.next() or try stmt.int(0) != 1) return error.InvalidGameDatabase;
@@ -180,6 +271,7 @@ pub const GameDb = struct {
                 .min_tile = std.math.minInt(i32),
                 .max_tile = std.math.maxInt(i32),
             }));
+            try self.createPrizeSchema();
             const stmt = try self.prepare("INSERT INTO game_meta (id, seed, generator_version) VALUES (1, ?1, ?2)");
             defer stmt.finalize();
             try stmt.bindBlob(1, &world.public_seed);
@@ -187,6 +279,58 @@ pub const GameDb = struct {
             try stmt.finish();
         }
         try self.commit();
+    }
+
+    const prize_index_sql = "CREATE INDEX pending_prizes_issued_owner ON pending_prizes (owner, x, y) WHERE state = 'issued'";
+
+    fn createPrizeSchema(self: *GameDb) !void {
+        try self.exec(
+            \\CREATE TABLE pending_prizes (
+            \\    x INTEGER NOT NULL CHECK (typeof(x) = 'integer' AND x BETWEEN -2147483648 AND 2147483647),
+            \\    y INTEGER NOT NULL CHECK (typeof(y) = 'integer' AND y BETWEEN -2147483648 AND 2147483647),
+            \\    owner BLOB NOT NULL CHECK (typeof(owner) = 'blob' AND length(owner) = 33),
+            \\    unit TEXT NOT NULL DEFAULT 'msat' CHECK (unit = 'msat'),
+            \\    amount_msat INTEGER NOT NULL CHECK (typeof(amount_msat) = 'integer' AND amount_msat > 0),
+            \\    state TEXT NOT NULL CHECK (state IN ('owed', 'sending', 'unfunded', 'issued')),
+            \\    operation_id BLOB CHECK (operation_id IS NULL OR (typeof(operation_id) = 'blob' AND length(operation_id) = 16)),
+            \\    token BLOB CHECK ((state = 'issued') = (token IS NOT NULL) AND
+            \\        (token IS NULL OR (typeof(token) = 'blob' AND length(token) > 0))),
+            \\    PRIMARY KEY (x, y)
+            \\) WITHOUT ROWID;
+        ++ "\n" ++ prize_index_sql);
+    }
+
+    fn validatePrizeSchema(self: *GameDb) !void {
+        const stmt = try self.prepare(
+            \\SELECT count(*) = 8 AND sum(CASE
+            \\    WHEN name = 'x' AND type = 'INTEGER' AND "notnull" = 1 AND pk = 1 THEN 1
+            \\    WHEN name = 'y' AND type = 'INTEGER' AND "notnull" = 1 AND pk = 2 THEN 1
+            \\    WHEN name = 'owner' AND type = 'BLOB' AND "notnull" = 1 AND pk = 0 THEN 1
+            \\    WHEN name = 'amount_msat' AND type = 'INTEGER' AND "notnull" = 1 AND pk = 0 THEN 1
+            \\    WHEN name = 'state' AND type = 'TEXT' AND "notnull" = 1 AND pk = 0 THEN 1
+            \\    WHEN name IN ('operation_id', 'token') AND type = 'BLOB' AND "notnull" = 0 AND pk = 0 THEN 1
+            \\    WHEN name = 'unit' AND type = 'TEXT' AND "notnull" = 1 AND pk = 0 AND dflt_value = '''msat''' THEN 1
+            \\    ELSE 0 END) = 8
+            \\FROM pragma_table_xinfo('pending_prizes', 'main') WHERE hidden = 0
+        );
+        defer stmt.finalize();
+        if (!try stmt.next() or try stmt.int(0) != 1) return error.InvalidGameDatabase;
+        try stmt.finish();
+
+        // Require the definition we ship: SQLite's index pragmas don't expose
+        // the predicate, and the key collations can be inherited from the table.
+        const index = try self.prepare(
+            \\SELECT sql, NOT EXISTS (
+            \\    SELECT 1 FROM pragma_index_xinfo('pending_prizes_issued_owner', 'main')
+            \\    WHERE "key" = 1 AND coll != 'BINARY'
+            \\)
+            \\FROM main.sqlite_master WHERE type = 'index'
+            \\    AND tbl_name = 'pending_prizes' AND name = 'pending_prizes_issued_owner'
+        );
+        defer index.finalize();
+        if (!try index.next() or !index.textEquals(0, prize_index_sql) or try index.int(1) != 1)
+            return error.InvalidGameDatabase;
+        try index.finish();
     }
 
     fn validateSchema(self: *GameDb) !void {
@@ -239,6 +383,25 @@ pub const GameDb = struct {
             _ = try readUser(users);
             _ = try users.blob(33, 5);
         }
+
+        // Oversized issued tokens stay in the journal for manual handling.
+        const prizes = try self.prepare(
+            \\SELECT 1 FROM pending_prizes
+            \\WHERE typeof(x) != 'integer' OR x NOT BETWEEN -2147483648 AND 2147483647
+            \\   OR typeof(y) != 'integer' OR y NOT BETWEEN -2147483648 AND 2147483647
+            \\   OR typeof(owner) != 'blob' OR length(owner) != 33
+            \\   OR typeof(unit) != 'text' OR unit COLLATE BINARY != 'msat'
+            \\   OR typeof(amount_msat) != 'integer' OR amount_msat <= 0
+            \\   OR typeof(state) != 'text' OR state COLLATE BINARY NOT IN ('owed', 'sending', 'unfunded', 'issued')
+            \\   OR (state COLLATE BINARY = 'issued') != (token IS NOT NULL)
+            \\   OR (token IS NOT NULL AND (typeof(token) != 'blob' OR length(token) = 0))
+            \\   OR (operation_id IS NOT NULL AND (typeof(operation_id) != 'blob' OR length(operation_id) != 16))
+            \\   OR (state COLLATE BINARY = 'owed' AND operation_id IS NOT NULL)
+            \\   OR (state COLLATE BINARY IN ('unfunded', 'issued') AND operation_id IS NULL)
+            \\LIMIT 1
+        );
+        defer prizes.finalize();
+        if (try prizes.next()) return error.InvalidGameDatabase;
     }
 
     fn hasSchema(self: *GameDb) !bool {
@@ -293,6 +456,160 @@ fn tempPath(tmp: *testing.TmpDir) ![:0]const u8 {
     const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(dir);
     return std.fmt.allocPrintSentinel(testing.allocator, "{s}/game.sqlite3", .{dir}, 0);
+}
+
+test "winning cut and unique owner survive reopen or roll back together" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tempPath(&tmp);
+    defer testing.allocator.free(path);
+    const prize: Prize = .{ .x = -1, .y = -1, .owner = @splat(0x32) };
+    const address = ChunkAddress.fromTile(prize.x, prize.y);
+    var bits: [32]u8 = @splat(0);
+    bits[31] = 0x80;
+    {
+        var db = try GameDb.open(path);
+        defer db.close();
+        try db.saveChunk(address, @splat(0));
+        try db.exec("CREATE TRIGGER reject_prize BEFORE INSERT ON pending_prizes BEGIN SELECT raise(ABORT, 'test'); END");
+        try testing.expectError(error.SqliteConstraint, db.commitPrizeCut(prize, bits, 1000));
+        try testing.expectEqual(@as(?[32]u8, @splat(0)), try db.loadChunk(address));
+        try db.exec("DROP TRIGGER reject_prize");
+        try db.commitPrizeCut(prize, bits, 1000);
+        var stranger = prize;
+        stranger.owner = @splat(0x44);
+        try testing.expectError(error.SqliteConstraint, db.commitPrizeCut(stranger, @splat(0xff), 1000));
+        try testing.expectError(error.PrizeStateConflict, db.recordPrizeSend(stranger, .intent));
+    }
+    var db = try GameDb.open(path);
+    defer db.close();
+    try testing.expectEqual(@as(?[32]u8, bits), try db.loadChunk(address));
+    const row = try db.prepare("SELECT x, y, owner, amount_msat, state FROM pending_prizes");
+    defer row.finalize();
+    try testing.expect(try row.next());
+    try testing.expectEqual(@as(i64, -1), try row.int(0));
+    try testing.expectEqual(@as(i64, -1), try row.int(1));
+    try testing.expectEqual(prize.owner, try row.blob(33, 2));
+    try testing.expectEqual(@as(i64, 1000), try row.int(3));
+    try testing.expect(row.textEquals(4, "owed"));
+    try row.finish();
+}
+
+test "game database refuses missing prize schema without writing it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tempPath(&tmp);
+    defer testing.allocator.free(path);
+    {
+        var db = try GameDb.open(path);
+        defer db.close();
+        try db.exec("DROP TABLE pending_prizes");
+    }
+    const before = try tmp.dir.readFileAlloc(testing.io, "game.sqlite3", testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(before);
+    try testing.expectError(error.InvalidGameDatabase, GameDb.open(path));
+    const after = try tmp.dir.readFileAlloc(testing.io, "game.sqlite3", testing.allocator, .limited(1024 * 1024));
+    defer testing.allocator.free(after);
+    try testing.expectEqualSlices(u8, before, after);
+}
+
+test "game database rejects incompatible prize indexes without rewriting" {
+    inline for (.{
+        "(x, y, owner) WHERE state = 'issued'",
+        "(owner, x DESC, y) WHERE state = 'issued'",
+        "(owner COLLATE NOCASE, x, y) WHERE state = 'issued'",
+        "(owner, x, y)",
+        "(owner, x, y) WHERE state = 'sending'",
+    }) |definition| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tempPath(&tmp);
+        defer testing.allocator.free(path);
+        {
+            var db = try GameDb.open(path);
+            defer db.close();
+            try db.exec("DROP INDEX pending_prizes_issued_owner; CREATE INDEX pending_prizes_issued_owner ON pending_prizes " ++ definition);
+        }
+        try expectRejectedUnchanged(&tmp, path);
+    }
+}
+
+test "game database rejects malformed prize rows without CHECKs or rewriting" {
+    const unchecked_prizes =
+        \\DROP TABLE pending_prizes;
+        \\CREATE TABLE pending_prizes (
+        \\    x INTEGER NOT NULL, y INTEGER NOT NULL, owner BLOB NOT NULL,
+        \\    unit TEXT NOT NULL DEFAULT 'msat', amount_msat INTEGER NOT NULL, state TEXT NOT NULL,
+        \\    operation_id BLOB, token BLOB, PRIMARY KEY (x, y)
+        \\) WITHOUT ROWID;
+    ++ "\n" ++ GameDb.prize_index_sql ++ ";";
+    inline for (.{
+        "x = 'not an integer'",
+        "y = 2147483648",
+        "owner = zeroblob(32)",
+        "unit = 'sat'",
+        "amount_msat = 0",
+        "amount_msat = 1.5",
+        "state = 'paid'",
+        "state = 'issued', operation_id = zeroblob(16)",
+        "state = 'issued', operation_id = zeroblob(16), token = X''",
+        "state = 'issued', operation_id = zeroblob(16), token = 'not a blob'",
+        "state = 'sending', token = X'aa'",
+        "state = 'sending', operation_id = zeroblob(15)",
+        "state = 'sending', operation_id = '1234567890123456'",
+        "operation_id = zeroblob(16)",
+        "state = 'unfunded'",
+        "state = 'issued', token = X'aa'",
+    }) |assignment| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try tempPath(&tmp);
+        defer testing.allocator.free(path);
+        {
+            var db = try GameDb.open(path);
+            defer db.close();
+            try db.exec(unchecked_prizes ++
+                "INSERT INTO pending_prizes (x, y, owner, amount_msat, state) VALUES (0, 0, zeroblob(33), 500, 'owed');" ++
+                "UPDATE pending_prizes SET " ++ assignment);
+        }
+        try expectRejectedUnchanged(&tmp, path);
+    }
+}
+
+test "game database keeps oversized issued prize tokens across reopen" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tempPath(&tmp);
+    defer testing.allocator.free(path);
+    const prize: Prize = .{ .x = 1, .y = 2, .owner = @splat(3) };
+    const token: [protocol.max_prize_token_bytes + 1]u8 = @splat(0x5a);
+    {
+        var db = try GameDb.open(path);
+        defer db.close();
+        try db.commitPrizeCut(prize, @splat(0xff), 500);
+        try db.recordPrizeSend(prize, .intent);
+        try db.recordPrizeSend(prize, .{ .issued = .{ .operation_id = @splat(1), .token = &token } });
+    }
+    try expectOpenUnchanged(&tmp, path);
+}
+
+test "unfunded prizes record millisats without a token" {
+    var db = try GameDb.open(":memory:");
+    defer db.close();
+    const prize: Prize = .{ .x = 1, .y = 2, .owner = @splat(3) };
+    try db.commitPrizeCut(prize, @splat(0xff), 1000);
+    try db.recordPrizeSend(prize, .intent);
+    try db.recordPrizeSend(prize, .{ .no_token = @splat(0) });
+    try testing.expectError(error.SqliteConstraint, db.exec("UPDATE pending_prizes SET unit = 'sat'"));
+    try testing.expectError(error.SqliteConstraint, db.exec("UPDATE pending_prizes SET token = X'aa'"));
+    const row = try db.prepare("SELECT unit, amount_msat, state, token FROM pending_prizes");
+    defer row.finalize();
+    try testing.expect(try row.next());
+    try testing.expect(row.textEquals(0, "msat"));
+    try testing.expectEqual(@as(u64, 1000), try row.uint(1));
+    try testing.expect(row.textEquals(2, "unfunded"));
+    try testing.expect(row.isNull(3));
+    try row.finish();
 }
 
 test "game database persists committed chunks and users across reopen" {

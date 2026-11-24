@@ -7,9 +7,10 @@ const wire = shared.wire;
 const protocol = shared.protocol;
 const wallet = @import("wallet.zig");
 const ws_auth = @import("ws_auth.zig");
+const OwnedCutReply = @import("paid_cut.zig").OwnedReply;
 
 const poll_ms = 20;
-const max_ws_response_bytes = @max(protocol.max_response_bytes, protocol.max_channel_status_reply_bytes, wire.max_auth_reply_bytes, wire.channel_settled_bytes);
+const max_ws_response_bytes = @max(protocol.max_response_bytes, protocol.max_channel_status_reply_bytes, wire.max_auth_reply_bytes, wire.channel_settled_bytes, wire.max_prize_notice_bytes);
 const endpoint = "127.0.0.1";
 const port = 9224;
 const authority = std.fmt.comptimePrint("{s}:{d}", .{ endpoint, port });
@@ -105,7 +106,7 @@ const CutMailbox = union(enum) {
     idle,
     queued: CutRequest,
     waiting: protocol.Id,
-    received: struct { id: protocol.Id, outcome: protocol.Outcome(.cut) },
+    received: struct { id: protocol.Id, reply: OwnedCutReply },
 };
 const Operation = union(enum) { play: sync.PlayRequest.Operation, channel: ChannelRequest, cut: CutRequest };
 const PendingRequest = union(enum) { play: sync.PlayRequest, channel: ChannelRequest, cut: CutRequest };
@@ -128,6 +129,8 @@ pub const Worker = struct {
     cut: CutMailbox = .idle,
     settled_ids: [8][32]u8 = undefined,
     settled_count: usize = 0,
+    prize_inbox: sync.PrizeInbox = .{},
+    prize_ack: ?protocol.Location = null,
 
     pub const area_limit = protocol.max_area_chunks;
 
@@ -144,6 +147,8 @@ pub const Worker = struct {
         self.channel = .idle;
         self.cut = .idle;
         self.settled_count = 0;
+        self.prize_inbox.clear();
+        self.prize_ack = null;
         self.mutex.unlock(self.io);
         if (self.thread) |thread| thread.join();
         self.thread = null;
@@ -176,6 +181,8 @@ pub const Worker = struct {
         self.channel = .idle;
         self.cut = .idle;
         self.settled_count = 0;
+        self.prize_inbox.clear();
+        self.prize_ack = null;
     }
 
     pub fn snapshot(self: *Worker) Snapshot {
@@ -285,14 +292,45 @@ pub const Worker = struct {
 
     /// Consumes only the matching reply. A lost session drops the slot without
     /// replaying the cut; a missing reply is not proof that it wasn't charged.
-    pub fn takeCut(self: *Worker, session: u64, request_id: protocol.Id) ?protocol.Outcome(.cut) {
+    pub fn takeCut(self: *Worker, session: u64, request_id: protocol.Id) ?OwnedCutReply {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (!self.readyLocked(session) or self.cut != .received) return null;
         const result = self.cut.received;
         if (!std.mem.eql(u8, &result.id, &request_id)) return null;
         self.cut = .idle;
-        return result.outcome;
+        return result.reply;
+    }
+
+    pub fn takePrizeNotice(self: *Worker, session: u64) ?@import("wallet_ui.zig").PrizeNotice {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.readyLocked(session)) return null;
+        return self.prize_inbox.take();
+    }
+
+    pub fn takeDeferredPrizes(self: *Worker, session: u64) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.readyLocked(session) and self.prize_inbox.takeDeferred();
+    }
+
+    pub fn ackPrize(self: *Worker, session: u64, player: [33]u8, tile: protocol.Location) bool {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.readyLocked(session) or self.prize_ack != null or
+            !std.meta.eql(self.auth_player, @as(?[33]u8, player))) return false;
+        self.prize_ack = tile;
+        return true;
+    }
+
+    fn takePrizeAck(self: *Worker, generation: u64) ?protocol.Location {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.activeLocked(generation) or self.state.status != .ready) return null;
+        const tile = self.prize_ack;
+        self.prize_ack = null;
+        return tile;
     }
 
     fn readyLocked(self: *const Worker, session: u64) bool {
@@ -338,7 +376,7 @@ pub const Worker = struct {
         if (!self.activeLocked(generation) or !self.readyLocked(request.session)) return;
         if (self.cut != .waiting or !std.mem.eql(u8, &self.cut.waiting, &id)) return;
         sync.applyCutBalance(&self.auth_tool_channels, request.command.payload, outcome);
-        self.cut = .{ .received = .{ .id = id, .outcome = outcome } };
+        self.cut = .{ .received = .{ .id = id, .reply = .init(outcome) } };
     }
 
     fn finishArea(self: *Worker, generation: u64, result: sync.AreaCompletion, reply: *const protocol.Snapshot) void {
@@ -368,6 +406,8 @@ pub const Worker = struct {
         self.channel = .idle;
         self.cut = .idle;
         self.settled_count = 0;
+        self.prize_inbox.clear();
+        self.prize_ack = null;
         self.auth_tool_channels = if (restored) |success| success.channels else @splat(null);
         self.auth_player = if (restored) |success| success.player else null;
         if (restored) |success| {
@@ -455,6 +495,10 @@ pub const Worker = struct {
 
         var pending: ?struct { request: PendingRequest, until: std.Io.Clock.Timestamp } = null;
         while (self.active(generation)) {
+            if (self.takePrizeAck(generation)) |tile| {
+                var frame: [wire.prize_ack_bytes]u8 = undefined;
+                try send(&client, &frame, try wire.encodePrizeAck(&frame, tile));
+            }
             if (pending) |active_request| {
                 if (expired(io, active_request.until)) return error.RequestTimeout;
             } else if (self.takeOperation(generation, &out)) |operation| {
@@ -489,6 +533,13 @@ pub const Worker = struct {
 
     // Returns true only when the pending request was answered.
     fn receivePlay(self: *Worker, generation: u64, pending: ?PendingRequest, bytes: []const u8) !bool {
+        if (wire.decodePrizeNotice(bytes, true)) |notice| {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.activeLocked(generation) and self.state.status == .ready and self.auth_player != null)
+                try self.prize_inbox.push(notice.tile, notice.token);
+            return false;
+        } else |_| {}
         if (wire.decodeChannelSettled(bytes, true)) |id| {
             self.recordChannelSettled(generation, id);
             return false;
@@ -632,6 +683,26 @@ test "plain authenticated login exposes the player without a channel" {
     try t.expect(worker.hoeLogin(0) == null);
     worker.refreshAuth(1);
     try t.expect(worker.hoeLogin(1) == null);
+}
+
+test "prize ACK mailbox rejects stale sessions and clears across logins" {
+    const t = std.testing;
+    var worker: Worker = .{ .io = t.io, .paths = undefined };
+    const player: [33]u8 = @splat(2);
+    const other: [33]u8 = @splat(3);
+    const tile: protocol.Location = .{ .x = -2, .y = 4 };
+    worker.setEnabled(true);
+    worker.status(1, .ready, .{ .location = shared.movement.spawn, .player = player });
+    try t.expect(!worker.ackPrize(0, player, tile));
+    try t.expect(!worker.ackPrize(1, other, tile));
+    try t.expect(worker.ackPrize(1, player, tile));
+    try t.expect(!worker.ackPrize(1, player, tile));
+    try t.expectEqual(tile, worker.takePrizeAck(1).?);
+    try t.expect(worker.ackPrize(1, player, tile));
+    worker.status(1, .retrying, null);
+    worker.status(1, .ready, .{ .location = shared.movement.spawn, .player = other });
+    try t.expect(worker.takePrizeAck(1) == null);
+    try t.expect(!worker.ackPrize(2, player, tile));
 }
 
 test "channel open queues owned bytes without changing movement or area mailboxes" {
@@ -857,13 +928,18 @@ test "signed cut queues alongside play and channel and yields only a matched rep
     try t.expect(worker.takeCut(1, test_cut.request_id) == null);
 
     const tile: protocol.State = .{ .x = test_cut.payload.x, .y = test_cut.payload.y, .terrain = .grass, .cut = true };
-    const outcome: protocol.Outcome(.cut) = .{ .ok = tile };
-    const reply = try wire.encodeReply(&out, .cut, test_cut, outcome);
+    var response: [protocol.max_response_bytes]u8 = undefined;
+    var with_prize = tile;
+    with_prize.prize_token = "cashuBtest";
+    const reply = try wire.encodeReply(&response, .cut, test_cut, .{ .ok = with_prize });
     try worker.finishCut(1, cut, reply, &scratch);
+    @memset(&response, 0);
     try t.expect(!worker.submitCut(1, test_cut));
     try t.expect(worker.takeCut(0, test_cut.request_id) == null);
     try t.expect(worker.takeCut(1, command.request_id) == null);
-    try t.expectEqualDeep(outcome, worker.takeCut(1, test_cut.request_id).?);
+    const owned = worker.takeCut(1, test_cut.request_id).?;
+    try t.expectEqualDeep(tile, owned.outcome.ok);
+    try t.expectEqualStrings("cashuBtest", owned.prize.slice());
     try t.expect(worker.takeCut(1, test_cut.request_id) == null);
     const completion = worker.takeChannelFor(1, close.request_id).?;
     try t.expect(completion.outcome.channel_close == .ok);
@@ -890,7 +966,7 @@ test "acknowledged cut advances only the matching tool balance before rebinding"
         const request = worker.takeOperation(1, &out).?.cut;
         const reply = try wire.encodeReply(&out, .cut, command, outcome);
         try worker.finishCut(1, request, reply, &scratch);
-        try t.expectEqualDeep(outcome, worker.takeCut(1, command.request_id).?);
+        try t.expectEqualDeep(outcome, worker.takeCut(1, command.request_id).?.outcome);
         try t.expectEqual(if (i == 0) @as(u64, 5) else 10, worker.toolLogin(1, .hoe).?.channel.?.balance_msats);
         try t.expectEqual(axe, worker.toolChannel(1, .axe).?);
         try t.expect(worker.toolChannel(1, .pickaxe) == null);
@@ -921,7 +997,7 @@ test "signed cut is not replayed and stale completions cannot replace the curren
     try worker.finishCut(0, current, reply, &scratch);
     try t.expect(worker.takeCut(2, id) == null);
     try worker.finishCut(1, current, reply, &scratch);
-    try t.expectEqualDeep(outcome, worker.takeCut(2, id).?);
+    try t.expectEqualDeep(outcome, worker.takeCut(2, id).?.outcome);
 
     try t.expect(worker.submitCut(2, test_cut));
     worker.refreshAuth(1);

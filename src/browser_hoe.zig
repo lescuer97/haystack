@@ -244,13 +244,14 @@ pub const Runtime = struct {
         if (self.cut) |cut| {
             // Apply the cut only after earlier queued area data has been consumed.
             if (area_pending) return;
-            const outcome = connection.takeCut(network.session, cut.id) orelse return;
-            const verdict = classify(self.tool, cut.tile, outcome) orelse {
+            const reply = connection.takeCut(network.session, cut.id) orelse return;
+            const verdict = classify(self.tool, cut.tile, reply.outcome) orelse {
                 self.cut = null;
                 self.phase = .recovery;
                 connection.refreshAuth(network.session);
                 return;
             };
+            if (verdict == .charged) game.menu.wallet.queuePrize(login.player, cut.tile, reply.prize);
             try self.resolve(cut, verdict, clock);
             return;
         }

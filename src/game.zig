@@ -200,6 +200,7 @@ pub const GameState = struct {
 
     /// Release every world buffer. `main` calls this before closing the window.
     pub fn deinit(self: *GameState) void {
+        self.menu.wallet.clearPendingPrizes();
         self.world.deinit();
     }
 

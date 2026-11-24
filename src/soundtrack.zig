@@ -70,6 +70,7 @@ const Desktop = struct {
     stream: ?rl.Music = null,
     snip: CueSound = .{},
     fail: CueSound = .{},
+    reward: CueSound = .{},
 
     fn init(allocator: std.mem.Allocator) Desktop {
         return .{ .allocator = allocator };
@@ -106,17 +107,19 @@ const Desktop = struct {
     }
 
     fn playCutCues(self: *Desktop, cues: CutCues) void {
-        if (!cues.snip and !cues.fail) return;
+        if (!cues.snip and !cues.fail and !cues.reward) return;
         if (!rl.isAudioDeviceReady()) rl.initAudioDevice();
         if (!rl.isAudioDeviceReady()) return;
         if (cues.snip) self.snip.play(@embedFile("cut_audio_assets/snip.wav"), 0.8);
         if (cues.fail) self.fail.play(@embedFile("cut_audio_assets/fail.wav"), 0.25);
+        if (cues.reward) self.reward.play(@embedFile("cut_audio_assets/reward.wav"), 0.45);
     }
 
     fn deinit(self: *Desktop) void {
         self.closeTrack();
         self.snip.unload();
         self.fail.unload();
+        self.reward.unload();
         if (rl.isAudioDeviceReady()) rl.closeAudioDevice();
     }
 };
@@ -148,8 +151,10 @@ const Browser = struct {
     extern "c" fn haystack_music_set_enabled(enabled: c_int) void;
     extern "c" fn haystack_music_status() c_int;
     extern "c" fn haystack_music_close() void;
+    extern "c" fn haystack_reward_audio(action: c_int) void;
 
     fn init(_: std.mem.Allocator) Browser {
+        haystack_reward_audio(1);
         return .{};
     }
 
@@ -174,11 +179,13 @@ const Browser = struct {
         haystack_music_close();
     }
 
-    // No WebAudio integration yet; visuals and refill notice still run.
-    fn playCutCues(_: *Browser, _: CutCues) void {}
+    fn playCutCues(_: *Browser, cues: CutCues) void {
+        if (cues.reward) haystack_reward_audio(2);
+    }
 
     fn deinit(self: *Browser) void {
         self.closeTrack();
+        haystack_reward_audio(0);
     }
 };
 
