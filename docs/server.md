@@ -133,6 +133,26 @@ Both clients automatically import the exact token bytes.
 Prizes require a server and client that understand the extended cut reply,
 reconnect notices, and redemption acknowledgments.
 
+To stock compact prize proofs, stop the server and use the same storage and
+mint configuration:
+
+```sh
+zig build run-server -Dgame=false -- fund-prizes 10
+# Pay the returned `request` using test funds only; save the returned `id`.
+zig build run-server -Dgame=false -- claim-prize-funding QUOTE_ID
+```
+
+`fund-prizes` takes a batch of 1–20 prizes. Check the returned amount before
+paying: after an interrupted request the wallet may return a previously saved
+invoice. If claim returns `"confirmed":false`, check the same quote again rather
+than creating another. Both commands exit without starting the listener.
+An explicit loopback fixture build requires its existing fixture ledger.
+
+The claim requests the active msat keyset's compact split once per prize:
+`256 + 128 + 64 + 32 + 16 + 4` on a standard power-of-two keyset. The proofs
+are ordinary wallet inventory, not reserved sets. The byte limit is still
+checked on every payout, and topping up does not automatically pay old debts.
+
 A winning tile and its debt commit together in `game.sqlite`. The private
 `pending_prizes` table records the tile, winner's authenticated public key,
 `unit` (always `msat`), `amount_msat`, state, and any wallet operation ID and

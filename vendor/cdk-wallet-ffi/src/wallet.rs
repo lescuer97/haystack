@@ -34,6 +34,7 @@ use std::time::Duration;
 use crate::browser_db::BrowserDatabase as WalletSqliteDatabase;
 #[cfg(target_arch = "wasm32")]
 use crate::browser_platform::{timeout, BrowserLock as File};
+use cdk::amount::SplitTarget;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::{
     BlindSignature, BlindedMessage, CheckStateRequest, CurrencyUnit, Id, MintQuoteState,
@@ -633,12 +634,71 @@ impl CdkWallet {
         Ok(serde_json::json!({"creation_recovery":status,"invoice":invoice}).to_string())
     }
 
-    /// One bounded check, then actual issuance. Never equate Paid with Issued.
-    pub(crate) async fn check_deposit(&mut self, mint: &str, id: &str) -> FfiResult<String> {
-        self.check_deposit_inner(mint, id, true, &mut false).await
+    // ponytail: small operator-funded batches; no separate prize inventory.
+    const MAX_PRIZE_STOCK: u64 = 20;
+    const MAX_PROOFS_PER_PRIZE: usize = 6;
+
+    async fn prize_stock_split(
+        &self,
+        wallet: &Wallet,
+        amount: u64,
+        prize: u64,
+    ) -> FfiResult<SplitTarget> {
+        // Bound the denomination split even if the mint only offers 1-msat proofs.
+        if prize == 0 || prize > 10_000 || amount == 0 || amount % prize != 0
+            || amount / prize > Self::MAX_PRIZE_STOCK
+        {
+            return Err(FfiErr::new(
+                CdkStatus::InvalidArgument,
+                "expected a batch of 1 to 20 whole prizes (up to 10000 msat each)",
+            ));
+        }
+        let proof_mix = timeout(self.network_deadline(), async {
+            let keyset = wallet.active_keyset().await?;
+            let amounts = wallet.get_keyset_fees_and_amounts_by_id(keyset.id).await?;
+            Amount::from(prize).split(&amounts).map_err(CdkError::from)
+        })
+        .await;
+        match proof_mix {
+            Ok(Ok(mix)) if mix.len() <= Self::MAX_PROOFS_PER_PRIZE => {
+                Ok(SplitTarget::Values(mix.repeat((amount / prize) as usize)))
+            }
+            Ok(Ok(_)) => Err(FfiErr::new(
+                CdkStatus::InvalidArgument,
+                "mint needs more than six proofs per prize",
+            )),
+            Ok(Err(err)) => Err(FfiErr::new(
+                CdkStatus::InvalidArgument,
+                format!("cannot split prize using the active keyset: {err}"),
+            )),
+            Err(_) => Err(FfiErr::new(CdkStatus::NetworkError, "prize keyset lookup timed out")),
+        }
     }
 
-    async fn check_deposit_inner(&mut self, mint: &str, id: &str, recover: bool, changed: &mut bool) -> FfiResult<String> {
+    pub(crate) async fn create_prize_stock(&mut self, mint: &str, count: &str, prize: &str) -> FfiResult<String> {
+        let count = Self::deposit_amount(count)?;
+        let prize = Self::deposit_amount(prize)?;
+        let amount = count.checked_mul(prize).ok_or_else(|| {
+            FfiErr::new(CdkStatus::InvalidArgument, "prize batch amount overflows")
+        })?;
+        let wallet = self.deposit_wallet(&parse_mint_url(mint)?).await?;
+        self.prize_stock_split(&wallet, amount, prize).await?;
+        self.create_deposit(mint, &amount.to_string()).await
+    }
+
+    pub(crate) async fn claim_prize_stock(&mut self, mint: &str, id: &str, prize: &str) -> FfiResult<String> {
+        if id.is_empty() || id.len() > 1024 || id.contains('\0') {
+            return Err(FfiErr::new(CdkStatus::InvalidArgument, "invalid saved quote id"));
+        }
+        self.check_deposit_inner(mint, id, true, &mut false, Some(Self::deposit_amount(prize)?)).await
+    }
+
+    /// One bounded check, then actual issuance. Never equate Paid with Issued.
+    pub(crate) async fn check_deposit(&mut self, mint: &str, id: &str) -> FfiResult<String> {
+        self.check_deposit_inner(mint, id, true, &mut false, None).await
+    }
+
+    async fn check_deposit_inner(&mut self, mint: &str, id: &str, recover: bool, changed: &mut bool, prize: Option<u64>) -> FfiResult<String> {
         if self.is_poisoned() {
             return Err(crate::api::poisoned_handle());
         }
@@ -695,10 +755,19 @@ impl CdkWallet {
         // issuance confirmation; the invoice still checks CDK's transaction.
         *changed |= quote.state != original_state;
         if quote.state == MintQuoteState::Paid {
+            let split = match prize {
+                Some(prize) => {
+                    let amount = quote.amount.ok_or_else(|| {
+                        FfiErr::new(CdkStatus::InvalidArgument, "prize funding quote has no amount")
+                    })?;
+                    self.prize_stock_split(&wallet, amount.to_u64(), prize).await?
+                }
+                None => SplitTarget::default(),
+            };
             *changed = true;
             match timeout(
                 self.network_deadline(),
-                wallet.mint(id, Default::default(), None),
+                wallet.mint(id, split, None),
             )
             .await
             {
@@ -1005,11 +1074,11 @@ impl CdkWallet {
             || quote.request.contains('\0')
         {
             // Check even oversized saved quotes, but never put them on the wire.
-            let _ = self.check_deposit_inner(&mint.to_string(), &quote.id, recover, changed).await;
+            let _ = self.check_deposit_inner(&mint.to_string(), &quote.id, recover, changed, None).await;
             return Ok(serde_json::json!({"invoice":null,"cursor":cursor(quote),"error":"Saved invoice exceeds display limit; retained in wallet"}).to_string());
         }
         let mut reply = serde_json::json!({"invoice":null,"cursor":cursor(quote)});
-        match self.check_deposit_inner(&mint.to_string(), &quote.id, recover, changed).await {
+        match self.check_deposit_inner(&mint.to_string(), &quote.id, recover, changed, None).await {
             Ok(raw) => reply["invoice"] = serde_json::from_str(&raw).map_err(|_| FfiErr::new(CdkStatus::DatabaseError, "invalid invoice view"))?,
             Err(error) => reply["error"] = serde_json::json!(error.message),
         }
@@ -1063,7 +1132,7 @@ impl CdkWallet {
             Ok(None)
         } else {
             match kind {
-                "check" => self.check_deposit_inner(mint, argument, false, &mut changed).await.map(Some),
+                "check" => self.check_deposit_inner(mint, argument, false, &mut changed, None).await.map(Some),
                 "poll" => self.poll_deposits_inner(mint, argument, false, &mut changed).await.map(Some),
                 _ => match recovered_quote {
                     Some(q) if q.id.len() > 1024 || q.id.contains('\0') || q.request.len() > 4096 || q.request.contains('\0') => Err(FfiErr::new(CdkStatus::InvalidArgument, "recovered invoice exceeds display limit")),

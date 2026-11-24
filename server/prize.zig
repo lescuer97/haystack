@@ -7,7 +7,7 @@ const Prize = @import("game_db.zig").Prize;
 const Persistence = @import("persistence.zig").Persistence;
 const log = std.log.scoped(.prizes);
 
-pub const amount_msat = 1000;
+pub const amount_msat = 500;
 const odds = 2000;
 
 pub fn parseSeed(hex: ?[]const u8) !?[32]u8 {
@@ -116,7 +116,7 @@ test "prize delivery journals intent before wallet I/O and never reissues a toke
 
         pub fn sendPrize(self: *@This(), amount: u64) Result {
             self.calls += 1;
-            t.expectEqual(1000, amount) catch unreachable;
+            t.expectEqual(amount_msat, amount) catch unreachable;
             t.expect(self.storage.world_lock.tryLock()) catch unreachable;
             self.storage.world_lock.unlock(t.io);
             t.expect(self.storage.disk_lock.tryLock()) catch unreachable;

@@ -1166,6 +1166,7 @@ cdk_wallet_post_swap (
  *  Deposit/history adapter. Arguments and results are JSON strings containing
  *  decimal-string amounts; returned strings use the ordinary Rust string free.
  *  Operations: create_deposit [mint, msats], check_deposit [mint, quote_id] (expired-unpaid is local-only),
+ *  create_prize_stock [mint, count, prize_msats], claim_prize_stock [mint, quote_id, prize_msats],
  *  unfinished_deposits [mint], quote_history [] (generic compatibility),
  *  wallet_screen [mint] (small selected balance/recovery status),
  *  quote_history_page [offset], resume_deposit [mint] (newest non-expired unfinished),

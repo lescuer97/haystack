@@ -218,6 +218,26 @@ pub const Headless = struct {
         return self.ledger != null;
     }
 
+    /// Operator-only, before the server starts listening and while it owns the storage lock.
+    pub fn prizeStock(self: *Headless, allocator: std.mem.Allocator, claim: bool, argument: []const u8, amount_msat: u64) !void {
+        const store = self.ledger orelse return error.PrizeTestMintUnavailable;
+        var amount_buf: [20]u8 = undefined;
+        const amount = try std.fmt.bufPrint(&amount_buf, "{d}", .{amount_msat});
+        const json = try std.json.Stringify.valueAlloc(allocator, .{ store.mint, argument, amount }, .{});
+        defer allocator.free(json);
+        const args = try allocator.dupeSentinel(u8, json, 0);
+        defer allocator.free(args);
+        const operation: [:0]const u8 = if (claim) "claim_prize_stock" else "create_prize_stock";
+        var result = cdk.c.cdk_wallet_quotes(store.wallet, operation.ptr, args.ptr);
+        defer cdk.c.cdk_string_free(result.value);
+        if (result.@"error") |message| std.log.err("prize funding: {s}", .{std.mem.span(message)});
+        try wallet.check(&result);
+        const value = result.value orelse return error.CdkFailure;
+        const stdout = std.Io.File.stdout();
+        try stdout.writeStreamingAll(self.io, std.mem.span(value));
+        try stdout.writeStreamingAll(self.io, "\n");
+    }
+
     // Reuse the world PRF from this module root; the server cannot import a
     // sibling source tree directly.
     pub const privateYield = @import("world.zig").privateYield;

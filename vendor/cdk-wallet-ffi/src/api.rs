@@ -243,6 +243,7 @@ fn send_error(e: FfiErr) -> CdkSendResult {
 /// Deposit/history adapter. Arguments and results are JSON strings containing
 /// decimal-string amounts; returned strings use the ordinary Rust string free.
 /// Operations: create_deposit [mint, msats], check_deposit [mint, quote_id] (expired-unpaid is local-only),
+/// create_prize_stock [mint, count, prize_msats], claim_prize_stock [mint, quote_id, prize_msats],
 /// unfinished_deposits [mint], quote_history [] (generic compatibility),
 /// wallet_screen [mint] (small selected balance/recovery status),
 /// quote_history_page [offset], resume_deposit [mint] (newest non-expired unfinished),
@@ -293,6 +294,8 @@ pub fn cdk_wallet_quotes(
                     match (op.as_str(), args.as_slice()) {
                         ("create_deposit", [mint, amount]) => h.create_deposit(mint, amount).await,
                         ("check_deposit", [mint, id]) => h.check_deposit(mint, id).await,
+                        ("create_prize_stock", [mint, count, prize]) => h.create_prize_stock(mint, count, prize).await,
+                        ("claim_prize_stock", [mint, id, prize]) => h.claim_prize_stock(mint, id, prize).await,
                         ("saved_invoice", [mint, id]) => h.saved_invoice(mint, id).await,
                         ("deposit_update", [mint, kind, argument]) => h.deposit_update(mint, kind, argument).await,
                         ("unfinished_deposits", [mint]) => h.unfinished_deposits(mint).await,

@@ -6,8 +6,10 @@ const native = @import("native_storage");
 const wallet_service = native.wallet_service;
 const GameDb = @import("game_db.zig").GameDb;
 const Persistence = @import("persistence.zig").Persistence;
+const prize = @import("prize.zig");
 const Shutdown = @import("shutdown.zig").Shutdown;
 const startup_log = std.log.scoped(.server_startup);
+const PrizeStock = enum { @"fund-prizes", @"claim-prize-funding" };
 
 const Options = struct {
     websocket_budget: usize,
@@ -32,8 +34,10 @@ const Options = struct {
 pub fn main(init: std.process.Init) !void {
     // Parse and validate configuration before acquiring persistent resources.
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const options = try Options.parse(args);
-    const prize_seed = try @import("prize.zig").parseSeed(init.environ_map.get("HAYSTACK_PRIZE_SEED"));
+    const stock = if (args.len >= 2) std.meta.stringToEnum(PrizeStock, args[1]) else null;
+    if (stock != null and args.len != 3) return error.UsageExpectedFundPrizesCountOrClaimPrizeFundingQuoteId;
+    const options = try Options.parse(if (stock != null) args[0..1] else args);
+    const prize_seed = if (stock == null) try prize.parseSeed(init.environ_map.get("HAYSTACK_PRIZE_SEED")) else null;
     startup_log.info("configuration parsed: websocket_budget={d}, application_budget={d}", .{
         options.websocket_budget, options.application_budget,
     });
@@ -48,10 +52,13 @@ pub fn main(init: std.process.Init) !void {
 
     // Only the explicit fixture mode comes from CLI; wallet_service selects the
     // automatic Testnut policy from the built-in mint, never from arguments.
-    var wallet = try wallet_service.Headless.open(init.io, init.gpa, locations, options.fixture_hoe_mode);
+    // Fixture funding opens the existing isolated ledger, never provisions a new one.
+    const hoe_mode = if (stock != null and wallet_service.fixture_mint != null) .existing else options.fixture_hoe_mode;
+    var wallet = try wallet_service.Headless.open(init.io, init.gpa, locations, hoe_mode);
     defer wallet.close() catch {};
     startup_log.info("wallet opened", .{});
     if (wallet.hasReceiver()) startup_log.info("hoe ledger ready (test funds only)", .{});
+    if (stock) |command| return wallet.prizeStock(init.gpa, command == .@"claim-prize-funding", args[2], prize.amount_msat);
 
     const data_dir = std.fs.path.dirname(locations.wallet_dir) orelse return error.InvalidPath;
     const game_path = try std.fs.path.joinZ(init.gpa, &.{ data_dir, "game.sqlite" });

@@ -489,6 +489,46 @@ fn e2e_fee_limit_cancels_and_preserves_balance() {
 }
 
 #[test]
+fn e2e_prize_stock_mints_two_compact_offline_payouts() {
+    let mint_url = block_on(start_fake_mint(0));
+    let (_dir, path) = temp_db();
+    let seed = [37u8; 64];
+    let mut handle = open_wallet(seed, &path);
+    block_on(handle.add_mint(&mint_url)).unwrap();
+    let invalid = block_on(handle.create_prize_stock(&mint_url, "21", "500")).unwrap_err();
+    assert_eq!(invalid.status, CdkStatus::InvalidArgument);
+
+    let raw = block_on(handle.create_prize_stock(&mint_url, "2", "500")).unwrap();
+    let invoice: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let id = invoice["id"].as_str().unwrap();
+    // Like the operator commands, creation and claim run on different opens.
+    drop(handle);
+    let mut handle = open_wallet(seed, &path);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let raw = block_on(handle.claim_prize_stock(&mint_url, id, "500")).unwrap();
+        let status: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        if status["confirmed"] == true {
+            break;
+        }
+        assert!(Instant::now() < deadline, "prize funding did not confirm");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    for _ in 0..2 {
+        let payout = block_on(handle.send_bounded(&mint_url, 500, 4096)).unwrap();
+        assert_eq!(payout.sender_fee_msats, 0);
+        assert!(payout.token.len() <= 4096);
+        let token = Token::from_str(&payout.token).unwrap();
+        assert_eq!(token.value().unwrap(), Amount::from(500));
+        assert_eq!(token.unit(), Some(CurrencyUnit::Msat));
+        assert_eq!(token.token_secrets().len(), 6);
+    }
+    let err = block_on(handle.send_bounded(&mint_url, 500, 4096)).unwrap_err();
+    assert_eq!(err.status, CdkStatus::InsufficientFunds);
+}
+
+#[test]
 fn e2e_bounded_send_requires_exact_proofs_and_checks_size_before_issuance() {
     let mint_url = block_on(start_fake_mint(0));
     let (_dir, path) = temp_db();
