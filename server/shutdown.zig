@@ -32,6 +32,10 @@ pub const Shutdown = struct {
         installed.store(false, .release);
     }
 
+    pub fn isRequested(_: *const Shutdown) bool {
+        return requested.load(.monotonic);
+    }
+
     /// Returns once either signal has been observed, or with error.Canceled
     /// if the waiting task is canceled. A signal stays latched for this install.
     pub fn wait(_: *const Shutdown, io: std.Io) std.Io.Cancelable!void {

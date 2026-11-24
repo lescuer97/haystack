@@ -34,6 +34,27 @@ const Options = struct {
 pub fn main(init: std.process.Init) !void {
     // Parse and validate configuration before acquiring persistent resources.
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "fund-wallet")) {
+        @import("fund_wallet.zig").run(init, args[2..]) catch |err| {
+            if (err == error.FundingInterrupted) {
+                std.log.info("fund-wallet interrupted", .{});
+                std.process.exit(130);
+            }
+            std.log.err("fund-wallet: {s}", .{switch (err) {
+                error.InvalidAmount => "usage: haystack_server fund-wallet <positive integer msats>",
+                error.AlreadyRunning => "server wallet storage is locked; stop the server or other wallet command first",
+                error.WalletNotFound => "no existing server wallet; start the server once to provision it",
+                error.IncompleteWallet => "server wallet is incomplete; no wallet was created or repaired",
+                error.QuoteExpired => "the unpaid invoice expired",
+                error.QuoteRecoveryPending => "could not confirm funding; saved wallet state retained",
+                error.QuoteDoesNotMatchRequestedFunding => "saved quote does not match the requested funding; no invoice displayed",
+                error.IssuanceNotConfirmedLocally => "mint reports issuance, but the local wallet does not confirm credit",
+                else => @errorName(err),
+            }});
+            std.process.exit(1);
+        };
+        return;
+    }
     const stock = if (args.len >= 2) std.meta.stringToEnum(PrizeStock, args[1]) else null;
     const stock_amount = if (stock) |command| blk: {
         if (args.len != 4) return error.UsageExpectedPrizeAmountAndCountOrQuoteId;

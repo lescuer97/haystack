@@ -17,6 +17,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
     storage.addImport("sqlite", sqlite);
     const shared = @import("shared.zig").create(b, target, optimize);
     storage.addImport("shared", shared);
+    storage.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
     const server_mod = b.createModule(.{
         .root_source_file = b.path("server/main.zig"),
         .target = target,

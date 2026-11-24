@@ -68,6 +68,26 @@ owns the CDK handle and any Spilman receiver state. Both are closed after task
 shutdown; the root lock is released last. CDK/Rust and SQLite memory
 are **outside the two reserved server budgets below**.
 
+### Fund the server wallet (test funds only)
+
+```sh
+zig build server -Dgame=false
+./zig-out/bin/haystack_server fund-wallet 21000
+```
+
+The only argument is a positive integer in **msats**. Run this as the same user
+and with the same storage environment as the server, **while the server is
+stopped**. The command takes the server's storage lock and requires an existing
+wallet; it never provisions one or starts the server. It uses Testnut (or the
+build-time loopback mint for fixture builds). **Never send real funds.**
+
+The command prints a quote ID, a copyable BOLT11 invoice, and a QR code for an
+ANSI terminal. It polls and claims the quote, reporting success only when CDK
+confirms the funds were credited to the local wallet. Ctrl-C, an expired unpaid
+invoice, or a failed check leaves the saved wallet state intact. Keep the quote
+ID if funding was not confirmed; requesting another amount is not a resume
+command and can create a new invoice.
+
 ### Hoe ledger (test funds only)
 
 `zig build run-server -Dgame=false` enables the hoe receiver for the built-in
