@@ -7,8 +7,35 @@ const Prize = @import("game_db.zig").Prize;
 const Persistence = @import("persistence.zig").Persistence;
 const log = std.log.scoped(.prizes);
 
-pub const amount_msat = 500;
-const odds = 2000;
+pub const Tier = enum(u8) {
+    small = 8,
+    medium = 32,
+    big = 128,
+
+    pub fn amount(self: Tier, tool: p.tool) u64 {
+        return @backingInt(self) * tool.priceMsat();
+    }
+};
+
+const bucket_count = 1600;
+
+fn tierForBucket(bucket: u64) ?Tier {
+    return switch (bucket) {
+        0...47 => .small,
+        48...63 => .medium,
+        64...66 => .big,
+        else => null,
+    };
+}
+
+pub fn canStock(amount_msat: u64) bool {
+    for (p.tools) |tool| {
+        for (std.enums.values(Tier)) |tier| {
+            if (tier.amount(tool) == amount_msat) return true;
+        }
+    }
+    return false;
+}
 
 pub fn parseSeed(hex: ?[]const u8) !?[32]u8 {
     var seed: [32]u8 = undefined;
@@ -18,22 +45,21 @@ pub fn parseSeed(hex: ?[]const u8) !?[32]u8 {
     return seed;
 }
 
-pub fn wins(secret: [32]u8, public_seed: [32]u8, x: i32, y: i32) bool {
+pub fn roll(secret: [32]u8, public_seed: [32]u8, x: i32, y: i32) ?Tier {
     var world_key: [32]u8 = undefined;
     var prf = std.crypto.hash.Blake3.init(.{ .key = secret });
-    prf.update("haystack.prize-world-key.v1");
+    prf.update("haystack.prize-world-key.v2");
     prf.update(&public_seed);
     prf.final(&world_key);
-    const roll = wallet.privateYield(world_key, x, y);
-    return roll % odds == 0;
+    return tierForBucket(wallet.privateYield(world_key, x, y) % bucket_count);
 }
 
 pub fn deliver(storage: *Persistence, prize: Prize, sender: anytype, out: *[p.max_prize_token_bytes]u8) !?[]const u8 {
-    {
+    const amount_msat = blk: {
         storage.disk_lock.lockUncancelable(storage.io);
         defer storage.disk_lock.unlock(storage.io);
-        try storage.db.recordPrizeSend(prize, .intent);
-    }
+        break :blk try storage.db.beginPrizeSend(prize);
+    };
     // Only the wallet guard is held during FFI, not either world or disk lock.
     const sent = sender.sendPrize(amount_msat);
     defer sent.deinit();
@@ -75,6 +101,14 @@ test "prize seed is optional and only accepts exactly 32 bytes of hex" {
     try t.expectEqual(@as([32]u8, @splat(0xab)), (try parseSeed(&valid)).?);
 }
 
+test "prize buckets return 80 percent of spending in expectation" {
+    var total_multiplier: u64 = 0;
+    for (0..bucket_count) |bucket| {
+        if (tierForBucket(bucket)) |tier| total_multiplier += @backingInt(tier);
+    }
+    try std.testing.expectEqual(bucket_count * 4, total_multiplier * 5);
+}
+
 test "prize roll is deterministic and scoped to the public world seed and coordinates" {
     const t = std.testing;
     const secret: [32]u8 = @splat(0x96);
@@ -85,12 +119,12 @@ test "prize roll is deterministic and scoped to the public world seed and coordi
     var differs = false;
     for (0..20000) |i| {
         const x: i32 = -@as(i32, @intCast(i));
-        if (!wins(secret, world, x, -7)) continue;
+        const tier = roll(secret, world, x, -7) orelse continue;
         count += 1;
-        try t.expect(wins(secret, world, x, -7));
-        differs = differs or !wins(secret, changed, x, -7);
+        try t.expectEqual(tier, roll(secret, world, x, -7).?);
+        differs = differs or tier != roll(secret, changed, x, -7);
     }
-    try t.expect(count > 0 and count < 30 and differs);
+    try t.expect(count > 0 and count < 1200 and differs);
 }
 
 test "prize delivery journals intent before wallet I/O and never reissues a token" {
@@ -111,12 +145,13 @@ test "prize delivery journals intent before wallet I/O and never reissues a toke
         storage: *Persistence,
         reader: *native.sqlite.Db,
         x: i32,
+        amount_msat: u64,
         result: Result,
         calls: usize = 0,
 
         pub fn sendPrize(self: *@This(), amount: u64) Result {
             self.calls += 1;
-            t.expectEqual(amount_msat, amount) catch unreachable;
+            t.expectEqual(self.amount_msat, amount) catch unreachable;
             t.expect(self.storage.world_lock.tryLock()) catch unreachable;
             self.storage.world_lock.unlock(t.io);
             t.expect(self.storage.disk_lock.tryLock()) catch unreachable;
@@ -152,9 +187,10 @@ test "prize delivery journals intent before wallet I/O and never reissues a toke
     };
     for (cases, 0..) |case, i| {
         const prize: Prize = .{ .x = @intCast(i), .y = 0, .owner = @splat(3) };
+        const amount_msat = @as(u64, 16) << @intCast(i);
         try db.commitPrizeCut(prize, @splat(0xff), amount_msat);
         if (case.fail_write) try reader.exec("CREATE TRIGGER reject_token BEFORE UPDATE OF token ON pending_prizes BEGIN SELECT raise(ABORT, 'test'); END");
-        var fake: Fake = .{ .storage = &storage, .reader = reader, .x = prize.x, .result = case.result };
+        var fake: Fake = .{ .storage = &storage, .reader = reader, .x = prize.x, .amount_msat = amount_msat, .result = case.result };
         var out: [p.max_prize_token_bytes]u8 = @splat(0);
         if (case.fail_write) {
             try t.expectError(error.SqliteConstraint, deliver(&storage, prize, &fake, &out));

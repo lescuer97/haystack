@@ -691,11 +691,14 @@ test "a restarted worker retains the local balance and reconciles only exact pen
     _ = try std.fmt.hexToBytes(&scope.receiver, receiver);
     const mint = "https://mint.example";
     const key = "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65";
-    const keys = "{\"keyset_id\":\"00891271bfa74eb8\",\"unit\":\"msat\",\"input_fee_ppk\":0,\"keys\":{\"32\":\"" ++ key ++
-        "\",\"2\":\"" ++ key ++ "\",\"1\":\"" ++ key ++ "\"}}";
+    const price = protocol.tool.hoe.priceMsat();
+    const capacity = 7 * price;
+    const top_up_capacity = capacity - 3 * price + protocol.large_tool_refill_cuts * price;
+    const keys = "{\"keyset_id\":\"00891271bfa74eb8\",\"unit\":\"msat\",\"input_fee_ppk\":0,\"keys\":{\"16\":\"" ++ key ++
+        "\",\"8\":\"" ++ key ++ "\",\"4\":\"" ++ key ++ "\"}}";
     const params = try std.fmt.allocPrintSentinel(t.allocator, "{{\"sender_pubkey\":\"{s}\",\"receiver_pubkey\":\"" ++ receiver ++
-        "\",\"mint\":\"" ++ mint ++ "\",\"unit\":\"msat\",\"capacity\":35,\"expiry_timestamp\":4000000000,\"setup_timestamp\":1," ++
-        "\"funding_token_amount\":35,\"maximum_amount\":32,\"keyset_id\":\"00891271bfa74eb8\",\"input_fee_ppk\":0}}", .{std.fmt.bytesToHex(scope.player, .lower)}, 0);
+        "\",\"mint\":\"" ++ mint ++ "\",\"unit\":\"msat\",\"capacity\":{d},\"expiry_timestamp\":4000000000,\"setup_timestamp\":1," ++
+        "\"funding_token_amount\":{d},\"maximum_amount\":16,\"keyset_id\":\"00891271bfa74eb8\",\"input_fee_ppk\":0}}", .{ std.fmt.bytesToHex(scope.player, .lower), capacity, capacity }, 0);
     defer t.allocator.free(params);
     const secret = "abababababababababababababababababababababababababababababababab";
     const derived = c.cdk_spilman_channel_parameters_get_channel_id(params, secret, keys);
@@ -715,7 +718,7 @@ test "a restarted worker retains the local balance and reconciles only exact pen
                 .operation_id = @splat(1),
                 .id = id,
                 .mint_url = mint,
-                .capacity_msats = 35,
+                .capacity_msats = capacity,
                 .refund_time = 4_000_000_000,
                 .channel_secret_hex = secret,
                 .params_json = params,
@@ -732,12 +735,12 @@ test "a restarted worker retains the local balance and reconciles only exact pen
     const new = (try state.bindPlay(t.io, paths, bind)).?;
     try t.expectEqual(@as(u64, 0), new.confirmed_balance_msats);
     try t.expect(!new.confirmed and !new.payment_pending and !new.server_active);
-    bind.active = .{ .id = id, .capacity_msats = 50, .balance_msats = 10 };
+    bind.active = .{ .id = id, .capacity_msats = protocol.hoe_refill_cuts * price, .balance_msats = 2 * price };
     try t.expectError(error.CapacityMismatch, state.bindPlay(t.io, paths, bind));
-    bind.active.?.capacity_msats = 35;
+    bind.active.?.capacity_msats = capacity;
     const admitted = (try state.bindPlay(t.io, paths, bind)).?;
     try t.expect(admitted.server_active);
-    try t.expectEqual(35, admitted.capacity_msats);
+    try t.expectEqual(capacity, admitted.capacity_msats);
     try t.expectEqual(5, admitted.cuts_left);
 
     const cut_id: protocol.Id = @splat(3);
@@ -749,7 +752,7 @@ test "a restarted worker retains the local balance and reconciles only exact pen
     var balance = try HoePayment.State.fromLocal(active.store, active.local);
     // This storage fixture has no spendable proofs. Commit the same reservation
     // that successful signing would produce, then exercise the real worker paths.
-    balance.prepared = .{ .request_id = cut_id, .amount = 15 };
+    balance.prepared = .{ .request_id = cut_id, .amount = 3 * price };
     try state.commitCut(t.io, balance);
     try t.expectError(error.PaymentUnresolved, state.execute(t.io, paths, &owner, prepare));
     try t.expectError(error.UnexpectedResolution, state.execute(t.io, paths, &owner, .{
@@ -760,33 +763,33 @@ test "a restarted worker retains the local balance and reconciles only exact pen
     bind = .{ .session = 2, .scope = scope };
     const offline = (try state.bindPlay(t.io, paths, bind)).?;
     try t.expect(offline.confirmed and offline.payment_pending and !offline.server_active);
-    try t.expectEqual(@as(u64, 10), offline.confirmed_balance_msats);
+    try t.expectEqual(2 * price, offline.confirmed_balance_msats);
     try t.expectEqual(@as(u64, 0), offline.cuts_left);
     var retry = prepare;
     retry.prepare_cut.session = 2;
     try t.expectError(error.NoActiveChannel, state.execute(t.io, paths, &owner, retry));
 
-    bind.active = .{ .id = id, .capacity_msats = 35, .balance_msats = 20 };
+    bind.active = .{ .id = id, .capacity_msats = capacity, .balance_msats = 4 * price };
     try t.expectError(error.PaymentUnresolved, state.bindPlay(t.io, paths, bind));
     try t.expectError(error.NoActiveChannel, state.execute(t.io, paths, &owner, retry));
     try t.expectEqual(offline, (try state.bindPlay(t.io, paths, .{ .session = 2, .scope = scope })).?);
-    bind.active.?.balance_msats = 15;
+    bind.active.?.balance_msats = 3 * price;
     const reconciled = (try state.bindPlay(t.io, paths, bind)).?;
     try t.expect(reconciled.server_active and !reconciled.payment_pending);
-    try t.expectEqual(@as(u64, 15), reconciled.confirmed_balance_msats);
+    try t.expectEqual(3 * price, reconciled.confirmed_balance_msats);
     const top_up: TopUp = .{
         .tool = .hoe,
         .player = scope.player,
         .receiver = scope.receiver,
         .channel = id,
-        .accepted = 15,
-        .capacity = 120,
-        .max_debit = 120,
+        .accepted = 3 * price,
+        .capacity = top_up_capacity,
+        .max_debit = top_up_capacity,
         .expires = 4_000_000_000,
     };
     const save: Request = .{ .top_up_save = .{ .session = 2, .intent = top_up } };
     var stale = save;
-    stale.top_up_save.intent.accepted = 10;
+    stale.top_up_save.intent.accepted = 2 * price;
     try t.expectError(error.PendingMismatch, state.execute(t.io, paths, &owner, stale));
     try t.expectEqualDeep(top_up, (try state.execute(t.io, paths, &owner, save)).top_up_saved);
     try t.expectError(error.FundingUnavailable, state.execute(t.io, paths, &owner, save));
@@ -797,12 +800,12 @@ test "a restarted worker retains the local balance and reconciles only exact pen
     try t.expect((try state.execute(t.io, paths, &owner, .top_up_read)).top_up_loaded == null);
 
     bind.session = 3;
-    bind.active.?.balance_msats = 10;
+    bind.active.?.balance_msats = 2 * price;
     try t.expectError(error.BalanceUnknown, state.bindPlay(t.io, paths, bind));
     bind.active = null;
     const restored = (try state.bindPlay(t.io, paths, bind)).?;
     try t.expect(!restored.server_active and !restored.payment_pending);
-    try t.expectEqual(@as(u64, 15), restored.confirmed_balance_msats);
+    try t.expectEqual(3 * price, restored.confirmed_balance_msats);
 }
 
 test "sender change receive is never replayed after a confirmed or uncertain attempt" {
@@ -1002,26 +1005,30 @@ const HoePayment = struct {
     }
 };
 
-test "next balance costs five msats, including when capacity is exact" {
-    try t.expectEqual(@as(u64, 5), try HoePayment.nextBalance(.hoe, 0, 15));
-    try t.expectEqual(@as(u64, 15), try HoePayment.nextBalance(.hoe, 10, 15));
-    try t.expectError(error.InsufficientCapacity, HoePayment.nextBalance(.hoe, 10, 14));
+test "next balance costs one cut, including when capacity is exact" {
+    const price = protocol.tool.hoe.priceMsat();
+    const capacity = 3 * price;
+    try t.expectEqual(price, try HoePayment.nextBalance(.hoe, 0, capacity));
+    try t.expectEqual(capacity, try HoePayment.nextBalance(.hoe, 2 * price, capacity));
+    try t.expectError(error.InsufficientCapacity, HoePayment.nextBalance(.hoe, 2 * price, capacity - 1));
     try t.expectError(error.InsufficientCapacity, HoePayment.nextBalance(.hoe, std.math.maxInt(u64) - 1, std.math.maxInt(u64)));
 }
 
 test "a reconnect resolves only the exact pending balance in the same scope" {
-    var previous = try HoePayment.State.reconcile(.hoe, null, @splat(1), @splat(2), 10, 24);
-    previous.prepared = .{ .request_id = @splat(3), .amount = 15 };
+    const price = protocol.tool.hoe.priceMsat();
+    const capacity = 5 * price - 1;
+    var previous = try HoePayment.State.reconcile(.hoe, null, @splat(1), @splat(2), 2 * price, capacity);
+    previous.prepared = .{ .request_id = @splat(3), .amount = 3 * price };
     try t.expectError(error.UnexpectedResolution, previous.resolve(@splat(4), .not_charged));
-    for ([_]u64{ 10, 15 }) |balance| {
-        const settled = try HoePayment.State.reconcile(.hoe, previous, previous.scope, previous.channel_id, balance, 24);
+    for ([_]u64{ 2 * price, 3 * price }) |balance| {
+        const settled = try HoePayment.State.reconcile(.hoe, previous, previous.scope, previous.channel_id, balance, capacity);
         try t.expectEqual(balance, settled.confirmed_balance_msats);
         try t.expect(settled.prepared == null);
     }
-    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.hoe, previous, previous.scope, previous.channel_id, 20, 24));
-    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.hoe, previous, @splat(9), previous.channel_id, 15, 24));
-    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.hoe, previous, previous.scope, @splat(9), 15, 24));
-    try t.expectError(error.BalanceUnknown, HoePayment.State.reconcile(.hoe, previous, previous.scope, previous.channel_id, 25, 24));
+    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.hoe, previous, previous.scope, previous.channel_id, 4 * price, capacity));
+    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.hoe, previous, @splat(9), previous.channel_id, 3 * price, capacity));
+    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.hoe, previous, previous.scope, @splat(9), 3 * price, capacity));
+    try t.expectError(error.BalanceUnknown, HoePayment.State.reconcile(.hoe, previous, previous.scope, previous.channel_id, 5 * price, capacity));
 }
 
 test "reconciliation and refill debit are bound to the price and tool" {
@@ -1039,7 +1046,9 @@ test "reconciliation and refill debit are bound to the price and tool" {
         try t.expect(recovered.prepared == null);
         try t.expectError(error.BalanceUnknown, HoePayment.State.reconcile(tool, previous, previous.scope, previous.channel_id, price + 1, capacity));
     }
-    var pending = try HoePayment.State.reconcile(.axe, null, @splat(1), @splat(2), 8, 20);
-    pending.prepared = .{ .request_id = @splat(3), .amount = 10 };
-    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.pickaxe, pending, pending.scope, pending.channel_id, 10, 20));
+    const shared_balance = protocol.tool.pickaxe.priceMsat() * protocol.tool.axe.priceMsat();
+    const capacity = 2 * shared_balance;
+    var pending = try HoePayment.State.reconcile(.axe, null, @splat(1), @splat(2), shared_balance - protocol.tool.axe.priceMsat(), capacity);
+    pending.prepared = .{ .request_id = @splat(3), .amount = shared_balance };
+    try t.expectError(error.PaymentUnresolved, HoePayment.State.reconcile(.pickaxe, pending, pending.scope, pending.channel_id, shared_balance, capacity));
 }

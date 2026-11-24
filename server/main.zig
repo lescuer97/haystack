@@ -35,7 +35,12 @@ pub fn main(init: std.process.Init) !void {
     // Parse and validate configuration before acquiring persistent resources.
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const stock = if (args.len >= 2) std.meta.stringToEnum(PrizeStock, args[1]) else null;
-    if (stock != null and args.len != 3) return error.UsageExpectedFundPrizesCountOrClaimPrizeFundingQuoteId;
+    const stock_amount = if (stock) |command| blk: {
+        if (args.len != 4) return error.UsageExpectedPrizeAmountAndCountOrQuoteId;
+        const amount_msat = try std.fmt.parseInt(u64, args[2], 10);
+        if (!prize.canStock(amount_msat) and !(command == .@"claim-prize-funding" and amount_msat == 500)) return error.InvalidPrizeFundingDenomination;
+        break :blk amount_msat;
+    } else 0;
     const options = try Options.parse(if (stock != null) args[0..1] else args);
     const prize_seed = if (stock == null) try prize.parseSeed(init.environ_map.get("HAYSTACK_PRIZE_SEED")) else null;
     startup_log.info("configuration parsed: websocket_budget={d}, application_budget={d}", .{
@@ -58,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
     defer wallet.close() catch {};
     startup_log.info("wallet opened", .{});
     if (wallet.hasReceiver()) startup_log.info("hoe ledger ready (test funds only)", .{});
-    if (stock) |command| return wallet.prizeStock(init.gpa, command == .@"claim-prize-funding", args[2], prize.amount_msat);
+    if (stock) |command| return wallet.prizeStock(init.gpa, command == .@"claim-prize-funding", args[3], stock_amount);
 
     const data_dir = std.fs.path.dirname(locations.wallet_dir) orelse return error.InvalidPath;
     const game_path = try std.fs.path.joinZ(init.gpa, &.{ data_dir, "game.sqlite" });

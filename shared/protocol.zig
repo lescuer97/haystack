@@ -1,7 +1,7 @@
 //! Typed message contract; serialization lives in wire.zig.
 const std = @import("std");
 const world = @import("world.zig");
-pub const hoe_price_msat: u64 = 5;
+pub const hoe_price_msat: u64 = 4;
 pub const hoe_refill_cuts: u64 = 10;
 pub const large_tool_refill_cuts: u64 = 20;
 pub const max_tool_channel_cuts: u64 = 40;
@@ -99,7 +99,7 @@ pub const tool = enum(u8) {
         return switch (self) {
             .axe => 2,
             .hoe => hoe_price_msat,
-            .pickaxe => 10,
+            .pickaxe => 8,
         };
     }
 

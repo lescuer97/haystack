@@ -122,10 +122,21 @@ independently generated 32-byte secret. Keep it stable across restarts, backed
 up privately, and out of source control and logs. Omitting it disables prizes;
 a malformed value prevents startup. The public world seed is unchanged.
 
-Each newly successful paid axe, hoe, or pickaxe cut independently has a
-1-in-2,000 chance of awarding 500 msat. The result is deterministic for the
-tile and seeds. The award is an ordinary serialized Cashu bearer token, which
-may contain multiple proofs, not a channel credit. The server attempts immediate
+Each newly successful paid cut gets one deterministic roll from the tile and
+seeds. The payout is a multiple of the cut price (axe 2 msat, hoe 4 msat,
+pickaxe 8 msat):
+
+| Tier | Chance per cut | Multiplier | Axe | Hoe | Pickaxe |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Small | 3% | 8× | 16 msat | 32 msat | 64 msat |
+| Medium | 1% | 32× | 64 msat | 128 msat | 256 msat |
+| Big | 0.1875% | 128× | 256 msat | 512 msat | 1,024 msat |
+| No award | 95.8125% | — | — | — | — |
+
+The expected face value is 80% of cut spending, before redemption fees and
+assuming all prizes are paid. Wallet inventory does not change the odds.
+The award is an ordinary serialized Cashu bearer token, which may contain
+multiple proofs, not a channel credit. The server attempts immediate
 payout from exact proofs held by its test wallet, without a swap or sender fee.
 Before issuing it, the wallet checks that the serialized token fits the 4,096-byte
 delivery limit. If it cannot issue a fitting token, the prize remains a debt.
@@ -137,21 +148,24 @@ To stock compact prize proofs, stop the server and use the same storage and
 mint configuration:
 
 ```sh
-zig build run-server -Dgame=false -- fund-prizes 10
+zig build run-server -Dgame=false -- fund-prizes 64 10
 # Pay the returned `request` using test funds only; save the returned `id`.
-zig build run-server -Dgame=false -- claim-prize-funding QUOTE_ID
+zig build run-server -Dgame=false -- claim-prize-funding 64 QUOTE_ID
 ```
 
-`fund-prizes` takes a batch of 1–20 prizes. Check the returned amount before
-paying: after an interrupted request the wallet may return a previously saved
-invoice. If claim returns `"confirmed":false`, check the same quote again rather
-than creating another. Both commands exit without starting the listener.
-An explicit loopback fixture build requires its existing fixture ledger.
+`fund-prizes PRIZE_MSAT COUNT` takes 1–20 prizes of one denomination from the
+table. The example stocks ten 64-msat prizes. Check that the invoice amount is
+`PRIZE_MSAT × COUNT` before paying: recovery may return a previously saved
+invoice. Claim with the same denomination and quote ID; if claim returns
+`"confirmed":false`, check that quote again rather than creating another. Use
+`500` only to claim a funding invoice created under the previous schedule.
+Both commands exit without listening. A loopback fixture build requires its
+existing fixture ledger.
 
-The claim requests the active msat keyset's compact split once per prize:
-`256 + 128 + 64 + 32 + 16 + 4` on a standard power-of-two keyset. The proofs
-are ordinary wallet inventory, not reserved sets. The byte limit is still
-checked on every payout, and topping up does not automatically pay old debts.
+Each award size uses one proof on a standard power-of-two msat keyset. Proofs
+are ordinary wallet inventory, not reserved sets. The byte limit is checked
+on every payout, and topping up does not automatically pay old debts or change
+the amounts previously recorded.
 
 A winning tile and its debt commit together in `game.sqlite`. The private
 `pending_prizes` table records the tile, winner's authenticated public key,
@@ -384,8 +398,11 @@ slices.
 
 Funded open accepts capacity for 1–40 whole actions at the reported price.
 The clients quote up to 10 for a standard refill, or exactly 20 for **+20** without an existing channel:
-axe (tree) costs 2 msat per action, hoe (grass) costs 5, and pickaxe (rock) costs
-10. Channel capacity does not include mint fees. The desktop shows the maximum wallet debit including those
+axe (tree) costs 2 msat per action, hoe (grass) costs 4, and pickaxe (rock) costs
+8. Settle old 5-msat hoe and 10-msat pickaxe channels with the previous client
+and server before upgrading. Old ledger terms are preserved for settlement,
+but those channels are not restored for paid play at the new prices.
+Channel capacity does not include mint fees. The desktop shows the maximum wallet debit including those
 fees before funding and opening the channel. The proof limit also accommodates larger denomination splits used by replacements.
 
 Channel negotiation bypasses the tick mailbox. Fixture builds without the

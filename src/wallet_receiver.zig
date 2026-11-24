@@ -832,8 +832,8 @@ test "funded channel price survives reopen and controls retries and signed payme
             try t.expectError(error.ChannelIdConflict, ledger.acceptFunded(owner, request, now));
         }
         const accepted = try ledger.acceptToolFunded(owner, request, now, tool);
-        try t.expectEqual(10, accepted.price_msat);
-        try t.expectEqual(run * 10, accepted.balance_msat);
+        try t.expectEqual(tool.priceMsat(), accepted.price_msat);
+        try t.expectEqual(run * tool.priceMsat(), accepted.balance_msat);
         const loaded = (try ledger.loadLive(owner, id, now)).?;
         const live = loaded.live.?;
         defer live.deinit();
@@ -970,7 +970,7 @@ test "current receiver ledger reopens without losing pending closes or receipts"
             try t.expectEqual(null, try ledger.nextDue(null, accepted.expiry - 1));
             try t.expectEqual(id, (try ledger.nextDue(null, accepted.expiry)).?.id);
             // Dust and exactly zero remaining both stay open until expiry.
-            for ([_]u64{ 9, 5 }) |capacity| {
+            for ([_]u64{ accepted.balance_msat + hoe_price_msat - 1, accepted.balance_msat }) |capacity| {
                 const update = try ledger.db.prepare(
                     \\UPDATE spilman_channels SET funding_json=json_set(funding_json,'$.params_json',
                     \\  json_set(json_extract(funding_json,'$.params_json'),'$.capacity',?2))

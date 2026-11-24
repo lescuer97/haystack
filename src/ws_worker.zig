@@ -645,7 +645,8 @@ test "movement mailbox waits for auth and holds only one move per session" {
     worker.status(1, .authenticating, null);
     try t.expect(!worker.submit(0, pos));
     const restored: protocol.Location = .{ .x = -38, .y = 211 };
-    const channel: HoeChannel = .{ .id = @splat(0x42), .capacity_msats = 100, .balance_msats = 15, .player = @splat(7) };
+    const price = protocol.tool.hoe.priceMsat();
+    const channel: HoeChannel = .{ .id = @splat(0x42), .capacity_msats = protocol.large_tool_refill_cuts * price, .balance_msats = 3 * price, .player = @splat(7) };
     worker.status(1, .ready, .{ .location = restored, .channels = .{ null, channel, null }, .player = channel.player });
     try t.expectEqual(channel, worker.hoeChannel(worker.snapshot().session).?);
     try t.expect(worker.hoeChannel(0) == null);
@@ -880,7 +881,7 @@ test "settlement notices leave status pending and status proofs survive frame re
 
 const test_cut: protocol.RequestFor(.cut) = .{
     .request_id = @splat(1),
-    .payload = .{ .x = -4, .y = 5, .payment = .{ .id = @splat(2), .amount = 5, .signature = @splat(3) } },
+    .payload = .{ .x = -4, .y = 5, .payment = .{ .id = @splat(2), .amount = protocol.tool.hoe.priceMsat(), .signature = @splat(3) } },
 };
 
 test "signed cut queues alongside play and channel and yields only a matched reply" {
@@ -949,14 +950,15 @@ test "signed cut queues alongside play and channel and yields only a matched rep
 test "acknowledged cut advances only the matching tool balance before rebinding" {
     const t = std.testing;
     const player: [33]u8 = @splat(3);
-    const hoe: HoeChannel = .{ .id = @splat(2), .capacity_msats = 15, .balance_msats = 5, .player = player };
+    const price = protocol.tool.hoe.priceMsat();
+    const hoe: HoeChannel = .{ .id = @splat(2), .capacity_msats = 3 * price, .balance_msats = price, .player = player };
     const axe: HoeChannel = .{ .id = @splat(4), .capacity_msats = 4, .balance_msats = 0, .player = player };
     var worker: Worker = .{ .io = t.io, .paths = undefined };
     worker.setEnabled(true);
     worker.status(1, .ready, .{ .location = shared.movement.spawn, .player = player, .channels = .{ axe, hoe, null } });
 
     var command = test_cut;
-    command.payload.payment.?.amount = 10;
+    command.payload.payment.?.amount = 2 * price;
     const tile: protocol.State = .{ .x = command.payload.x, .y = command.payload.y, .terrain = .grass, .cut = true };
     var out: [protocol.max_request_bytes]u8 = undefined;
     var scratch: protocol.Snapshot = undefined;
@@ -967,7 +969,7 @@ test "acknowledged cut advances only the matching tool balance before rebinding"
         const reply = try wire.encodeReply(&out, .cut, command, outcome);
         try worker.finishCut(1, request, reply, &scratch);
         try t.expectEqualDeep(outcome, worker.takeCut(1, command.request_id).?.outcome);
-        try t.expectEqual(if (i == 0) @as(u64, 5) else 10, worker.toolLogin(1, .hoe).?.channel.?.balance_msats);
+        try t.expectEqual(if (i == 0) hoe.balance_msats else command.payload.payment.?.amount, worker.toolLogin(1, .hoe).?.channel.?.balance_msats);
         try t.expectEqual(axe, worker.toolChannel(1, .axe).?);
         try t.expect(worker.toolChannel(1, .pickaxe) == null);
     }
@@ -1021,7 +1023,8 @@ test "login restores each tool independently and invalidates every slot on recon
     var worker: Worker = .{ .io = t.io, .paths = undefined };
     const player: [33]u8 = @splat(2);
     const axe: protocol.ToolChannel = .{ .id = @splat(3), .capacity_msat = 20, .balance_msat = 2 };
-    const pickaxe: protocol.ToolChannel = .{ .id = @splat(4), .capacity_msat = 100, .balance_msat = 50 };
+    const pickaxe_price = protocol.tool.pickaxe.priceMsat();
+    const pickaxe: protocol.ToolChannel = .{ .id = @splat(4), .capacity_msat = protocol.hoe_refill_cuts * pickaxe_price, .balance_msat = 5 * pickaxe_price };
     const ack: protocol.AuthOutcome = .{ .ok_with_tool_channels = .{ .location = shared.movement.spawn, .channels = .{ axe, null, pickaxe } } };
     worker.setEnabled(true);
     worker.status(1, .ready, Restored.fromReply(ack, player));

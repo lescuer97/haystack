@@ -24,7 +24,7 @@ separate HTTP payment API. Run the native game server and browser bundle on
 loopback as described in the [README](../README.md). Open **Tools** from the
 main menu or right-click the tool in the hotbar. Click its refill button for a
 quote, then click again to approve the quoted debit. Axe, hoe, and pickaxe actions
-cost 2, 5, and 10 msat respectively. Each tool has its own IndexedDB channel and
+cost 2, 4, and 8 msat respectively. Each tool has its own IndexedDB channel and
 funding journal; a depleted channel must be closed and settled before that tool
 can be refilled.
 

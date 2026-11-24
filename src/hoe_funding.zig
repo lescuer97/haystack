@@ -447,7 +447,7 @@ fn take(a: Allocator, result: c.CdkStringResult_t) ![:0]const u8 {
 const t = std.testing;
 const TestInputs = struct {
     const policy: Policy = .{ .mint_url = "https://mint.example.com", .max_output_msats = 32 };
-    const cost_per_cut = 5;
+    const cost_per_cut = protocol.tool.hoe.priceMsat();
     const receiver_secret = &@as([64:0]u8, @splat('2'));
     const sender: Sender = .{
         .pubkey = blk: {
@@ -499,7 +499,7 @@ test "funding preflight requires exact derived capacity and supports split fundi
     const f = TestInputs;
     const q = try f.quote();
     const wallet: *const c.CdkWallet_t = @ptrFromInt(1); // Invalid capacity must fail before reading the wallet.
-    for ([_]u64{ 0, 14, 205 }) |capacity| {
+    for ([_]u64{ 0, 3 * q.amount - 1, (protocol.max_tool_channel_cuts + 1) * q.amount }) |capacity| {
         try t.expectError(error.InvalidCapacity, preflight(t.io, a, wallet, @splat(1), f.policy, q, .{
             .capacity = capacity,
             .nominal = capacity,
@@ -510,9 +510,9 @@ test "funding preflight requires exact derived capacity and supports split fundi
     try t.expectError(error.InvalidQuote, validateQuote(f.policy, q, q.refundTime));
     var zero_price = q;
     zero_price.amount = 0;
-    try t.expectError(error.InvalidQuote, prepare(a, f.policy, zero_price, 5, "", f.keyset, f.sender));
+    try t.expectError(error.InvalidQuote, prepare(a, f.policy, zero_price, q.amount, "", f.keyset, f.sender));
     try t.expectError(error.InvalidCapacity, prepare(a, f.policy, q, 0, "", f.keyset, f.sender));
-    try t.expectError(error.InvalidCapacity, prepare(a, f.policy, q, 4, "", f.keyset, f.sender));
+    try t.expectError(error.InvalidCapacity, prepare(a, f.policy, q, q.amount - 1, "", f.keyset, f.sender));
     const policy_64: Policy = .{ .mint_url = f.policy.mint_url, .max_output_msats = 64 };
     const keyset_64 = f.keyset[0 .. f.keyset.len - 2] ++
         ",\"64\":\"03bf23c1542d16eab70b1051eaf832823cfc4c6f1dcdbafd81e37918e6f874ef8b\"}}";
@@ -521,18 +521,18 @@ test "funding preflight requires exact derived capacity and supports split fundi
     try t.expectEqual(@as(u64, 64), prepared.material.capacity_msats);
     try t.expectError(error.FundingCapacityMismatch, prepare(a, policy_64, q, 60, power_of_two, keyset_64, f.sender));
     const wrong = try f.token(a, &.{8}, "https://wrong.example.com");
-    try t.expectError(error.WrongMint, prepare(a, f.policy, q, 5, wrong, f.keyset, f.sender));
+    try t.expectError(error.WrongMint, prepare(a, f.policy, q, q.amount, wrong, f.keyset, f.sender));
     var wrong_identity = f.sender;
     wrong_identity.pubkey = q.pubkey;
-    try t.expectError(error.SenderIdentityMismatch, prepare(a, f.policy, q, 5, wrong, f.keyset, wrong_identity));
+    try t.expectError(error.SenderIdentityMismatch, prepare(a, f.policy, q, q.amount, wrong, f.keyset, wrong_identity));
     var same_receiver = q;
     same_receiver.pubkey = f.sender.pubkey;
     same_receiver.pubkey[0] = 2;
-    try t.expectError(error.IdenticalChannelKeys, prepare(a, f.policy, same_receiver, 5, wrong, f.keyset, f.sender));
+    try t.expectError(error.IdenticalChannelKeys, prepare(a, f.policy, same_receiver, q.amount, wrong, f.keyset, f.sender));
     const expiring = f.keyset[0 .. f.keyset.len - 1] ++ ",\"finalExpiry\":1}";
-    try t.expectError(error.KeysetExpiresBeforeRefund, prepare(a, f.policy, q, 5, wrong, expiring, f.sender));
+    try t.expectError(error.KeysetExpiresBeforeRefund, prepare(a, f.policy, q, q.amount, wrong, expiring, f.sender));
     const token = try f.token(a, &.{8}, f.policy.mint_url);
-    try t.expectError(error.FundingCapacityMismatch, prepare(a, f.policy, q, 5, token, f.keyset, f.sender));
+    try t.expectError(error.FundingCapacityMismatch, prepare(a, f.policy, q, q.amount, token, f.keyset, f.sender));
     try t.expectError(error.FundingCapacityMismatch, prepare(a, f.policy, q, 10, token, f.keyset, f.sender));
     const split = try f.token(a, &.{ 8, 2 }, f.policy.mint_url);
     try t.expectEqual(10, (try prepare(a, f.policy, q, 10, split, f.keyset, f.sender)).material.capacity_msats);
@@ -674,14 +674,16 @@ test "ambiguous funding is journaled before POST and recovery verifies the exact
     const f = TestInputs;
     var q = try f.quote();
     q.amount = protocol.tool.pickaxe.priceMsat();
-    // 33 msat input -> 32 msat funding proof -> 31 -> 30 msat spendable after fees.
-    const token = try f.token(a, &.{ 32, 1 }, f.policy.mint_url);
+    // 27 msat input -> 26 msat funding nominal -> 25 -> 24 msat spendable after fees.
+    const capacity = 3 * q.amount;
+    const nominal = capacity + 2;
+    const token = try f.token(a, &.{ 16, 8, 2, 1 }, f.policy.mint_url);
     const fee_keyset = try a.dupeSentinel(u8, try std.mem.replaceOwned(u8, a, f.keyset, "\"input_fee_ppk\":0", "\"input_fee_ppk\":100"), 0);
     var identity = f.sender;
     identity.pubkey[0] = 2; // The server normalizes the odd-Y login key.
     var fee_policy = f.policy;
     fee_policy.input_fee_ppk = 100;
-    var p = try prepareExact(a, fee_policy, q, .{ .capacity = 30, .nominal = 32, .send = 33 }, token, fee_keyset, identity);
+    var p = try prepareExact(a, fee_policy, q, .{ .capacity = capacity, .nominal = nominal, .send = nominal + 1 }, token, fee_keyset, identity);
     p.material.tool = .pickaxe;
     const terms: Amounts = .{ .capacity = 14, .nominal = 16, .send = 17 };
     const exact = try f.token(a, &.{ 1, 16 }, f.policy.mint_url);
@@ -727,7 +729,7 @@ test "ambiguous funding is journaled before POST and recovery verifies the exact
     const verified = try completeRecovery(a, saved, evidence);
     try t.expectEqual(try channelId(a, p.material), verified.id);
     try t.expectEqual(p.proof_bytes, verified.proofs.len);
-    try t.expectEqual(p.proof_bytes, try quotedProofBytes(a, 32, f.keyset_id, q.refundTime));
+    try t.expectEqual(p.proof_bytes, try quotedProofBytes(a, nominal, f.keyset_id, q.refundTime));
     try t.expect(verified.proofs.len <= protocol.max_channel_proof_bytes);
     const channel = verified.owned(arena, id, saved);
     const open = channel.openPayload();
@@ -736,9 +738,9 @@ test "ambiguous funding is journaled before POST and recovery verifies the exact
     try t.expectEqualStrings(verified.proofs, open.proof);
     try t.expectEqualStrings(saved.material.params_json, open.params);
     const params = try parse(struct { sender_pubkey: [:0]const u8, capacity: u64, funding_token_amount: u64 }, a, open.params);
-    try t.expectEqual(@as(u64, 3) * q.amount, channel.capacity_msats);
+    try t.expectEqual(capacity, channel.capacity_msats);
     try t.expectEqual(channel.capacity_msats, params.capacity);
-    try t.expectEqual(@as(u64, 32), params.funding_token_amount);
+    try t.expectEqual(nominal, params.funding_token_amount);
     try t.expectEqualStrings(&std.fmt.bytesToHex(f.sender.pubkey, .lower), params.sender_pubkey);
     const receiver_secret = try take(a, c.cdk_spilman_compute_channel_secret(f.receiver_secret, params.sender_pubkey));
     try t.expectEqualStrings(saved.material.channel_secret_hex, receiver_secret);

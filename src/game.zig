@@ -749,7 +749,7 @@ test "right click opens Tools and only enabled controls submit channel actions" 
 
     game.menu.wallet.balance_msat = 27;
     try t.expectEqual(@as(?u64, 10), game.toolIncreaseLimit(.axe));
-    try t.expectEqual(@as(?u64, 2), game.toolIncreaseLimit(.pickaxe));
+    try t.expectEqual(@as(?u64, 27 / shared.protocol.tool.pickaxe.priceMsat()), game.toolIncreaseLimit(.pickaxe));
     const row = toolMenuRow(game.menu.layoutFor(320, 640).content, 1);
     const increase: input.FrameInput = .{ .viewport_w = 320, .clicked = true, .pointer_x = row.increase.centerX(), .pointer_y = row.increase.centerY() };
     try game.update(increase);

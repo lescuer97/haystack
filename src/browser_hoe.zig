@@ -972,16 +972,18 @@ test "browser hoe quotes bind to original terms and expose the wallet's maximum 
     const t = std.testing;
     const terms: Terms = .{ .player = @splat(2), .server = .{ .pubkey = @splat(3), .amount = protocol.tool.hoe.priceMsat(), .refundTime = 120 } };
     const receiver = std.fmt.bytesToHex(terms.server.pubkey, .lower);
+    const capacity = terms.server.amount * protocol.hoe_refill_cuts;
+    const debit = capacity + 3;
     const json = try std.json.Stringify.valueAlloc(t.allocator, .{
         .status = 0,
         .quote_id = "01234567-89ab-cdef-0123-456789abcdef",
         .scope = scope,
         .receiver_pubkey = @as([]const u8, &receiver),
-        .price_msats = "5",
-        .cuts = "10",
+        .price_msats = decimal(terms.server.amount).slice(),
+        .cuts = decimal(protocol.hoe_refill_cuts).slice(),
         .refund_time = "120",
-        .capacity_msats = "50",
-        .max_debit_msats = "53",
+        .capacity_msats = decimal(capacity).slice(),
+        .max_debit_msats = decimal(debit).slice(),
         .expires_at = "100",
     }, .{});
     defer t.allocator.free(json);
@@ -989,7 +991,7 @@ test "browser hoe quotes bind to original terms and expose the wallet's maximum 
     defer parsed.deinit();
     const fields = try successful(parsed.value);
     const offer = try parseOffer(.hoe, fields, terms);
-    try t.expectEqual(@as(u64, 53), offer.debit);
+    try t.expectEqual(debit, offer.debit);
     var fresh = terms.server;
     fresh.refundTime += 5;
     try t.expect(terms.acceptsFresh(fresh, terms.player));
@@ -1060,7 +1062,8 @@ test "browser tool switch cannot change the owner of wallet, channel or cut requ
 
 test "browser hoe gates saved admission and explicit close on authoritative state" {
     const t = std.testing;
-    var runtime: Runtime = .{ .record = .{ .id = @splat(1), .capacity = 10, .accepted = 0, .refund = 400, .admitted = false } };
+    const capacity = 2 * protocol.tool.hoe.priceMsat();
+    var runtime: Runtime = .{ .record = .{ .id = @splat(1), .capacity = capacity, .accepted = 0, .refund = 400, .admitted = false } };
     const record = &runtime.record.?;
     try t.expect(record.canReopen(false, 100));
     try t.expect(!record.canReopen(false, 101));
@@ -1070,9 +1073,9 @@ test "browser hoe gates saved admission and explicit close on authoritative stat
     record.admitted = true;
     try t.expect(!record.canReopen(false, 90));
     try t.expect(!runtime.canClose(90));
-    record.accepted = 10;
+    record.accepted = capacity;
     try t.expect(!runtime.canClose(90));
-    runtime.server = 10;
+    runtime.server = capacity;
     try t.expect(runtime.canClose(90));
 }
 

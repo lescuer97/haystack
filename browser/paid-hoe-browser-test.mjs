@@ -25,11 +25,21 @@ const changeRecovery = mode === '--funding-change-recovery';
 const fundingRecovery = mode === '--funding-recovery' || changeRecovery;
 const rendererResume = mode === '--renderer-funding-resume';
 const fundingResume = mode === '--funding-resume' || rendererResume;
+const hoePrice = 4;
+const hoeAmounts = {
+  oneCut: String(hoePrice),
+  twoCuts: String(2 * hoePrice),
+  tenCuts: String(10 * hoePrice),
+  twentyCuts: String(20 * hoePrice),
+  twentyOneCuts: String(21 * hoePrice),
+  recoveryInput: '64',
+  recoveryChange: String(64 - 10 * hoePrice),
+};
 // Sampled from shared/world.zig's sampleTile(public_seed, x, y), terrain v2.
 const toolsFixture = mode === '--tools' ? {
   start:[80, 11],
   axe:{name:'axe', tag:0, price:'2', terrain:3, tile:[80, 10]},
-  pickaxe:{name:'pickaxe', tag:2, price:'10', terrain:2, tile:[80, 12]},
+  pickaxe:{name:'pickaxe', tag:2, price:'8', terrain:2, tile:[80, 12]},
 } : null;
 const [mintExe, serverExe, assets] = args.map(arg => resolve(arg));
 const mintOrigin = 'http://127.0.0.1:18787'; // Matches the native fixture build option.
@@ -98,7 +108,9 @@ async function load(reload = false, url = origin) {
 // Runs entirely in the Chromium page: only the production Wasm wallet sees
 // the seed, and no proof/signature bytes are returned to Node. This small test
 // peer implements the TLV subset in shared/wire.zig.
-async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, resumeOffer, tools, toolChannels, largeRefill, rendererTopUp}) {
+async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, resumeOffer, tools, toolChannels, largeRefill, rendererTopUp, amounts}) {
+  const {oneCut, twoCuts, tenCuts, twentyCuts, twentyOneCuts, recoveryInput, recoveryChange} = amounts;
+  const refillCapacity = largeRefill ? twentyCuts : twoCuts;
   const check = (condition, step) => {
     if (!condition) {
       window.paidHoeStep = step;
@@ -150,6 +162,12 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     throw new Error('Wallet call failed');
   }
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+  async function waitForNextFundingSecond() {
+    // The wallet requires strictly increasing whole-second setup timestamps,
+    // even across tools and after a channel settles.
+    const nextSetup = (Math.floor(Date.now() / 1000) + 1) * 1000;
+    while (Date.now() < nextSetup) await pause(nextSetup - Date.now());
+  }
   const scope = 'ws://127.0.0.1:9224/';
   const bytes = (...values) => Uint8Array.of(...values);
   const random = length => crypto.getRandomValues(new Uint8Array(length));
@@ -317,7 +335,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     check(invoice?.confirmed === true && invoice.state === 'ISSUED', 'deposit issued');
     check(await walletBalance(mint) === total, 'deposit spendable in IndexedDB');
   }
-  const requirements = async ({name, tag, price} = {name:'hoe', tag:1, price:'5'}) => {
+  const requirements = async ({name, tag, price} = {name:'hoe', tag:1, price:oneCut}) => {
     step(`fetch real ${name} requirements`);
     const terms = (await request(0x21, 0xa1, [[0x23, bytes(tag)]])).get(3);
     check(terms?.length === 49 && u64(terms, 33) === price && Number(u64(terms, 41)) > Date.now() / 1000,
@@ -325,13 +343,13 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     return terms;
   };
   async function fund(mint, player, terms, capacity) {
-    const argumentsForTerms = [scope, hex(terms.subarray(0, 33)), '5', u64(terms, 41), hex(player)];
+    const argumentsForTerms = [scope, hex(terms.subarray(0, 33)), oneCut, u64(terms, 41), hex(player)];
     const swapUrl = `${mint}/v1/swap`;
     const beforeQuote = performance.getEntriesByName(swapUrl).length;
     const quote = await hoe('quote', ...argumentsForTerms);
-    check(quote.capacity_msats === capacity && quote.max_debit_msats === capacity && quote.cuts === (BigInt(capacity) / 5n).toString(),
+    check(quote.capacity_msats === capacity && quote.max_debit_msats === capacity && quote.cuts === (BigInt(capacity) / BigInt(oneCut)).toString(),
       'quote offers the expected cuts with zero fixture fees');
-    check(await walletBalance(mint) === (changeRecovery ? '64' : capacity) && performance.getEntriesByName(swapUrl).length === beforeQuote,
+    check(await walletBalance(mint) === (changeRecovery ? recoveryInput : capacity) && performance.getEntriesByName(swapUrl).length === beforeQuote,
       'quote neither swaps nor debits before consent');
     const fresh = await requirements();
     check(hex(fresh.subarray(0, 41)) === hex(terms.subarray(0, 41)) && BigInt(u64(fresh, 41)) >= BigInt(u64(terms, 41)),
@@ -342,7 +360,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       if (changeRecovery) {
         const {proofs} = await walletSnapshot();
         const inputs = proofs.filter(proof => proof.used_by_operation === operationId);
-        check(inputs.length === 1 && String(inputs[0].proof.amount) === '64' && inputs[0].state === 'RESERVED' &&
+        check(inputs.length === 1 && String(inputs[0].proof.amount) === recoveryInput && inputs[0].state === 'RESERVED' &&
           !proofs.some(proof => proof.created_by_operation === operationId),
           'the operation reserves the single 64-msat input and credits no change yet');
       }
@@ -372,7 +390,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
   async function cut(x, y, amount, duplicate = false) {
     const id = random(16);
     const payment = await hoe('prepare_cut', scope, channel, hex(id));
-    check(payment.balance_msats === amount, 'wallet signs the next cumulative 5-msat increment');
+    check(payment.balance_msats === amount, `wallet signs the next cumulative ${oneCut}-msat increment`);
     const tile = point(x, y);
     step(duplicate ? 'submit paid duplicate cut' : 'submit signed paid cut');
     const reply = await sendCut(id, tile, channel, amount, payment);
@@ -450,10 +468,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     if (phase === 'tools') {
       check(at(start) && !entries && !auth.has(0x20), 'fresh tools player is at fixture start with no channels');
       const axeChannel = await fundTool(axe);
-      // The wallet shares a whole-second setup watermark across tools to keep
-      // deterministic funding outputs distinct. Never retry a funding call.
-      const nextSetup = (Math.floor(Date.now() / 1000) + 1) * 1000;
-      while (Date.now() < nextSetup) await pause(nextSetup - Date.now());
+      await waitForNextFundingSecond();
       toolChannels = {axe:axeChannel, pickaxe:await fundTool(pickaxe)};
       check(toolChannels.axe !== toolChannels.pickaxe, 'the tools have distinct funded channel IDs');
       await move(axe.tile, false);
@@ -520,15 +535,14 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
         // CDK first fills its inventory of small denominations (three of each
         // from 1 to 32). Fill those slots so the next deposit issues one 64.
         await deposit(mint, '189', '189');
-        await deposit(mint, '64', '253');
+        await deposit(mint, recoveryInput, '253');
         for (let i = 0; i < 3; i++) await walletCall('send', [mint, '63', '0']);
         const {proofs} = await walletSnapshot();
         const spendable = proofs.filter(proof => proof.state === 'UNSPENT');
-        check(spendable.length === 1 && String(spendable[0].proof.amount) === '64' && await walletBalance(mint) === '64',
+        check(spendable.length === 1 && String(spendable[0].proof.amount) === recoveryInput && await walletBalance(mint) === recoveryInput,
           'fixture leaves exactly one spendable 64-msat proof after setting aside the smaller denominations');
       } else if (!tools) {
-        const initial = largeRefill ? '100' : '10';
-        await deposit(mint, initial, initial);
+        await deposit(mint, refillCapacity, refillCapacity);
       }
     }
     if (phase === 'renderer-verify' || phase === 'renderer-resume-verify') {
@@ -536,7 +550,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       // reconcile an unresolved payment on behalf of the renderer under test.
       const saved = await hoe('inspect', scope);
       const resumed = phase === 'renderer-resume-verify';
-      check(saved.admitted && saved.capacity_msats === (largeRefill ? '100' : '10') && saved.balance_msats === (resumed ? '0' : '5') &&
+      check(saved.admitted && saved.capacity_msats === refillCapacity && saved.balance_msats === (resumed ? '0' : oneCut) &&
         (resumed ? saved.channel_id === channel : /^[0-9a-f]{64}$/.test(saved.channel_id)),
         'renderer persisted the expected channel binding and accepted balance');
       channel = saved.channel_id;
@@ -570,15 +584,15 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       check(recoveryReads(mint).length === beforeOffer, 'resume quote requests no mint recovery evidence');
       check(offer.operation_id === operationId && offer.scope === scope && offer.mint_url === mint &&
         /^[0-9a-f]{64}$/.test(offer.channel_id) && offer.refund_time === savedOperation.refundTime &&
-        offer.cuts === '2' && offer.capacity_msats === '10' && offer.max_debit_msats === '10',
+        offer.cuts === '2' && offer.capacity_msats === twoCuts && offer.max_debit_msats === twoCuts,
         'resume quote shows the exact saved operation and debit');
       check((await walletSnapshot()).revision === revision, 'inspect and resume quote did not write wallet state');
       return {operationId, channel:offer.channel_id, debit:offer.max_debit_msats, refundTime:offer.refund_time};
     }
     if (phase === 'funding-recover' || phase === 'funding-resume') {
       check(!auth.has(0x20), 'interrupted funding never opened a native channel');
-      const capacity = changeRecovery ? '50' : '10';
-      const balance = changeRecovery ? '14' : '0';
+      const capacity = changeRecovery ? tenCuts : twoCuts;
+      const balance = changeRecovery ? recoveryChange : '0';
       let funding;
       if (phase === 'funding-resume') {
         funding = await hoe('resume', scope, resumeOffer.operationId, resumeOffer.debit);
@@ -601,8 +615,8 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
           check(after.revision === before.revision + 1 && input?.state === 'SPENT' &&
             change.length > 0 && change.every(proof => proof.spending_condition === null &&
               proof.created_by_operation === savedOperation.operationId) &&
-            change.reduce((total, proof) => total + BigInt(proof.proof.amount), 0n) === 14n,
-            'one IndexedDB commit recovers funding, marks the 64-msat input spent and credits 14 msat of ordinary change');
+            change.reduce((total, proof) => total + BigInt(proof.proof.amount), 0n) === BigInt(recoveryChange),
+            `one IndexedDB commit recovers funding, marks the input spent and credits ${recoveryChange} msat of ordinary change`);
         }
         channel = recovered.channel_id;
         funding = await hoe('open_payload', scope, channel);
@@ -616,13 +630,14 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     if (phase === 'funding-change-verify') {
       check(auth.get(0x20)?.length === 32 && hex(auth.get(0x20)) === channel, 'reloaded native player has the recovered channel');
       const saved = await hoe('inspect', scope);
-      check(saved.admitted === true && saved.channel_id === channel && saved.capacity_msats === '50' &&
-        saved.balance_msats === '0' && await walletBalance(mint) === '14', 'admission and exactly 14 msat of ordinary change survive reload');
-      await status('50', '0');
+      check(saved.admitted === true && saved.channel_id === channel && saved.capacity_msats === tenCuts &&
+        saved.balance_msats === '0' && await walletBalance(mint) === recoveryChange,
+        `admission and exactly ${recoveryChange} msat of ordinary change survive reload`);
+      await status(tenCuts, '0');
       step('spend the recovered change as ordinary wallet funds');
-      const sent = await walletCall('send', [mint, '14', '0']);
+      const sent = await walletCall('send', [mint, recoveryChange, '0']);
       check(sent.sender_fee_msats === '0' && typeof sent.token === 'string' && sent.token.length > 0 &&
-        await walletBalance(mint) === '0', 'the ordinary wallet can send all 14 recovered msat without a fee');
+        await walletBalance(mint) === '0', `the ordinary wallet can send all ${recoveryChange} recovered msat without a fee`);
       return true;
     }
     if (phase === 'initial' || phase === 'funding-drop') {
@@ -630,97 +645,98 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       const terms = await requirements();
       check(!(await areaCut(0, 1)), 'native tile starts uncut');
       if (smoke) return true;
-      const pending = await fund(mint, player, terms, changeRecovery ? '50' : '10');
+      const pending = await fund(mint, player, terms, changeRecovery ? tenCuts : twoCuts);
       if (phase === 'funding-drop') return pending;
       // Issuing this after the first funding keeps its exact proofs in reserve for channel two.
-      const reserved = rendererTopUp ? '100' : '5';
+      const reserved = rendererTopUp ? twentyCuts : oneCut;
       await deposit(mint, reserved, reserved);
-      await cut(0, 1, '5');
+      await cut(0, 1, oneCut);
       // The test peer checks the wire reply, but deliberately leaves the wallet cut pending.
       return channel; // Public identifier only.
     }
 
     if (phase === 'renderer-top-up-verify') {
       const saved = await hoe('inspect', scope);
-      check(saved.admitted && saved.channel_id !== channel && saved.capacity_msats === '105' && saved.balance_msats === '0',
+      check(saved.admitted && saved.channel_id !== channel && saved.capacity_msats === twentyOneCuts && saved.balance_msats === '0',
         'replacement keeps the unused cut and adds twenty new uses');
-      check(await walletBalance(mint) === '0', 'replacement spends the credited 5 msat plus the approved additional 100 msat');
-      await status('105', '0', 0, saved.channel_id);
-      await status('10', '5', 3, channel, true);
+      check(await walletBalance(mint) === '0', `replacement spends the credited ${oneCut} msat plus the approved additional ${twentyCuts} msat`);
+      await status(twentyOneCuts, '0', 0, saved.channel_id);
+      await status(twoCuts, oneCut, 3, channel, true);
       return true;
     }
     if (phase === 'partial-replace') {
       check(!auth.has(0x20), 'settled channel is absent from authenticated playable state');
-      const receipt = await status('10', '5', 3, channel, true);
+      const receipt = await status(twoCuts, oneCut, 3, channel, true);
       await hoe('finalize', scope, channel, receipt.capacity, receipt.accepted, receipt.proofs);
-      check(await walletBalance(mint) === '10', 'settlement returns the one unused cut to the wallet exactly once');
-      await fund(mint, player, await requirements(), '10');
+      check(await walletBalance(mint) === twoCuts, 'settlement returns the one unused cut to the wallet exactly once');
+      await waitForNextFundingSecond();
+      await fund(mint, player, await requirements(), twoCuts);
       return channel;
     }
-    const accepted = phase === 'renderer-resume-verify' ? '0' : '5';
+    const accepted = phase === 'renderer-resume-verify' ? '0' : oneCut;
     check(auth.get(0x20)?.length === 32 && hex(auth.get(0x20)) === channel &&
-      auth.get(0x26)?.length === 8 && u64(auth.get(0x26)) === (largeRefill ? '100' : '10') &&
+      auth.get(0x26)?.length === 8 && u64(auth.get(0x26)) === refillCapacity &&
       auth.get(0x27)?.length === 8 && u64(auth.get(0x27)) === accepted,
       'new authenticated socket resumes the same channel at the expected accepted balance');
     if (phase === 'renderer-resume-verify') {
-      await status('10', '0');
+      await status(twoCuts, '0');
       return true;
     }
     if (phase === 'renderer-verify') {
-      await status(largeRefill ? '100' : '10', '5');
+      await status(refillCapacity, oneCut);
       check(await areaCut(0, 1), 'native snapshot marks the grass clicked by the renderer cut');
       return true;
     }
     const saved = await hoe('inspect', scope);
-    const locallyAccepted = phase === 'recover' ? '0' : '5';
-    check(saved.channel_id === channel && saved.capacity_msats === '10' && saved.balance_msats === locallyAccepted && saved.admitted,
+    const locallyAccepted = phase === 'recover' ? '0' : oneCut;
+    check(saved.channel_id === channel && saved.capacity_msats === twoCuts && saved.balance_msats === locallyAccepted && saved.admitted,
       'wallet retains the expected local balance across reload');
     if (phase === 'recover') {
-      const authoritative = await status('10', '5');
+      const authoritative = await status(twoCuts, oneCut);
       // A plausible but unsent cumulative balance must not overwrite the pending payment.
       step('reject a bind above the pending payment');
-      const wrong = JSON.parse(await wallet.hoe_request('bind', JSON.stringify([scope, channel, authoritative.capacity, '10'])));
+      const wrong = JSON.parse(await wallet.hoe_request('bind', JSON.stringify([scope, channel, authoritative.capacity, twoCuts])));
       check(wrong.status === 19, 'wallet rejects a nonmatching accepted balance');
       step('check durable pending cut blocks a new payment');
       const blocked = JSON.parse(await wallet.hoe_request('prepare_cut', JSON.stringify([scope, channel, hex(random(16))])));
       check(blocked.status === 19, 'pending cut survives reload and blocks a new payment');
       const bound = await hoe('bind', scope, channel, authoritative.capacity, authoritative.accepted);
       check(bound.balance_msats === authoritative.accepted, 'wallet binds the exact authoritative cumulative balance');
-      await status('10', '5');
+      await status(twoCuts, oneCut);
       check(await areaCut(0, 1), 'native snapshot still marks the tile cut after reload');
-      check(await walletBalance(mint) === (rendererTopUp ? '100' : '5'), 'reconciliation preserves the replacement deposit');
+      check(await walletBalance(mint) === (rendererTopUp ? twentyCuts : oneCut), 'reconciliation preserves the replacement deposit');
       return true;
     }
 
     if (phase === 'partial-close') {
       const closeAt = amount => request(0x23, 0xa3, [[0x20, unhex(channel)], [0x27, encodeU64(amount)]]);
-      for (const stale of ['0', '10']) {
+      for (const stale of ['0', twoCuts]) {
         check(failureCode((await closeAt(stale)).get(4)) === 23, 'a close at a mismatched balance is rejected');
       }
-      await status('10', '5');
+      await status(twoCuts, oneCut);
       const lateId = random(16);
       const latePayment = await hoe('prepare_cut', scope, channel, hex(lateId));
       closingChannels.add(channel);
-      const closed = await closeAt('5');
+      const closed = await closeAt(oneCut);
       check(closed.get(3)?.length === 0 || failureCode(closed.get(4)) === 25, 'exact partial close starts settlement');
-      const late = await sendCut(lateId, point(1, 0), channel, '10', latePayment);
+      const late = await sendCut(lateId, point(1, 0), channel, twoCuts, latePayment);
       check(late.has(4) && !(await areaCut(1, 0)), 'a payment prepared before close cannot charge after the freeze');
       await hoe('resolve_cut', scope, channel, hex(lateId), 'not_charged');
-      await status('10', '5', 3, channel, true);
-      check((await closeAt('5')).get(3)?.length === 0, 'retrying the exact close returns the settled result');
-      check(await walletBalance(mint) === '5', 'only finalization credits the sender');
+      await status(twoCuts, oneCut, 3, channel, true);
+      check((await closeAt(oneCut)).get(3)?.length === 0, 'retrying the exact close returns the settled result');
+      check(await walletBalance(mint) === oneCut, 'only finalization credits the sender');
       return true;
     }
 
-    const duplicate = await cut(0, 1, '10', true);
+    const duplicate = await cut(0, 1, twoCuts, true);
     const rejected = await hoe('resolve_cut', scope, channel, duplicate, 'not_charged');
-    check(rejected.balance_msats === '5', 'duplicate did not increase the wallet balance');
-    await status('10', '5');
+    check(rejected.balance_msats === oneCut, 'duplicate did not increase the wallet balance');
+    await status(twoCuts, oneCut);
     check(!(await areaCut(1, 0)), 'second grass tile starts uncut');
-    const finalCut = await cut(1, 0, '10');
+    const finalCut = await cut(1, 0, twoCuts);
     const charged = await hoe('resolve_cut', scope, channel, finalCut, 'charged');
-    check(charged.balance_msats === '10', 'second grass cut consumes the remaining capacity');
-    await status('10', '10', 1);
+    check(charged.balance_msats === twoCuts, 'second grass cut consumes the remaining capacity');
+    await status(twoCuts, twoCuts, 1);
     check(await areaCut(1, 0), 'depleting cut is visible in the world');
 
     step('close the depleted channel');
@@ -729,11 +745,12 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
     const closeFailure = closed.get(4);
     check(closed.get(3)?.length === 0 || (closeFailure?.length === 2 && failureCode(closeFailure) === 25),
       'native close succeeded or started settlement');
-    const settled = await status('10', '10', 3);
+    const settled = await status(twoCuts, twoCuts, 3);
     await hoe('finalize', scope, channel, settled.capacity, settled.accepted, '');
     check((await hoe('inspect', scope)).channel_id === null, 'finalize releases the settled wallet funding slot');
-    check(await walletBalance(mint) === '5', 'fully depleted settlement credits no sender change');
-    await fund(mint, player, await requirements(), '5');
+    check(await walletBalance(mint) === oneCut, 'fully depleted settlement credits no sender change');
+    await waitForNextFundingSecond();
+    await fund(mint, player, await requirements(), oneCut);
     return channel;
   } finally {
     socket?.close();
@@ -745,7 +762,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
 
 // Observe the production bridge without changing its calls or replies. Keep
 // only completed operation numbers and allowlisted scalar result fields.
-function observeRendererHoe(savedOperation, interruptTopUp = false) {
+function observeRendererHoe({oneCut, twoCuts, twentyCuts, twentyOneCuts}, savedOperation, interruptTopUp = false) {
   const replies = window.rendererHoeReplies = {};
   const requests = window.rendererHoeRequests = {};
   const successes = window.rendererHoeSuccesses = {};
@@ -778,19 +795,19 @@ function observeRendererHoe(savedOperation, interruptTopUp = false) {
             if (data?.status === 0) successes[op] = (successes[op] ?? 0) + 1;
             replies[op] = {
               ok: data?.status === 0,
-              twentyCutQuote: op === 2 && data?.cuts === '20' && data.capacity_msats === '100' && data.max_debit_msats === '100',
-              topUpQuote: op === 2 && data?.cuts === '21' && data.capacity_msats === '105' && data.max_debit_msats === '105',
+              twentyCutQuote: op === 2 && data?.cuts === '20' && data.capacity_msats === twentyCuts && data.max_debit_msats === twentyCuts,
+              topUpQuote: op === 2 && data?.cuts === '21' && data.capacity_msats === twentyOneCuts && data.max_debit_msats === twentyOneCuts,
               status: Number.isInteger(data?.status) ? data.status : null,
               noEligibleFunds: data?.error === 'no affordable whole hoe cut using eligible active-keyset proofs',
               proofLimit: data?.error === 'requested capacity exceeds the funding proof limit',
               incompatibleMint: data?.error === 'requested capacity cannot be represented by the mint',
-              twoCutQuote: (op === 2 || op === 9) && data?.cuts === '2' && data.capacity_msats === '10' && data.max_debit_msats === '10',
+              twoCutQuote: (op === 2 || op === 9) && data?.cuts === '2' && data.capacity_msats === twoCuts && data.max_debit_msats === twoCuts,
               pendingSaved: op === 1 && data?.status === 19 && data.operation_id === savedOperation?.operationId,
               savedQuote: op === 9 && data?.operation_id === savedOperation?.operationId &&
                 data?.refund_time === savedOperation?.refundTime && data?.mint_url === location.origin,
               channel: op === 9 && /^[0-9a-f]{64}$/.test(data?.channel_id) ? data.channel_id : null,
               zeroAccepted: op === 5 && data?.balance_msats === '0',
-              fiveAccepted: (op === 5 || op === 7) && data?.balance_msats === '5',
+              oneCutAccepted: (op === 5 || op === 7) && data?.balance_msats === oneCut,
             };
             if (interruptTopUp && op === 8 && data?.status === 0) return;
           }
@@ -859,7 +876,10 @@ async function rendererFlow(areaReady, savedOperation = null) {
 
   stage = 'load real game renderer';
   await send('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor:1, mobile:false});
-  let {identifier} = await send('Page.addScriptToEvaluateOnNewDocument', {source:`(${observeRendererHoe})(${JSON.stringify(savedOperation)}, ${resumeTopUp})`});
+  const observeHoe = (operation, interrupt) => send('Page.addScriptToEvaluateOnNewDocument', {
+    source:`(${observeRendererHoe})(${JSON.stringify(hoeAmounts)}, ${JSON.stringify(operation)}, ${interrupt})`,
+  });
+  let {identifier} = await observeHoe(savedOperation, resumeTopUp);
   const beforeRequirements = requirementsRequests;
   await send('Page.bringToFront');
   await load(false, `${mintOrigin}/renderer/index.html`);
@@ -894,13 +914,13 @@ async function rendererFlow(areaReady, savedOperation = null) {
   // Center of the increase button on the third Tools row, at 1000x640.
   const clickRefill = () => click(width / 2 - 4, height / 2 + 19);
   if (rendererTopUp) {
-    await expect('renderer binds the partially used channel before the click', 'rendererHoeReplies[5]?.fiveAccepted');
+    await expect('renderer binds the partially used channel before the click', 'rendererHoeReplies[5]?.oneCutAccepted');
     await click(width / 2 + 124, height / 2 + 19);
     if (resumeTopUp) {
       await expect('credit committed before simulated page loss', 'rendererHoeReplies[12]?.ok && rendererHoeReplies[8]?.ok');
       assert.equal(opens, 1, 'no replacement admitted before page loss');
       await send('Page.removeScriptToEvaluateOnNewDocument', {identifier});
-      ({identifier} = await send('Page.addScriptToEvaluateOnNewDocument', {source:`(${observeRendererHoe})(null)`}));
+      ({identifier} = await observeHoe(null, false));
       await load(false, `${mintOrigin}/renderer/index.html`);
     }
     await expect('one click completes exact quote, purchase and channel binding',
@@ -921,7 +941,7 @@ async function rendererFlow(areaReady, savedOperation = null) {
     assert.equal(await evaluate('rendererHoeRequests[9] ?? 0'), 0, 'inspect does not request a resume quote');
     stage = 'click Review saved refill in the HUD';
     await clickRefill();
-    await expect('HUD click quotes the original saved refill for two cuts and 10 msat',
+    await expect(`HUD click quotes the original saved refill for two cuts and ${hoeAmounts.twoCuts} msat`,
       'rendererHoeReplies[9]?.ok && rendererHoeReplies[9].twoCutQuote && rendererHoeReplies[9].savedQuote && rendererHoeReplies[9].channel');
     const channel = await evaluate('rendererHoeReplies[9].channel');
     await assertNoResume();
@@ -953,7 +973,7 @@ async function rendererFlow(areaReady, savedOperation = null) {
   await expect('refill binds the real server channel at zero accepted', 'rendererHoeReplies[3]?.ok && rendererHoeReplies[5]?.ok && rendererHoeReplies[5].zeroAccepted');
   assert.equal(swaps, 1, 'consent performs exactly one mint swap');
   assert.equal(cuts, 0, 'the refill click must not send a cut');
-  console.log(`ok - Tools quoted ${largeRefill ? '20 cuts for 100 msat' : 'two cuts for 10 msat'}, then refilled on a separate click with one mint swap`);
+  console.log(`ok - Tools quoted ${largeRefill ? '20' : 'two'} cuts for ${largeRefill ? hoeAmounts.twentyCuts : hoeAmounts.twoCuts} msat, then refilled on a separate click with one mint swap`);
   await expect('native area supplies the renderer with uncut grass at (0,1)', areaReady);
   await settle();
   await expect('renderer rebinds the funded channel after authentication refresh', 'rendererHoeSuccesses[5] >= 2');
@@ -977,7 +997,7 @@ async function rendererFlow(areaReady, savedOperation = null) {
   stage = 'aim from four tiles down and one tile right in the renderer';
   await click(grassX + 32, height / 2 + 4 * 32);
   await expect('distant click aims at the adjacent grass', 'rendererHoeRequests[6] === 1');
-  await expect('renderer resolves the cut at 5 msat', 'rendererHoeReplies[7]?.ok && rendererHoeReplies[7].fiveAccepted');
+  await expect(`renderer resolves the cut at ${hoeAmounts.oneCut} msat`, 'rendererHoeReplies[7]?.ok && rendererHoeReplies[7].oneCutAccepted');
   assert.equal(cuts, 1, 'the grass click sends exactly one paid cut');
   assert.equal(swaps, 1, 'the grass click uses the channel without another mint swap');
   await send('Page.removeScriptToEvaluateOnNewDocument', {identifier});
@@ -1053,7 +1073,7 @@ async function run() {
 
   stage = 'bootstrap wallet and native player';
   await load();
-  const flow = options => evaluate(`(${pageFlow})(${JSON.stringify({changeRecovery, tools:toolsFixture, largeRefill, rendererTopUp, ...options})})`);
+  const flow = options => evaluate(`(${pageFlow})(${JSON.stringify({changeRecovery, tools:toolsFixture, largeRefill, rendererTopUp, amounts:hoeAmounts, ...options})})`);
   assert.equal(await flow({phase:'bootstrap', smoke}), true);
   if (changeRecovery) {
     assert.equal(swaps, 0, 'fixture setup sets aside exact denominations without swapping');
@@ -1084,7 +1104,7 @@ async function run() {
     assert.equal(swaps, 2, 'reconnect and pickaxe harvest must not swap');
     assert.equal(opens, 2, 'reconnect must not reopen either channel');
     assert.equal(cuts, 4, 'only one more cut after reconnect');
-    console.log('ok - axe (2 msat) and pickaxe (10 msat): mismatches not charged, independent depletion and settlement, restored auth bindings, and movement onto both harvested tiles');
+    console.log(`ok - axe (${toolsFixture.axe.price} msat) and pickaxe (${toolsFixture.pickaxe.price} msat): mismatches not charged, independent depletion and settlement, restored auth bindings, and movement onto both harvested tiles`);
     return;
   }
 
@@ -1158,7 +1178,7 @@ async function run() {
     await load(true);
     const channel = await flow({phase:'funding-recover', savedOperation});
     if (changeRecovery) {
-      stage = 'verify recovered 14-msat wallet change and binding after another reload';
+      stage = `verify recovered ${hoeAmounts.recoveryChange}-msat wallet change and binding after another reload`;
       await load(true);
       assert.equal(await flow({phase:'funding-change-verify', channel}), true);
     }
@@ -1169,7 +1189,7 @@ async function run() {
     assert.equal(opens, 1, 'the recovered channel opened exactly once');
     assert.equal(cuts, 0, 'funding recovery must not send a cut');
     console.log(changeRecovery
-      ? 'ok - lost swap response recovered ten cuts (50 msat) and 14 msat of ordinary wallet change in one commit; opened and bound with one swap POST'
+      ? `ok - lost swap response recovered ten cuts (${hoeAmounts.tenCuts} msat) and ${hoeAmounts.recoveryChange} msat of ordinary wallet change in one commit; opened and bound with one swap POST`
       : 'ok - committed swap response dropped; inspect recovered via NUT-07 and NUT-09 after reload; channel opened and bound with one swap POST total');
     return;
   }
@@ -1192,11 +1212,12 @@ async function run() {
   assert.equal(await flow({phase:'recover', channel}), true);
   assert.equal(swaps, 1, 'recovery must not submit a second funding swap');
   assert.equal(cuts, 1, 'recovery must not retransmit the cut');
-  console.log('ok - unresolved cut bound to exactly 5 msat from native status after reload; no repeated cut or swap');
+  console.log(`ok - unresolved cut bound to exactly ${hoeAmounts.oneCut} msat from native status after reload; no repeated cut or swap`);
 
   if (rendererTopUp) {
     await rendererFlow(null);
-    await load(true);
+    stage = 'verify durable renderer top-up and native settlement';
+    await load();
     assert.equal(await flow({phase:'renderer-top-up-verify', channel}), true);
     assert.equal(opens, 2, 'one initial open and one replacement');
     assert.equal(cuts, 1, 'top-up never charges an extra cut');

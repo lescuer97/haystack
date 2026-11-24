@@ -159,17 +159,27 @@ pub const GameDb = struct {
         try self.commit();
     }
 
+    /// Enter 'sending' durably and return the original amount, not today's prize schedule.
+    pub fn beginPrizeSend(self: *GameDb, prize: Prize) !u64 {
+        try self.reopenIfPoisoned();
+        const stmt = try self.prepare("UPDATE pending_prizes SET state = 'sending' WHERE x = ?1 AND y = ?2 AND owner = ?3 AND state = 'owed' RETURNING amount_msat");
+        defer stmt.finalize();
+        try bindPrize(stmt, prize);
+        if (!try stmt.next()) return error.PrizeStateConflict;
+        const amount_msat = try stmt.uint(0);
+        try stmt.finish();
+        return amount_msat;
+    }
+
     /// Every transition is its own durable write. An interrupted send remains
     /// in 'sending' for manual reconciliation, even when no operation ID made it back.
     pub fn recordPrizeSend(self: *GameDb, prize: Prize, change: union(enum) {
-        intent,
         no_token: [16]u8,
         uncertain: [16]u8,
         issued: struct { operation_id: [16]u8, token: []const u8 },
     }) !void {
         try self.reopenIfPoisoned();
         const stmt = try self.prepare(switch (change) {
-            .intent => "UPDATE pending_prizes SET state = 'sending' WHERE x = ?1 AND y = ?2 AND owner = ?3 AND state = 'owed'",
             .no_token => "UPDATE pending_prizes SET state = 'unfunded', operation_id = ?4 WHERE x = ?1 AND y = ?2 AND owner = ?3 AND state = 'sending'",
             .uncertain => "UPDATE pending_prizes SET operation_id = ?4 WHERE x = ?1 AND y = ?2 AND owner = ?3 AND state = 'sending'",
             .issued => "UPDATE pending_prizes SET state = 'issued', operation_id = ?4, token = ?5 WHERE x = ?1 AND y = ?2 AND owner = ?3 AND state = 'sending'",
@@ -177,7 +187,6 @@ pub const GameDb = struct {
         defer stmt.finalize();
         try bindPrize(stmt, prize);
         switch (change) {
-            .intent => {},
             .no_token, .uncertain => |id| try stmt.bindBlob(4, &id),
             .issued => |issued| {
                 try stmt.bindBlob(4, &issued.operation_id);
@@ -479,7 +488,7 @@ test "winning cut and unique owner survive reopen or roll back together" {
         var stranger = prize;
         stranger.owner = @splat(0x44);
         try testing.expectError(error.SqliteConstraint, db.commitPrizeCut(stranger, @splat(0xff), 1000));
-        try testing.expectError(error.PrizeStateConflict, db.recordPrizeSend(stranger, .intent));
+        try testing.expectError(error.PrizeStateConflict, db.beginPrizeSend(stranger));
     }
     var db = try GameDb.open(path);
     defer db.close();
@@ -586,8 +595,8 @@ test "game database keeps oversized issued prize tokens across reopen" {
     {
         var db = try GameDb.open(path);
         defer db.close();
-        try db.commitPrizeCut(prize, @splat(0xff), 500);
-        try db.recordPrizeSend(prize, .intent);
+        try db.commitPrizeCut(prize, @splat(0xff), 1);
+        _ = try db.beginPrizeSend(prize);
         try db.recordPrizeSend(prize, .{ .issued = .{ .operation_id = @splat(1), .token = &token } });
     }
     try expectOpenUnchanged(&tmp, path);
@@ -597,8 +606,9 @@ test "unfunded prizes record millisats without a token" {
     var db = try GameDb.open(":memory:");
     defer db.close();
     const prize: Prize = .{ .x = 1, .y = 2, .owner = @splat(3) };
-    try db.commitPrizeCut(prize, @splat(0xff), 1000);
-    try db.recordPrizeSend(prize, .intent);
+    const owed_msat: u64 = 37;
+    try db.commitPrizeCut(prize, @splat(0xff), owed_msat);
+    _ = try db.beginPrizeSend(prize);
     try db.recordPrizeSend(prize, .{ .no_token = @splat(0) });
     try testing.expectError(error.SqliteConstraint, db.exec("UPDATE pending_prizes SET unit = 'sat'"));
     try testing.expectError(error.SqliteConstraint, db.exec("UPDATE pending_prizes SET token = X'aa'"));
@@ -606,7 +616,7 @@ test "unfunded prizes record millisats without a token" {
     defer row.finalize();
     try testing.expect(try row.next());
     try testing.expect(row.textEquals(0, "msat"));
-    try testing.expectEqual(@as(u64, 1000), try row.uint(1));
+    try testing.expectEqual(owed_msat, try row.uint(1));
     try testing.expect(row.textEquals(2, "unfunded"));
     try testing.expect(row.isNull(3));
     try row.finish();

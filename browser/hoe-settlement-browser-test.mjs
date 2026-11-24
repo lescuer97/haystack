@@ -44,35 +44,39 @@ async function settlementPreflight() {
     } while (performance.now() < deadline);
     throw new Error('fixture deposit was not issued');
   };
+  const price = 4;
+  const twoCuts = String(2 * price);
+  const withdrawalBalance = 32;
+  const depositWithChange = String(withdrawalBalance + price);
   try {
     signer = await service.open_game_signer();
     wallet = await service.open_ready_wallet();
     await call('add_mint', mint);
-    await deposit('10');
+    await deposit(twoCuts);
     const player = Array.from(signer.sign(new Uint8Array(32), new Uint8Array(32)).subarray(0, 33),
       byte => byte.toString(16).padStart(2, '0')).join('');
     const scope = 'settlement-preflight-fixture';
-    const terms = [scope, pure('spilman_generate_keypair').pubkey_hex, '5', String(Math.floor(Date.now() / 1000) + 600), player];
+    const terms = [scope, pure('spilman_generate_keypair').pubkey_hex, String(price), String(Math.floor(Date.now() / 1000) + 600), player];
     const quote = await hoe('quote', ...terms);
     const {channel_id: channel, capacity_msats: capacity} = await hoe('fund', quote.quote_id, ...terms);
-    check(capacity === '10', 'expected a two-cut channel');
+    check(capacity === twoCuts, 'expected a two-cut channel');
     await hoe('bind', scope, channel, capacity, '0');
     await hoe('prepare_cut', scope, channel, '01'.repeat(16));
 
     // Use real, unspent mint proofs; the fixture isolates wallet finalization,
     // not the native server's construction of conditional sender change.
-    await deposit('37');
-    const {token} = await call('send', mint, '5', '0');
+    await deposit(depositWithChange);
+    const {token} = await call('send', mint, String(price), '0');
     const keyset = (await call('get_active_keyset_info_json', mint)).value;
     const proofs = pure('token_to_proofs_json', token, keyset).value;
-    check(await balance() === '32', 'fixture leaves 32 msat before withdrawal');
+    check(await balance() === String(withdrawalBalance), 'fixture leaves the expected balance before withdrawal');
     const invoice = await fetch('/test-withdrawal-invoice?msats=21');
     check(invoice.ok, 'fixture withdrawal invoice unavailable');
     const review = JSON.parse((await call('prepare_withdrawal', mint, (await invoice.json()).invoice)).value);
     const before = await snapshot();
     const swaps = () => performance.getEntriesByName(`${mint}/v1/swap`).length;
     const beforePreflight = swaps();
-    const finalize = [scope, channel, capacity, '5', proofs];
+    const finalize = [scope, channel, capacity, String(price), proofs];
     const blocked = JSON.parse(await hoeReply('finalize', ...finalize));
     check(blocked.status === 19 && blocked.error === 'hoe_settlement_preflight: cancel or confirm the active withdrawal review first',
       'finalize must reach and return the real withdrawal preflight rejection');
@@ -82,15 +86,15 @@ async function settlementPreflight() {
     check(swaps() === beforePreflight, 'preflight rejection must not start a mint swap');
 
     const cancel = JSON.parse((await call('cancel_withdrawal', mint, review.operation_id)).value);
-    check(cancel.cancelled === true && await balance() === '32', 'cancellation restores the original spendable balance');
+    check(cancel.cancelled === true && await balance() === String(withdrawalBalance), 'cancellation restores the original spendable balance');
     const beforeRetry = swaps();
     await hoe('finalize', ...finalize);
     check(swaps() === beforeRetry + 1, 'retry performs exactly one mint swap');
     check((await hoe('inspect', scope)).channel_id === null, 'retry releases the funding slot');
-    check(await balance() === '37', 'retry credits exactly 5 msat');
+    check(await balance() === depositWithChange, `retry credits exactly ${price} msat`);
     const completed = await snapshot();
     const receipt = JSON.parse(new TextDecoder().decode(Uint8Array.from(JSON.parse(completed.data).kv['browser_hoe\x1f\x1fpayment_v1'])));
-    check(receipt.balance === 5 && receipt.pending === null && receipt.receipt?.net === 5,
+    check(receipt.balance === price && receipt.pending === null && receipt.receipt?.net === price,
       'retry reconciles the pending cut and persists the completed credit receipt');
     return true;
   } finally {

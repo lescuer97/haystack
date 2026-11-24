@@ -21,8 +21,8 @@ play the walk animation; blocked steps don't. Releasing movement returns to
 idle. Mouse drag only pans the view.
 Click the hotbar or press `1` for Pickaxe, `2` for Axe, or `3` for Hoe. The
 hoe starts selected. Aim with a world click or use `Space` on the tile you
-face: the pickaxe clears rock (10 msats), the axe clears trees (2 msats),
-and the hoe cuts grass (5 msats). Refill each tool separately. You can switch
+face: the pickaxe clears rock (8 msats), the axe clears trees (2 msats),
+and the hoe cuts grass (4 msats). Refill each tool separately. You can switch
 slots while a payment is pending; it still charges and animates the original
 tool, and a second paid action waits. Cleared trees and rocks become walkable
 and don’t drop inventory items. Keys `4` and `5` still preview the watering can

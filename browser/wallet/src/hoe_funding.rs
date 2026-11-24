@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     fn prepare_record(keyset: KeysetInfo, selection: &Selection<'_>) -> FundingRecord {
-        prepare_tool_record(Tool::Hoe, Uuid::nil(), 50, keyset, selection)
+        prepare_tool_record(Tool::Hoe, Uuid::nil(), 40, keyset, selection)
     }
 
     fn prepare_tool_record(
@@ -1336,7 +1336,7 @@ mod tests {
                 )
                 .map(|s| (cuts, s.debit))
         });
-        assert_eq!(largest, Some((9, 53)));
+        assert_eq!(largest, Some((11, 52)));
         let (_, large) = fixture(100, &[64]);
         let selection = large.find(52, 100, 55).unwrap();
         assert_eq!((selection.debit, selection.change), (53, 11));
@@ -1351,7 +1351,7 @@ mod tests {
         let (keyset, inputs) = fixture(0, &[32, 64]);
         let mut store = super::super::browser_db::Store::default();
         let mut records = Vec::new();
-        for (tool, capacity, id, input) in [(Tool::Axe, 20, 1, 1), (Tool::Hoe, 50, 2, 0)] {
+        for (tool, capacity, id, input) in [(Tool::Axe, 16, 1, 1), (Tool::Hoe, 40, 2, 0)] {
             let unspent = FundingInputs(vec![inputs.0[input].clone()]);
             let selection = unspent.find(capacity, 0, tool.max_debit()).unwrap();
             let record = prepare_tool_record(
@@ -1371,7 +1371,7 @@ mod tests {
                     .is_none());
             }
             assert!(decode_record(tool, &prior).is_ok());
-            // Capacity 20 is valid for both axe and pickaxe; the record must
+            // Both capacities are valid for the pickaxe; the record must
             // still be rejected if it appears in the wrong slot.
             assert!(decode_record(Tool::Pickaxe, &prior).is_err());
             store.kv.insert(key, prior.clone());
@@ -1413,13 +1413,13 @@ mod tests {
     #[test]
     fn journal_restores_every_signature_and_credits_only_verified_change() {
         let (keyset, inputs) = fixture(0, &[64]);
-        let selection = inputs.find(50, 0, 50).unwrap();
+        let selection = inputs.find(40, 0, 40).unwrap();
         let record = prepare_record(keyset, &selection);
         let prior = encode(&record).unwrap();
         let mut record = decode_record(Tool::Hoe, &prior).unwrap();
         let saved = submitted(&record).unwrap();
-        assert_eq!(saved.layout.debit, 50);
-        assert_eq!(saved.layout.change, 14);
+        assert_eq!(saved.layout.debit, 40);
+        assert_eq!(saved.layout.change, 24);
         assert_eq!(saved.raw, serde_json::to_string(&saved.swap).unwrap());
         let response = sign(&saved.swap);
         let (funding, change) = verify_completed(&record, &saved, &response).unwrap();
@@ -1428,7 +1428,7 @@ mod tests {
                 .iter()
                 .map(|p| u64::from(p.proof.amount))
                 .sum::<u64>(),
-            14
+            24
         );
         assert!(change.iter().all(|p| p.state == State::Unspent
             && p.spending_condition.is_none()
@@ -1500,7 +1500,7 @@ mod tests {
     #[test]
     fn testnut_returns_exact_change_net_of_the_raw_swap_fee() {
         let (keyset, inputs) = fixture(100, &[64]);
-        let selection = inputs.find(52, 100, Tool::Hoe.max_debit()).unwrap();
+        let selection = inputs.find(42, 100, Tool::Hoe.max_debit()).unwrap();
         let record = prepare_record(keyset, &selection);
         let saved = submitted(&record).unwrap();
         assert_eq!(u64::from(saved.swap.output_amount().unwrap()), 63);
@@ -1510,15 +1510,15 @@ mod tests {
                 .iter()
                 .map(|p| u64::from(p.proof.amount))
                 .sum::<u64>(),
-            11
+            21
         );
-        assert_eq!(saved.layout.debit, 53);
+        assert_eq!(saved.layout.debit, 43);
     }
 
     #[test]
     fn journal_requires_the_current_schema_even_without_change() {
-        let (keyset, inputs) = fixture(0, &[32, 16, 2]);
-        let selection = inputs.find(50, 0, 50).unwrap();
+        let (keyset, inputs) = fixture(0, &[32, 8]);
+        let selection = inputs.find(40, 0, 40).unwrap();
         let record = prepare_record(keyset, &selection);
         let record = decode_record(Tool::Hoe, &encode(&record).unwrap()).unwrap();
         let saved = submitted(&record).unwrap();

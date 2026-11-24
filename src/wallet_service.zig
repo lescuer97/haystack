@@ -132,7 +132,8 @@ test "wallet guard validates capacity for the selected tool before funding" {
     _ = try std.fmt.hexToBytes(&owner, owner_hex);
     const receiver_hex = std.fmt.bytesToHex(headless.receiverPubkey(3600).?, .lower);
     const now = headless.unixSeconds().?;
-    for ([_]protocol.tool{ .axe, .hoe, .pickaxe }, [_]u64{ 2, 5, 10 }) |tool, price| {
+    for (protocol.tools) |tool| {
+        const price = tool.priceMsat();
         for ([_]u64{ price, price + 1 }) |capacity| {
             const params = try std.json.Stringify.valueAlloc(a, .{
                 .capacity = capacity,

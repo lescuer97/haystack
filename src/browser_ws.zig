@@ -570,7 +570,7 @@ test "browser serializes move, owned channel open, signed cut and area" {
     @memset(&proof, 0);
     @memset(&params, 0);
     try t.expect(!worker.submitCut(1, cut));
-    cut.payload.payment = .{ .id = open.payload.id, .amount = 5, .signature = @splat(0x33) };
+    cut.payload.payment = .{ .id = open.payload.id, .amount = protocol.tool.hoe.priceMsat(), .signature = @splat(0x33) };
     try t.expect(!worker.submitCut(0, cut));
     try t.expect(worker.submitCut(1, cut));
     try t.expect(!worker.submitCut(1, cut));

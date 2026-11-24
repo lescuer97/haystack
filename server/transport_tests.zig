@@ -287,11 +287,11 @@ test "pending prize notices replay exact tokens only to the confirmed owner unti
     @memcpy(large_token[0..6], "cashuB");
     const tokens = [_][]const u8{ "cashu-exact-first", &large_token, "cashu-stranger", &oversized_token };
     for ([_]Prize{ first, second, .{ .x = 0, .y = 0, .owner = stranger }, oversized }, tokens) |prize, token| {
-        try db.commitPrizeCut(prize, @splat(0xff), @import("prize.zig").amount_msat);
-        try db.recordPrizeSend(prize, .intent);
+        try db.commitPrizeCut(prize, @splat(0xff), 1);
+        _ = try db.beginPrizeSend(prize);
         try db.recordPrizeSend(prize, .{ .issued = .{ .operation_id = @splat(7), .token = token } });
     }
-    try db.commitPrizeCut(owed, @splat(0xff), @import("prize.zig").amount_msat);
+    try db.commitPrizeCut(owed, @splat(0xff), 1);
 
     var signature: [64]u8 = undefined;
     _ = try std.fmt.hexToBytes(&signature, test_signature_hex);
@@ -372,7 +372,7 @@ test "pending prize notices replay exact tokens only to the confirmed owner unti
             var owed_ack: [wire.prize_ack_bytes]u8 = undefined;
             try handler.clientMessage(try wire.encodePrizeAck(&owed_ack, .{ .x = owed.x, .y = owed.y }), .binary);
             try t.expectEqual(before, output.buffered().len);
-            try db.recordPrizeSend(owed, .intent); // The ACK did not delete unpaid debt.
+            _ = try db.beginPrizeSend(owed); // The ACK did not delete unpaid debt.
         }
         handler.close();
     }
@@ -768,12 +768,13 @@ test "headless wallet exposes owned spendable and depleted channels and quotes u
     const unredeemed: ChannelId = @splat(11);
     const exhausted_in_cutoff: ChannelId = @splat(12);
     const expired_exhausted: ChannelId = @splat(13);
+    const legacy_price: ChannelId = @splat(14);
     const active_capacity = 3 * p.hoe_price_msat;
     const active_balance = 2 * p.hoe_price_msat;
     const exhausted_capacity = p.hoe_price_msat;
     const open_proofs = "[{\"trusted_fixture_proof\":true}]";
     const sender_proofs = "[{\"sender\":true}]";
-    const cases = [_]struct { id: ChannelId, owner: [33]u8, expiry: u64, phase: wallet_service.ChannelPhase }{
+    const cases = [_]struct { id: ChannelId, owner: [33]u8, expiry: u64, phase: wallet_service.ChannelPhase, price: u64 = p.hoe_price_msat }{
         .{ .id = active, .owner = key, .expiry = now + 3600, .phase = .active },
         .{ .id = @splat(2), .owner = key, .expiry = now, .phase = .expired },
         .{ .id = @splat(3), .owner = key, .expiry = now + 120, .phase = .closing_window },
@@ -786,13 +787,14 @@ test "headless wallet exposes owned spendable and depleted channels and quotes u
         .{ .id = unredeemed, .owner = key, .expiry = now + 3600, .phase = .settled },
         .{ .id = exhausted_in_cutoff, .owner = key, .expiry = now + 60, .phase = .depleted },
         .{ .id = expired_exhausted, .owner = key, .expiry = now, .phase = .expired },
+        .{ .id = legacy_price, .owner = key, .expiry = now + 3600, .phase = .active, .price = 5 },
     };
     var active_params: ?[]const u8 = null;
     var orphan_params: ?[]const u8 = null;
     for (cases) |row| {
         const single_cut = std.meta.eql(row.id, exhausted) or std.meta.eql(row.id, settled) or
             std.meta.eql(row.id, exhausted_in_cutoff) or std.meta.eql(row.id, expired_exhausted);
-        const capacity: u64 = if (single_cut) exhausted_capacity else if (std.meta.eql(row.id, active)) active_capacity else if (row.phase == .settled) p.hoe_capacity_msat else if (std.meta.eql(row.id, dust)) 14 else 100;
+        const capacity: u64 = if (single_cut) exhausted_capacity else if (std.meta.eql(row.id, active)) active_capacity else if (row.phase == .settled) p.hoe_capacity_msat else if (std.meta.eql(row.id, dust)) 10 + p.hoe_price_msat - 1 else 100;
         const params_json = try std.json.Stringify.valueAlloc(a, .{
             .sender_pubkey = test_pubkey_hex,
             .expiry_timestamp = row.expiry,
@@ -802,11 +804,12 @@ test "headless wallet exposes owned spendable and depleted channels and quotes u
         if (std.meta.eql(row.id, active)) active_params = params_json;
         if (std.meta.eql(row.id, orphan)) orphan_params = params_json;
         {
-            const stmt = try channel_sql.prepare("INSERT INTO receiver_channels (id,owner,wallet_net_msat) VALUES (?1,?2,?3)");
+            const stmt = try channel_sql.prepare("INSERT INTO receiver_channels (id,owner,wallet_net_msat,price_msat) VALUES (?1,?2,?3,?4)");
             defer stmt.finalize();
             try stmt.bindBlob(1, &row.id);
             try stmt.bindBlob(2, &row.owner);
             if (row.phase == .settled and !std.meta.eql(row.id, unredeemed)) try stmt.bindUInt(3, 5);
+            try stmt.bindUInt(4, row.price);
             try stmt.finish();
         }
         const terminal = row.phase == .settlement_pending or row.phase == .settled;
@@ -841,7 +844,7 @@ test "headless wallet exposes owned spendable and depleted channels and quotes u
 
     const active_open: p.SpillmanChannelOpen = .{ .id = active, .proof = open_proofs, .params = active_params.? };
     const orphan_open: p.SpillmanChannelOpen = .{ .id = orphan, .proof = open_proofs, .params = orphan_params.? };
-    for ([_]?ChannelId{ active, @splat(2), @splat(3), @splat(4), @splat(5), @splat(6), @splat(7), null, active, active, exhausted, exhausted_in_cutoff, expired_exhausted }, 0..) |id, i| {
+    for ([_]?ChannelId{ active, @splat(2), @splat(3), @splat(4), @splat(5), @splat(6), @splat(7), null, active, active, exhausted, exhausted_in_cutoff, expired_exhausted, legacy_price }, 0..) |id, i| {
         try db.saveUser(key, .{ .location = location, .hoe_channel_id = id });
         output.end = 0;
         var handler = try Handler.init(&socket, app);
@@ -937,7 +940,7 @@ test "headless wallet exposes owned spendable and depleted channels and quotes u
             .{ .id = @splat(5), .outcome = .{ .ok = .{ .phase = .settlement_pending, .capacity_msat = 100, .balance_msat = 5 } } },
             .{ .id = settled, .outcome = .{ .ok = .{ .phase = .settled, .capacity_msat = exhausted_capacity, .balance_msat = exhausted_capacity, .sender_proofs = sender_proofs } } },
             .{ .id = @splat(7), .outcome = .{ .failed = .not_found } }, // missing
-            .{ .id = unredeemed, .outcome = .{ .ok = .{ .phase = .settlement_pending, .capacity_msat = 50, .balance_msat = 50 } } },
+            .{ .id = unredeemed, .outcome = .{ .ok = .{ .phase = .settlement_pending, .capacity_msat = p.hoe_capacity_msat, .balance_msat = p.hoe_capacity_msat } } },
         };
         for (statuses) |status| {
             output.end = 0;
@@ -1093,10 +1096,15 @@ test "signed winning cuts for all tools persist independently of channel payment
     for ([_]p.tool{ .hoe, .axe, .pickaxe, .hoe, .hoe }, 0..) |tool, i| {
         const fail_prize_commit = i == 3;
         const disabled = i == 4;
+        const tier: prizes.Tier = switch (i) {
+            1 => .medium,
+            2 => .big,
+            else => .small,
+        };
         var pos: p.Location = .{ .x = 0, .y = -@as(i32, @intCast(i)) };
         while (pos.x > -1000000) : (pos.x -= 1) {
             if (shared.world.sampleTile(shared.world.public_seed, pos.x, pos.y) == tool.terrain() and
-                prizes.wins(seed, shared.world.public_seed, pos.x, pos.y)) break;
+                prizes.roll(seed, shared.world.public_seed, pos.x, pos.y) == tier) break;
         } else return error.TestWinningTileNotFound;
         const channel_path = try std.fmt.allocPrintSentinel(a, "{s}/channel-{d}.sqlite", .{ dir, i }, 0);
         const wallet_path = try std.fmt.allocPrintSentinel(a, "{s}/wallet-{d}.sqlite", .{ dir, i }, 0);
@@ -1182,7 +1190,7 @@ test "signed winning cuts for all tools persist independently of channel payment
         const channels = wallet.tryAcquire().?;
         defer channels.release();
         try t.expectEqual(tool.priceMsat(), (try channels.lookup(owner, id, now)).?.balance_msat);
-        const row = try game_sql.prepare("SELECT owner, state FROM pending_prizes WHERE x = ?1 AND y = ?2");
+        const row = try game_sql.prepare("SELECT owner, state, amount_msat FROM pending_prizes WHERE x = ?1 AND y = ?2");
         defer row.finalize();
         try row.bindInt(1, pos.x);
         try row.bindInt(2, pos.y);
@@ -1193,6 +1201,7 @@ test "signed winning cuts for all tools persist independently of channel payment
             try t.expectEqual(owner, try row.blob(33, 0));
             // The isolated wallet's non-policy mint must never be contacted.
             try t.expect(row.textEquals(1, "sending"));
+            try t.expectEqual(tier.amount(tool), try row.uint(2));
             const address = @import("chunk_address.zig").ChunkAddress.fromTile(pos.x, pos.y);
             const bits = (try db.loadChunk(address)).?;
             const bit: usize = @intCast(@mod(pos.y, 16) * 16 + @mod(pos.x, 16));

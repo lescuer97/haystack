@@ -51,8 +51,8 @@ impl Tool {
     pub(super) fn price(self) -> u64 {
         match self {
             Self::Axe => 2,
-            Self::Hoe => 5,
-            Self::Pickaxe => 10,
+            Self::Hoe => 4,
+            Self::Pickaxe => 8,
         }
     }
 
@@ -597,25 +597,27 @@ mod tests {
 
     #[test]
     fn only_the_original_request_or_exact_authoritative_balances_resolve_a_cut() {
+        let price = Tool::Hoe.price();
+        let capacity = 4 * price;
         let mut state = Payment {
-            balance: 5,
+            balance: price,
             pending: Some(Pending {
                 id: "original".into(),
-                amount: 10,
+                amount: 2 * price,
             }),
             ..Payment::default()
         };
         let original = state.clone();
         assert!(resolve(&mut state, "another", true).is_err());
-        assert!(reconcile(&mut state, 20, 15).is_err());
+        assert!(reconcile(&mut state, capacity, 3 * price).is_err());
         assert!(state == original);
-        for accepted in [5, 10] {
+        for accepted in [price, 2 * price] {
             let mut state = original.clone();
-            reconcile(&mut state, 20, accepted).unwrap();
+            reconcile(&mut state, capacity, accepted).unwrap();
             assert_eq!(state.balance, accepted);
             assert!(state.pending.is_none());
         }
         resolve(&mut state, "original", false).unwrap();
-        assert_eq!(state.balance, 5);
+        assert_eq!(state.balance, price);
     }
 }

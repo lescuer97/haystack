@@ -1050,7 +1050,7 @@ test "a signed cut is not sent after the login or reach has changed" {
 
 test "refill closes only after a click and exact fresh zero, then retries only status" {
     const t = std.testing;
-    const channel = testLocal(true, 50);
+    const channel = testLocal(.hoe, true, protocol.hoe_refill_cuts);
     var rt: Runtime = .{ .session = 1, .live = .{ .server = .{}, .session = 1, .requirements = .{ .pubkey = @splat(2), .amount = protocol.hoe_price_msat, .refundTime = 1000 } } };
     rt.applyActive(channel);
     var game = try Game.init(t.allocator, 800, 600);
@@ -1114,7 +1114,7 @@ test "refill closes only after a click and exact fresh zero, then retries only s
 test "persisted native top-up compares live balance before requesting partial close" {
     const t = std.testing;
     const live = testLive();
-    const active = testLocal(true, 5);
+    const active = testLocal(.hoe, true, 1);
     var rt: Runtime = .{ .session = live.session, .live = live };
     rt.applyActive(active);
     var game = try Game.init(t.allocator, 800, 600);
@@ -1130,8 +1130,8 @@ test "persisted native top-up compares live balance before requesting partial cl
     rt.click(&connection, &worker, &game, 100);
     try t.expect(worker.request.hoe == .top_up_save and connection.channel == .idle);
     const saved = worker.request.hoe.top_up_save.intent;
-    try t.expectEqual(@as(u64, 145), saved.capacity);
-    try t.expectEqual(@as(u64, 5), saved.accepted);
+    try t.expectEqual((active.cuts_left + protocol.large_tool_refill_cuts) * live.tool.priceMsat(), saved.capacity);
+    try t.expectEqual(live.tool.priceMsat(), saved.accepted);
     worker.hoe_result = .{ .top_up_saved = saved };
     worker.state.store(.result, .release);
     rt.update(&connection, network, &worker, &game, false, 100);
@@ -1139,11 +1139,11 @@ test "persisted native top-up compares live balance before requesting partial cl
     try t.expectEqual(protocol.Kind.channel_status, query.kind);
     connection.channel = .{ .received = .{
         .request_id = query.id,
-        .outcome = .{ .channel_status = .{ .ok = .{ .capacity_msat = 50, .balance_msat = 5, .phase = .active } } },
+        .outcome = .{ .channel_status = .{ .ok = .{ .capacity_msat = active.capacity_msats, .balance_msat = active.confirmed_balance_msats, .phase = .active } } },
     } };
     rt.update(&connection, network, &worker, &game, false, 101);
     const request = try @import("shared").wire.decodeMessage(connection.channel_bytes[0..connection.channel.queued.len], true);
-    try t.expectEqual(@as(?u64, 5), request.operation.channel_close.expected_balance_msat);
+    try t.expectEqual(@as(?u64, active.confirmed_balance_msats), request.operation.channel_close.expected_balance_msat);
     try t.expectEqual(active.id, request.operation.channel_close.id);
 }
 
@@ -1151,15 +1151,15 @@ test "only a local channel needing recovery is queried on bind, and it gates fun
     const t = std.testing;
     const live: hoe.Live = .{ .server = .{}, .session = 1, .requirements = .{
         .pubkey = @splat(1),
-        .amount = 5,
+        .amount = protocol.tool.hoe.priceMsat(),
         .refundTime = 1000,
     } };
     var rt: Runtime = .{ .session = 1, .live = live };
-    rt.applyBinding(testLocal(true, 5));
+    rt.applyBinding(testLocal(.hoe, true, 1));
     try t.expect(rt.phase == .active and rt.fundingLive(1) == null);
-    rt.applyBinding(testLocal(true, 50));
+    rt.applyBinding(testLocal(.hoe, true, protocol.hoe_refill_cuts));
     try t.expect(rt.phase == .query and !rt.canClose());
-    rt.applyBinding(testLocal(false, 0));
+    rt.applyBinding(testLocal(.hoe, false, 0));
     try t.expect(rt.phase == .query and rt.fundingLive(1) == null);
     rt.applyBinding(null);
     try t.expectEqual(live, rt.fundingLive(1).?);
@@ -1169,10 +1169,7 @@ test "only a local channel needing recovery is queried on bind, and it gates fun
 test "only a matching settlement notice triggers status and forwards its owned receipt" {
     const t = std.testing;
     var rt: Runtime = .{ .session = 1, .tool = .axe, .selected_tool = .axe };
-    var local = testLocal(true, 4);
-    local.tool = .axe;
-    local.capacity_msats = 20;
-    local.cuts_left = 8;
+    const local = testLocal(.axe, true, 2);
     rt.applyActive(local);
     var game = try Game.init(t.allocator, 800, 600);
     defer game.deinit();
@@ -1191,8 +1188,8 @@ test "only a matching settlement notice triggers status and forwards its owned r
     try t.expectEqual(protocol.Kind.channel_status, connection.channel.queued.kind);
     const request = connection.channel.queued.id;
     var receipt: ws.ChannelStatusOutcome = .{ .ok = .{
-        .capacity_msat = 20,
-        .balance_msat = 4,
+        .capacity_msat = local.capacity_msats,
+        .balance_msat = local.confirmed_balance_msats,
         .phase = .settled,
         .len = 2,
     } };
@@ -1208,15 +1205,16 @@ test "only a matching settlement notice triggers status and forwards its owned r
     try t.expectEqualStrings("[]", command.sender_proofs.?.slice());
 }
 
-fn testLocal(active: bool, accepted: u64) hoe.PlayView {
+fn testLocal(tool: protocol.tool, active: bool, paid_cuts: u64) hoe.PlayView {
     return .{
         .id = @splat(2),
-        .capacity_msats = 50,
+        .tool = tool,
+        .capacity_msats = protocol.hoe_refill_cuts * tool.priceMsat(),
         .refund_time = 1000,
         .confirmed = true,
         .server_active = active,
-        .cuts_left = if (active) (50 - accepted) / 5 else 0,
-        .confirmed_balance_msats = accepted,
+        .cuts_left = if (active) protocol.hoe_refill_cuts - paid_cuts else 0,
+        .confirmed_balance_msats = paid_cuts * tool.priceMsat(),
     };
 }
 
@@ -1244,11 +1242,11 @@ test "refill authorizes only a fresh affordable offer within the displayed cap" 
     offer.max_debit_msats = refill_debit_limit + 1;
     offer.max_sender_fee_msats = offer.max_debit_msats - offer.send_msats;
     try t.expectEqual(null, rt.consentRequest(offer, 100));
-    offer.capacity_msats = 35;
-    offer.nominal_msats = 35;
-    offer.send_msats = 35;
+    offer.capacity_msats = 7 * live.tool.priceMsat();
+    offer.nominal_msats = offer.capacity_msats;
+    offer.send_msats = offer.capacity_msats;
     offer.max_sender_fee_msats = 0;
-    offer.max_debit_msats = 35;
+    offer.max_debit_msats = offer.capacity_msats;
     try t.expectEqual(offer, rt.consentRequest(offer, 100).?.fund_with_consent.offer);
     try t.expectEqual(null, rt.consentRequest(offer, 400));
     offer.requirements.refundTime += 1;
@@ -1359,17 +1357,18 @@ test "saved admission opens without UI consent and records its acknowledgement" 
     var live = testLive();
     live.tool = .pickaxe;
     live.requirements.amount = live.tool.priceMsat();
+    const capacity = live.tool.priceMsat() * protocol.hoe_refill_cuts;
     var native: Runtime = .{ .tool = live.tool, .session = live.session, .live = live, .phase = .reopen, .local = .{
         .id = id,
         .tool = live.tool,
-        .capacity_msats = funding_ops.capacity_msats,
+        .capacity_msats = capacity,
         .confirmed_balance_msats = 0,
         .confirmed = false,
         .server_active = false,
         .refund_time = 1000,
         .cuts_left = 0,
     } };
-    var saved: hoe.Open = .{ .tool = live.tool, .id = id, .operation_id = @splat(1), .capacity_msats = funding_ops.capacity_msats, .refund_time = 1000 };
+    var saved: hoe.Open = .{ .tool = live.tool, .id = id, .operation_id = @splat(1), .capacity_msats = capacity, .refund_time = 1000 };
     try t.expect(saved.params.set("{}"));
     try t.expect(saved.proof.set("[]"));
     var rt: FundingRuntime = .{ .session = live.session, .live = live, .reopen_id = id, .phase = .{ .funded = saved } };
@@ -1400,7 +1399,7 @@ test "reopen only offers matching confirmed funding or non-spending saved admiss
     const live = testLive();
     const offer = testOffer(live);
     const confirmed: hoe.Pending = .{ .confirmed = .{ .offer = offer, .operation_id = @splat(1) } };
-    const opened: hoe.Pending = .{ .funded = .{ .id = @splat(2), .operation_id = @splat(1), .capacity_msats = 50, .refund_time = 1000 } };
+    const opened: hoe.Pending = .{ .funded = .{ .id = @splat(2), .operation_id = @splat(1), .capacity_msats = offer.capacity_msats, .refund_time = 1000 } };
     var rt: FundingRuntime = .{ .live = live };
     try t.expect(rt.inspect(.idle, live, 100) == .quoting);
     try t.expect(rt.inspect(.other_context, live, 100) == .recovery);
@@ -1430,15 +1429,14 @@ fn testLive() hoe.Live {
 }
 
 fn testOffer(live: hoe.Live) hoe.Offer {
-    return .{ .id = @splat(1), .requirements = live.requirements, .capacity_msats = 50, .nominal_msats = 52, .send_msats = 53, .max_sender_fee_msats = 2, .max_debit_msats = 55, .keyset_hash = @splat(0) };
+    const capacity = live.tool.priceMsat() * protocol.hoe_refill_cuts;
+    return .{ .id = @splat(1), .requirements = live.requirements, .capacity_msats = capacity, .nominal_msats = capacity + 2, .send_msats = capacity + 3, .max_sender_fee_msats = 2, .max_debit_msats = capacity + 5, .keyset_hash = @splat(0) };
 }
 
 test "clicking the hoe after a paid cut starts keeps the session and the original swing" {
     const t = std.testing;
     const tool: protocol.tool = .axe;
-    var active = testLocal(true, 0);
-    active.tool = tool;
-    active.capacity_msats = 20;
+    var active = testLocal(tool, true, 0);
     var rt: Runtime = .{ .session = 1, .tool = tool, .selected_tool = tool };
     rt.applyActive(active);
     const network: Network = .{ .status = .ready, .session = 1 };

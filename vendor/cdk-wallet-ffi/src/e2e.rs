@@ -495,10 +495,12 @@ fn e2e_prize_stock_mints_two_compact_offline_payouts() {
     let seed = [37u8; 64];
     let mut handle = open_wallet(seed, &path);
     block_on(handle.add_mint(&mint_url)).unwrap();
-    let invalid = block_on(handle.create_prize_stock(&mint_url, "21", "500")).unwrap_err();
+    let prize_msat = 1024;
+    let denomination = prize_msat.to_string();
+    let invalid = block_on(handle.create_prize_stock(&mint_url, "21", &denomination)).unwrap_err();
     assert_eq!(invalid.status, CdkStatus::InvalidArgument);
 
-    let raw = block_on(handle.create_prize_stock(&mint_url, "2", "500")).unwrap();
+    let raw = block_on(handle.create_prize_stock(&mint_url, "2", &denomination)).unwrap();
     let invoice: serde_json::Value = serde_json::from_str(&raw).unwrap();
     let id = invoice["id"].as_str().unwrap();
     // Like the operator commands, creation and claim run on different opens.
@@ -506,7 +508,7 @@ fn e2e_prize_stock_mints_two_compact_offline_payouts() {
     let mut handle = open_wallet(seed, &path);
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let raw = block_on(handle.claim_prize_stock(&mint_url, id, "500")).unwrap();
+        let raw = block_on(handle.claim_prize_stock(&mint_url, id, &denomination)).unwrap();
         let status: serde_json::Value = serde_json::from_str(&raw).unwrap();
         if status["confirmed"] == true {
             break;
@@ -516,15 +518,15 @@ fn e2e_prize_stock_mints_two_compact_offline_payouts() {
     }
 
     for _ in 0..2 {
-        let payout = block_on(handle.send_bounded(&mint_url, 500, 4096)).unwrap();
+        let payout = block_on(handle.send_bounded(&mint_url, prize_msat, 4096)).unwrap();
         assert_eq!(payout.sender_fee_msats, 0);
         assert!(payout.token.len() <= 4096);
         let token = Token::from_str(&payout.token).unwrap();
-        assert_eq!(token.value().unwrap(), Amount::from(500));
+        assert_eq!(token.value().unwrap(), Amount::from(prize_msat));
         assert_eq!(token.unit(), Some(CurrencyUnit::Msat));
-        assert_eq!(token.token_secrets().len(), 6);
+        assert_eq!(token.token_secrets().len(), 1);
     }
-    let err = block_on(handle.send_bounded(&mint_url, 500, 4096)).unwrap_err();
+    let err = block_on(handle.send_bounded(&mint_url, prize_msat, 4096)).unwrap_err();
     assert_eq!(err.status, CdkStatus::InsufficientFunds);
 }
 

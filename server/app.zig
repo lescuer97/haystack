@@ -105,8 +105,9 @@ pub const App = struct {
                 return unavailable;
             }) orelse continue;
             if (loaded.info.price_msat != tool.priceMsat()) {
+                // Old terms stay in the ledger for settlement, not new gameplay.
                 if (loaded.live) |live| live.deinit();
-                return unavailable;
+                continue;
             }
             self.registry.setToolChannel(handle, tool, loaded.live);
             if (loaded.live == null and loaded.info.phase != .depleted) continue;
@@ -344,14 +345,16 @@ pub const App = struct {
                 },
             };
             if (live.exhausted()) self.registry.setToolChannel(handle, tile.tool, null);
-            won = if (self.prize_seed) |seed| prizes.wins(seed, shared.world.public_seed, tile.x, tile.y) else false;
-            if (won) {
-                storage.db.commitPrizeCut(prize, prepared.bitmapAfter(), prizes.amount_msat) catch |err| {
+            const tier = if (self.prize_seed) |seed| prizes.roll(seed, shared.world.public_seed, tile.x, tile.y) else null;
+            if (tier) |win| {
+                const amount_msat = win.amount(tile.tool);
+                storage.db.commitPrizeCut(prize, prepared.bitmapAfter(), amount_msat) catch |err| {
                     prize_log.warn("paid cut needs manual reconciliation at ({d},{d}): channel={s}, balance_msat={d}, error={s}", .{
                         tile.x, tile.y, std.fmt.bytesToHex(payment.id, .lower), payment.amount, @errorName(err),
                     });
                     return busy;
                 };
+                won = true;
                 break :blk prepared.applySaved();
             }
             break :blk prepared.apply();

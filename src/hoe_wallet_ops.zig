@@ -591,23 +591,25 @@ test "quote picks the largest whole-cut offer that fits balance, fees, denominat
     const zero = try a.dupeSentinel(u8, try std.mem.replaceOwned(u8, a, camel, "input_fee_ppk", "inputFeePpk"), 0);
     const fixture: funding.Policy = .{ .mint_url = "http://127.0.0.1:18787", .max_output_msats = 1_000_000 };
     const limit = 8192;
-    const free = try choose(a, req, fixture, zero, 50, limit);
-    try t.expectEqual(50, free.capacity_msats);
-    try t.expectEqual(50, free.nominal_msats);
-    try t.expectEqual(50, free.max_debit_msats);
-    try t.expectEqual(10, free.cuts());
-    const partial = try choose(a, req, fixture, zero, 49, limit);
-    try t.expectEqual(9, partial.cuts());
-    try t.expectEqual(45, partial.max_debit_msats);
-    try t.expectEqual(1, (try choose(a, req, fixture, zero, 9, limit)).cuts());
-    try t.expectError(error.InsufficientBalance, choose(a, req, fixture, zero, 4, limit));
+    const full_capacity = req.amount * protocol.hoe_refill_cuts;
+    const partial_capacity = full_capacity - req.amount;
+    const free = try choose(a, req, fixture, zero, full_capacity, limit);
+    try t.expectEqual(full_capacity, free.capacity_msats);
+    try t.expectEqual(full_capacity, free.nominal_msats);
+    try t.expectEqual(full_capacity, free.max_debit_msats);
+    try t.expectEqual(protocol.hoe_refill_cuts, free.cuts());
+    const partial = try choose(a, req, fixture, zero, full_capacity - 1, limit);
+    try t.expectEqual(protocol.hoe_refill_cuts - 1, partial.cuts());
+    try t.expectEqual(partial_capacity, partial.max_debit_msats);
+    try t.expectEqual(1, (try choose(a, req, fixture, zero, 2 * req.amount - 1, limit)).cuts());
+    try t.expectError(error.InsufficientBalance, choose(a, req, fixture, zero, req.amount - 1, limit));
     var capped = fixture;
     capped.max_output_msats = 32;
-    try t.expectEqual(30, (try choose(a, req, capped, zero, 100, limit)).capacity_msats);
+    try t.expectEqual(32 / req.amount * req.amount, (try choose(a, req, capped, zero, 100, limit)).capacity_msats);
     const key = "\"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\"";
     const small = "{\"unit\":\"msat\",\"inputFeePpk\":0,\"keysetId\":\"00891271bfa74eb8\",\"amounts\":[1,2,4,8]," ++
         "\"keys\":{\"1\":" ++ key ++ ",\"2\":" ++ key ++ ",\"4\":" ++ key ++ ",\"8\":" ++ key ++ "}}";
-    try t.expectEqual(15, (try choose(a, req, fixture, small, 100, limit)).capacity_msats);
+    try t.expectEqual(15 / req.amount * req.amount, (try choose(a, req, fixture, small, 100, limit)).capacity_msats);
 
     const fee = try a.dupeSentinel(u8, try std.mem.replaceOwned(u8, a, zero, "\"inputFeePpk\":0", "\"inputFeePpk\":100"), 0);
     const testnut: funding.Policy = .{ .mint_url = "https://testnut.cashu.space", .max_output_msats = 1_000_000, .input_fee_ppk = 100, .max_sender_fee_msats = 2 };
@@ -624,27 +626,32 @@ test "quote picks the largest whole-cut offer that fits balance, fees, denominat
         try t.expect(bounded.max_debit_msats <= capacity + 5);
         try t.expectError(error.InvalidRequirements, chooseForTool(tool, a, .{ .pubkey = terms.pubkey, .amount = terms.amount + 1, .refundTime = terms.refundTime }, fixture, zero, capacity, limit));
     }
-    const offer = try choose(a, req, testnut, fee, 55, limit);
-    try t.expectEqual(50, offer.capacity_msats);
-    try t.expectEqual(52, offer.nominal_msats);
-    try t.expectEqual(53, offer.send_msats);
-    try t.expectEqual(55, offer.max_debit_msats);
-    try t.expectEqual(10, offer.cuts());
-    const fee_partial = try choose(a, req, testnut, fee, 54, limit);
-    try t.expectEqual(45, fee_partial.capacity_msats);
-    try t.expectEqual(47, fee_partial.nominal_msats);
-    try t.expectEqual(48, fee_partial.send_msats);
-    try t.expectEqual(50, fee_partial.max_debit_msats);
-    try t.expectEqual(45, (try choose(a, req, testnut, fee, 54, protocol.max_channel_proof_bytes)).capacity_msats);
-    const proof_limited = try choose(a, req, testnut, fee, 55, 1024);
-    try t.expectEqual(30, proof_limited.capacity_msats);
-    try t.expectEqual(32, proof_limited.nominal_msats);
-    try t.expectEqual(35, proof_limited.max_debit_msats);
-    try t.expectError(error.ProofTooLarge, choose(a, req, testnut, fee, 55, 1));
-    try t.expectError(error.InsufficientBalance, choose(a, req, testnut, fee, 9, limit));
-    try t.expectError(error.UnquotableFundingInputFee, choose(a, req, testnut, zero, 55, limit));
+    const budget = full_capacity + 5;
+    const offer = try choose(a, req, testnut, fee, budget, limit);
+    try t.expectEqual(full_capacity, offer.capacity_msats);
+    try t.expectEqual(full_capacity + 2, offer.nominal_msats);
+    try t.expectEqual(full_capacity + 3, offer.send_msats);
+    try t.expectEqual(budget, offer.max_debit_msats);
+    try t.expectEqual(protocol.hoe_refill_cuts, offer.cuts());
+    const fee_partial = try choose(a, req, testnut, fee, budget - 1, limit);
+    try t.expectEqual(partial_capacity, fee_partial.capacity_msats);
+    try t.expectEqual(partial_capacity + 2, fee_partial.nominal_msats);
+    try t.expectEqual(partial_capacity + 3, fee_partial.send_msats);
+    try t.expectEqual(partial_capacity + 5, fee_partial.max_debit_msats);
+    try t.expectEqual(partial_capacity, (try choose(a, req, testnut, fee, budget - 1, protocol.max_channel_proof_bytes)).capacity_msats);
+    // The eight-cut offer needs two proofs (32 + 2); the larger offers need three.
+    const proof_capacity = 8 * req.amount;
+    const proof_nominal = proof_capacity + 2;
+    const proof_budget = try funding.quotedProofBytes(a, proof_nominal, "00891271bfa74eb8", req.refundTime);
+    const proof_limited = try choose(a, req, testnut, fee, budget, proof_budget);
+    try t.expectEqual(proof_capacity, proof_limited.capacity_msats);
+    try t.expectEqual(proof_nominal, proof_limited.nominal_msats);
+    try t.expectEqual(proof_capacity + 5, proof_limited.max_debit_msats);
+    try t.expectError(error.ProofTooLarge, choose(a, req, testnut, fee, budget, 1));
+    try t.expectError(error.InsufficientBalance, choose(a, req, testnut, fee, req.amount + 4, limit));
+    try t.expectError(error.UnquotableFundingInputFee, choose(a, req, testnut, zero, budget, limit));
     const mismatch = try a.dupeSentinel(u8, try std.mem.replaceOwned(u8, a, fee, "64,32,16", "64,32,15"), 0);
-    try t.expectError(error.UnquotableDenominations, choose(a, req, testnut, mismatch, 55, limit));
+    try t.expectError(error.UnquotableDenominations, choose(a, req, testnut, mismatch, budget, limit));
 }
 
 test "an uncertain send preserves the exact returned ID and blocks across reopen" {
@@ -665,7 +672,8 @@ test "an uncertain send preserves the exact returned ID and blocks across reopen
     const policy: funding.Policy = .{ .mint_url = "https://mint.example", .max_output_msats = 1_000_000 };
     const wallet: *c.CdkWallet_t = @ptrFromInt(1); // The fake never dereferences this.
     const req = testRequirements(scope.receiver);
-    const offer: Offer = .{ .id = @splat(6), .requirements = req, .capacity_msats = 50, .nominal_msats = 50, .send_msats = 50, .max_sender_fee_msats = 0, .max_debit_msats = 50, .keyset_hash = @splat(1) };
+    const capacity = req.amount * protocol.hoe_refill_cuts;
+    const offer: Offer = .{ .id = @splat(6), .requirements = req, .capacity_msats = capacity, .nominal_msats = capacity, .send_msats = capacity, .max_sender_fee_msats = 0, .max_debit_msats = capacity, .keyset_hash = @splat(1) };
     {
         var ops = try Ops.open(t.io, root, wallet, scope, policy);
         defer ops.close(t.io);
@@ -696,7 +704,10 @@ test "an uncertain send preserves the exact returned ID and blocks across reopen
     var axe_offer = offer;
     axe_offer.tool = .axe;
     axe_offer.requirements.amount = protocol.tool.axe.priceMsat();
-    axe_offer.capacity_msats = 20;
+    axe_offer.capacity_msats = axe_offer.requirements.amount * protocol.hoe_refill_cuts;
+    axe_offer.nominal_msats = axe_offer.capacity_msats;
+    axe_offer.send_msats = axe_offer.capacity_msats;
+    axe_offer.max_debit_msats = axe_offer.capacity_msats;
     try t.expectError(error.SendNeedsReconciliation, axe.recordSend(t.io, t.allocator, axe_offer, Fake.send));
     const axe_saved = try axe.readPending(t.io, t.allocator);
     defer axe_saved.deinit();
@@ -720,7 +731,8 @@ test "confirmed consent survives reopen but an existing journal forbids another 
     const policy: funding.Policy = .{ .mint_url = "https://mint.example", .max_output_msats = 1_000_000 };
     const wallet: *c.CdkWallet_t = @ptrFromInt(1); // No wallet call is authorized in this test.
     const req = testRequirements(scope.receiver);
-    const offer: Offer = .{ .id = @splat(6), .requirements = req, .capacity_msats = 30, .nominal_msats = 30, .send_msats = 30, .max_sender_fee_msats = 0, .max_debit_msats = 30, .keyset_hash = @splat(1) };
+    const capacity = 6 * req.amount;
+    const offer: Offer = .{ .id = @splat(6), .requirements = req, .capacity_msats = capacity, .nominal_msats = capacity, .send_msats = capacity, .max_sender_fee_msats = 0, .max_debit_msats = capacity, .keyset_hash = @splat(1) };
     const op: OperationId = @splat(7);
     const sender: funding.Sender = .{ .pubkey = scope.player, .secret_key_hex = test_sender_secret };
     {
@@ -728,20 +740,20 @@ test "confirmed consent survives reopen but an existing journal forbids another 
         defer ops.close(t.io);
         ops.current = offer;
         var substituted = offer;
-        substituted.capacity_msats = 25;
-        substituted.nominal_msats = 25;
-        substituted.send_msats = 25;
-        substituted.max_debit_msats = 25;
+        substituted.capacity_msats = capacity - req.amount;
+        substituted.nominal_msats = substituted.capacity_msats;
+        substituted.send_msats = substituted.capacity_msats;
+        substituted.max_debit_msats = substituted.capacity_msats;
         try t.expectError(error.StaleOffer, ops.fundWithConsent(t.io, a, substituted, req, sender));
         try t.expectEqualDeep(offer, try ops.consumeOffer(offer));
         try t.expectError(error.StaleOffer, ops.consumeOffer(offer));
 
         var mark: Pending = .{ .scope = ops.store.scope, .mint_url = policy.mint_url, .max_output_msats = policy.max_output_msats, .offer = offer, .state = .sending };
-        for ([_]u64{ 0, 29, 205 }) |capacity| {
-            mark.offer.capacity_msats = capacity;
-            mark.offer.nominal_msats = capacity;
-            mark.offer.send_msats = capacity;
-            mark.offer.max_debit_msats = capacity;
+        for ([_]u64{ 0, capacity - 1, (protocol.max_tool_channel_cuts + 1) * req.amount }) |invalid_capacity| {
+            mark.offer.capacity_msats = invalid_capacity;
+            mark.offer.nominal_msats = invalid_capacity;
+            mark.offer.send_msats = invalid_capacity;
+            mark.offer.max_debit_msats = invalid_capacity;
             try t.expectError(error.InvalidPending, ops.writePending(t.io, a, mark));
         }
         mark.offer = offer;
