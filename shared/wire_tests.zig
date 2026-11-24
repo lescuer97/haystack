@@ -371,6 +371,16 @@ test "channel requirements return a quote and close only acknowledges" {
     try t.expectError(error.InvalidFieldValue, wire.decodeMessage("\x21\x17\x00" ++ id_tlv ++ "\x23\x01\x00\xff\x7e", true));
 }
 
+test "partial close carries an optional exact balance only on close requests" {
+    const close: p.RequestFor(.channel_close) = .{
+        .request_id = id.*,
+        .payload = .{ .id = @splat(0x42), .expected_balance_msat = 5 },
+    };
+    const body = id_tlv ++ "\x20\x20\x00" ++ repeat("B", 32) ++ "\x27\x08\x00\x05" ++ repeat("\x00", 7) ++ "\x7e";
+    try checkRequest(.channel_close, close, "\x23\x41\x00" ++ body);
+    try t.expectError(error.UnknownField, wire.decodeMessage("\x25\x41\x00" ++ body, true));
+}
+
 test "channel status carries sender proofs and unsolicited settlement carries only the channel ID" {
     const request: p.RequestFor(.channel_status) = .{ .request_id = id.*, .payload = .{ .id = @splat(0x42) } };
     try checkRequest(.channel_status, request, "\x25\x36\x00" ++ id_tlv ++ "\x20\x20\x00" ++ repeat("B", 32) ++ "\x7e");

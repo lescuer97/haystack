@@ -15,6 +15,56 @@ pub const ToolChannel = struct {
 pub const ToolLogin = struct { player: [33]u8, channel: ?ToolChannel };
 pub const ToolChannels = [protocol.tools.len]?ToolChannel;
 
+pub fn toolStates(connection: anytype, session: u64) game_mod.ToolStates {
+    var states: game_mod.ToolStates = @splat(.{});
+    for (protocol.tools) |tool| {
+        const login = connection.toolLogin(session, tool) orelse continue;
+        states[@backingInt(tool)] = if (login.channel) |channel|
+            .{ .uses_left = (channel.capacity_msats - channel.balance_msats) / tool.priceMsat(), .has_channel = true }
+        else
+            .{ .uses_left = 0 };
+    }
+    return states;
+}
+
+// Only an acknowledged, matching charge advances the cached login balance.
+pub fn applyCutBalance(channels: *ToolChannels, tile: protocol.Cut, outcome: protocol.Outcome(.cut)) void {
+    if (outcome != .ok or !outcome.ok.cut or outcome.ok.terrain != tile.tool.terrain() or
+        outcome.ok.x != tile.x or outcome.ok.y != tile.y) return;
+    const payment = tile.payment orelse return;
+    if (channels[@backingInt(tile.tool)]) |*channel| {
+        if (!std.mem.eql(u8, &channel.id, &payment.id) or payment.amount > channel.capacity_msats or
+            payment.amount < channel.balance_msats or payment.amount - channel.balance_msats != tile.tool.priceMsat()) return;
+        channel.balance_msats = payment.amount;
+    }
+}
+
+test "tool uses are session-scoped and only a matching paid cut updates its slot" {
+    const Connection = struct {
+        channels: ToolChannels = @splat(null),
+
+        fn toolLogin(self: *const @This(), session: u64, tool: protocol.tool) ?ToolLogin {
+            if (session != 1) return null;
+            return .{ .player = @splat(0), .channel = self.channels[@backingInt(tool)] };
+        }
+    };
+    var connection: Connection = .{};
+    const axe = @backingInt(protocol.tool.axe);
+    const hoe = @backingInt(protocol.tool.hoe);
+    connection.channels[axe] = .{ .id = @splat(1), .capacity_msats = 4, .balance_msats = 2, .player = @splat(0) };
+    try std.testing.expectEqual(@as(?u64, null), toolStates(&connection, 0)[axe].uses_left);
+    try std.testing.expectEqual(@as(?u64, 1), toolStates(&connection, 1)[axe].uses_left);
+    try std.testing.expectEqual(@as(?u64, 0), toolStates(&connection, 1)[hoe].uses_left);
+    try std.testing.expect(!toolStates(&connection, 1)[hoe].has_channel);
+    const cut: protocol.Cut = .{ .x = 2, .y = 3, .tool = .axe, .payment = .{ .id = @splat(1), .amount = 4, .signature = @splat(0) } };
+    const tile: protocol.State = .{ .x = 2, .y = 3, .terrain = .tree, .cut = true };
+    applyCutBalance(&connection.channels, cut, .{ .failed = .{ .already_cut = tile } });
+    try std.testing.expectEqual(@as(?u64, 1), toolStates(&connection, 1)[axe].uses_left);
+    applyCutBalance(&connection.channels, cut, .{ .ok = tile });
+    try std.testing.expectEqual(@as(?u64, 0), toolStates(&connection, 1)[axe].uses_left);
+    try std.testing.expect(toolStates(&connection, 1)[axe].has_channel);
+}
+
 pub const AuthRestore = struct {
     location: protocol.Location,
     channels: ToolChannels = @splat(null),

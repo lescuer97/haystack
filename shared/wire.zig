@@ -244,7 +244,8 @@ pub fn encodeRequest(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind)) 
         .update_location => header_bytes + 8,
         .read_area => header_bytes + 16,
         .channel_requirements => header_bytes + 1,
-        .channel_close, .channel_status => header_bytes + 32,
+        .channel_close => header_bytes + 32 + @as(u16, if (req.payload.expected_balance_msat != null) header_bytes + 8 else 0),
+        .channel_status => header_bytes + 32,
         .channel_open => blk: {
             const proof_len = req.payload.proof.len;
             if (proof_len == 0 or proof_len > p.max_channel_proof_bytes) return error.InvalidProofLength;
@@ -268,7 +269,11 @@ pub fn encodeRequest(out: []u8, comptime kind: p.Kind, req: p.RequestFor(kind)) 
         .update_location => writePoint(writer.field(.payload, 8), req.payload.x, req.payload.y),
         .read_area => writeArea(writer.field(.payload, 16), req.payload),
         .channel_requirements => writer.field(.tool, 1)[0] = @backingInt(req.payload.tool),
-        .channel_close, .channel_status => writer.bytes(.channel_id, &req.payload.id),
+        .channel_close => {
+            writer.bytes(.channel_id, &req.payload.id);
+            if (req.payload.expected_balance_msat) |balance| put(u64, writer.field(.channel_balance_msat, 8), 0, balance);
+        },
+        .channel_status => writer.bytes(.channel_id, &req.payload.id),
         .channel_open => {
             writer.bytes(.channel_id, &req.payload.id);
             if (tool_bytes != 0) writer.field(.tool, 1)[0] = @backingInt(req.payload.tool);
@@ -299,7 +304,8 @@ pub fn decodeMessage(data: []const u8, binary: bool) DecodeError!p.Request {
         .read_area, .update_location => &.{ .id, .payload },
         .channel_requirements => &.{ .id, .tool },
         .channel_open => &.{ .id, .channel_id, .tool, .funding_proof, .channel_params },
-        .channel_close, .channel_status => &.{ .id, .channel_id },
+        .channel_close => &.{ .id, .channel_id, .channel_balance_msat },
+        .channel_status => &.{ .id, .channel_id },
         else => return error.UnexpectedMessageType,
     };
     const id = (try frame.body.exact(fields, .id, @sizeOf(p.Id))).*;
@@ -333,7 +339,14 @@ pub fn decodeMessage(data: []const u8, binary: bool) DecodeError!p.Request {
             if (params.bytes.len == 0 or params.bytes.len > p.max_channel_params_bytes) return error.InvalidFieldLength;
             break :blk .{ .channel_open = .{ .id = channel_id, .proof = proof.bytes, .params = params.bytes, .tool = tool } };
         },
-        .channel_close => .{ .channel_close = .{ .id = (try frame.body.exact(fields, .channel_id, 32)).* } },
+        .channel_close => blk: {
+            const channel_id = (try frame.body.exact(fields, .channel_id, 32)).*;
+            const expected = if (nextIs(frame.body, .channel_balance_msat))
+                get(u64, try frame.body.exact(fields, .channel_balance_msat, 8), 0)
+            else
+                null;
+            break :blk .{ .channel_close = .{ .id = channel_id, .expected_balance_msat = expected } };
+        },
         .channel_status => .{ .channel_status = .{ .id = (try frame.body.exact(fields, .channel_id, 32)).* } },
         else => unreachable,
     };

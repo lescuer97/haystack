@@ -10,13 +10,17 @@ import {DatabaseSync} from 'node:sqlite';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {bounded, CdpConnection, discoverEndpoint, launchBrowser, makeProfile, removeProfile, stopBrowser} from './cdp-runner.mjs';
 
-const modes = ['--smoke-only', '--renderer-only', '--funding-recovery', '--funding-change-recovery', '--funding-resume', '--renderer-funding-resume', '--tools'];
+const modes = ['--smoke-only', '--renderer-only', '--renderer-large-refill', '--partial-close', '--renderer-top-up', '--renderer-top-up-resume', '--funding-recovery', '--funding-change-recovery', '--funding-resume', '--renderer-funding-resume', '--tools'];
 const args = process.argv.slice(2).filter(arg => !modes.includes(arg));
 const selected = process.argv.slice(2).filter(arg => modes.includes(arg));
 if (args.length !== 3 || selected.length > 1) throw new Error(`Usage: paid-hoe-browser-test.mjs MINT_EXE SERVER_EXE WASM_TEST_DIR [${modes.join(' | ')}]`);
 const [mode] = selected;
 const smoke = mode === '--smoke-only';
-const renderer = mode === '--renderer-only';
+const largeRefill = mode === '--renderer-large-refill';
+const partialClose = mode === '--partial-close';
+const resumeTopUp = mode === '--renderer-top-up-resume';
+const rendererTopUp = mode === '--renderer-top-up' || resumeTopUp;
+const renderer = mode === '--renderer-only' || largeRefill;
 const changeRecovery = mode === '--funding-change-recovery';
 const fundingRecovery = mode === '--funding-recovery' || changeRecovery;
 const rendererResume = mode === '--renderer-funding-resume';
@@ -94,7 +98,7 @@ async function load(reload = false, url = origin) {
 // Runs entirely in the Chromium page: only the production Wasm wallet sees
 // the seed, and no proof/signature bytes are returned to Node. This small test
 // peer implements the TLV subset in shared/wire.zig.
-async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, resumeOffer, tools, toolChannels}) {
+async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, resumeOffer, tools, toolChannels, largeRefill, rendererTopUp}) {
   const check = (condition, step) => {
     if (!condition) {
       window.paidHoeStep = step;
@@ -263,7 +267,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       return {revision:saved.revision, proofs:Object.values(JSON.parse(saved.data).proofs)};
     } finally { db.close(); }
   }
-  async function status(capacity, accepted, expectedPhase = 0, id = channel) {
+  async function status(capacity, accepted, expectedPhase = 0, id = channel, senderChange = false) {
     step('native channel status');
     const deadline = performance.now() + 8000;
     do {
@@ -271,11 +275,14 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       const failure = response.get(4);
       if (!(failure?.length === 2 && failureCode(failure) === 12)) {
         const value = response.get(3);
-        // This fixture expects no sender change, even when the channel is settled.
-        check(value?.length === 17 && u64(value) === capacity && u64(value, 8) === accepted,
-          'native channel status matches capacity and cumulative accepted amount without sender proofs');
+        check(value?.length >= 17 && u64(value) === capacity && u64(value, 8) === accepted,
+          'native status matches capacity and cumulative accepted amount');
         const actualPhase = value[16]; // active=0, depleted=1, settlement_pending=2, settled=3
-        if (actualPhase === expectedPhase) return {capacity:u64(value), accepted:u64(value, 8)};
+        const hasProofs = senderChange && actualPhase === 3;
+        check(hasProofs ? value.length > 17 : value.length === 17, 'sender proofs appear only for settled sender change');
+        if (actualPhase === expectedPhase) return {
+          capacity:u64(value), accepted:u64(value, 8), proofs:new TextDecoder().decode(value.subarray(17)),
+        };
         check(expectedPhase === 3 && (actualPhase === 1 || actualPhase === 2), 'native channel has the expected phase');
       }
       // Retry reads only; never resubmit a cut or close while waiting for settlement.
@@ -520,7 +527,8 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
         check(spendable.length === 1 && String(spendable[0].proof.amount) === '64' && await walletBalance(mint) === '64',
           'fixture leaves exactly one spendable 64-msat proof after setting aside the smaller denominations');
       } else if (!tools) {
-        await deposit(mint, '10', '10');
+        const initial = largeRefill ? '100' : '10';
+        await deposit(mint, initial, initial);
       }
     }
     if (phase === 'renderer-verify' || phase === 'renderer-resume-verify') {
@@ -528,11 +536,11 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       // reconcile an unresolved payment on behalf of the renderer under test.
       const saved = await hoe('inspect', scope);
       const resumed = phase === 'renderer-resume-verify';
-      check(saved.admitted && saved.capacity_msats === '10' && saved.balance_msats === (resumed ? '0' : '5') &&
+      check(saved.admitted && saved.capacity_msats === (largeRefill ? '100' : '10') && saved.balance_msats === (resumed ? '0' : '5') &&
         (resumed ? saved.channel_id === channel : /^[0-9a-f]{64}$/.test(saved.channel_id)),
         'renderer persisted the expected channel binding and accepted balance');
       channel = saved.channel_id;
-      check(await walletBalance(mint) === '0', 'renderer refill debited exactly the deposited 10 msat');
+      check(await walletBalance(mint) === '0', 'renderer refill debited exactly the deposited balance');
     }
 
     step('authenticate real native game socket');
@@ -625,15 +633,33 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       const pending = await fund(mint, player, terms, changeRecovery ? '50' : '10');
       if (phase === 'funding-drop') return pending;
       // Issuing this after the first funding keeps its exact proofs in reserve for channel two.
-      await deposit(mint, '5', '5');
+      const reserved = rendererTopUp ? '100' : '5';
+      await deposit(mint, reserved, reserved);
       await cut(0, 1, '5');
       // The test peer checks the wire reply, but deliberately leaves the wallet cut pending.
       return channel; // Public identifier only.
     }
 
+    if (phase === 'renderer-top-up-verify') {
+      const saved = await hoe('inspect', scope);
+      check(saved.admitted && saved.channel_id !== channel && saved.capacity_msats === '105' && saved.balance_msats === '0',
+        'replacement keeps the unused cut and adds twenty new uses');
+      check(await walletBalance(mint) === '0', 'replacement spends the credited 5 msat plus the approved additional 100 msat');
+      await status('105', '0', 0, saved.channel_id);
+      await status('10', '5', 3, channel, true);
+      return true;
+    }
+    if (phase === 'partial-replace') {
+      check(!auth.has(0x20), 'settled channel is absent from authenticated playable state');
+      const receipt = await status('10', '5', 3, channel, true);
+      await hoe('finalize', scope, channel, receipt.capacity, receipt.accepted, receipt.proofs);
+      check(await walletBalance(mint) === '10', 'settlement returns the one unused cut to the wallet exactly once');
+      await fund(mint, player, await requirements(), '10');
+      return channel;
+    }
     const accepted = phase === 'renderer-resume-verify' ? '0' : '5';
     check(auth.get(0x20)?.length === 32 && hex(auth.get(0x20)) === channel &&
-      auth.get(0x26)?.length === 8 && u64(auth.get(0x26)) === '10' &&
+      auth.get(0x26)?.length === 8 && u64(auth.get(0x26)) === (largeRefill ? '100' : '10') &&
       auth.get(0x27)?.length === 8 && u64(auth.get(0x27)) === accepted,
       'new authenticated socket resumes the same channel at the expected accepted balance');
     if (phase === 'renderer-resume-verify') {
@@ -641,7 +667,7 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       return true;
     }
     if (phase === 'renderer-verify') {
-      await status('10', '5');
+      await status(largeRefill ? '100' : '10', '5');
       check(await areaCut(0, 1), 'native snapshot marks the grass clicked by the renderer cut');
       return true;
     }
@@ -662,7 +688,27 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
       check(bound.balance_msats === authoritative.accepted, 'wallet binds the exact authoritative cumulative balance');
       await status('10', '5');
       check(await areaCut(0, 1), 'native snapshot still marks the tile cut after reload');
-      check(await walletBalance(mint) === '5', 'reconciliation preserves the replacement deposit');
+      check(await walletBalance(mint) === (rendererTopUp ? '100' : '5'), 'reconciliation preserves the replacement deposit');
+      return true;
+    }
+
+    if (phase === 'partial-close') {
+      const closeAt = amount => request(0x23, 0xa3, [[0x20, unhex(channel)], [0x27, encodeU64(amount)]]);
+      for (const stale of ['0', '10']) {
+        check(failureCode((await closeAt(stale)).get(4)) === 23, 'a close at a mismatched balance is rejected');
+      }
+      await status('10', '5');
+      const lateId = random(16);
+      const latePayment = await hoe('prepare_cut', scope, channel, hex(lateId));
+      closingChannels.add(channel);
+      const closed = await closeAt('5');
+      check(closed.get(3)?.length === 0 || failureCode(closed.get(4)) === 25, 'exact partial close starts settlement');
+      const late = await sendCut(lateId, point(1, 0), channel, '10', latePayment);
+      check(late.has(4) && !(await areaCut(1, 0)), 'a payment prepared before close cannot charge after the freeze');
+      await hoe('resolve_cut', scope, channel, hex(lateId), 'not_charged');
+      await status('10', '5', 3, channel, true);
+      check((await closeAt('5')).get(3)?.length === 0, 'retrying the exact close returns the settled result');
+      check(await walletBalance(mint) === '5', 'only finalization credits the sender');
       return true;
     }
 
@@ -699,9 +745,10 @@ async function pageFlow({phase, smoke, channel, changeRecovery, savedOperation, 
 
 // Observe the production bridge without changing its calls or replies. Keep
 // only completed operation numbers and allowlisted scalar result fields.
-function observeRendererHoe(savedOperation) {
+function observeRendererHoe(savedOperation, interruptTopUp = false) {
   const replies = window.rendererHoeReplies = {};
   const requests = window.rendererHoeRequests = {};
+  const successes = window.rendererHoeSuccesses = {};
   const toolInspects = window.rendererToolInspects = {};
   let bridge;
   Object.defineProperty(window, 'haystackOnboarding', {
@@ -728,16 +775,24 @@ function observeRendererHoe(savedOperation) {
             try { data = JSON.parse(text); } catch (_) {}
             if (op === 1 && data?.status === 0) toolInspects[tool] = (toolInspects[tool] ?? 0) + 1;
             if (tool !== 1) return deliver.apply(this, arguments);
+            if (data?.status === 0) successes[op] = (successes[op] ?? 0) + 1;
             replies[op] = {
               ok: data?.status === 0,
+              twentyCutQuote: op === 2 && data?.cuts === '20' && data.capacity_msats === '100' && data.max_debit_msats === '100',
+              topUpQuote: op === 2 && data?.cuts === '21' && data.capacity_msats === '105' && data.max_debit_msats === '105',
+              status: Number.isInteger(data?.status) ? data.status : null,
+              noEligibleFunds: data?.error === 'no affordable whole hoe cut using eligible active-keyset proofs',
+              proofLimit: data?.error === 'requested capacity exceeds the funding proof limit',
+              incompatibleMint: data?.error === 'requested capacity cannot be represented by the mint',
               twoCutQuote: (op === 2 || op === 9) && data?.cuts === '2' && data.capacity_msats === '10' && data.max_debit_msats === '10',
               pendingSaved: op === 1 && data?.status === 19 && data.operation_id === savedOperation?.operationId,
               savedQuote: op === 9 && data?.operation_id === savedOperation?.operationId &&
                 data?.refund_time === savedOperation?.refundTime && data?.mint_url === location.origin,
               channel: op === 9 && /^[0-9a-f]{64}$/.test(data?.channel_id) ? data.channel_id : null,
               zeroAccepted: op === 5 && data?.balance_msats === '0',
-              fiveAccepted: op === 7 && data?.balance_msats === '5',
+              fiveAccepted: (op === 5 || op === 7) && data?.balance_msats === '5',
             };
+            if (interruptTopUp && op === 8 && data?.status === 0) return;
           }
         }
         return deliver.apply(this, arguments);
@@ -787,10 +842,10 @@ async function rendererFlow(areaReady, savedOperation = null) {
       Object.entries(rendererHoeReplies).map(([op, {channel, ...flags}]) => [op, flags]))})`);
     throw new Error(`Renderer check timed out (${JSON.stringify(progress)})`);
   }
-  async function click(x, y, dragX = 0) {
+  async function click(x, y, dragX = 0, button = 'left') {
     await send('Input.dispatchMouseEvent', {type:'mouseMoved', x, y});
     await settle();
-    await send('Input.dispatchMouseEvent', {type:'mousePressed', x, y, button:'left', buttons:1, clickCount:1});
+    await send('Input.dispatchMouseEvent', {type:'mousePressed', x, y, button, buttons:button === 'right' ? 2 : 1, clickCount:1});
     await evaluate('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))');
     if (dragX) {
       await send('Input.dispatchMouseEvent', {type:'mouseMoved', x:x + dragX, y, buttons:1});
@@ -798,13 +853,13 @@ async function rendererFlow(areaReady, savedOperation = null) {
       await send('Input.dispatchMouseEvent', {type:'mouseMoved', x, y, buttons:1});
       await settle();
     }
-    await send('Input.dispatchMouseEvent', {type:'mouseReleased', x, y, button:'left', clickCount:1});
+    await send('Input.dispatchMouseEvent', {type:'mouseReleased', x, y, button, clickCount:1});
     await settle();
   }
 
   stage = 'load real game renderer';
   await send('Emulation.setDeviceMetricsOverride', {width, height, deviceScaleFactor:1, mobile:false});
-  const {identifier} = await send('Page.addScriptToEvaluateOnNewDocument', {source:`(${observeRendererHoe})(${JSON.stringify(savedOperation)})`});
+  let {identifier} = await send('Page.addScriptToEvaluateOnNewDocument', {source:`(${observeRendererHoe})(${JSON.stringify(savedOperation)}, ${resumeTopUp})`});
   const beforeRequirements = requirementsRequests;
   await send('Page.bringToFront');
   await load(false, `${mintOrigin}/renderer/index.html`);
@@ -819,7 +874,7 @@ async function rendererFlow(areaReady, savedOperation = null) {
   })()`), {x:0, y:0, width, height});
   await settle();
 
-  if (!savedOperation) {
+  if (!savedOperation && !rendererTopUp) {
     // The hotbar's slots are centered at -90, 0, +90 from viewport center.
     // A slot click and then number keys must load the selected tool's own journal.
     await click(width / 2, height - 32);
@@ -834,9 +889,26 @@ async function rendererFlow(areaReady, savedOperation = null) {
     assert.equal(cuts, 0, 'switching hotbar slots does not harvest');
   }
 
-  // src/game.zig: the refill button is centered 84 px right of the viewport
-  // center and 88 px above the bottom, both before and after the quote.
-  const clickRefill = () => click(width / 2 + 84, height - 88);
+  stage = 'right-click the Hoe slot to open Tools';
+  await click(width / 2 + 90, height - 32, 0, 'right');
+  // Center of the increase button on the third Tools row, at 1000x640.
+  const clickRefill = () => click(width / 2 - 4, height / 2 + 19);
+  if (rendererTopUp) {
+    await expect('renderer binds the partially used channel before the click', 'rendererHoeReplies[5]?.fiveAccepted');
+    await click(width / 2 + 124, height / 2 + 19);
+    if (resumeTopUp) {
+      await expect('credit committed before simulated page loss', 'rendererHoeReplies[12]?.ok && rendererHoeReplies[8]?.ok');
+      assert.equal(opens, 1, 'no replacement admitted before page loss');
+      await send('Page.removeScriptToEvaluateOnNewDocument', {identifier});
+      ({identifier} = await send('Page.addScriptToEvaluateOnNewDocument', {source:`(${observeRendererHoe})(null)`}));
+      await load(false, `${mintOrigin}/renderer/index.html`);
+    }
+    await expect('one click completes exact quote, purchase and channel binding',
+      'rendererHoeReplies[2]?.topUpQuote && rendererHoeReplies[3]?.ok && rendererHoeReplies[13]?.ok');
+    if (resumeTopUp) assert.equal(await evaluate('rendererHoeRequests[8] ?? 0'), 0, 'reconnect does not credit sender change again');
+    await send('Page.removeScriptToEvaluateOnNewDocument', {identifier});
+    return;
+  }
   if (savedOperation) {
     const assertNoResume = async () => {
       assert.equal(swaps, 1, 'only the pre-dispatch attempt is allowed before consent');
@@ -865,9 +937,12 @@ async function rendererFlow(areaReady, savedOperation = null) {
     return channel;
   }
 
-  stage = 'click Get refill quote in the HUD';
-  await clickRefill();
-  await expect('HUD click obtains a two-cut quote for 10 msat', 'rendererHoeReplies[2]?.ok && rendererHoeReplies[2].twoCutQuote');
+  stage = 'request a refill quote in Tools';
+  if (largeRefill) await click(width / 2 + 124, height / 2 + 19);
+  else await clickRefill();
+  await expect('Tools obtains the expected refill quote', largeRefill
+    ? 'rendererHoeReplies[2]?.ok && rendererHoeReplies[2].twentyCutQuote'
+    : 'rendererHoeReplies[2]?.ok && rendererHoeReplies[2].twoCutQuote');
   await settle();
   assert.equal(swaps, 0, 'the quote must not swap before a second click');
   assert.equal(cuts, 0, 'the quote click must not send a cut');
@@ -878,9 +953,13 @@ async function rendererFlow(areaReady, savedOperation = null) {
   await expect('refill binds the real server channel at zero accepted', 'rendererHoeReplies[3]?.ok && rendererHoeReplies[5]?.ok && rendererHoeReplies[5].zeroAccepted');
   assert.equal(swaps, 1, 'consent performs exactly one mint swap');
   assert.equal(cuts, 0, 'the refill click must not send a cut');
-  console.log('ok - real renderer HUD quoted two cuts for 10 msat, then refilled on a separate click with one mint swap');
+  console.log(`ok - Tools quoted ${largeRefill ? '20 cuts for 100 msat' : 'two cuts for 10 msat'}, then refilled on a separate click with one mint swap`);
   await expect('native area supplies the renderer with uncut grass at (0,1)', areaReady);
   await settle();
+  await expect('renderer rebinds the funded channel after authentication refresh', 'rendererHoeSuccesses[5] >= 2');
+  stage = 'leave Tools via Back to Main and Resume';
+  await click(width / 2, height / 2 + 114);
+  await click(width / 2, height / 2 + 154);
 
   // Camera centers on the authenticated player at (0,0), with 32 px tiles.
   const grassX = width / 2, grassY = height / 2 + 32;
@@ -974,7 +1053,7 @@ async function run() {
 
   stage = 'bootstrap wallet and native player';
   await load();
-  const flow = options => evaluate(`(${pageFlow})(${JSON.stringify({changeRecovery, tools:toolsFixture, ...options})})`);
+  const flow = options => evaluate(`(${pageFlow})(${JSON.stringify({changeRecovery, tools:toolsFixture, largeRefill, rendererTopUp, ...options})})`);
   assert.equal(await flow({phase:'bootstrap', smoke}), true);
   if (changeRecovery) {
     assert.equal(swaps, 0, 'fixture setup sets aside exact denominations without swapping');
@@ -1114,6 +1193,29 @@ async function run() {
   assert.equal(swaps, 1, 'recovery must not submit a second funding swap');
   assert.equal(cuts, 1, 'recovery must not retransmit the cut');
   console.log('ok - unresolved cut bound to exactly 5 msat from native status after reload; no repeated cut or swap');
+
+  if (rendererTopUp) {
+    await rendererFlow(null);
+    await load(true);
+    assert.equal(await flow({phase:'renderer-top-up-verify', channel}), true);
+    assert.equal(opens, 2, 'one initial open and one replacement');
+    assert.equal(cuts, 1, 'top-up never charges an extra cut');
+    console.log('ok - a single Tools click carries the unused cut into a 21-use replacement');
+    return;
+  }
+  if (partialClose) {
+    stage = 'close a partially used channel and reject a late payment';
+    await load(true);
+    assert.equal(await flow({phase:'partial-close', channel}), true);
+    stage = 'reconnect, credit sender change, and open a replacement';
+    await load(true);
+    const replacement = await flow({phase:'partial-replace', channel});
+    assert.match(replacement, /^[0-9a-f]{64}$/);
+    assert.notEqual(replacement, channel);
+    assert.equal(cuts, 2, 'one charged cut and one rejected late cut');
+    console.log('ok - exact partial close freezes gameplay; reconnect recovers unused value and funds a distinct replacement');
+    return;
+  }
 
   stage = 'reject duplicate, deplete, close, finalize and replace';
   await load(true);

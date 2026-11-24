@@ -232,7 +232,7 @@ mergeInto(LibraryManager.library, {
       var self = this, s = self.session, argument, op, tool;
       try {
         tool = ['axe', 'hoe', 'pickaxe'][toolIndex];
-        op = [null, 'inspect', 'quote', 'fund', 'open_payload', 'bind', 'prepare_cut', 'resolve_cut', 'finalize', 'resume_quote', 'resume'][operation];
+        op = [null, 'inspect', 'quote', 'fund', 'open_payload', 'bind', 'prepare_cut', 'resolve_cut', 'finalize', 'resume_quote', 'resume', 'top_up_read', 'top_up_save', 'top_up_clear'][operation];
         if (!tool || !op || !s || s.closing || s.generation !== generation || len > 131072 || ptr < 0 || ptr + len > HEAPU8.length) throw 0;
         argument = new TextDecoder('utf-8', { fatal: true }).decode(HEAPU8.subarray(ptr, ptr + len));
       } catch (_) {

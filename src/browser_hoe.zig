@@ -13,7 +13,11 @@ const scope = "ws://127.0.0.1:9224/";
 const open_remaining_seconds = 300;
 const payment_remaining_seconds = 120;
 const max_funding_overhead_msats = 5; // Fixtures enforce zero overhead in the wallet.
-const Op = enum(c_int) { inspect = 1, quote, fund, open_payload, bind, prepare_cut, resolve_cut, finalize, resume_quote, resume_funding };
+
+pub fn refillFeeLimit(mint: []const u8) ?u64 {
+    return if (std.mem.eql(u8, std.mem.trimEnd(u8, mint, "/"), "https://testnut.cashu.space")) max_funding_overhead_msats else null;
+}
+const Op = enum(c_int) { inspect = 1, quote, fund, open_payload, bind, prepare_cut, resolve_cut, finalize, resume_quote, resume_funding, top_up_read, top_up_save, top_up_clear };
 const Callback = *const fn (c_int, u32, u32, [*c]const u8, u32) callconv(.c) void;
 extern fn haystack_tool_request(u32, u32, c_int, c_int, [*]const u8, u32, Callback) void;
 extern "c" fn getentropy([*]u8, usize) c_int;
@@ -76,6 +80,22 @@ const Phase = enum {
     resume_available,
     recovery,
 };
+const TopUp = struct {
+    channel: [32]u8,
+    receiver: [33]u8,
+    accepted: u64,
+    capacity: u64,
+    max_debit: u64,
+    expires: u64,
+
+    fn authorized(self: TopUp, now: ?u64) bool {
+        return if (now) |timestamp| timestamp < self.expires else false;
+    }
+
+    fn permits(self: TopUp, offer: Offer, now: ?u64) bool {
+        return self.authorized(now) and self.capacity == offer.capacity and offer.debit <= self.max_debit;
+    }
+};
 const Job = struct { session: u64, serial: u32, op: Op, started: f64 };
 
 pub const Runtime = struct {
@@ -83,6 +103,9 @@ pub const Runtime = struct {
     session: ?u64 = null,
     tool: protocol.tool = .hoe,
     phase: Phase = .inspect,
+    large_refill: bool = false,
+    top_up_loaded: bool = false,
+    top_up: ?TopUp = null,
     record: ?Record = null,
     server: ?u64 = null,
     terms: ?Terms = null,
@@ -140,14 +163,13 @@ pub const Runtime = struct {
         self.publish(game, now, clock);
         const changed = switched or !std.meta.eql(before, game.paid_hoe.view) or funding_before != game.hoe_funding.status;
         if (changed) {
-            game.paid_hoe.refill_presented = false;
             game.paid_hoe.click_origin = null;
         }
         return changed;
     }
 
     fn selectTool(self: *Runtime, selected: protocol.tool) bool {
-        if (selected == self.tool or self.job != null or self.request != null or self.cut != null) return false;
+        if (selected == self.tool or self.job != null or self.request != null or self.cut != null or self.top_up != null) return false;
         // Complete an immediate reconciliation (e.g. after Close) before
         // switching, but don't hold the input slot across status backoff.
         if (self.phase == .query and self.query_at == 0) return false;
@@ -162,6 +184,8 @@ pub const Runtime = struct {
         // another tool's balances, offer, or login channel.
         self.restartQuery();
         self.phase = .inspect;
+        self.top_up_loaded = false;
+        self.top_up = null;
         self.record = null;
         self.server = null;
         self.terms = null;
@@ -233,7 +257,7 @@ pub const Runtime = struct {
         if (self.request) |id| {
             const done = connection.takeChannelFor(network.session, id) orelse return;
             self.request = null;
-            try self.channelResult(done.outcome, login, game, now, clock);
+            try self.channelResult(connection, done.outcome, login, game, now, clock);
             return;
         }
         if (self.notice and (self.phase == .active or self.phase == .depleted or self.phase == .recovery or self.phase == .query)) {
@@ -241,11 +265,18 @@ pub const Runtime = struct {
             self.restartQuery();
         }
         switch (self.phase) {
-            .inspect => try self.send(.inspect, &.{scope}, clock),
+            .inspect => if (!self.top_up_loaded)
+                try self.send(.top_up_read, &.{scope}, clock)
+            else
+                try self.send(.inspect, &.{scope}, clock),
+            .unfunded => if (self.top_up != null and self.quote_failed) try self.clearTopUp(clock),
+            .resume_available => if (self.top_up) |intent| {
+                if (intent.authorized(now)) try self.send(.resume_quote, &.{scope}, clock) else try self.clearTopUp(clock);
+            },
             .query => if (clock >= self.query_at) {
                 try self.channel(connection, .channel_status, .{ .id = self.record.?.id });
             },
-            .offer => if (!self.offerUsable(now) or game.menu.opened) self.discardOffer(),
+            .offer => if (!self.offerUsable(now) or (!game.toolsOpen() and self.top_up == null)) self.discardOffer(),
             else => {},
         }
     }
@@ -253,6 +284,10 @@ pub const Runtime = struct {
     fn discardOffer(self: *Runtime) void {
         self.phase = if (self.offer != null and self.offer.?.resume_funding != null) .resume_available else .unfunded;
         self.offer = null;
+        if (self.top_up != null) {
+            self.phase = .unfunded;
+            self.quote_failed = true;
+        }
     }
 
     fn walletRejection(self: *Runtime, op: Op, fields: std.json.ObjectMap, login: ws.HoeLogin) bool {
@@ -290,14 +325,18 @@ pub const Runtime = struct {
 
     pub fn click(self: *Runtime, connection: *ws.Worker, network: Snapshot, game: *Game, now: ?u64, clock: f64) void {
         const refill = game.paid_hoe.refill_requested;
+        const large = game.paid_hoe.refill_large;
+        game.paid_hoe.refill_large = false;
+        const close = game.paid_hoe.close_requested;
         const tile = game.paid_hoe.target;
         game.paid_hoe.refill_requested = false;
+        game.paid_hoe.close_requested = false;
         game.paid_hoe.target = null;
-        if (game.menu.opened) {
+        if (game.menu.opened and self.job != null and self.job.?.op == .prepare_cut) {
+            if (self.cut) |*cut| cut.cancelled = true;
+        }
+        if (!game.toolsOpen() and game.menu.opened and self.top_up == null) {
             self.consent = false;
-            if (self.job != null and self.job.?.op == .prepare_cut) {
-                if (self.cut) |*cut| cut.cancelled = true;
-            }
             if (self.phase == .offer) {
                 self.discardOffer();
                 self.publish(game, now, clock);
@@ -310,11 +349,51 @@ pub const Runtime = struct {
         }
         const session = self.session orelse return;
         if (self.job != null or self.request != null or self.cut != null or connection.toolLogin(session, self.tool) == null) return;
-        self.act(connection, network, game, refill, tile, now, clock) catch {
+        if (close and self.phase != .depleted) return;
+        if (self.top_up != null) {
+            if (refill and self.phase == .settlement_retry) self.restartQuery();
+            return;
+        }
+        if (refill and self.phase == .active) {
+            self.beginTopUp(game, large, now, clock) catch {
+                self.phase = .recovery;
+            };
+            self.publish(game, now, clock);
+            return;
+        }
+        if (refill and self.phase == .unfunded) self.large_refill = large;
+        self.act(connection, network, game, refill or close, tile, now, clock) catch {
             self.phase = .recovery;
             self.cut = null;
         };
         self.publish(game, now, clock);
+    }
+
+    fn beginTopUp(self: *Runtime, game: *Game, large: bool, now: ?u64, clock: f64) !void {
+        const plan = game.topUpPlan(game.selected_tool, large) orelse return;
+        const record = self.record orelse return;
+        const timestamp = now orelse return;
+        if (!record.canPay(now) or record.accepted == 0 or self.server != record.accepted) return;
+        const expires = decimal(@min(record.refund, timestamp +| 300));
+        const accepted = decimal(record.accepted);
+        const capacity = decimal(plan.capacity);
+        const max_debit = decimal(plan.max_debit);
+        try self.send(.top_up_save, &.{ scope, &std.fmt.bytesToHex(record.id, .lower), accepted.slice(), capacity.slice(), max_debit.slice(), expires.slice() }, clock);
+    }
+
+    fn clearTopUp(self: *Runtime, clock: f64) !void {
+        const id = self.top_up.?.channel;
+        try self.send(.top_up_clear, &.{ scope, &std.fmt.bytesToHex(id, .lower) }, clock);
+    }
+
+    fn confirmTopUp(self: *Runtime, connection: *ws.Worker, now: ?u64, clock: f64) !void {
+        if (!self.top_up.?.permits(self.offer.?, now)) {
+            self.quote_failed = true;
+            return self.clearTopUp(clock);
+        }
+        try self.channel(connection, .channel_requirements, .{ .tool = self.tool });
+        self.consent = true;
+        self.phase = .confirm_terms;
     }
 
     fn act(self: *Runtime, connection: *ws.Worker, network: Snapshot, game: *Game, refill: bool, tile_opt: ?protocol.Location, now: ?u64, clock: f64) !void {
@@ -354,7 +433,7 @@ pub const Runtime = struct {
         self.cut = .{ .id = id, .tile = tile };
     }
 
-    fn channelResult(self: *Runtime, outcome: ws.ChannelCompletion.Outcome, login: ws.HoeLogin, game: *Game, now: ?u64, clock: f64) !void {
+    fn channelResult(self: *Runtime, connection: *ws.Worker, outcome: ws.ChannelCompletion.Outcome, login: ws.HoeLogin, game: *Game, now: ?u64, clock: f64) !void {
         switch (outcome) {
             .channel_requirements => |response| {
                 const confirming = self.phase == .confirm_terms;
@@ -365,8 +444,13 @@ pub const Runtime = struct {
                     return;
                 }
                 if (self.record != null or login.channel != null) return error.ChannelExists;
+                if (self.top_up) |intent| {
+                    if (!std.mem.eql(u8, &intent.receiver, &response.ok.pubkey)) return self.clearTopUp(clock);
+                }
                 if (confirming) {
-                    if (!self.consent or game.menu.opened or !self.offerUsable(now)) {
+                    if (!self.consent or (self.top_up == null and !game.toolsOpen()) or !self.offerUsable(now) or
+                        (self.top_up != null and !self.top_up.?.permits(self.offer.?, now)))
+                    {
                         self.discardOffer();
                         return;
                     }
@@ -394,7 +478,10 @@ pub const Runtime = struct {
                     try self.send(.fund, &([_]?[]const u8{&self.offer.?.id} ++ args), clock);
                     self.phase = .funding;
                 } else {
-                    try self.send(.quote, &args, clock);
+                    if (self.top_up != null or self.large_refill) {
+                        const count = decimal(if (self.top_up) |intent| intent.capacity / self.tool.priceMsat() else protocol.large_tool_refill_cuts);
+                        try self.send(.quote, &(args ++ [_]?[]const u8{count.slice()}), clock);
+                    } else try self.send(.quote, &args, clock);
                     self.phase = .quoting;
                 }
             },
@@ -414,9 +501,14 @@ pub const Runtime = struct {
                     .invalid_request, .invalid_proof => return error.OpenRejected,
                 },
             },
-            .channel_close => {
+            .channel_close => |closed| {
                 // No close response, including an error, proves settlement.
                 self.restartQuery();
+                if (closed == .failed) switch (closed.failed) {
+                    .close_rejected => if (self.top_up != null) try self.clearTopUp(clock),
+                    .server_busy, .unavailable => self.retryQuery(clock),
+                    else => {},
+                };
             },
             .channel_status => |response| switch (response.view()) {
                 .failed => |why| switch (why) {
@@ -428,6 +520,14 @@ pub const Runtime = struct {
                     const record = self.record.?;
                     if (status.capacity_msat != record.capacity or !validBalance(self.tool, record.capacity, status.balance_msat)) return error.BadStatus;
                     self.server = status.balance_msat;
+                    if (self.top_up) |intent| if (std.mem.eql(u8, &intent.channel, &record.id)) {
+                        if (status.phase == .active or status.phase == .depleted) {
+                            if (!intent.authorized(now) or status.balance_msat != intent.accepted) return self.clearTopUp(clock);
+                            try self.channel(connection, .channel_close, .{ .id = intent.channel, .expected_balance_msat = intent.accepted });
+                            self.phase = .closing;
+                            return;
+                        }
+                    };
                     switch (status.phase) {
                         .active => if (login.channel == null) {
                             if (status.balance_msat != 0) return error.UnlinkedBalance;
@@ -456,11 +556,45 @@ pub const Runtime = struct {
 
     fn walletResult(self: *Runtime, op: Op, result: std.json.ObjectMap, connection: *ws.Worker, network: Snapshot, login: ws.HoeLogin, game: *Game, now: ?u64, clock: f64) !void {
         switch (op) {
+            .top_up_read => {
+                self.top_up_loaded = true;
+                const value = result.get("channel") orelse return error.BadTopUp;
+                self.top_up = if (value == .null) null else .{
+                    .channel = try hexField(32, result, "channel"),
+                    .receiver = try hexField(33, result, "receiver"),
+                    .accepted = try number(result, "accepted"),
+                    .capacity = try number(result, "capacity"),
+                    .max_debit = try number(result, "max_debit"),
+                    .expires = try number(result, "expires"),
+                };
+                if (self.top_up) |intent| {
+                    const tool_id = try number(result, "tool");
+                    if (tool_id >= protocol.tools.len) return error.BadTopUp;
+                    self.tool = @fromBackingInt(@intCast(tool_id));
+                    game.selected_tool = PlayerTool.fromProtocol(self.tool);
+                    if (!validDebit(self.tool, intent.capacity, intent.max_debit) or intent.accepted == 0) return error.BadTopUp;
+                }
+            },
+            .top_up_save => {
+                // Reload the committed authorization before any close is sent.
+                self.top_up_loaded = false;
+                self.phase = .inspect;
+            },
+            .top_up_clear => {
+                self.top_up = null;
+                self.top_up_loaded = true;
+                self.phase = .inspect;
+            },
             .inspect => {
                 const value = result.get("channel_id") orelse return error.BadInspect;
                 if (value == .null) {
                     if (login.channel != null) return error.MissingLocalChannel;
                     self.phase = .unfunded;
+                    if (self.top_up) |intent| {
+                        if (!intent.authorized(now)) return self.clearTopUp(clock);
+                        try self.channel(connection, .channel_requirements, .{ .tool = self.tool });
+                        self.phase = .quote_terms;
+                    }
                     return;
                 }
                 const record: Record = .{
@@ -487,15 +621,22 @@ pub const Runtime = struct {
                     self.quote_failed = true;
                     return;
                 };
+                const cuts = offer.capacity / self.tool.priceMsat();
+                if (self.top_up != null) {
+                    self.offer = offer;
+                    return self.confirmTopUp(connection, now, clock);
+                }
+                if (if (self.large_refill) cuts != protocol.large_tool_refill_cuts else cuts > protocol.hoe_refill_cuts) return error.FundingMismatch;
                 self.offer = offer;
                 self.phase = .offer;
             },
             .resume_quote => {
-                if (login.channel != null or game.menu.opened) {
+                if (login.channel != null or (!game.toolsOpen() and self.top_up == null)) {
                     self.phase = .resume_available;
                     return;
                 }
                 self.offer = try parseResumeOffer(self.tool, result);
+                if (self.top_up != null) return self.confirmTopUp(connection, now, clock);
                 self.phase = .offer;
             },
             .fund, .resume_funding, .open_payload => {
@@ -530,7 +671,12 @@ pub const Runtime = struct {
                     self.refresh_after_bind = false;
                     self.phase = .inspect;
                     connection.refreshAuth(network.session);
-                } else self.phase = if (balance == record.capacity) .depleted else .active;
+                } else {
+                    self.phase = if (balance == record.capacity) .depleted else .active;
+                    if (self.top_up) |intent| {
+                        if (!std.mem.eql(u8, &record.id, &intent.channel)) try self.clearTopUp(clock);
+                    }
+                }
             },
             .prepare_cut => {
                 const cut = self.cut.?;
@@ -674,12 +820,22 @@ pub const Runtime = struct {
                 view.offer = .{ .cuts = offer.capacity / self.tool.priceMsat(), .debit = offer.debit, .resume_funding = offer.resume_funding != null };
             }
             view.close_first = self.phase == .depleted and self.canClose(now);
+            if (self.phase == .active and self.top_up == null and self.job == null and self.cut == null and self.request == null) {
+                const record = self.record.?;
+                if (record.canPay(now) and record.accepted != 0 and self.server == record.accepted) {
+                    view.top_up = .{
+                        .remaining = (record.capacity - record.accepted) / self.tool.priceMsat(),
+                        .fee_limit = refillFeeLimit(game.menu.wallet.mint.slice()) orelse 0,
+                    };
+                }
+            }
             view.recovery_action = switch (self.phase) {
                 .resume_available => .review_funding,
                 .settlement_retry => .retry_settlement,
                 else => null,
             };
-            view.can_refill = self.job == null and (self.phase == .unfunded or view.offer != null or view.close_first or view.recovery_action != null);
+            view.can_refill = self.job == null and (self.phase == .settlement_retry or
+                (self.top_up == null and (self.phase == .unfunded or view.offer != null or view.close_first or view.recovery_action != null)));
             // A missing callback must not free the mutation slot for another
             // attempt. A late result is recovered through a fresh login.
             if (self.job) |job| if (clock >= job.started + 30) {
@@ -743,7 +899,10 @@ fn parseOffer(tool: protocol.tool, result: std.json.ObjectMap, terms: Terms) !Of
 }
 
 fn validDebit(tool: protocol.tool, capacity: u64, debit: u64) bool {
-    return tool.validCapacity(capacity) and debit >= capacity and debit <= tool.priceMsat() * protocol.hoe_refill_cuts + max_funding_overhead_msats;
+    const standard_capacity = tool.priceMsat() * protocol.hoe_refill_cuts;
+    const large_capacity = tool.priceMsat() * protocol.large_tool_refill_cuts;
+    const cap = if (capacity <= standard_capacity) standard_capacity else if (capacity <= large_capacity) large_capacity else capacity;
+    return tool.validCapacity(capacity) and debit >= capacity and debit <= cap + max_funding_overhead_msats;
 }
 
 fn parseResumeOffer(tool: protocol.tool, result: std.json.ObjectMap) !Offer {
@@ -865,7 +1024,10 @@ test "browser tool replies and balances belong to the pinned tool" {
         try t.expect(!validBalance(tool, capacity, capacity - 1));
         try t.expect(validDebit(tool, capacity, capacity + 5));
         try t.expect(!validDebit(tool, capacity, capacity + 6));
-        try t.expect(!validDebit(tool, capacity + tool.priceMsat(), capacity + tool.priceMsat()));
+        const large_capacity = tool.priceMsat() * protocol.large_tool_refill_cuts;
+        try t.expect(validDebit(tool, large_capacity, large_capacity));
+        const oversized = (protocol.max_tool_channel_cuts + 1) * tool.priceMsat();
+        try t.expect(!validDebit(tool, oversized, oversized));
         for (protocol.tools) |other| {
             try t.expectEqual(tool == other, classify(other, tile, .{ .ok = state }) == .charged);
             try t.expectEqual(tool == other, classify(other, tile, .{ .failed = .{ .already_cut = state } }) == .already_cut);

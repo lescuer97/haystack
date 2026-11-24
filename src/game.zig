@@ -57,25 +57,19 @@ pub fn walletBadgeBounds(vw: f32, vh: f32) ?menu.Rect {
     return .{ .x = margin, .y = y, .width = width, .height = height };
 }
 
-/// Both pointer routing and drawing use the same status panel above the toolbar.
-pub fn hoeStatusBounds(vw: f32, vh: f32) ?menu.Rect {
-    const margin = 8;
-    const width = @min(320, vw - 2 * margin);
-    if (width < 288) return null;
-    const toolbar = toolbarLayout(vw, vh) orelse return null;
-    const x = toolbar.bounds.centerX() - width / 2;
-    var anchor_y = toolbar.bounds.y;
-    if (walletBadgeBounds(vw, vh)) |badge| {
-        if (x < badge.x + badge.width + margin) anchor_y = @min(anchor_y, badge.y);
-    }
-    const height = 48;
-    const y = anchor_y - height - margin;
-    if (y < margin) return null;
-    return .{ .x = x, .y = y, .width = width, .height = height };
-}
+pub const ToolMenuRow = struct { bounds: menu.Rect, name: menu.Rect, increase: menu.Rect, close: menu.Rect };
 
-pub fn hoeRefillButton(panel: menu.Rect) menu.Rect {
-    return .{ .x = panel.x + panel.width - 142, .y = panel.y + 9, .width = 132, .height = 30 };
+pub fn toolMenuRow(content: menu.Rect, index: usize) ToolMenuRow {
+    const step = content.height * 0.26;
+    const y = content.y + (@as(f32, @floatFromInt(index)) + 0.075) * step;
+    const height = step * 0.75;
+    const w = content.width;
+    return .{
+        .bounds = .{ .x = content.x, .y = y, .width = w, .height = height },
+        .name = .{ .x = content.x, .y = y, .width = w * 0.33, .height = height },
+        .increase = .{ .x = content.x + w * 0.33, .y = y, .width = w * 0.32, .height = height },
+        .close = .{ .x = content.x + w * 0.65, .y = y, .width = w * 0.35, .height = height },
+    };
 }
 
 pub const HoeFundingUi = struct {
@@ -134,8 +128,15 @@ pub const HoeView = struct {
     payment_pending: bool = false,
     can_refill: bool = false,
     close_first: bool = false,
+    top_up: ?struct { remaining: u64, fee_limit: u64 } = null,
     recovery_action: ?enum { review_funding, retry_settlement } = null,
     offer: ?struct { cuts: u64, debit: u64, resume_funding: bool = false } = null,
+};
+
+pub const ToolStates = [player.Tool.slots.len]struct {
+    uses_left: ?u64 = null,
+    has_channel: bool = false,
+    refill_fee_limit: ?u64 = null,
 };
 
 pub const GameState = struct {
@@ -148,11 +149,13 @@ pub const GameState = struct {
         target: ?Location = null,
         click_origin: ?struct { x: f32, y: f32 } = null,
         refill_requested: bool = false,
-        refill_presented: bool = false,
+        refill_large: bool = false,
+        close_requested: bool = false,
         view: HoeView = .{},
     } = .{},
     player_walking: bool = false,
     selected_tool: player.Tool = .hoe,
+    tool_states: ToolStates = @splat(.{}),
     hoe_funding: HoeFundingUi.Controller = .{},
     ui_press_held: bool = false,
     menu: menu.Menu,
@@ -211,14 +214,12 @@ pub const GameState = struct {
     /// closes.
     pub fn update(self: *GameState, frame: input.FrameInput) world.CoordinateError!void {
         self.paid_hoe.target = null;
-        if (self.applyHoeFundingInput(frame)) {
-            self.paid_hoe.click_origin = null;
-            self.ui_press_held = frame.dragging;
-            self.player_walking = false;
-            self.camera.resetDrag();
-            return;
-        }
+        self.prepareToolMenuControls(frame);
         if (self.menu.applyInput(frame)) {
+            if (self.menu.tool_activation) |control| {
+                self.menu.tool_activation = null;
+                self.activateToolControl(control);
+            }
             self.paid_hoe.click_origin = null;
             if (self.menu.option_toggle) |action| {
                 self.menu.option_toggle = null;
@@ -237,6 +238,18 @@ pub const GameState = struct {
         }
 
         if (!frame.dragging or frame.clicked) self.ui_press_held = false;
+        if (frame.right_clicked) if (toolbarLayout(frame.viewport_w, frame.viewport_h)) |layout| {
+            for (layout.slots, player.Tool.slots) |slot, tool| {
+                if (!slot.contains(frame.pointer_x, frame.pointer_y)) continue;
+                self.selectTool(tool);
+                self.menu.openTools();
+                self.paid_hoe.click_origin = null;
+                self.ui_press_held = frame.dragging;
+                self.player_walking = false;
+                self.camera.resetDrag();
+                return;
+            }
+        };
         var aim_pointer = false;
         if (frame.clicked) {
             self.paid_hoe.click_origin = null;
@@ -325,7 +338,7 @@ pub const GameState = struct {
     fn selectTool(self: *GameState, tool: player.Tool) void {
         if (self.selected_tool == tool) return;
         self.selected_tool = tool;
-        self.paid_hoe.refill_presented = false;
+        self.paid_hoe.view = .{ .status = .checking };
     }
 
     fn pointerToolTarget(self: *const GameState, frame: input.FrameInput) ?Location {
@@ -394,18 +407,103 @@ pub const GameState = struct {
         };
     }
 
-    fn applyHoeFundingInput(self: *GameState, frame: input.FrameInput) bool {
-        if (self.menu.opened or self.menu.exit_requested or frame.escape_clicked or !frame.clicked or frame.right_clicked) return false;
-        if (self.paid_hoe.view.status == .hidden) return false;
-        const panel = hoeStatusBounds(frame.viewport_w, frame.viewport_h) orelse return false;
-        if (!panel.contains(frame.pointer_x, frame.pointer_y)) return false;
-        if (self.paid_hoe.refill_presented and self.paid_hoe.view.can_refill and self.hoe_funding.canStart() and
-            hoeRefillButton(panel).contains(frame.pointer_x, frame.pointer_y))
-        {
-            self.paid_hoe.refill_requested = true;
-            self.paid_hoe.refill_presented = false;
+    fn affordableToolUses(self: *const GameState, tool: player.Tool) ?u64 {
+        const balance = self.menu.wallet.balance_msat orelse return null;
+        const state = self.tool_states[@backingInt(tool.protocolTool())];
+        return (balance -| (state.refill_fee_limit orelse 0)) / tool.protocolTool().priceMsat();
+    }
+
+    pub fn reconcileSelectedToolUses(self: *GameState) void {
+        const view = self.paid_hoe.view;
+        const state = &self.tool_states[@backingInt(self.selected_tool.protocolTool())];
+        if (view.payment_pending) {
+            state.uses_left = null;
+        } else if (view.cuts_left) |uses| {
+            state.uses_left = uses;
+        } else switch (view.status) {
+            .unavailable, .empty, .settled => state.uses_left = 0,
+            else => {},
         }
-        return true;
+    }
+
+    pub const TopUpPlan = struct { added: u64, capacity: u64, max_debit: u64 };
+
+    pub fn topUpPlan(self: *const GameState, tool: player.Tool, large: bool) ?TopUpPlan {
+        if (tool != self.selected_tool) return null;
+        const preview = self.paid_hoe.view.top_up orelse return null;
+        const wallet_balance = self.menu.wallet.balance_msat orelse return null;
+        const added = if (large) shared.protocol.large_tool_refill_cuts else shared.protocol.hoe_refill_cuts;
+        const total = preview.remaining + added;
+        if (total > shared.protocol.max_tool_channel_cuts) return null;
+        const price = tool.protocolTool().priceMsat();
+        const capacity = total * price;
+        const limit = capacity + preview.fee_limit;
+        if (wallet_balance < added * price + preview.fee_limit) return null;
+        return .{ .added = added, .capacity = capacity, .max_debit = limit };
+    }
+
+    pub fn toolIncreaseLimit(self: *const GameState, tool: player.Tool) ?u64 {
+        if (tool == self.selected_tool) {
+            if (self.paid_hoe.view.top_up != null) return if (self.topUpPlan(tool, false)) |plan| plan.added else 0;
+            if (self.paid_hoe.view.offer) |offer| return offer.cuts;
+        }
+        const affordable = self.affordableToolUses(tool) orelse return null;
+        return @min(shared.protocol.hoe_refill_cuts, affordable);
+    }
+
+    pub fn showLargeRefill(self: *const GameState, tool: player.Tool) bool {
+        if (self.hasToolChannel(tool)) return self.topUpPlan(tool, true) != null;
+        if (tool == self.selected_tool and (self.paid_hoe.view.offer != null or self.paid_hoe.view.recovery_action != null)) return false;
+        return (self.affordableToolUses(tool) orelse 0) >= shared.protocol.large_tool_refill_cuts;
+    }
+
+    pub fn canIncreaseTool(self: *const GameState, tool: player.Tool) bool {
+        if (tool != self.selected_tool or !self.hoe_funding.canStart()) return false;
+        const view = self.paid_hoe.view;
+        if (view.top_up != null) return self.topUpPlan(tool, false) != null or self.topUpPlan(tool, true) != null;
+        return view.can_refill and !view.close_first and
+            (view.recovery_action != null or (self.toolIncreaseLimit(tool) orelse 1) != 0);
+    }
+
+    pub fn hasToolChannel(self: *const GameState, tool: player.Tool) bool {
+        return self.tool_states[@backingInt(tool.protocolTool())].has_channel;
+    }
+
+    pub fn canCloseTool(self: *const GameState, tool: player.Tool) bool {
+        return self.hasToolChannel(tool) and tool == self.selected_tool and self.hoe_funding.canStart() and
+            self.paid_hoe.view.can_refill and self.paid_hoe.view.close_first;
+    }
+
+    pub fn toolsOpen(self: *const GameState) bool {
+        return self.menu.opened and self.menu.currentPage == .Tools;
+    }
+
+    fn prepareToolMenuControls(self: *GameState, frame: input.FrameInput) void {
+        self.menu.tool_control_count = 0;
+        if (!self.toolsOpen()) return;
+        const content = self.menu.layoutFor(frame.viewport_w, frame.viewport_h).content;
+        for (player.Tool.slots, 0..) |tool, index| {
+            const row = toolMenuRow(content, index);
+            const rects = [_]menu.Rect{ row.name, row.increase, row.close };
+            for (rects, 0..) |rect, column| {
+                if (column == 2 and !self.hasToolChannel(tool) and !self.showLargeRefill(tool)) continue;
+                self.menu.tool_controls[self.menu.tool_control_count] = .{ .id = index * rects.len + column, .rect = rect };
+                self.menu.tool_control_count += 1;
+            }
+        }
+    }
+
+    fn activateToolControl(self: *GameState, control: usize) void {
+        const tool = player.Tool.slots[control / 3];
+        const column = control % 3;
+        if (tool != self.selected_tool) {
+            self.selectTool(tool);
+        } else if (column == 2 and self.canCloseTool(tool)) {
+            self.paid_hoe.close_requested = true;
+        } else if (self.canIncreaseTool(tool) and (column == 1 or (column == 2 and self.showLargeRefill(tool)))) {
+            self.paid_hoe.refill_requested = true;
+            self.paid_hoe.refill_large = column == 2;
+        }
     }
 
     /// Load visible chunks first, then prefetch; keep whatever is available on
@@ -639,28 +737,70 @@ test "wallet badge opens Wallet directly and consumes gameplay input" {
     }
 }
 
-test "refill requires a click on the presented button and consumes the input" {
+test "right click opens Tools and only enabled controls submit channel actions" {
     const t = std.testing;
     var game = try GameState.init(t.allocator, 320, 640);
     defer game.deinit();
-    const panel = hoeStatusBounds(320, 640).?;
-    try t.expect(panel.y + panel.height < walletBadgeBounds(320, 640).?.y);
-    const button = hoeRefillButton(panel);
-    const click: input.FrameInput = .{ .viewport_w = 320, .clicked = true, .pointer_x = button.centerX(), .pointer_y = button.centerY(), .use_tool = true };
-    game.paid_hoe.view = .{ .status = .empty, .can_refill = true };
-    try game.update(click);
-    try t.expect(!game.paid_hoe.refill_requested);
-    game.paid_hoe.refill_presented = true;
-    try game.update(click);
-    try t.expect(game.paid_hoe.refill_requested);
-    try t.expect(!game.paid_hoe.refill_presented);
+    const axe = toolbarLayout(320, 640).?.slots[1];
+    try game.update(.{ .viewport_w = 320, .right_clicked = true, .pointer_x = axe.centerX(), .pointer_y = axe.centerY(), .use_tool = true });
+    try t.expect(game.menu.opened and game.menu.currentPage == .Tools and game.selected_tool == .axe);
     try t.expectEqual(null, game.paid_hoe.target);
 
-    game.paid_hoe.refill_requested = false;
-    game.paid_hoe.refill_presented = true;
-    _ = game.hoe_funding.publish(.funding);
-    try game.update(click);
+    game.menu.wallet.balance_msat = 27;
+    try t.expectEqual(@as(?u64, 10), game.toolIncreaseLimit(.axe));
+    try t.expectEqual(@as(?u64, 2), game.toolIncreaseLimit(.pickaxe));
+    const row = toolMenuRow(game.menu.layoutFor(320, 640).content, 1);
+    const increase: input.FrameInput = .{ .viewport_w = 320, .clicked = true, .pointer_x = row.increase.centerX(), .pointer_y = row.increase.centerY() };
+    try game.update(increase);
     try t.expect(!game.paid_hoe.refill_requested);
+    game.paid_hoe.view = .{ .status = .unavailable, .can_refill = true };
+    try game.update(increase);
+    try t.expect(game.paid_hoe.refill_requested and !game.paid_hoe.refill_large);
+
+    game.paid_hoe.refill_requested = false;
+    try t.expect(!game.showLargeRefill(.axe));
+    game.menu.wallet.balance_msat = 40;
+    const axe_state = &game.tool_states[@backingInt(shared.protocol.tool.axe)];
+    axe_state.refill_fee_limit = 5;
+    try t.expect(!game.showLargeRefill(.axe));
+    game.menu.wallet.balance_msat = 45;
+    try t.expect(game.showLargeRefill(.axe));
+    try game.update(.{ .viewport_w = 320, .clicked = true, .pointer_x = row.close.centerX(), .pointer_y = row.close.centerY() });
+    try t.expect(game.paid_hoe.refill_requested and game.paid_hoe.refill_large);
+    game.paid_hoe.refill_large = false;
+    game.menu.wallet.balance_msat = 27;
+
+    game.paid_hoe.refill_requested = false;
+    game.paid_hoe.view = .{ .status = .empty, .can_refill = true, .close_first = true };
+    try game.update(increase);
+    try t.expect(!game.paid_hoe.refill_requested);
+    const close: input.FrameInput = .{ .viewport_w = 320, .clicked = true, .pointer_x = row.close.centerX(), .pointer_y = row.close.centerY() };
+    try game.update(close);
+    try t.expect(!game.paid_hoe.close_requested);
+    game.tool_states[@backingInt(shared.protocol.tool.axe)].has_channel = true;
+    try game.update(close);
+    try t.expect(game.paid_hoe.close_requested and !game.paid_hoe.refill_requested);
+}
+
+test "Tools controls support menu navigation and keep acknowledged uses while checking" {
+    const t = std.testing;
+    var game = try GameState.init(t.allocator, 1000, 640);
+    defer game.deinit();
+    game.menu.openTools();
+    try game.update(.{ .confirm = true });
+    try t.expectEqual(player.Tool.pickaxe, game.selected_tool);
+    const state = &game.tool_states[@backingInt(shared.protocol.tool.pickaxe)];
+    state.uses_left = 3;
+    game.reconcileSelectedToolUses();
+    try t.expectEqual(@as(?u64, 3), state.uses_left);
+    game.paid_hoe.view = .{ .status = .pending, .payment_pending = true };
+    game.reconcileSelectedToolUses();
+    try t.expectEqual(@as(?u64, null), state.uses_left);
+
+    game.paid_hoe.view = .{ .status = .unavailable, .can_refill = true };
+    try game.update(.{ .down = true });
+    try game.update(.{ .confirm = true });
+    try t.expect(game.paid_hoe.refill_requested);
 }
 
 test "input at the world edge cannot move or pan beyond it" {

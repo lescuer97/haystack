@@ -37,7 +37,7 @@ const FUNDING_MARGIN_SECONDS: u64 = 90;
 const CONSENT_SECONDS: u64 = 60;
 const MAX_OUTPUT: u64 = 1_000_000;
 const MAX_PARAMS_BYTES: usize = 4096;
-const MAX_PROOF_BYTES: usize = 3072;
+const MAX_PROOF_BYTES: usize = 8192;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -221,7 +221,7 @@ fn check_terms(tool: Tool, terms: &Terms, time: u64) -> Result<()> {
 }
 
 fn read_terms(tool: Tool, args: &Args, offset: usize) -> Result<Terms> {
-    if args.0.len() != offset + 5 {
+    if args.0.len() != offset + 5 && !(offset == 0 && args.0.len() == 6) {
         return Err(invalid(
             "expected scope, receiver key, amount, refund time and player key",
         ));
@@ -601,6 +601,15 @@ fn prepare(
 
 pub(super) async fn quote(wallet: &CdkWallet, tool: Tool, args: &Args) -> Result<Value> {
     let terms = read_terms(tool, args, 0)?;
+    let (min_cuts, max_cuts) = if args.0.len() == 6 {
+        let count = args.number(5).map_err(|_| invalid("invalid refill size"))?;
+        if !(1..=Tool::MAX_CUTS).contains(&count) {
+            return Err(invalid("invalid refill size"));
+        }
+        (count, count)
+    } else {
+        (1, Tool::STANDARD_CUTS)
+    };
     if load(wallet, tool).await?.is_some() {
         return Err(pending());
     }
@@ -623,12 +632,17 @@ pub(super) async fn quote(wallet: &CdkWallet, tool: Tool, args: &Args) -> Result
         debit_msats: 0,
         keyset: serde_json::from_str(&raw_keyset).map_err(|_| failed())?,
     };
-    for cuts in (1..=Tool::MAX_CUTS).rev() {
+    let mut reason = "no affordable whole hoe cut using eligible active-keyset proofs";
+    for cuts in (min_cuts..=max_cuts).rev() {
         let capacity = cuts * tool.price();
         let Some(nominal) = nominal_for(capacity, &raw_keyset, &keyset) else {
+            if min_cuts == max_cuts {
+                reason = "requested capacity cannot be represented by the mint";
+            }
             continue;
         };
-        let Some(selection) = inputs.find(nominal, keyset.input_fee_ppk, tool.max_debit()) else {
+        let debit_cap = tool.max_debit() - (Tool::MAX_CUTS - max_cuts) * tool.price();
+        let Some(selection) = inputs.find(nominal, keyset.input_fee_ppk, debit_cap) else {
             continue;
         };
         let debit = selection.debit;
@@ -647,6 +661,9 @@ pub(super) async fn quote(wallet: &CdkWallet, tool: Tool, args: &Args) -> Result
         )?
         .is_none()
         {
+            if min_cuts == max_cuts {
+                reason = "requested capacity exceeds the funding proof limit";
+            }
             continue;
         }
         let bytes = encode(&offer)?;
@@ -671,10 +688,7 @@ pub(super) async fn quote(wallet: &CdkWallet, tool: Tool, args: &Args) -> Result
             "refund_time": offer.terms.refund_time.to_string(), "expires_at": offer.expires_at.to_string(),
         }));
     }
-    Err(FfiErr::new(
-        CdkStatus::InsufficientFunds,
-        "no affordable whole hoe cut using eligible active-keyset proofs",
-    ))
+    Err(FfiErr::new(CdkStatus::InsufficientFunds, reason))
 }
 
 pub(super) async fn fund(wallet: &CdkWallet, tool: Tool, args: &Args) -> Result<Value> {

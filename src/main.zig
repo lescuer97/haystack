@@ -358,6 +358,9 @@ fn browserFrame() callconv(.c) void {
     if (ctx.hoe.update(&ctx.connection, ctx.network, generation, &ctx.game_state, ctx.unix_now, rl.getTime(), ctx.network_frame.area_pending)) {
         ctx.driver.invalidateInput();
     }
+    ctx.game_state.tool_states = ws_sync.toolStates(&ctx.connection, ctx.network.session);
+    const browser_fee_limit = browser_hoe.refillFeeLimit(wallet_model.mint.slice());
+    for (&ctx.game_state.tool_states) |*state| state.refill_fee_limit = browser_fee_limit;
     ctx.driver.movement_blocked = ctx.network.pending or ctx.hoe.cutPending();
     stepFrame(
         &ctx.game_state,
@@ -523,6 +526,7 @@ fn stepFrame(
     const vw: f32 = @floatFromInt(rl.getScreenWidth());
     const vh: f32 = @floatFromInt(rl.getScreenHeight());
 
+    game_state.reconcileSelectedToolUses();
     driver.observeRouting(game_state, model);
     const settings_before = game_state.settings;
     const blocked = presentation.blocksInput();
@@ -563,13 +567,7 @@ fn stepFrame(
         },
         .disconnected => |detail| rendering.drawDisconnected(detail, driver.viewport_w, driver.viewport_h),
     }
-    const hoe_visible = !blocked and !game_state.menu.opened and !(if (model) |m| m.isBlocking() else false);
-    game_state.paid_hoe.refill_presented = hoe_visible and game_state.paid_hoe.view.can_refill and game_state.hoe_funding.canStart() and
-        game_mod.hoeStatusBounds(driver.viewport_w, driver.viewport_h) != null;
-    if (hoe_visible) {
-        const debit_limit = if (native_hoe.enabled) native_hoe.refillDebitLimit(game_state.selected_tool.protocolTool()) else 0;
-        rendering.drawToolStatus(game_state.selected_tool, game_state.paid_hoe.view, game_state.hoe_funding, driver.viewport_w, driver.viewport_h, debit_limit);
-    }
+
     // Capture after drawing and before `endDrawing` swaps/presents, otherwise
     // the framebuffer read is the cleared back buffer (a black screenshot).
     // The 2D overlay (HUD/minimap) is still batched at this point;
@@ -996,7 +994,7 @@ pub fn main() anyerror!void {
     var connection: ws_worker.Worker = .{ .io = io, .paths = wallet_paths };
     try connection.start();
     defer connection.stop();
-    var hoe: native_hoe.Runtime = .{};
+    var hoe: native_hoe.Runtime = .{ .top_up_checked = false };
     var funding: native_hoe.FundingRuntime = .{};
     var effects = NativeEffects{
         .allocator = allocator,
@@ -1059,6 +1057,11 @@ pub fn main() anyerror!void {
                 game_state.menu.wallet.balance_dirty = true;
                 game_state.menu.wallet.history_dirty = true;
             }
+        }
+        game_state.tool_states = ws_sync.toolStates(&connection, network.session);
+        for (@import("shared").protocol.tools) |tool| {
+            const cap = if (native_hoe.enabled) native_hoe.refillDebitLimit(tool) else 0;
+            game_state.tool_states[@backingInt(tool)].refill_fee_limit = if (cap == 0) null else cap - tool.priceMsat() * @import("shared").protocol.large_tool_refill_cuts;
         }
         // Capture on the last requested frame, inside stepFrame's drawing pass.
         privacy_blocked = privacy_blocked or model.isBlocking();

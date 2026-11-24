@@ -21,23 +21,32 @@ commit.
 
 The renderer uses the existing authenticated binary WebSocket service, not a
 separate HTTP payment API. Run the native game server and browser bundle on
-loopback as described in the [README](../README.md). Select a tool and quote a
-refill, then approve the actual maximum debit. Axe, hoe, and pickaxe actions
+loopback as described in the [README](../README.md). Open **Tools** from the
+main menu or right-click the tool in the hotbar. Click its refill button for a
+quote, then click again to approve the quoted debit. Axe, hoe, and pickaxe actions
 cost 2, 5, and 10 msat respectively. Each tool has its own IndexedDB channel and
 funding journal; a depleted channel must be closed and settled before that tool
 can be refilled.
 
-The browser quotes up to ten cuts, selecting eligible active-keyset proofs and
-returning any wallet change in the same raw mint swap. The quote includes fees
-and caps the net debit per tool. The hoe cap, for example, is 55 msat on
-Testnut and 50 msat in the zero-fee fixture.
+For a partially used channel, Tools previews the total replacement uses and
+maximum gross funding debit, including a fee allowance. One click saves the
+intent, cooperatively closes the old channel, credits sender change, and funds
+an exact replacement under that limit. Reconnect resumes from wallet state;
+an expired intent or an unaffordable exact quote cannot authorize a new debit.
+Untouched channels do not support this cooperative close. The total channel
+capacity is capped at 40 uses.
+
+The browser quotes up to ten cuts for a standard refill, or exactly twenty
+when you choose **+20**. It selects eligible active-keyset proofs and returns
+wallet change in the same raw mint swap. The quote includes fees and caps the
+net debit by tool and refill size.
 It does not use the wallet's nested online send/swap path. IndexedDB commits the
 proof reservation and exact request before mint I/O. A successful checkpoint
 marks the inputs spent, credits verified change, and saves the channel together.
 
 Recovery first checks the mint and tries to restore the saved outputs without
-posting again. If the swap is unresolved, choose **Review saved refill** and
-explicitly approve **Resume refill**. Only if every original input is still
+posting again. If the swap is unresolved, choose **Review refill** in Tools,
+then confirm the quoted number of uses. Only if every original input is still
 unspent will the wallet resend the identical saved request. The mint can spend
 those inputs only once, and either request would produce the same outputs.
 Resume never releases inputs or creates a different swap. Expired or otherwise

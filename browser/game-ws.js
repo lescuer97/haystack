@@ -8,7 +8,7 @@ mergeInto(LibraryManager.library, {
     // Keep these tags aligned with Event in src/browser_ws.zig.
     event: {prepared: 1, opened: 2, message: 3, closed: 4, proof: 5, walletError: 6},
     // Match max_channel_open_with_params_bytes and max_channel_status_reply_bytes.
-    maxOutboundBytes: 7232,
+    maxOutboundBytes: 12356,
     maxInboundBytes: 61483,
     emit: function (callback, token, kind, bytes) {
       var ptr = 0, len = bytes ? bytes.length : 0;

@@ -86,14 +86,15 @@ pub const Ops = struct {
     /// balance check is not a reservation.
     /// Use the current authenticated server requirements and a trusted mint
     /// that meets hoe_funding.Policy's recovery prerequisites.
-    pub fn quote(self: *Ops, io: Io, a: Allocator, requirements: Requirements, sender: funding.Sender) !Offer {
+    pub fn quote(self: *Ops, io: Io, a: Allocator, requirements: Requirements, sender: funding.Sender, exact_cuts: ?u64) !Offer {
         self.current = null;
         try self.requireIdle(io, a);
         try self.validateTerms(io, requirements, sender);
         const json = try self.activeKeyset();
         defer freeString(json);
         const keyset_json = std.mem.span(json.value);
-        var fresh = try chooseForTool(self.store.tool, a, requirements, self.policy, keyset_json, try self.balance(), protocol.max_channel_proof_bytes);
+        const available = try self.balance();
+        var fresh = try chooseForToolSize(self.store.tool, a, requirements, self.policy, keyset_json, available, protocol.max_channel_proof_bytes, exact_cuts);
         try self.checkExistingChannel(io, a, fresh);
         try checkExpiry(io, requirements);
         io.random(&fresh.id);
@@ -459,11 +460,19 @@ fn choose(a: Allocator, req: Requirements, policy: funding.Policy, json: [:0]con
 }
 
 fn chooseForTool(tool: protocol.tool, a: Allocator, req: Requirements, policy: funding.Policy, json: [:0]const u8, available: u64, proof_limit: usize) !Offer {
+    return chooseForToolSize(tool, a, req, policy, json, available, proof_limit, null);
+}
+
+fn chooseForToolSize(tool: protocol.tool, a: Allocator, req: Requirements, policy: funding.Policy, json: [:0]const u8, available: u64, proof_limit: usize, exact_cuts: ?u64) !Offer {
     if (req.amount != tool.priceMsat()) return error.InvalidRequirements;
     const keyset = try parseKeyset(a, json, req, policy);
     defer keyset.deinit();
     var mask: u64 = 0;
     for (keyset.value.amounts) |amount| mask |= amount;
+    if (exact_cuts) |count| {
+        if (count == 0 or count > protocol.max_tool_channel_cuts) return error.InvalidCapacity;
+        return quoteCapacity(tool, a, req, policy, json, keyset.value, mask, count * req.amount, available, proof_limit);
+    }
     // Proof sizes and fee splits need not be monotonic in capacity.
     var cuts = protocol.hoe_refill_cuts;
     while (cuts > 1) : (cuts -= 1) {
@@ -626,7 +635,7 @@ test "quote picks the largest whole-cut offer that fits balance, fees, denominat
     try t.expectEqual(47, fee_partial.nominal_msats);
     try t.expectEqual(48, fee_partial.send_msats);
     try t.expectEqual(50, fee_partial.max_debit_msats);
-    try t.expectEqual(40, (try choose(a, req, testnut, fee, 54, protocol.max_channel_proof_bytes)).capacity_msats);
+    try t.expectEqual(45, (try choose(a, req, testnut, fee, 54, protocol.max_channel_proof_bytes)).capacity_msats);
     const proof_limited = try choose(a, req, testnut, fee, 55, 1024);
     try t.expectEqual(30, proof_limited.capacity_msats);
     try t.expectEqual(32, proof_limited.nominal_msats);
@@ -696,7 +705,7 @@ test "an uncertain send preserves the exact returned ID and blocks across reopen
     defer hoe_saved.deinit();
     try t.expectEqualDeep(offer, hoe_saved.value.offer);
     const sender: funding.Sender = .{ .pubkey = scope.player, .secret_key_hex = test_sender_secret };
-    try t.expectError(error.HoeOperationPending, ops.quote(t.io, t.allocator, req, sender));
+    try t.expectError(error.HoeOperationPending, ops.quote(t.io, t.allocator, req, sender, null));
     try t.expectError(error.StaleOffer, ops.fundWithConsent(t.io, t.allocator, offer, req, sender));
     try t.expectError(error.FundingNotAuthorized, ops.resumeFunding(t.io, t.allocator, @splat(7), req, sender));
 }
@@ -728,7 +737,7 @@ test "confirmed consent survives reopen but an existing journal forbids another 
         try t.expectError(error.StaleOffer, ops.consumeOffer(offer));
 
         var mark: Pending = .{ .scope = ops.store.scope, .mint_url = policy.mint_url, .max_output_msats = policy.max_output_msats, .offer = offer, .state = .sending };
-        for ([_]u64{ 0, 29, 55 }) |capacity| {
+        for ([_]u64{ 0, 29, 205 }) |capacity| {
             mark.offer.capacity_msats = capacity;
             mark.offer.nominal_msats = capacity;
             mark.offer.send_msats = capacity;
@@ -746,7 +755,7 @@ test "confirmed consent survives reopen but an existing journal forbids another 
     defer saved.deinit();
     try t.expectEqual(op, saved.value.state.confirmed.operation_id);
     try t.expectEqualDeep(offer, saved.value.offer);
-    try t.expectError(error.HoeOperationPending, ops.quote(t.io, a, req, sender));
+    try t.expectError(error.HoeOperationPending, ops.quote(t.io, a, req, sender, null));
     try t.expectError(error.StaleOffer, ops.resumeFunding(t.io, a, @splat(8), req, sender));
     try t.expectError(error.FundingNotRecoverable, ops.recoverFunding(t.io, a, op));
     try ops.journal.prepare(t.io, a, op, .{ .mint_swap = .{ .kind = .funding, .mint_url = policy.mint_url, .request_json = "{}", .completion_material = "{}" } });

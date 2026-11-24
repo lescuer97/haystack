@@ -614,19 +614,19 @@ test "headless wallet exposes owned spendable and depleted channels and quotes u
             .{ .capacity = 0, .funding = 64 },
             .{ .capacity = price - 1, .funding = 64 },
             .{ .capacity = price + 1, .funding = 64 },
-            .{ .capacity = p.hoe_capacity_msat + price, .funding = 64 },
+            .{ .capacity = p.max_tool_channel_cuts * price + price, .funding = 256 },
             .{ .capacity = 2 * price, .funding = price },
         };
-        for (0..p.hoe_refill_cuts + rejected.len) |i| {
-            const valid = i < p.hoe_refill_cuts;
-            const invalid = if (valid) null else rejected[i - p.hoe_refill_cuts];
+        for (0..p.max_tool_channel_cuts + rejected.len) |i| {
+            const valid = i < p.max_tool_channel_cuts;
+            const invalid = if (valid) null else rejected[i - p.max_tool_channel_cuts];
             const params_json = try std.json.Stringify.valueAlloc(a, .{
                 .capacity = if (invalid) |row| row.capacity else (i + 1) * price,
                 .expiry_timestamp = now + 3600,
-                .funding_token_amount = if (invalid) |row| row.funding else 64,
+                .funding_token_amount = if (invalid) |row| row.funding else 256,
                 .input_fee_ppk = 0,
                 .keyset_id = "test",
-                .maximum_amount = 64,
+                .maximum_amount = 256,
                 .mint = "https://mint.example.com",
                 .receiver_pubkey = receiver_hex[0..],
                 .sender_pubkey = test_pubkey_hex,

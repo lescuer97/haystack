@@ -89,7 +89,7 @@ pub const Reader = struct {
         held.pointer_x = pointer.x;
         held.pointer_y = pointer.y;
         held.clicked = rl.isMouseButtonPressed(.left);
-        if (!builtin.cpu.arch.isWasm()) held.right_clicked = rl.isMouseButtonPressed(.right);
+        held.right_clicked = rl.isMouseButtonPressed(.right);
         held.viewport_w = @floatFromInt(rl.getScreenWidth());
         held.viewport_h = @floatFromInt(rl.getScreenHeight());
         if (rl.isGamepadAvailable(gamepad)) {

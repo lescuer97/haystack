@@ -111,8 +111,28 @@ pub const PlayView = struct {
     payment_pending: bool = false,
 };
 
+pub const TopUp = struct {
+    tool: protocol.tool,
+    player: [33]u8,
+    receiver: [33]u8,
+    channel: channels.Id,
+    accepted: u64,
+    capacity: u64,
+    max_debit: u64,
+    expires: u64,
+
+    pub fn permits(self: TopUp, offer: Offer) bool {
+        return self.tool == offer.tool and self.capacity == offer.capacity_msats and self.max_debit >= offer.max_debit_msats;
+    }
+};
+const top_up_namespace = "tool_top_up_v1";
+const top_up_key = "current";
+
 pub const Request = union(enum) {
     bind_play: BindPlay,
+    top_up_read: void,
+    top_up_save: struct { session: u64, intent: TopUp },
+    top_up_clear: channels.Id,
     /// Only after an authenticated open acknowledgement or status for this ID.
     mark_admitted: struct { session: u64, tool: protocol.tool = .hoe, id: channels.Id },
     /// Only for a correlated, authenticated settled reply. Null proofs mean
@@ -123,7 +143,7 @@ pub const Request = union(enum) {
     /// Returns the largest affordable whole-cut offer, up to ten cuts. Does
     /// not reserve or spend money. First use can open the existing CDK wallet
     /// (with its standard startup recovery) and initialize local storage.
-    quote: Live,
+    quote: struct { live: Live, large: bool = false, exact_cuts: ?u64 = null },
     /// Pass the quoted Offer unchanged. Consent covers its exact capacity,
     /// send and funding swap; funding never substitutes a different quote.
     fund_with_consent: struct { live: Live, offer: Offer },
@@ -185,6 +205,9 @@ pub const Result = union(enum) {
     funded: Open,
     pending: Pending,
     play_bound: ?PlayView,
+    top_up_loaded: ?TopUp,
+    top_up_saved: TopUp,
+    top_up_cleared: void,
     admission_marked: channels.Id,
     settlement_finalized: struct { id: channels.Id, credited_msats: u64 },
     cut_prepared: protocol.RequestFor(.cut),
@@ -348,15 +371,63 @@ pub const State = struct {
         return state.settlement.?.net_msats.?;
     }
 
+    fn readTopUp(db: channels.Db) !?TopUp {
+        const parsed = db.read(TopUp, a, top_up_namespace, top_up_key, 2048) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    fn topUpRequest(self: *State, io: std.Io, paths: wallet.Paths, request: Request) !Result {
+        const journal = try channels.Journal.open(io, paths.dir);
+        defer journal.close(io);
+        const db = journal.db;
+        const saved = try readTopUp(db);
+        switch (request) {
+            .top_up_read => return .{ .top_up_loaded = saved },
+            .top_up_save => |req| {
+                if (saved != null or self.play_session != req.session) return error.FundingUnavailable;
+                const scope = self.play_scope orelse return error.MissingPlayScope;
+                const active = self.active orelse return error.NoActiveChannel;
+                const intent = req.intent;
+                if (scope.tool != intent.tool or !std.meta.eql(scope.player, intent.player) or
+                    !std.meta.eql(scope.receiver, intent.receiver) or !std.meta.eql(active.local.id, intent.channel) or
+                    active.local.state.pending_cut != null or active.local.state.settlement != null or
+                    intent.accepted == 0 or intent.accepted != active.local.state.confirmed_balance_msats or
+                    intent.accepted >= active.local.capacity_msats or !intent.tool.validCapacity(intent.capacity)) return error.PendingMismatch;
+                const added = intent.capacity -| (active.local.capacity_msats - intent.accepted);
+                if (added != intent.tool.priceMsat() * protocol.hoe_refill_cuts and
+                    added != intent.tool.priceMsat() * protocol.large_tool_refill_cuts) return error.InvalidCapacity;
+                const fee_limit = toolRefillDebitLimit(wallet.cdk.app_mint, intent.tool) -| (intent.tool.priceMsat() * protocol.large_tool_refill_cuts);
+                if (intent.max_debit < intent.capacity or intent.max_debit > intent.capacity + fee_limit) return error.InvalidCapacity;
+                const bytes = try std.json.Stringify.valueAlloc(a, intent, .{});
+                defer a.free(bytes);
+                try db.put(top_up_namespace, top_up_key, bytes, false);
+                return .{ .top_up_saved = intent };
+            },
+            .top_up_clear => |id| {
+                if (saved) |intent| {
+                    if (!std.meta.eql(intent.channel, id)) return error.ChannelMismatch;
+                    try db.remove(top_up_namespace, top_up_key);
+                }
+                return .top_up_cleared;
+            },
+            else => unreachable,
+        }
+    }
+
     pub fn execute(self: *State, io: std.Io, paths: wallet.Paths, owner: *?wallet.Wallet, request: Request) !Result {
         // A replacement quote (even a failed one) must revoke the previous one.
         if (request == .quote) if (self.ops) |*ops| ops.invalidateQuote();
         const live = switch (request) {
-            .quote => |req| req,
+            .quote => |req| req.live,
             .fund_with_consent => |req| req.live,
             .resume_funding => |req| req.live,
             .recover_funding => |req| req.live,
             .inspect => |req| req,
+            .top_up_read, .top_up_save, .top_up_clear => return self.topUpRequest(io, paths, request),
             .bind_play => |req| return .{ .play_bound = try self.bindPlay(io, paths, req) },
             .mark_admitted => |req| {
                 if (self.play_session != req.session) return error.StalePlaySession;
@@ -426,7 +497,7 @@ pub const State = struct {
         try HoePayment.senderKey(&self.signer, &hex);
         const sender: funding.Sender = .{ .pubkey = self.signer.pubkey, .secret_key_hex = &hex };
         return switch (request) {
-            .quote => .{ .quoted = try ops.quote(io, a, live.requirements, sender) },
+            .quote => |req| .{ .quoted = try ops.quote(io, a, live.requirements, sender, req.exact_cuts orelse if (req.large) protocol.large_tool_refill_cuts else null) },
             .fund_with_consent => |req| blk: {
                 var channel = try ops.fundWithConsent(io, a, req.offer, live.requirements, sender);
                 defer channel.deinit();
@@ -437,7 +508,7 @@ pub const State = struct {
                 defer channel.deinit();
                 break :blk .{ .funded = try Open.copy(live.tool, channel) };
             },
-            .recover_funding, .inspect, .bind_play, .mark_admitted, .finalize_settled, .prepare_cut, .resolve_cut => unreachable,
+            .recover_funding, .inspect, .bind_play, .mark_admitted, .finalize_settled, .prepare_cut, .resolve_cut, .top_up_read, .top_up_save, .top_up_clear => unreachable,
         };
     }
 };
@@ -554,9 +625,9 @@ pub fn refillDebitLimit(comptime mint: [:0]const u8) u64 {
 
 pub fn toolRefillDebitLimit(comptime mint: [:0]const u8, tool: protocol.tool) u64 {
     const policy = comptime mintPolicy(mint) catch return 0;
-    // For up to 100 msat, each of the three mint fee passes costs at most
+    // For up to 200 msat, each of the three mint fee passes costs at most
     // 1 msat on Testnut (fewer than ten proofs in the binary split).
-    return tool.priceMsat() * protocol.hoe_refill_cuts + (if (policy.input_fee_ppk == 0) @as(u64, 0) else 3) + policy.max_sender_fee_msats;
+    return tool.priceMsat() * protocol.large_tool_refill_cuts + (if (policy.input_fee_ppk == 0) @as(u64, 0) else 3) + policy.max_sender_fee_msats;
 }
 
 fn mintPolicy(comptime mint: [:0]const u8) !funding.Policy {
@@ -695,7 +766,27 @@ test "a restarted worker retains the local balance and reconciles only exact pen
     const reconciled = (try state.bindPlay(t.io, paths, bind)).?;
     try t.expect(reconciled.server_active and !reconciled.payment_pending);
     try t.expectEqual(@as(u64, 15), reconciled.confirmed_balance_msats);
+    const top_up: TopUp = .{
+        .tool = .hoe,
+        .player = scope.player,
+        .receiver = scope.receiver,
+        .channel = id,
+        .accepted = 15,
+        .capacity = 120,
+        .max_debit = 120,
+        .expires = 4_000_000_000,
+    };
+    const save: Request = .{ .top_up_save = .{ .session = 2, .intent = top_up } };
+    var stale = save;
+    stale.top_up_save.intent.accepted = 10;
+    try t.expectError(error.PendingMismatch, state.execute(t.io, paths, &owner, stale));
+    try t.expectEqualDeep(top_up, (try state.execute(t.io, paths, &owner, save)).top_up_saved);
+    try t.expectError(error.FundingUnavailable, state.execute(t.io, paths, &owner, save));
     state.deinit(t.io);
+    try t.expectEqualDeep(@as(?TopUp, top_up), (try state.execute(t.io, paths, &owner, .top_up_read)).top_up_loaded);
+    try t.expectError(error.ChannelMismatch, state.execute(t.io, paths, &owner, .{ .top_up_clear = @splat(99) }));
+    try t.expect((try state.execute(t.io, paths, &owner, .{ .top_up_clear = id })) == .top_up_cleared);
+    try t.expect((try state.execute(t.io, paths, &owner, .top_up_read)).top_up_loaded == null);
 
     bind.session = 3;
     bind.active.?.balance_msats = 10;
@@ -929,7 +1020,7 @@ test "reconciliation and refill debit are bound to the price and tool" {
     const mint = "https://testnut.cashu.space/";
     for (protocol.tools) |tool| {
         const price = tool.priceMsat();
-        const capacity = price * protocol.hoe_refill_cuts;
+        const capacity = price * protocol.large_tool_refill_cuts;
         try t.expectEqual(capacity + 5, toolRefillDebitLimit(mint, tool));
         try t.expectEqual(capacity, toolRefillDebitLimit("http://127.0.0.1:18787", tool));
         try t.expectEqual(capacity, try HoePayment.nextBalance(tool, capacity - price, capacity));

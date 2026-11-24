@@ -309,8 +309,8 @@ with the usual 16-byte request `id` (`0x01`), then the following TLV fields:
 | Operation | Request / reply tags | Additional request fields, in order | Request size |
 |---|---|---|---:|
 | Requirements | `0x21` / `0xa1` | Tool (`0x23`, u8: axe=0, hoe=1, pickaxe=2) | 27 |
-| Funded open | `0x24` / `0xa2` | Channel ID (`0x20`, 32 bytes), optional tool (`0x23`, defaults to hoe), funding proofs (`0x24`, 1–3072 bytes), canonical CDK params JSON (`0x25`, 1–4096 bytes) | 66–7236 |
-| Close | `0x23` / `0xa3` | Channel ID (`0x20`, 32 bytes) | 58 |
+| Funded open | `0x24` / `0xa2` | Channel ID (`0x20`, 32 bytes), optional tool (`0x23`, defaults to hoe), funding proofs (`0x24`, 1–8192 bytes), canonical CDK params JSON (`0x25`, 1–4096 bytes) | 66–12356 |
+| Close | `0x23` / `0xa3` | Channel ID (`0x20`, 32 bytes), optional expected cumulative payment (`0x27`, u64) | 58 or 69 |
 | Status | `0x25` / `0xa5` | Channel ID (`0x20`, 32 bytes) | 58 |
 
 Replies echo the request ID and contain exactly one `ok` or `failed`. Requirements
@@ -321,11 +321,11 @@ return proofs. `channel_settled` (`0xa6`) is an unsolicited notice containing on
 the 32-byte channel ID. The codec treats proofs and params as opaque borrowed
 slices.
 
-Funded open accepts capacity for 1–10 whole actions at the reported price:
+Funded open accepts capacity for 1–40 whole actions at the reported price.
+The clients quote up to 10 for a standard refill, or exactly 20 for **+20** without an existing channel:
 axe (tree) costs 2 msat per action, hoe (grass) costs 5, and pickaxe (rock) costs
 10. Channel capacity does not include mint fees. The desktop shows the maximum wallet debit including those
-fees before funding and opening the channel. The proof limit accommodates the
-three-proof layouts used by the supported funding fixtures.
+fees before funding and opening the channel. The proof limit also accommodates larger denomination splits used by replacements.
 
 Channel negotiation bypasses the tick mailbox. Fixture builds without the
 startup opt-in do not inject a channel service, so channel requests return
@@ -349,13 +349,20 @@ or it expires. Before expiry, auth includes its channel ID and fully consumed
 balance, and a status query reports `depleted`, even during the payment cutoff
 window. It cannot be used for another cut or replaced while still open.
 
-At zero remaining, the desktop's **Refill hoe** button requests close. The
+At zero remaining, the **Close channel** button requests close. Without an exact
+expected payment, the wire request remains depleted-only. When present, the
+expected payment must be nonzero and match the latest earned balance under the
+wallet guard. Settlement freezes that balance before submitting the mint swap.
+A stale expectation is rejected without attempting settlement. This wire path
+supports partially used channels. The Tools menu saves a wallet-local intent
+before using it. The intent binds the old channel and expected payment to a
+replacement capacity and gross debit limit. The
 background sweep starts new settlements only at or after the actual expiry,
 when there is an earned balance. It can still finish settlement work already
 started by an explicit close. The client looks up settlement by the saved
-channel ID, credits any sender change, and reauthenticates before funding the
-largest affordable refill up to ten whole cuts. The button displays an upper
-bound on the wallet debit including fees.
+channel ID, credits any sender change, and reauthenticates. Refilling is a
+separate action. The desktop displays an upper bound on the wallet debit
+including fees before funding.
 
 At login the wallet resolves the tool references before reporting any channel.
 If an axe or pickaxe channel is restorable, auth success carries `tool_channels`

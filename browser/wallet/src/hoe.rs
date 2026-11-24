@@ -23,7 +23,9 @@ pub(super) enum Tool {
 
 impl Tool {
     pub(super) const ALL: [Self; 3] = [Self::Axe, Self::Hoe, Self::Pickaxe];
-    pub(super) const MAX_CUTS: u64 = 10;
+    pub(super) const STANDARD_CUTS: u64 = 10;
+    pub(super) const LARGE_CUTS: u64 = 20;
+    pub(super) const MAX_CUTS: u64 = 40;
 
     pub(super) fn parse(name: &str) -> Result<Self> {
         match name {
@@ -230,6 +232,118 @@ fn balance(state: &Payment) -> Value {
     json!({"balance_msats": state.balance.to_string()})
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TopUp {
+    scope: String,
+    tool: Tool,
+    channel: String,
+    receiver: String,
+    accepted: u64,
+    capacity: u64,
+    max_debit: u64,
+    expires: u64,
+}
+
+async fn top_up(wallet: &CdkWallet, tool: Tool, op: &str, args: &Args) -> Result<Value> {
+    const KEY: &str = "top_up_v1";
+    let scope = text(args, 0)?;
+    let db = wallet.browser_database();
+    let prior = db.kv_read(NS, "", KEY).await.map_err(database)?;
+    let saved: Option<TopUp> = prior
+        .as_deref()
+        .map(serde_json::from_slice)
+        .transpose()
+        .map_err(database)?;
+    if saved.as_ref().is_some_and(|intent| intent.scope != scope) {
+        return Err(recovery());
+    }
+    if op == "top_up_read" && args.0.len() == 1 {
+        return Ok(saved.map_or_else(
+            || json!({"channel": null}),
+            |intent| {
+                json!({
+                    "channel": intent.channel,
+                    "receiver": intent.receiver,
+                "tool": match intent.tool { Tool::Axe => "0", Tool::Hoe => "1", Tool::Pickaxe => "2" },
+                    "accepted": intent.accepted.to_string(),
+                    "capacity": intent.capacity.to_string(),
+                    "max_debit": intent.max_debit.to_string(),
+                    "expires": intent.expires.to_string(),
+                })
+            },
+        ));
+    }
+    let next = match op {
+        "top_up_save" if args.0.len() == 6 && saved.is_none() => {
+            let channel = text(args, 1)?;
+            let accepted = number(args, 2)?;
+            let capacity = number(args, 3)?;
+            let max_debit = number(args, 4)?;
+            let expires = number(args, 5)?;
+            let record = funding::load(wallet, tool).await?.ok_or_else(recovery)?;
+            let (_, state) = read(wallet, &record).await?;
+            let state = state.ok_or_else(recovery)?;
+            if record.scope != scope
+                || record.channel_id != channel
+                || accepted == 0
+                || state.balance != accepted
+                || state.pending.is_some()
+                || state.receipt.is_some()
+                || accepted >= record.capacity_msats
+                || !tool.valid_capacity(capacity)
+                || !matches!(
+                    capacity
+                        .checked_sub(record.capacity_msats - accepted)
+                        .map(|value| value / tool.price()),
+                    Some(Tool::STANDARD_CUTS | Tool::LARGE_CUTS)
+                )
+                || !(capacity..=tool.max_debit()).contains(&max_debit)
+                || expires == 0
+            {
+                return Err(invalid());
+            }
+            Some(
+                serde_json::to_vec(&TopUp {
+                    scope: scope.to_owned(),
+                    tool,
+                    channel: channel.to_owned(),
+                    receiver: record.receiver_pubkey,
+                    accepted,
+                    capacity,
+                    max_debit,
+                    expires,
+                })
+                .map_err(database)?,
+            )
+        }
+        "top_up_clear"
+            if args.0.len() == 2
+                && saved.as_ref().is_some_and(|intent| {
+                    intent.tool == tool && text(args, 1).ok() == Some(intent.channel.as_str())
+                }) =>
+        {
+            None
+        }
+        _ => return Err(invalid()),
+    };
+    let key = kv_key(NS, "", KEY);
+    db.write(|store| {
+        if store.kv.get(&key) != prior.as_ref() {
+            return Err(DbError::Internal("top-up authorization changed".into()));
+        }
+        if let Some(next) = next {
+            store.kv.insert(key, next);
+        } else {
+            store.kv.remove(&key);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(database)?;
+    Ok(json!({}))
+}
+
 pub(super) async fn request(
     wallet: &mut CdkWallet,
     tool: Tool,
@@ -244,6 +358,9 @@ pub(super) async fn request(
         "fund" => return funding::fund(wallet, tool, args).await,
         "resume_quote" => return funding::resume_quote(wallet, tool, args).await,
         "resume" => return funding::resume(wallet, tool, args).await,
+        "top_up_read" | "top_up_save" | "top_up_clear" => {
+            return top_up(wallet, tool, op, args).await
+        }
         _ => {}
     }
     let count = match op {

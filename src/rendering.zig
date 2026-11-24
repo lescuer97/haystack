@@ -896,69 +896,6 @@ fn drawSolidRect(rect: menu.Rect, color: rl.Color) void {
     );
 }
 
-pub fn drawHoeStatus(view: game_mod.HoeView, funding: game_mod.HoeFundingUi.Controller, vw: f32, vh: f32, debit_limit: u64) void {
-    drawToolStatus(.hoe, view, funding, vw, vh, debit_limit);
-}
-
-pub fn drawToolStatus(tool: player.Tool, view: game_mod.HoeView, funding: game_mod.HoeFundingUi.Controller, vw: f32, vh: f32, debit_limit: u64) void {
-    if (view.status == .hidden) return;
-    const status: [:0]const u8 = if (funding.status) |state| state.text() else switch (view.status) {
-        .hidden => unreachable,
-        .unavailable => "No uses loaded",
-        .checking => "Checking channel...",
-        .ready => switch (tool) {
-            .pickaxe => "Click to clear nearby rock",
-            .axe => "Click to clear nearby tree",
-            .hoe => "Click nearby grass to cut",
-        },
-        .pending => "Action pending...",
-        .recovery => "Recovery required",
-        .empty => "Out of uses",
-        .settling => "Settling previous refill...",
-        .settled => "Ready to refill",
-    };
-    const panel = game_mod.hoeStatusBounds(vw, vh) orelse return;
-    rl.drawRectangleRec(.{ .x = panel.x, .y = panel.y, .width = panel.width, .height = panel.height }, .{ .r = 30, .g = 28, .b = 24, .a = 240 });
-    const show_button = view.can_refill and funding.canStart();
-    const text_width = panel.width - (if (show_button) @as(f32, 142) else 0);
-    var buf: [64]u8 = undefined;
-    const count = if (view.offer) |offer|
-        std.mem.printSentinel(&buf, "{s}: load {d}", .{ tool.label(), offer.cuts }, 0) catch unreachable
-    else if (view.cuts_left) |left|
-        std.mem.printSentinel(&buf, "{s}: {d} left", .{ tool.label(), left }, 0) catch unreachable
-    else
-        std.mem.printSentinel(&buf, "{s}: unknown", .{tool.label()}, 0) catch unreachable;
-    drawCenteredText(count, .{ .x = panel.x, .y = panel.y + 6, .width = text_width, .height = 16 }, 16, .ray_white);
-    drawCenteredText(status, .{ .x = panel.x, .y = panel.y + 27, .width = text_width, .height = 12 }, 12, .ray_white);
-    if (!show_button) return;
-    const button = game_mod.hoeRefillButton(panel);
-    const rect: rl.Rectangle = .{ .x = button.x, .y = button.y, .width = button.width, .height = button.height };
-    rl.drawRectangleRec(rect, .dark_gray);
-    rl.drawRectangleLinesEx(rect, 1, .gray);
-    if (view.close_first) {
-        drawCenteredText("Close channel", button, 14, .ray_white);
-        return;
-    }
-    if (view.recovery_action) |action| {
-        drawCenteredText(switch (action) {
-            .review_funding => "Review saved refill",
-            .retry_settlement => "Retry settlement",
-        }, button, 14, .ray_white);
-        return;
-    }
-    const label: [:0]const u8 = if (view.offer) |offer| (if (offer.resume_funding) "Resume refill" else "Refill") else if (debit_limit == 0) "Get refill quote" else "Refill";
-    if (view.offer == null and debit_limit == 0) {
-        drawCenteredText(label, button, 14, .ray_white);
-        return;
-    }
-    drawCenteredText(label, .{ .x = button.x, .y = button.y + 3, .width = button.width, .height = 14 }, 14, .ray_white);
-    const cost = if (view.offer) |offer|
-        std.mem.printSentinel(&buf, "{d} msat incl. fees", .{offer.debit}, 0) catch unreachable
-    else
-        std.mem.printSentinel(&buf, "Up to {d} msat incl. fees", .{debit_limit}, 0) catch unreachable;
-    drawCenteredText(cost, .{ .x = button.x, .y = button.y + 17, .width = button.width, .height = 10 }, 10, .ray_white);
-}
-
 fn drawCenteredText(text: [:0]const u8, rect: menu.Rect, font_size: i32, color: rl.Color) void {
     const text_w = rl.measureText(text, font_size);
     const x = rect.x + (rect.width - @as(f32, @floatFromInt(text_w))) / 2;
@@ -1150,7 +1087,9 @@ fn drawMenu(game: *const game_mod.GameState, viewport_w: f32, viewport_h: f32) v
     drawSolidRect(layout.panel, menu_panel_bg);
     rl.drawRectangleLinesEx(toRaylibRect(layout.panel), 2.0, menu_panel_border);
     drawCenteredText(menu.pageTitle(state.currentPage), layout.title, 26, menu_title_color);
-    if (layout.content.height > 0) drawWalletContent(state, layout.content);
+    if (layout.content.height > 0) {
+        if (state.currentPage == .Tools) drawToolsContent(game, layout.content) else drawWalletContent(state, layout.content);
+    }
 
     const page_items = state.items();
 
@@ -1158,6 +1097,93 @@ fn drawMenu(game: *const game_mod.GameState, viewport_w: f32, viewport_h: f32) v
     while (index < layout.item_count) : (index += 1) {
         drawMenuItem(layout.items[index], page_items[index], game, state.isSelected(index));
     }
+}
+
+fn drawToolsContent(game: *const game_mod.GameState, content: menu.Rect) void {
+    const view = game.paid_hoe.view;
+    for (player.Tool.slots, 0..) |tool, index| {
+        const row = game_mod.toolMenuRow(content, index);
+        const selected = tool == game.selected_tool;
+        const uses = game.tool_states[@backingInt(tool.protocolTool())].uses_left;
+        const colors = toolSlotColors(uses, selected);
+        const half = row.name.height / 2;
+        var buf: [64]u8 = undefined;
+        drawSolidRect(row.bounds, menu_item_bg);
+        drawSolidRect(row.name, colors.fill);
+        drawCenteredText(tool.label(), .{ .x = row.name.x, .y = row.name.y, .width = row.name.width, .height = half }, 16, colors.text);
+        const balance = if (uses) |count|
+            std.mem.printSentinel(&buf, "{d} left", .{count}, 0) catch unreachable
+        else
+            "Unknown";
+        drawCenteredText(balance, .{ .x = row.name.x, .y = row.name.y + half, .width = row.name.width, .height = half }, 12, colors.text);
+
+        const recovery = if (selected) view.recovery_action else null;
+        const add_label: [:0]const u8 = if (recovery) |action| switch (action) {
+            .review_funding => "Review refill",
+            .retry_settlement => "Retry close",
+        } else if (game.toolIncreaseLimit(tool)) |count|
+            std.mem.printSentinel(&buf, "+{d}", .{count}, 0) catch unreachable
+        else
+            "Quote";
+        if (game.topUpPlan(tool, false)) |plan| {
+            drawTopUpButton(row.increase, add_label, plan, tool);
+        } else {
+            drawToolMenuButton(row.increase, add_label, game.canIncreaseTool(tool));
+        }
+        if (game.showLargeRefill(tool)) {
+            const large_label = std.mem.printSentinel(&buf, "+{d}", .{@import("shared").protocol.large_tool_refill_cuts}, 0) catch unreachable;
+            if (game.topUpPlan(tool, true)) |plan| {
+                drawTopUpButton(row.close, large_label, plan, tool);
+            } else {
+                drawToolMenuButton(row.close, large_label, game.canIncreaseTool(tool));
+            }
+        } else if (game.hasToolChannel(tool)) {
+            drawToolMenuButton(row.close, "Close channel", game.canCloseTool(tool));
+        }
+        rl.drawRectangleLinesEx(toRaylibRect(row.bounds), 1, if (selected) menu_accent else menu_panel_border);
+        if (game.menu.selected_index < game.menu.tool_control_count) {
+            const focus = game.menu.tool_controls[game.menu.selected_index];
+            if (focus.id / 3 == index) rl.drawRectangleLinesEx(toRaylibRect(focus.rect), 2, menu_title_color);
+        }
+    }
+
+    var buf: [96]u8 = undefined;
+    const tool = game.selected_tool;
+    const fee_limit = game.tool_states[@backingInt(tool.protocolTool())].refill_fee_limit;
+    const refill_max = if (game.showLargeRefill(tool)) @import("shared").protocol.large_tool_refill_cuts else @import("shared").protocol.hoe_refill_cuts;
+    const status: [:0]const u8 = if (view.offer) |offer|
+        std.mem.printSentinel(&buf, "{d} uses for {d} msat incl. fees", .{ offer.cuts, offer.debit }, 0) catch unreachable
+    else if (view.top_up != null)
+        "Unused funds credited first. Debit limits include fees."
+    else if (game.hoe_funding.status) |funding|
+        funding.text()
+    else if (@import("builtin").os.tag != .emscripten and fee_limit != null and game.canIncreaseTool(tool))
+        std.mem.printSentinel(&buf, "Refill: up to {d} msat incl. fees", .{refill_max * tool.protocolTool().priceMsat() + fee_limit.?}, 0) catch unreachable
+    else switch (view.status) {
+        .checking, .pending => "Checking channel...",
+        .settling => "Settling channel...",
+        .recovery => "Channel needs recovery",
+        .empty => "Close the depleted channel before refilling.",
+        else => "Select a tool to manage it.",
+    };
+    drawCenteredText(status, .{ .x = content.x, .y = content.y + content.height * 0.78, .width = content.width, .height = content.height * 0.22 }, 12, menu_muted);
+}
+
+fn drawTopUpButton(rect: menu.Rect, label: [:0]const u8, plan: game_mod.GameState.TopUpPlan, tool: player.Tool) void {
+    drawSolidRect(rect, menu_item_focus);
+    const half = rect.height / 2;
+    var buf: [64]u8 = undefined;
+    const title = std.mem.printSentinel(&buf, "{s} / {d} total", .{ label, plan.capacity / tool.protocolTool().priceMsat() }, 0) catch unreachable;
+    drawCenteredText(title, .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = half }, 12, menu_text_color);
+    const cost = std.mem.printSentinel(&buf, "Up to {d} msat", .{plan.max_debit}, 0) catch unreachable;
+    drawCenteredText(cost, .{ .x = rect.x, .y = rect.y + half, .width = rect.width, .height = half }, 11, menu_text_color);
+}
+
+fn drawToolMenuButton(rect: menu.Rect, label: [:0]const u8, enabled: bool) void {
+    drawSolidRect(rect, if (enabled) menu_item_focus else menu_item_bg);
+    const divider: rl.Vector2 = .{ .x = rect.x, .y = rect.y };
+    rl.drawLineEx(divider, .{ .x = rect.x, .y = rect.y + rect.height }, 1, if (enabled) menu_accent else menu_panel_border);
+    drawCenteredText(label, rect, if (rect.width < 100) 12 else 14, if (enabled) menu_text_color else menu_muted);
 }
 
 fn drawWalletContent(state: *const menu.Menu, rect: menu.Rect) void {
@@ -1303,17 +1329,31 @@ fn drawWrapped(text: []const u8, rect: menu.Rect, size: i32, tail: bool) void {
     }
 }
 
+fn toolSlotColors(uses_left: ?u64, selected: bool) struct { fill: rl.Color, text: rl.Color } {
+    const uses = uses_left orelse return .{ .fill = .yellow, .text = .black };
+    if (uses == 0) return .{ .fill = .{ .r = 162, .g = 29, .b = 38, .a = 255 }, .text = .white };
+    return .{ .fill = if (selected) menu_item_focus else menu_item_bg, .text = menu_text_color };
+}
+
 fn drawToolbar(game: *const game_mod.GameState, vw: f32, vh: f32) void {
     const layout = game_mod.toolbarLayout(vw, vh) orelse return;
     drawSolidRect(layout.bounds, menu_panel_bg);
     rl.drawRectangleLinesEx(toRaylibRect(layout.bounds), 1, menu_panel_border);
-    for (layout.slots, player.Tool.slots, 1..) |slot, tool, key| {
+    for (layout.slots, player.Tool.slots) |slot, tool| {
         const selected = game.selected_tool == tool;
-        drawSolidRect(slot, if (selected) menu_item_focus else menu_item_bg);
+        const uses_left = game.tool_states[@backingInt(tool.protocolTool())].uses_left;
+        const colors = toolSlotColors(uses_left, selected);
+        drawSolidRect(slot, colors.fill);
         rl.drawRectangleLinesEx(toRaylibRect(slot), 2, if (selected) menu_accent else menu_panel_border);
-        var buf: [16]u8 = undefined;
-        const label = std.mem.printSentinel(&buf, "{d} {s}", .{ key, tool.label() }, 0) catch unreachable;
-        drawCenteredText(label, slot, 16, menu_text_color);
+
+        const half = slot.height / 2;
+        var buf: [32]u8 = undefined;
+        drawCenteredText(tool.label(), .{ .x = slot.x, .y = slot.y + 2, .width = slot.width, .height = half }, 16, colors.text);
+        const count = if (uses_left) |uses|
+            std.mem.printSentinel(&buf, "{d} left", .{uses}, 0) catch unreachable
+        else
+            "Unknown";
+        drawCenteredText(count, .{ .x = slot.x, .y = slot.y + half, .width = slot.width, .height = half }, 12, colors.text);
     }
 }
 
@@ -1540,6 +1580,15 @@ test "wallet badge anchors left and clears the toolbar on narrow viewports" {
     try std.testing.expect(narrow.x + narrow.width <= 320);
     try std.testing.expect(narrow.y + narrow.height < narrow_tools.bounds.y);
     try std.testing.expect(game_mod.walletBadgeBounds(320, 64) == null);
+}
+
+test "named tool slots distinguish unknown and empty balances without losing funded focus styling" {
+    const t = std.testing;
+    try t.expectEqual(rl.Color.yellow, toolSlotColors(null, false).fill);
+    try t.expectEqual(rl.Color.black, toolSlotColors(null, false).text);
+    try t.expectEqual(rl.Color.white, toolSlotColors(0, true).text);
+    try t.expectEqual(menu_item_focus, toolSlotColors(1, true).fill);
+    try t.expectEqual(menu_item_bg, toolSlotColors(1, false).fill);
 }
 
 test "wallet badge distinguishes unknown balance from zero and shows exact msat" {

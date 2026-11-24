@@ -499,7 +499,7 @@ test "funding preflight requires exact derived capacity and supports split fundi
     const f = TestInputs;
     const q = try f.quote();
     const wallet: *const c.CdkWallet_t = @ptrFromInt(1); // Invalid capacity must fail before reading the wallet.
-    for ([_]u64{ 0, 14, 55 }) |capacity| {
+    for ([_]u64{ 0, 14, 205 }) |capacity| {
         try t.expectError(error.InvalidCapacity, preflight(t.io, a, wallet, @splat(1), f.policy, q, .{
             .capacity = capacity,
             .nominal = capacity,

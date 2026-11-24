@@ -123,11 +123,11 @@ frame, no restore and no cuts.
 The direct wallet bootstrap drops the first swap before dispatch as above,
 then closes the interrupted tab. A new tab on the same Chromium profile loads
 `/renderer/index.html`. The production renderer finds the pending operation.
-One CDP mouse click on **Review saved refill** retrieves the original two-cut
-quote with a 10-msat maximum debit. Neither startup inspect nor review sends a
-new swap POST or opens a channel. A second click at the same position, now
-**Resume refill**, fetches fresh native requirements and resumes the saved
-swap. The test checks two input-state reads (inspect and resume), no restore,
+A right-click on the Hoe slot opens **TOOLS**. Clicking **Review refill**
+retrieves the original two-cut quote with a 10-msat maximum debit. Neither
+startup inspect nor review sends a new swap POST or opens a channel. A second
+click at the same position, now **+2**, fetches fresh native requirements and
+resumes the saved swap. The test checks two input-state reads (inspect and resume), no restore,
 one successful mint swap after the blocked attempt, one native open, and no
 cuts. A readback after leaving the canvas verifies that the quoted channel is
 active on the native server and durably bound in the wallet at zero accepted.
@@ -137,8 +137,8 @@ active on the native server and durably bound in the wallet at zero accepted.
 The same bootstrap prepares a ready wallet with 10 msat and positions its
 player offline. Chromium then loads `/renderer/index.html`, selects the axe by
 clicking the hotbar, and uses `1` and `3` to select the pickaxe and hoe. It then
-clicks the HUD for a quote and clicks again to consent to refill.
-It then drags on grass and clicks the player's own tile, neither of which
+right-clicks the Hoe slot to open **TOOLS**, clicks for a quote, and clicks
+again to consent to refill. After closing the menu it drags on grass and clicks the player's own tile, neither of which
 should prepare a payment. Finally it clicks four tiles down and one tile right
 and expects one 5-msat cut on the adjacent grass at `(0,1)`. The quote must not
 swap before consent, and refill must use exactly one swap. The renderer uses
@@ -187,7 +187,16 @@ timeout -k 15s 120s unshare --map-root-user --net sh -c 'ip link set lo up && ex
 
 Append one scenario flag to run it instead of the default direct wallet/socket
 regression: `--funding-recovery`, `--funding-change-recovery`, `--funding-resume`,
-`--renderer-funding-resume`, `--renderer-only`, or `--tools`.
+`--renderer-funding-resume`, `--renderer-only`, `--renderer-large-refill`, or
+`--tools`. The large refill renderer scenario clicks **+20**, confirms a
+100-msat hoe quote, and verifies the new channel's capacity in both the
+wallet and the server after one cut. `--partial-close` exercises the wallet and
+wire without the Tools UI: it rejects stale close balances, verifies a late
+cut cannot charge after an exact partial close, then reconnects, redeems sender
+change, and funds a distinct replacement. `--renderer-top-up` exercises one
+**+20** click that carries one remaining use into a 21-use channel.
+`--renderer-top-up-resume` drops the page after sender credit commits, then
+verifies the replacement opens without another click or credit.
 
 The private namespace has only loopback; the fixed game and mint ports cannot
 collide with host services. Do not stop a host listener to run the test. The

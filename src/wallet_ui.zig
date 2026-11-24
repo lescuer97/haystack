@@ -154,6 +154,7 @@ pub const Model = struct {
     selection_loading: bool = false,
     recovery: Recovery = .none,
     balance: Text(100) = .{},
+    balance_msat: ?u64 = null,
     mint: Text(256) = .{},
     message: Text(160) = .{},
     invoice: Text(4096) = .{},
@@ -567,7 +568,7 @@ pub const Model = struct {
                 const mint = string(value, "mint_url") orelse return error.Invalid;
                 if (self.mint.len != 0 and !std.mem.eql(u8, mint, self.mint.slice())) return error.Invalid;
                 const msats = string(value, "msats") orelse return error.Invalid;
-                _ = try decimal(msats);
+                const balance_msat = try decimal(msats);
                 const recovery = try recoveryState(value);
                 if (value.object.get("recovery_pending")) |pending| {
                     if (pending != .bool) return error.Invalid;
@@ -576,6 +577,7 @@ pub const Model = struct {
                 if (mint.len > 256) return error.Invalid;
                 var buf: [100]u8 = undefined;
                 _ = self.balance.set(try std.fmt.bufPrint(&buf, "{s} msat", .{msats}));
+                self.balance_msat = balance_msat;
                 _ = self.mint.set(mint);
                 self.setRecovery(recovery, now);
                 self.available = true;

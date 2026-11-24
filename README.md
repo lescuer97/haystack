@@ -55,9 +55,12 @@ browser wallet regression suites use a separate non-interactive test fixture at
 `wallet-test.html`, installed only for `test`/`test-mint`.
 
 Browser play uses the same local server as desktop for paid axe, pickaxe, and
-hoe actions. Select a tool, choose **Get refill quote**, then confirm the
-wallet debit. Browser funding returns change in the same mint swap. Use test
-funds only. See [paid tool recovery and limitations](docs/browser-wallet.md#browser-paid-tools).
+hoe actions. Choose **Tools** in the main menu or right-click a hotbar slot to
+see remaining uses, refill, or close a depleted channel. Tools without a channel
+can load up to 10 uses, or 20 when the wallet can cover a larger refill. On the browser, the
+first refill click quotes the amount and the second confirms the debit. Browser
+funding returns change in the same mint swap. Use test funds only. See
+[paid tool recovery and limitations](docs/browser-wallet.md#browser-paid-tools).
 
 Host prerequisites are Zig 0.17.0, Python 3, Rustup/Cargo and a native C
 toolchain. Linux additionally needs the normal raylib/X11/OpenGL development

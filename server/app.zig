@@ -156,7 +156,9 @@ pub const App = struct {
                 if (info) |existing| switch (existing.phase) {
                     .depleted => return .{ .failed = .invalid_request },
                     .active, .closing_window => if (existing.remaining() >= open.tool.priceMsat()) return .{ .failed = .invalid_request },
-                    .expired, .sender_refund_required, .settlement_pending, .settled => {},
+                    .settlement_pending => if (now < existing.expiry) return .{ .failed = .invalid_request },
+                    .settled => if (now < existing.expiry and !existing.wallet_redeemed) return .{ .failed = .invalid_request },
+                    .expired, .sender_refund_required => {},
                 };
             }
         }
@@ -212,20 +214,24 @@ pub const App = struct {
         const channels = wallet.tryAcquire() orelse return .{ .failed = .server_busy };
         defer channels.release();
         const now = self.unixSeconds() orelse return unavailable;
-        const closed = channels.closeChannel(session.pubkey, close.id, now) catch |err| return switch (err) {
-            error.ChannelNotFound, error.ChannelNotDepleted => .{ .failed = .close_rejected },
+        const closed = channels.closeChannel(session.pubkey, close, now) catch |err| return switch (err) {
+            error.ChannelNotFound, error.ChannelNotDepleted, error.ChannelCloseBalanceMismatch => .{ .failed = .close_rejected },
             error.SqliteBusy => .{ .failed = .server_busy },
             else => blk: {
                 hoe_log.debug("close failed: {s}", .{@errorName(err)});
                 break :blk unavailable;
             },
         };
+        for (p.tools) |tool| {
+            const live = self.registry.toolChannel(handle, tool) orelse continue;
+            if (std.mem.eql(u8, &live.id, &close.id)) self.registry.setToolChannel(handle, tool, null);
+        }
         if (closed == .pending) return .{ .failed = .settlement_pending };
         if (closed == .newly_settled) self.registry.notifySettlement(session.pubkey, close.id);
         return .ok;
     }
 
-    pub fn handleChannelStatus(self: *App, handle: sessions.Handle, request: p.SpillmanChannelClosing, reply_allocator: std.mem.Allocator) p.Outcome(.channel_status) {
+    pub fn handleChannelStatus(self: *App, handle: sessions.Handle, request: p.ChannelStatusRequest, reply_allocator: std.mem.Allocator) p.Outcome(.channel_status) {
         const unavailable: p.Outcome(.channel_status) = .{ .failed = .unavailable };
         const wallet = self.wallet orelse return unavailable;
         if (!wallet.hasReceiver()) return unavailable;

@@ -3,6 +3,8 @@ const std = @import("std");
 const world = @import("world.zig");
 pub const hoe_price_msat: u64 = 5;
 pub const hoe_refill_cuts: u64 = 10;
+pub const large_tool_refill_cuts: u64 = 20;
+pub const max_tool_channel_cuts: u64 = 40;
 pub const hoe_capacity_msat = hoe_price_msat * hoe_refill_cuts;
 
 pub fn validHoeCapacity(capacity_msat: u64) bool {
@@ -11,8 +13,8 @@ pub fn validHoeCapacity(capacity_msat: u64) bool {
 
 pub const max_area_chunks = 64;
 pub const max_gameplay_request_bytes = 256;
-pub const max_request_bytes = 8192;
-pub const max_channel_proof_bytes = 3072;
+pub const max_request_bytes = max_channel_open_with_params_bytes;
+pub const max_channel_proof_bytes = 8192;
 pub const max_channel_params_bytes = 4096;
 // Envelope, five TLV headers, and the request ID, channel ID, tool, proof and params values.
 pub const max_channel_open_with_params_bytes = 4 + 5 * 3 + @sizeOf(Id) + 32 + 1 + max_channel_proof_bytes + max_channel_params_bytes;
@@ -100,7 +102,7 @@ pub const tool = enum(u8) {
 
     pub fn validCapacity(self: tool, capacity_msat: u64) bool {
         const price = self.priceMsat();
-        return capacity_msat != 0 and capacity_msat <= price * hoe_refill_cuts and capacity_msat % price == 0;
+        return capacity_msat != 0 and capacity_msat <= price * max_tool_channel_cuts and capacity_msat % price == 0;
     }
 
     pub fn terrain(self: tool) world.Tile {
@@ -123,7 +125,13 @@ pub const SpillmanChannelRequirementsRes = struct {
 };
 
 pub const SpillmanChannelPayment = struct { id: [32]u8, amount: u64, signature: [64]u8 };
-pub const SpillmanChannelClosing = struct { id: [32]u8 };
+pub const SpillmanChannelClosing = struct {
+    id: [32]u8,
+    /// Opt in to cooperative close at this exact cumulative accepted payment.
+    /// Omission preserves the depleted-only close behavior.
+    expected_balance_msat: ?u64 = null,
+};
+pub const ChannelStatusRequest = struct { id: [32]u8 };
 
 pub const SpillmanChannelClosingRequest = SpillmanChannelClosing;
 /// Proof and canonical CDK params JSON are opaque to the wire codec. Decoding borrows both slices.
@@ -152,7 +160,7 @@ pub const Request = struct {
         channel_open: SpillmanChannelOpen,
 
         channel_close: SpillmanChannelClosing,
-        channel_status: SpillmanChannelClosing,
+        channel_status: ChannelStatusRequest,
     },
 };
 

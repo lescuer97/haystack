@@ -402,6 +402,7 @@ pub const Worker = struct {
             .channel => |channel| self.channel = .{ .received = try channel.decode(bytes, &scratch) },
             .cut => |cut| {
                 const outcome = try wire.decodeReply(bytes, .cut, cut.request_id, &scratch);
+                sync.applyCutBalance(&self.auth_tool_channels, cut.payload, outcome);
                 self.cut = .{ .received = .{ .id = cut.request_id, .outcome = outcome } };
             },
         }
@@ -539,7 +540,7 @@ test "browser serializes move, owned channel open, signed cut and area" {
     worker.pending = worker.nextRequest();
     try t.expect(!worker.snapshot().pending);
     const channel = worker.pending.?.channel;
-    try t.expectEqual(@as(usize, 7232), channel.len);
+    try t.expectEqual(protocol.max_channel_open_with_params_bytes - 4, channel.len);
     const sent = try wire.decodeMessage(worker.channel_bytes[0..channel.len], true);
     try t.expectEqual(open.request_id, sent.request_id);
     try t.expectEqualSlices(u8, &(@as([protocol.max_channel_proof_bytes]u8, @splat(0x11))), sent.operation.channel_open.proof);
@@ -574,7 +575,7 @@ test "browser correlates max-size status replies and owns proofs after callback 
     try t.expectEqual(@as(f64, 5), worker.deadline);
     try t.expectError(error.UnexpectedMessageType, worker.receivePlay(try wire.encodeReply(&frame, .channel_close, .{
         .request_id = req.request_id,
-        .payload = req.payload,
+        .payload = .{ .id = req.payload.id },
     }, .{ .ok = {} })));
     const proofs: [protocol.max_sender_change_proofs_bytes]u8 = @splat(0x11);
     const reply = try wire.encodeReply(&frame, .channel_status, req, .{ .ok = .{

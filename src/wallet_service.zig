@@ -151,7 +151,7 @@ test "wallet guard validates capacity for the selected tool before funding" {
             try t.expectEqual(null, try guard.lookup(owner, request.id, now));
         }
     }
-    try t.expectError(error.ChannelNotFound, guard.closeChannel(owner, @splat(1), now));
+    try t.expectError(error.ChannelNotFound, guard.closeChannel(owner, .{ .id = @splat(1) }, now));
 }
 
 const receiver_log = std.log.scoped(.hoe_channels);
@@ -266,10 +266,16 @@ pub const Headless = struct {
 
         pub const Close = enum { pending, already_settled, newly_settled };
 
-        pub fn closeChannel(self: Locked, owner: receiver.Pubkey, id: receiver.Id, now: u64) !Close {
+        pub fn closeChannel(self: Locked, owner: receiver.Pubkey, request: protocol.SpillmanChannelClosing, now: u64) !Close {
             const store = self.ledger();
+            const id = request.id;
             const info = (try store.lookup(owner, id, now)) orelse return error.ChannelNotFound;
-            if (info.remaining() != 0 or info.balance_msat == 0) return error.ChannelNotDepleted;
+            // This comparison and the journal freeze both run under the same
+            // wallet guard that serializes accepted payments.
+            if (request.expected_balance_msat) |expected| {
+                if (expected == 0 or expected != info.balance_msat or info.phase == .sender_refund_required)
+                    return error.ChannelCloseBalanceMismatch;
+            } else if (info.remaining() != 0 or info.balance_msat == 0) return error.ChannelNotDepleted;
             if (info.phase == .settled and info.wallet_redeemed) return .already_settled;
             return if (try store.settleAndRedeem(owner, id, now)) .newly_settled else .pending;
         }

@@ -22,7 +22,7 @@ const wallet_ui = @import("wallet_ui.zig");
 /// backing array is the sentinel that makes `cString` possible.
 pub const max_text_bytes: usize = 128;
 
-pub const MenuPage = enum { Main, Settings, Debug, Wallet, Deposit, Invoice, History, Withdraw, Withdrawal };
+pub const MenuPage = enum { Main, Settings, Debug, Wallet, Tools, Deposit, Invoice, History, Withdraw, Withdrawal };
 
 /// Local menu actions. None of these touch a wallet, payment, or network layer;
 /// they only change menu-local UI state.
@@ -118,6 +118,7 @@ const main_items = [_]MenuItem{
     .{ .navigate = .Wallet },
     .{ .navigate = .Debug },
     .{ .navigate = .Settings },
+    .{ .navigate = .Tools },
     .{ .action = .close_menu },
 } ++ (if (builtin.os.tag == .emscripten) [_]MenuItem{} else [_]MenuItem{.{ .action = .exit_game }});
 
@@ -171,6 +172,7 @@ pub fn pageTitle(page: MenuPage) [:0]const u8 {
         .Settings => "Settings",
         .Debug => "Debug Settings",
         .Wallet => "Wallet",
+        .Tools => "TOOLS",
         .Deposit => "Deposit - msat",
         .Invoice => "Deposit - invoice",
         .History => "History",
@@ -185,6 +187,7 @@ pub fn pageItems(page: MenuPage) []const MenuItem {
         .Settings => &settings_items,
         .Debug => &debug_items,
         .Wallet => &wallet_items,
+        .Tools => &.{.{ .navigate = .Main }},
         .Deposit => &deposit_items,
         .Invoice => &invoice_items,
         .History => &history_items,
@@ -200,6 +203,7 @@ pub fn itemLabel(item: MenuItem) [:0]const u8 {
             .Settings => "Settings",
             .Debug => "Debug Settings",
             .Wallet => "Wallet",
+            .Tools => "Tools",
             .Deposit => "Deposit",
             .Invoice => "Saved invoice",
             .History => "History",
@@ -327,6 +331,7 @@ fn calculateLayoutCount(page: MenuPage, viewport_w: f32, viewport_h: f32, item_c
     const content_height: f32 = switch (page) {
         .Main, .Settings, .Debug => 0,
         .Wallet, .Deposit => 62,
+        .Tools => 184,
         .Invoice => 340,
         .History => 352,
         .Withdraw => 62,
@@ -401,6 +406,9 @@ pub const Menu = struct {
     withdrawal_invoice: BoundedTextField(4096) = .{},
     paste_requested: bool = false,
     option_toggle: ?Action = null,
+    tool_controls: [9]struct { id: usize, rect: Rect } = undefined,
+    tool_control_count: usize = 0,
+    tool_activation: ?usize = null,
 
     /// Persistent row highlight. Opening a page selects its first row; it then
     /// moves only when a menu direction step or moving pointer selects another
@@ -458,7 +466,7 @@ pub const Menu = struct {
         // 3. A click selects and activates the clicked row; anywhere else
         //    blurs the field without clearing the highlight. A confirm edge
         //    activates the currently selected row through the same handler.
-        if (frame.clicked) {
+        if (frame.clicked and !frame.right_clicked) {
             if (self.hitTest(layout, frame.pointer_x, frame.pointer_y)) |index| {
                 self.selected_index = index;
                 self.activateIndex(index);
@@ -479,6 +487,11 @@ pub const Menu = struct {
         self.currentPage = .Main;
         self.focus = null;
         self.selected_index = 0;
+    }
+
+    pub fn openTools(self: *Menu) void {
+        self.open();
+        self.activate(.{ .navigate = .Tools });
     }
 
     pub fn openWallet(self: *Menu) void {
@@ -504,7 +517,11 @@ pub const Menu = struct {
         return index + self.rowCount() == self.selected_index and index < self.items().len;
     }
     pub fn rowCount(self: *const Menu) usize {
-        return if (self.currentPage == .History) self.wallet.row_count else 0;
+        return switch (self.currentPage) {
+            .History => self.wallet.row_count,
+            .Tools => self.tool_control_count,
+            else => 0,
+        };
     }
     pub fn items(self: *const Menu) []const MenuItem {
         if (self.currentPage == .Wallet and self.wallet.invoice.len != 0 and !self.wallet.issued and !self.wallet.expired) return &wallet_with_invoice_items;
@@ -525,6 +542,11 @@ pub const Menu = struct {
     }
     fn hitTest(self: *const Menu, layout: Layout, x: f32, y: f32) ?usize {
         if (layout.hitTest(x, y)) |index| return self.rowCount() + index;
+        if (self.currentPage == .Tools) {
+            for (self.tool_controls[0..self.tool_control_count], 0..) |control, index| {
+                if (control.rect.contains(x, y)) return index;
+            }
+        }
         if (self.currentPage == .History and layout.content.height > 0 and layout.content.contains(x, y)) {
             const row: usize = @intFromFloat((y - layout.content.y) / (layout.content.height / 8));
             if (row < self.rowCount()) return row;
@@ -533,6 +555,10 @@ pub const Menu = struct {
     }
     pub fn activateIndex(self: *Menu, index: usize) void {
         if (index < self.rowCount()) {
+            if (self.currentPage == .Tools) {
+                self.tool_activation = self.tool_controls[index].id;
+                return;
+            }
             if (self.wallet.openRow(index)) {
                 self.currentPage = if (self.wallet.rows[index].outgoing) .Withdrawal else .Invoice;
                 self.wallet.history_active = false;
@@ -591,7 +617,7 @@ pub const Menu = struct {
                     self.paste_requested = false;
                 }
                 self.currentPage = page;
-                self.wallet.visit(self.currentPage == .History, page == .Wallet);
+                self.wallet.visit(page == .History, page == .Wallet or page == .Tools);
                 self.focus = null;
                 self.selected_index = 0;
             },
@@ -894,6 +920,20 @@ test "Deposit clears hidden focus and disables duplicates; Withdraw navigation r
     try std.testing.expectEqualStrings("", state.withdrawal_invoice.slice());
     try std.testing.expectEqual(serial, state.wallet.serial);
     try std.testing.expect(state.wallet.request == null);
+}
+
+test "Main navigates to Tools" {
+    var state: Menu = .{};
+    state.open();
+    const layout = state.layoutFor(1000, 640);
+    for (state.items(), 0..) |item, index| {
+        if (item != .navigate or item.navigate != .Tools) continue;
+        const point = itemCenter(layout, index);
+        try std.testing.expect(state.applyInput(frameFor(point.x, point.y, 1000, 640)));
+        try std.testing.expectEqual(MenuPage.Tools, state.currentPage);
+        return;
+    }
+    return error.MissingToolsMenu;
 }
 
 test "Main navigates to Wallet and Back returns to Main" {

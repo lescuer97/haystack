@@ -19,6 +19,7 @@ const MAX_RECORD: usize = 6 * 1024 * 1024 + 1024;
 const JOURNAL: &[u8] = b"journal";
 const WALLET: &[u8] = b"wallet";
 const HOE_LIFECYCLE: &[u8] = b"hoe-lifecycle";
+const TOOL_TOP_UP: &[u8] = b"tool_top_up_v1";
 
 #[derive_ReprC]
 #[repr(opaque)]
@@ -184,8 +185,8 @@ impl CdkSpilmanClientStorage {
             let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = self
                 .app
                 .query_row(
-                    "SELECT namespace,id,data FROM records WHERE namespace NOT IN (?1,?2,?3) LIMIT 1",
-                    params![JOURNAL, WALLET, HOE_LIFECYCLE],
+                    "SELECT namespace,id,data FROM records WHERE namespace NOT IN (?1,?2,?3,?4) LIMIT 1",
+                    params![JOURNAL, WALLET, HOE_LIFECYCLE, TOOL_TOP_UP],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()
@@ -386,6 +387,7 @@ fn metadata_key(namespace: &[u8], id: &[u8]) -> FfiResult<()> {
     if (namespace == JOURNAL && id.len() == 16)
         || (namespace == WALLET && id == b"pending")
         || (namespace == HOE_LIFECYCLE && id.len() == 32)
+        || (namespace == TOOL_TOP_UP && id == b"current")
     {
         Ok(())
     } else {

@@ -337,22 +337,7 @@ pub const Worker = struct {
         defer self.mutex.unlock(self.io);
         if (!self.activeLocked(generation) or !self.readyLocked(request.session)) return;
         if (self.cut != .waiting or !std.mem.eql(u8, &self.cut.waiting, &id)) return;
-        // Keep the login balance usable when the player switches away and back.
-        const tile = request.command.payload;
-        if (outcome == .ok and outcome.ok.cut and outcome.ok.terrain == tile.tool.terrain() and
-            outcome.ok.x == tile.x and outcome.ok.y == tile.y)
-        {
-            if (tile.payment) |payment| {
-                if (self.auth_tool_channels[@backingInt(tile.tool)]) |*channel| {
-                    if (std.mem.eql(u8, &channel.id, &payment.id) and
-                        payment.amount <= channel.capacity_msats and payment.amount >= channel.balance_msats and
-                        payment.amount - channel.balance_msats == tile.tool.priceMsat())
-                    {
-                        channel.balance_msats = payment.amount;
-                    }
-                }
-            }
-        }
+        sync.applyCutBalance(&self.auth_tool_channels, request.command.payload, outcome);
         self.cut = .{ .received = .{ .id = id, .outcome = outcome } };
     }
 
