@@ -73,6 +73,29 @@ class GraphIsolationTests(unittest.TestCase):
         for step in ("server", "run-server", "test-server", "bench-chunk-reads", "build-bench-server", "bench-server"):
             self.assertNotRegex(self.wasm, rf"(?m)^  {step}\s")
 
+    def test_standalone_is_only_valid_for_the_native_client(self):
+        for flag in ("-Dplatform=wasm", "-Dgame=false"):
+            with self.subTest(flag=flag):
+                result = configure("-Dstandalone", flag)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("StandaloneRequiresDesktopGame", result.stderr)
+
+    @unittest.skipUnless(SUPPORTED_DESKTOP_HOST, "desktop host is not supported")
+    def test_standalone_profile_is_client_only(self):
+        result = configure("-Dstandalone")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"(?m)^\s+standalone-debug\s")
+        for step in ("server", "run-server", "test-server", "bench-chunk-reads"):
+            self.assertNotRegex(result.stdout, rf"(?m)^\s+{step}\s")
+        self.assertRegex(self.desktop, r"(?m)^\s+server\s")
+
+    def test_smoke_option_requires_standalone(self):
+        for flags in (("-Dgame=false",), ("-Dplatform=wasm",)):
+            with self.subTest(flags=flags):
+                result = configure("-Dstandalone-smoke", *flags)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("SmokeRequiresStandalone", result.stderr)
+
     def test_wasm_server_only_is_explicitly_rejected(self):
         result = configure("-Dplatform=wasm", "-Dgame=false")
         self.assertNotEqual(result.returncode, 0)

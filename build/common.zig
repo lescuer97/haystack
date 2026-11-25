@@ -4,9 +4,18 @@ const platform = @import("platform.zig");
 pub const macos_deployment_target = platform.macos_deployment_target;
 pub const macos_deployment_version = platform.macos_deployment_version;
 
-pub fn addCutSoundAssets(b: *std.Build, module: *std.Build.Module) void {
+pub fn addAssetOptions(b: *std.Build, module: *std.Build.Module, standalone: bool, standalone_smoke: bool) void {
+    const options = b.addOptions();
+    options.addOption(bool, "standalone", standalone);
+    options.addOption(bool, "standalone_smoke", standalone_smoke);
+    module.addOptions("asset_options", options);
+}
+
+pub fn addCutSoundAssets(b: *std.Build, module: *std.Build.Module, check: ?*std.Build.Step.Run) void {
     for ([_][]const u8{ "snip.wav", "fail.wav", "reward.wav" }) |filename| {
-        module.addAnonymousImport(filename, .{ .root_source_file = b.path(b.fmt("assets/sfx/{s}", .{filename})) });
+        const path = b.fmt("assets/sfx/{s}", .{filename});
+        if (check) |step| step.addArg(path);
+        module.addAnonymousImport(filename, .{ .root_source_file = b.path(path) });
     }
 }
 

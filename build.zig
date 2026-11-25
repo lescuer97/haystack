@@ -5,9 +5,13 @@ const Platform = enum { desktop, wasm };
 
 pub fn build(b: *std.Build) !void {
     const requested = b.option(Platform, "platform", "Build desktop (default) or the complete browser Wasm application");
+    const standalone = b.option(bool, "standalone", "Install the native desktop client as one executable with embedded assets") orelse false;
+    const standalone_smoke = b.option(bool, "standalone-smoke", "Enable the offline runtime smoke fixture in a standalone test build") orelse false;
     const target = b.standardTargetOptions(.{
         .default_target = if (requested == .wasm)
             .{ .cpu_arch = .wasm32, .os_tag = .emscripten }
+        else if (standalone)
+            .{ .cpu_model = .baseline }
         else
             .{},
     });
@@ -21,14 +25,22 @@ pub fn build(b: *std.Build) !void {
         );
         return error.WasmRequiresPlatform;
     }
+    const game = b.option(bool, "game", "Configure the game (default true; native server wallet is always configured)") orelse true;
+    if (standalone and (platform != .desktop or !game)) {
+        std.log.err("-Dstandalone requires the native desktop game; omit it for Wasm or -Dgame=false", .{});
+        return error.StandaloneRequiresDesktopGame;
+    }
+    if (standalone_smoke and !standalone) {
+        std.log.err("-Dstandalone-smoke requires -Dstandalone", .{});
+        return error.SmokeRequiresStandalone;
+    }
     const optimize: std.builtin.Optimize = b.option(std.builtin.Optimize, "optimize", "Debug, ReleaseSafe, ReleaseFast or ReleaseSmall (Wasm defaults to ReleaseSmall)") orelse switch (b.graph.release_mode) {
-        .off => if (platform == .wasm) .small else .debug,
+        .off => if (platform == .wasm) .small else if (standalone) .safe else .debug,
         .any => if (platform == .wasm) .small else .safe,
         .small => .small,
         .safe => .safe,
         .fast => .fast,
     };
-    const game = b.option(bool, "game", "Configure the game (default true; native server wallet is always configured)") orelse true;
     const toolchain = b.option([]const u8, "rust-toolchain", b.fmt("Rustup toolchain (default: pinned {s})", .{common.default_toolchain})) orelse common.default_toolchain;
     const offline = b.option(bool, "offline", "Forbid tool downloads and Cargo network access") orelse false;
     if (platform == .wasm and !game) {
@@ -46,7 +58,11 @@ pub fn build(b: *std.Build) !void {
         .offline = offline,
     };
     const native = if (platform == .desktop) try @import("build/native_wallet.zig").create(b, options) else null;
-    if (native) |graph| @import("build/server.zig").build(b, graph);
+    // Standalone is a client-only profile; the independent server retains its
+    // ordinary native CPU and optimization defaults in a separate invocation.
+    if (!standalone) {
+        if (native) |graph| try @import("build/server.zig").build(b, graph);
+    }
     if (!game) return;
     const build_tests = b.addSystemCommand(&.{ "python3", "-m", "unittest", "discover", "-s", "build-support", "-p", "test_*.py" });
     build_tests.setCwd(b.path("."));
@@ -90,7 +106,7 @@ pub fn build(b: *std.Build) !void {
     // Deliberately configure ONE graph. Desktop never initializes browser
     // toolchains; Wasm never translates/links the native C ABI or desktop raylib.
     switch (platform) {
-        .desktop => try @import("build/desktop.zig").build(b, native.?),
+        .desktop => try @import("build/desktop.zig").build(b, native.?, standalone, standalone_smoke),
         .wasm => try @import("build/wasm.zig").build(b, options),
     }
 }

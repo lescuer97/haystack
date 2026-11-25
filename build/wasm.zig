@@ -2,6 +2,7 @@ const std = @import("std");
 const rlz = @import("raylib_zig");
 const common = @import("common.zig");
 const emsdk_compat = @import("emsdk_compat.zig");
+const hardening = @import("hardening.zig");
 
 const wasm_setup_base = "zig build setup -Dplatform=wasm";
 
@@ -41,10 +42,14 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     artifact.step.dependOn(&sdk_check.step);
     const root = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = options.target, .optimize = options.optimize, .link_libc = true });
     root.addImport("shared", @import("shared.zig").create(b, options.target, options.optimize));
-    common.addCutSoundAssets(b, root);
+    common.addAssetOptions(b, root, false, false);
+    common.addCutSoundAssets(b, root, null);
     root.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
     root.addImport("raylib", raylib.module("raylib"));
     root.linkLibrary(artifact);
+    hardening.zigModule(root, options.optimize);
+    try hardening.cSources(root, options.optimize, .emscripten);
+    try hardening.cSources(artifact.root_module, options.optimize, .emscripten);
     const renderer = b.addLibrary(.{ .name = "haystack_renderer", .linkage = .static, .root_module = root });
     var flags = rlz.emsdk.emccDefaultFlags(b.allocator, .{ .optimize = options.optimize, .asyncify = false, .fsanitize = false });
     if (options.optimize.runtimeSafety()) try flags.put("-fsanitize=undefined", {});
@@ -52,9 +57,10 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     try settings.put("EXIT_RUNTIME", "0");
     // Bounded history/invoice state and Debug aggregate-return copies exceed
     // 1 MiB alongside onboarding scratch. Both renderer links share the tested
-    // 2 MiB budget; keep overflow checks rather than silently overwriting globals.
+    // 2 MiB budget. Level 2 also checks updates to the linear-memory stack
+    // pointer, including in ReleaseSmall and ReleaseFast.
     try settings.put("STACK_SIZE", "2097152");
-    try settings.put("STACK_OVERFLOW_CHECK", if (options.optimize.runtimeSafety()) "2" else "1");
+    try settings.put("STACK_OVERFLOW_CHECK", "2");
     try settings.put("EXPORTED_FUNCTIONS", "['_main','_haystack_onboarding_link']");
     // Emscripten accepts a single `--js-library` path here. Combine the startup
     // UI, storage bridge and onboarding input bridge at configure time.

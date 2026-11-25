@@ -156,6 +156,7 @@ fn makeSQLiteLib(b: *std.Build, dep: *std.Build.Dependency, c_flags: []const []c
 
 pub fn build(b: *std.Build) !void {
     const server_namespace = b.option(bool, "server_namespace", "Isolate world SQLite from native CDK SQLite") orelse false;
+    const c_hardening_flags = b.option([]const []const u8, "c_hardening_flags", "Additional compiler flags for the main SQLite archive") orelse &.{};
     const in_memory = b.option(bool, "in_memory", "Should the tests run with sqlite in memory (default true)") orelse true;
     const dbfile = b.option([]const u8, "dbfile", "Always use this database file instead of a temporary one");
     const ci = b.option(bool, "ci", "Build and test in the CI on GitHub");
@@ -232,6 +233,7 @@ pub fn build(b: *std.Build) !void {
     defer server_flags.deinit(b.allocator);
     try server_flags.appendSlice(b.allocator, c_flags);
     if (server_namespace) try server_flags.appendSlice(b.allocator, &.{ "-include", try b.root.joinString(b.allocator, "c/server_namespace.h") });
+    try server_flags.appendSlice(b.allocator, c_hardening_flags);
 
     //
     // Main library and module
@@ -240,6 +242,7 @@ pub fn build(b: *std.Build) !void {
     // const sqlite_lib, const sqlite_mod = blk: {
     const sqlite_lib, _ = blk: {
         const lib = makeSQLiteLib(b, sqlite_dep, server_flags.items, target, optimize, .with);
+        if (c_hardening_flags.len != 0) lib.root_module.pic = true;
 
         const mod = b.addModule("sqlite", .{
             .root_source_file = b.path("sqlite.zig"),

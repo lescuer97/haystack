@@ -1,7 +1,8 @@
 const std = @import("std");
+const hardening = @import("hardening.zig");
 
 /// Native server graph only. Installation is explicit, never the default game.
-pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
+pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     const target = native.options.target;
     const optimize = native.options.optimize;
     const secp = @import("secp256k1.zig").create(b, target, optimize) orelse return;
@@ -9,6 +10,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
         .target = target,
         .optimize = optimize,
         .server_namespace = true,
+        .c_hardening_flags = hardening.cFlags(optimize, native.policy.os),
     }) orelse return).module("sqlite");
     const storage = b.createModule(.{ .root_source_file = b.path("src/native_storage.zig"), .target = target, .optimize = optimize, .link_libc = true });
     storage.addImport("cdk", native.cdk);
@@ -18,6 +20,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
     const shared = @import("shared.zig").create(b, target, optimize);
     storage.addImport("shared", shared);
     storage.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
+    try hardening.cSources(storage, optimize, native.policy.os);
     const server_mod = b.createModule(.{
         .root_source_file = b.path("server/main.zig"),
         .target = target,
@@ -28,6 +31,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) void {
     secp.link(server_mod);
     server_mod.link_libc = true;
     const server = b.addExecutable(.{ .name = "haystack_server", .root_module = server_mod });
+    hardening.executable(server, optimize);
     server.step.dependOn(&native.rust.step);
     const install_server = b.addInstallArtifact(server, .{});
     b.step("server", "Build and install the local server").dependOn(&install_server.step);

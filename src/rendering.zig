@@ -8,6 +8,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const rl = @import("raylib");
+const atlas_assets = @import("atlas_assets.zig");
+const standalone = @import("asset_options").standalone;
 
 const camera = @import("camera.zig");
 const game_mod = @import("game.zig");
@@ -23,25 +25,21 @@ const terrain = shared.world;
 /// Frame-rate target. The HUD's FPS colour thresholds are derived from it.
 pub const target_fps: i32 = 144;
 
-const grass_asset = "assets/Tiles/Grass_Middle.png";
-const grass_sheet_width = 16;
-const grass_sheet_height = 16;
+const grass_sheet_width: comptime_int = atlas_assets.grass.width;
+const grass_sheet_height: comptime_int = atlas_assets.grass.height;
+const dirt_sheet_width: comptime_int = atlas_assets.dirt.width;
+const dirt_sheet_height: comptime_int = atlas_assets.dirt.height;
+const water_sheet_width: comptime_int = atlas_assets.water.width;
+const water_sheet_height: comptime_int = atlas_assets.water.height;
+const oak_sheet_width: comptime_int = atlas_assets.oak.width;
+const oak_sheet_height: comptime_int = atlas_assets.oak.height;
+const decor_sheet_width: comptime_int = atlas_assets.decor.width;
+const decor_sheet_height: comptime_int = atlas_assets.decor.height;
+
 const grass_source = rl.Rectangle{ .x = 0, .y = 0, .width = 16, .height = 16 };
-const dirt_asset = "assets/Tiles/Path_Tile.png";
-const dirt_sheet_width = 48;
-const dirt_sheet_height = 96;
 const dirt_source = rl.Rectangle{ .x = 16, .y = 16, .width = 16, .height = 16 };
-const water_asset = "assets/Tiles/Water_Tile.png";
-const water_sheet_width = 48;
-const water_sheet_height = 96;
 const water_source = rl.Rectangle{ .x = 0, .y = 80, .width = 16, .height = 16 };
-const oak_asset = "assets/Outdoor decoration/Oak_Tree.png";
-const oak_sheet_width = 64;
-const oak_sheet_height = 80;
 const oak_source = rl.Rectangle{ .x = 0, .y = 0, .width = 64, .height = 80 };
-const decor_asset = "assets/Outdoor decoration/Outdoor_Decor_Free.png";
-const decor_sheet_width = 112;
-const decor_sheet_height = 192;
 const rock_source = rl.Rectangle{ .x = 32, .y = 32, .width = 16, .height = 16 };
 const grass_clump_source = rl.Rectangle{ .x = 96, .y = 16, .width = 16, .height = 16 };
 const cut_grass_source = rl.Rectangle{ .x = 16, .y = 16, .width = 16, .height = 16 };
@@ -140,19 +138,26 @@ fn quadrantDest(x: f32, y: f32, quadrant: usize) rl.Rectangle {
     };
 }
 
-fn loadAtlas(allocator: std.mem.Allocator, comptime asset: []const u8, width: i32, height: i32) !rl.Texture2D {
-    const path: [:0]const u8 = if (builtin.os.tag == .emscripten)
-        "/" ++ asset
-    else
-        try std.fs.path.joinZ(allocator, &.{ rl.getApplicationDirectory(), asset });
-    defer if (builtin.os.tag != .emscripten) allocator.free(path);
-    const texture = rl.loadTexture(path) catch |err| {
-        std.log.err("texture: cannot load path={s} error={s}", .{ path, @errorName(err) });
+fn loadAtlasTexture(allocator: std.mem.Allocator, comptime path: []const u8) !rl.Texture2D {
+    if (standalone) {
+        const image = try rl.loadImageFromMemory(".png", @embedFile(path));
+        defer rl.unloadImage(image);
+        return rl.loadTextureFromImage(image);
+    }
+    if (builtin.os.tag == .emscripten) return rl.loadTexture("/" ++ path);
+    const full_path = try std.fs.path.joinZ(allocator, &.{ rl.getApplicationDirectory(), path });
+    defer allocator.free(full_path);
+    return rl.loadTexture(full_path);
+}
+
+fn loadAtlas(allocator: std.mem.Allocator, comptime atlas: atlas_assets.Atlas) !rl.Texture2D {
+    const texture = loadAtlasTexture(allocator, atlas.path) catch |err| {
+        std.log.err("texture: cannot load asset={s} error={s}", .{ atlas.path, @errorName(err) });
         return err;
     };
     errdefer rl.unloadTexture(texture);
-    if (texture.width != width or texture.height != height) {
-        std.log.err("texture: invalid dimensions path={s} expected={d}x{d} actual={d}x{d}", .{ path, width, height, texture.width, texture.height });
+    if (texture.width != atlas.width or texture.height != atlas.height) {
+        std.log.err("texture: invalid dimensions asset={s} expected={d}x{d} actual={d}x{d}", .{ atlas.path, atlas.width, atlas.height, texture.width, texture.height });
         return error.InvalidTextureDimensions;
     }
     rl.setTextureFilter(texture, .point);
@@ -172,17 +177,17 @@ pub const Resources = struct {
     player_actions: rl.Texture2D,
 
     pub fn init(allocator: std.mem.Allocator) !Resources {
-        const grass = try loadAtlas(allocator, grass_asset, grass_sheet_width, grass_sheet_height);
+        const grass = try loadAtlas(allocator, atlas_assets.grass);
         errdefer rl.unloadTexture(grass);
-        const dirt = try loadAtlas(allocator, dirt_asset, dirt_sheet_width, dirt_sheet_height);
+        const dirt = try loadAtlas(allocator, atlas_assets.dirt);
         errdefer rl.unloadTexture(dirt);
-        const oak = try loadAtlas(allocator, oak_asset, oak_sheet_width, oak_sheet_height);
+        const oak = try loadAtlas(allocator, atlas_assets.oak);
         errdefer rl.unloadTexture(oak);
-        const decor = try loadAtlas(allocator, decor_asset, decor_sheet_width, decor_sheet_height);
+        const decor = try loadAtlas(allocator, atlas_assets.decor);
         errdefer rl.unloadTexture(decor);
-        const water = try loadAtlas(allocator, water_asset, water_sheet_width, water_sheet_height);
+        const water = try loadAtlas(allocator, atlas_assets.water);
         errdefer rl.unloadTexture(water);
-        const player_sheet = try loadAtlas(allocator, "assets/Player/Player.png", 192, 320);
+        const player_sheet = try loadAtlas(allocator, atlas_assets.player);
         errdefer rl.unloadTexture(player_sheet);
         return .{
             .allocator = allocator,
@@ -192,7 +197,7 @@ pub const Resources = struct {
             .decor = decor,
             .water = water,
             .player_sheet = player_sheet,
-            .player_actions = try loadAtlas(allocator, "assets/Player/Player_Actions.png", 96, 576),
+            .player_actions = try loadAtlas(allocator, atlas_assets.player_actions),
         };
     }
 

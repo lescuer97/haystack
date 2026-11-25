@@ -280,8 +280,10 @@ compiled checkout targets are intentionally neither copied nor packaged.
 ## macOS Apple Silicon desktop
 
 macOS desktop support is native Apple Silicon (`aarch64-apple-darwin`) only.
-Intel Macs, Rosetta/x86_64 shells, universal binaries, signing, packaging, `.app`
-bundles and DMGs are out of scope.
+Intel Macs, Rosetta/x86_64 shells, universal binaries, distribution signing,
+notarization, `.app` bundles, and DMGs are out of scope. The standalone build
+renews the executable's ad-hoc signature after stripping; this is not a
+Developer ID signature or notarization.
 
 Prerequisites (the build never runs sudo or installs system packages):
 
@@ -357,9 +359,96 @@ the pinned raylib dependency rather than silently mixing framework sources.
 
 The macOS path is **implemented but not yet executed here**: this checkout is on
 Linux, so the macOS build, Xcode/SDK preflight and Mach-O checks are covered by
-source/unit contracts and a macOS CI job only. A graphical desktop smoke test
-(opening a window, rendering and closing it) remains a manual macOS step; CI does
-not pretend to automate it.
+source/unit contracts and a macOS CI job only. The standalone graphical smoke
+in that job needs a logged-in WindowServer session and a CoreAudio output.
+
+## Standalone desktop release
+
+```sh
+zig build setup
+zig build -Dstandalone
+# Optional: select a fresh install prefix for staging or auditing.
+zig build -Dstandalone --prefix zig-out-release
+```
+
+Copy only `<prefix>/desktop-standalone/haystack_game` to the target machine.
+`zig build run -Dstandalone` runs that installed file. Standalone defaults to
+`ReleaseSafe` and the baseline CPU for the native architecture; existing target
+and optimization overrides still apply. It links raylib and the Rust wallet
+statically and embeds the seven PNG atlases, four Ogg tracks, and three WAV cues.
+There is no game asset directory, shared raylib, or rpath in this install.
+Standalone installs strip debug information and nonessential symbols using the
+host's `strip` (binutils on GNU/Linux, Xcode tools on macOS). The same install
+always saves the matching unstripped copy at
+`<prefix>/desktop-standalone-debug/haystack_game`. Archive that file privately
+for crash analysis; only distribute the file from `<prefix>/desktop-standalone/`.
+The `standalone-debug` step can still export just the private copy.
+
+Wallet/settings data still goes into the usual user directories. The browser
+and server are not in the standalone graph. Build the server separately with
+`zig build server -Dgame=false`, adding an explicit `-Doptimize` if desired.
+
+- **Build inputs:** Put the seven sheets in `assets/` at the paths and dimensions
+  specified in `src/atlas_assets.zig`. Put all four Ogg files in
+  `assets/music/media/` with the names in [the soundtrack credits](../assets/music/CREDITS.md).
+  The build lists missing or empty PNGs, Oggs, and checked-in WAVs together; it does not fetch a sprite pack
+  or fall back to loose files at runtime.
+- **Distribution rights:** The original local Cute Fantasy pack's license
+  forbids redistribution, even if modified. Do not distribute an executable
+  containing those sheets unless you have permission. For public releases,
+  use redistributable replacements at the same paths and dimensions (including
+  the expected sprite layout), or obtain permission; record the assets' sources,
+  versions or hashes, and licenses in the release inputs. The current soundtrack
+  is CC0; the cue provenance is in [the SFX license](../assets/sfx/LICENSE.md).
+  CI uses generated test graphics and audio, not release assets, and does not
+  publish them.
+- **Runtime dependencies:** This is one application file, not a fully static
+  OS executable. GNU/Linux builds use system glibc, X11 (or Xwayland), and the
+  host's OpenGL/audio stack. Build on the oldest distro you intend to support;
+  the glibc requirement can vary by build host.
+  The standalone release verifier, `python3 build-support/check_standalone.py
+  <prefix>`, supports **GNU/glibc Linux and Apple Silicon macOS**, not musl.
+  On GNU/Linux it reports the highest required glibc symbol version. Apple
+  Silicon builds require macOS 15.0 or later and use its system frameworks.
+  Linux aarch64 has no standalone CI coverage yet.
+- **Validation:** CI checks the stripped install and its matching private copy.
+  A separate, non-distributable build with `-Dstandalone -Dstandalone-smoke`
+  is relocated and launched with a disposable home. It renders and loads all
+  seven atlases, checks that the Ogg stream advances and the three WAV cues
+  reach the audio mixer, and confirms wallet startup blocks without creating
+  a wallet or exporting a private screenshot. It does not contact the mint.
+  Linux CI provides Xvfb and ALSA null output; Apple Silicon requires
+  WindowServer and a default CoreAudio output. `zig build test -Dstandalone`
+  also checks embedded audio decoding without a sound device.
+
+### Release hardening
+
+- **Linux desktop and server:** Release executables use PIE, a non-executable
+  stack, and full RELRO. Zig release modules enable canaries, and Zig x86_64
+  also explicitly enables stack probing. Zig 0.17 does not support that option
+  on Linux aarch64; C sources built by Zig (including raylib, namespaced SQLite,
+  secp256k1 and the QR encoder) use strong canaries and Clang's stack-clash
+  protection on both architectures.
+- **Apple Silicon macOS:** Release executables use Mach-O PIE without requesting
+  an executable stack. Zig and project-built C code enable canaries. This Zig
+  and Clang toolchain does not provide the Linux stack-clash flags on this
+  target; do not treat the macOS build as having equivalent page probing.
+- **Browser:** Native PIE and guard-page probing do not apply to Wasm. The
+  Emscripten renderer uses stack canaries in release and level-2 linear-memory
+  stack checking in all modes (including the test fixture).
+
+These Zig and C settings do not configure the separately built Cargo archives
+or Rust Wasm module. Rust retains the pinned compiler's target defaults; in
+particular this build does not request an unstable Rust stack-canary option.
+
+CI audits the stripped standalone binary for the applicable executable flags.
+On Linux x86_64 it also checks for generated canary and stack-probe instructions
+in the unstripped copy; `checksec` can miss those after stripping or when Zig
+uses an out-of-line probe. `python3 build-support/check_rust_hardening.py`
+separately inspects the Cargo-produced Linux x86_64 `cdk_wallet_ffi` codegen
+objects for inline stack probes and canary-related relocations. This is an
+evidence report, not a guarantee of coverage, and does not audit other crates,
+bundled C objects, or non-x86_64 ELF formats.
 
 ## Options and offline builds
 
@@ -391,7 +480,8 @@ runtime assets to `<prefix>/desktop/bin/assets`, next to the executable. Provide
 local assets to exercise rendering and music; the Wasm renderer build requires
 the referenced sheets and tracks at build time.
 
-Default optimization is **Debug for desktop**, **ReleaseSmall for Wasm**.
+Default optimization is **Debug for ordinary desktop**, **ReleaseSafe for
+standalone desktop**, and **ReleaseSmall for Wasm**.
 An unqualified `--release` selects ReleaseSafe on desktop and ReleaseSmall on Wasm.
 `-Doptimize=Debug` uses Cargo's debug profile; the release modes use Cargo release
 with matching opt-level (`2`, `3`, `s` for safe/fast/small). ReleaseSafe enables

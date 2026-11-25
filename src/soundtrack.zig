@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rl = @import("raylib");
 const tracks = @import("soundtrack_tracks.zig").paths;
+const standalone = @import("asset_options").standalone;
 const CutCues = @import("cut_feedback.zig").Cues;
 
 const Status = enum { active, ended, failed };
@@ -59,10 +60,64 @@ fn Player(comptime Backend: type) type {
             self.backend.playCutCues(cues);
         }
 
+        pub fn verifyStandalonePlayback(self: *Self) !void {
+            if (self.update(true, true)) return error.SmokeMusicUnavailable;
+            var music = self.backend.stream orelse return error.SmokeMusicUnavailable;
+            if (!rl.isMusicValid(music)) return error.SmokeMusicUnavailable;
+            // CI tracks are only a quarter-second long and ALSA's null PCM
+            // can drain buffers faster than real time. Keep feeding the same
+            // decoder instead of racing the playlist's end-of-track handling.
+            music.looping = true;
+            self.backend.stream = music;
+            const initial = rl.getMusicTimePlayed(music);
+            const deadline = rl.getTime() + 2;
+            while (true) {
+                if (self.backend.status() != .active) return error.SmokeMusicStopped;
+                if (rl.getMusicTimePlayed(music) != initial) break;
+                if (rl.getTime() >= deadline) return error.SmokeMusicNotAdvancing;
+                rl.waitTime(0.005);
+            }
+            std.log.info("standalone smoke: embedded music advanced", .{});
+
+            // Use the normal lazy WAV load/play path. Observe a replay in
+            // raylib's mixer: the null PCM can finish a cue before a poll.
+            inline for (.{
+                .{ .field = "snip", .cues = CutCues{ .snip = true } },
+                .{ .field = "fail", .cues = CutCues{ .fail = true } },
+                .{ .field = "reward", .cues = CutCues{ .reward = .win } },
+            }) |cue| {
+                self.playCutCues(cue.cues);
+                const sound = @field(self.backend, cue.field).sound orelse {
+                    std.log.err("standalone smoke: could not load {s} cue", .{cue.field});
+                    return error.SmokeCueUnavailable;
+                };
+                rl.stopSound(sound);
+                smoke_cue_mixed.store(false, .monotonic);
+                rl.attachAudioStreamProcessor(sound.stream, observeSmokeCue);
+                defer rl.detachAudioStreamProcessor(sound.stream, observeSmokeCue);
+                self.playCutCues(cue.cues);
+                const cue_deadline = rl.getTime() + 2;
+                while (!smoke_cue_mixed.load(.monotonic)) {
+                    if (rl.getTime() >= cue_deadline) {
+                        std.log.err("standalone smoke: {s} cue did not reach the mixer", .{cue.field});
+                        return error.SmokeCueNotPlaying;
+                    }
+                    rl.waitTime(0.005);
+                }
+            }
+            std.log.info("standalone smoke: snip, fail and reward cues played", .{});
+        }
+
         pub fn deinit(self: *Self) void {
             self.backend.deinit();
         }
     };
+}
+
+var smoke_cue_mixed: std.atomic.Value(bool) = .init(false);
+
+fn observeSmokeCue(_: ?*anyopaque, frames: c_uint) callconv(.c) void {
+    if (frames > 0) smoke_cue_mixed.store(true, .monotonic);
 }
 
 const reward_wav = @embedFile("reward.wav");
@@ -82,15 +137,26 @@ const Desktop = struct {
         if (!rl.isAudioDeviceReady()) rl.initAudioDevice();
         if (!rl.isAudioDeviceReady()) return false;
 
-        const full_path = std.fs.path.joinZ(self.allocator, &.{ rl.getApplicationDirectory(), path }) catch return false;
-        defer self.allocator.free(full_path);
-        var music = rl.loadMusicStream(full_path) catch return false;
+        var music = self.openTrack(path) catch return false;
         music.looping = false;
         rl.setMusicVolume(music, 0.0875);
         rl.playMusicStream(music);
         rl.updateMusicStream(music);
         self.stream = music;
         return true;
+    }
+
+    fn openTrack(self: *Desktop, path: [:0]const u8) !rl.Music {
+        if (standalone) {
+            // The decoder retains the input bytes until the stream is unloaded.
+            inline for (tracks) |track| {
+                if (std.mem.eql(u8, path, track)) return rl.loadMusicStreamFromMemory(".ogg", @embedFile(track));
+            }
+            return error.UnknownTrack;
+        }
+        const full_path = try std.fs.path.joinZ(self.allocator, &.{ rl.getApplicationDirectory(), path });
+        defer self.allocator.free(full_path);
+        return rl.loadMusicStream(full_path);
     }
 
     fn setEnabled(self: *Desktop, enabled: bool) void {
@@ -192,6 +258,22 @@ const Browser = struct {
         haystack_reward_audio(0, null, 0, 0);
     }
 };
+
+test "standalone audio assets decode without files or an audio device" {
+    if (!standalone) return error.SkipZigTest;
+    rl.setTraceLogLevel(.none);
+    defer rl.setTraceLogLevel(.info);
+    inline for (tracks) |track| {
+        const wave = try rl.loadWaveFromMemory(".ogg", @embedFile(track));
+        defer rl.unloadWave(wave);
+        try std.testing.expect(wave.frameCount > 0);
+    }
+    inline for (.{ @embedFile("snip.wav"), @embedFile("fail.wav"), reward_wav }) |cue| {
+        const wave = try rl.loadWaveFromMemory(".wav", cue);
+        defer rl.unloadWave(wave);
+        try std.testing.expect(wave.frameCount > 0);
+    }
+}
 
 test "soundtrack waits for controls, pauses, and retries after exhausting the playlist" {
     const Fake = struct {

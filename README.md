@@ -4,6 +4,7 @@ Separate builds, coordinated entirely by Zig:
 
 ```sh
 zig build                       # native desktop: Linux x86_64/aarch64 or macOS Apple Silicon
+zig build -Dstandalone          # native single-file client; requires local sprite sheets and soundtrack
 zig build -Dplatform=wasm        # complete browser application
 ```
 
@@ -31,6 +32,13 @@ build installs `zig-out/desktop/bin/haystack_game` and a shared raylib library
 `zig-out/desktop/lib`. The executable records only a relative
 `$ORIGIN/../lib` (Linux) or `@loader_path/../lib` (macOS) lookup, so the
 installed `desktop` directory can be moved outside the repository.
+
+For one-file deployment, `zig build -Dstandalone` builds the client with static
+raylib and embedded game assets at `zig-out/desktop-standalone/haystack_game`.
+Keep the matching copy in `zig-out/desktop-standalone-debug/` private for
+crash analysis. The deployable executable still needs the host's desktop system libraries and a separate server for
+play. The existing local sprite pack prohibits redistribution; don't distribute a
+binary containing it without permission. See [standalone build requirements](docs/build.md#standalone-desktop-release).
 
 On Linux and macOS the desktop binary creates its window and world first, then
 runs native wallet startup inspection. A validated existing wallet proceeds to
@@ -67,8 +75,8 @@ toolchain. Linux additionally needs the normal raylib/X11/OpenGL development
 libraries and libunwind. macOS requires **native Apple Silicon (arm64)**,
 macOS 15.0 or newer, Xcode Command Line Tools and a macOS SDK; `zig build` runs
 an actionable preflight and never uses sudo or installs system packages. macOS
-Intel, universal binaries, packaging, signing and `.app`/DMG output are not
-supported.
+Intel, universal binaries, distribution signing, notarization, and `.app`/DMG
+output are not supported. Standalone binaries are ad-hoc signed after stripping.
 
 Provision the selected platform once. This is the only path that installs Rust
 components, wasm-bindgen or Emscripten:

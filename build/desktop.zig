@@ -1,23 +1,26 @@
 const std = @import("std");
 const common = @import("common.zig");
 const platform = @import("platform.zig");
+const hardening = @import("hardening.zig");
 
 const raylib_library_name = "raylib";
 
-pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
+pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph, standalone: bool, standalone_smoke: bool) !void {
     const options = native.options;
     const policy = native.policy;
     const target = options.target;
     const macos = policy.os == .macos;
 
+    const bin_dir = if (standalone) "desktop-standalone" else "desktop/bin";
     std.log.info(
-        "desktop: {s}-{s}-{s}, Rust {s}, optimize {s}, output desktop/bin/haystack_game",
+        "desktop: {s}-{s}-{s}, Rust {s}, optimize {s}, output {s}/haystack_game",
         .{
             @tagName(policy.arch),
             @tagName(policy.os),
             @tagName(policy.abi),
             policy.rust_target,
             @tagName(options.optimize),
+            bin_dir,
         },
     );
 
@@ -30,14 +33,18 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     const mod = b.addModule("haystack_game", .{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = options.optimize });
     const shared = @import("shared.zig").create(b, target, options.optimize);
     mod.addImport("shared", shared);
-    const raylib = b.dependency("raylib_zig", .{ .target = target, .optimize = options.optimize, .linkage = .dynamic });
+    const linkage: std.builtin.LinkMode = if (standalone) .static else .dynamic;
+    const raylib = b.dependency("raylib_zig", .{ .target = target, .optimize = options.optimize, .linkage = linkage });
     const raylib_artifact = raylib.artifact(raylib_library_name);
     const raylib_module = raylib.module(raylib_library_name);
-    if (macos) raylib_artifact.install_name = "@rpath/libraylib.dylib";
+    try hardening.cSources(raylib_artifact.root_module, options.optimize, policy.os);
+    if (macos and !standalone) raylib_artifact.install_name = "@rpath/libraylib.dylib";
     if (preflight) |step| raylib_artifact.step.dependOn(&step.step);
     const root = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = options.optimize });
     root.addImport("shared", shared);
-    common.addCutSoundAssets(b, root);
+    common.addAssetOptions(b, root, standalone, standalone_smoke);
+    const asset_check = if (standalone) addStandaloneAssets(b, root) else null;
+    common.addCutSoundAssets(b, root, asset_check);
     const websocket = b.lazyDependency("websocket", .{ .target = target, .optimize = options.optimize }) orelse return;
     root.addImport("websocket", websocket.module("websocket"));
     const secp = @import("secp256k1.zig").create(b, target, options.optimize) orelse return;
@@ -46,47 +53,56 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
         .target = target,
         .optimize = options.optimize,
         .server_namespace = true,
+        .c_hardening_flags = hardening.cFlags(options.optimize, policy.os),
     }) orelse return).module("sqlite");
     root.addImport("sqlite", sqlite);
     root.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
     root.addImport("haystack_game", mod);
     root.addImport("raylib", raylib_module);
     root.addImport("raygui", raylib.module("raygui"));
-    root.addRPathSpecial(policy.rpath);
-    // Link raylib by name from its build directory instead of linking the
-    // artifact path directly. Zig records a cache-directory rpath for dynamic
-    // library inputs reached through the imported raylib module; that would
-    // precede the installed-tree rpath and make the shipped binary depend on a
-    // build cache. Detach that direct link first, then link the same library by
-    // name from its emitted directory.
-    detachArtifactLink(raylib_module, raylib_artifact);
-    root.addLibraryPath(raylib_artifact.getEmittedBin().dirname());
-    root.linkSystemLibrary(raylib_library_name, .{ .use_pkg_config = .no });
+    // The bindings already link the static raylib artifact. For the shared
+    // build, link by name instead so Zig doesn't inject a cache-directory rpath.
+    if (!standalone) {
+        root.addRPathSpecial(policy.rpath);
+        detachArtifactLink(raylib_module, raylib_artifact);
+        root.addLibraryPath(raylib_artifact.getEmittedBin().dirname());
+        root.linkSystemLibrary(raylib_library_name, .{ .use_pkg_config = .no });
+    }
     linkWallet(root, cdk, archive, policy);
     const exe = b.addExecutable(.{ .name = "haystack_game", .root_module = root });
-    // We add exactly one relocatable rpath above; do not add cache fallbacks.
+    try hardening.cSources(root, options.optimize, policy.os);
+    hardening.executable(exe, options.optimize);
+    // Do not add cache fallbacks to either flavor.
     exe.each_lib_rpath = false;
     exe.step.dependOn(&rust.step);
     exe.step.dependOn(&raylib_artifact.step);
     if (preflight) |step| exe.step.dependOn(&step.step);
-    const installed = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "desktop/bin" } } });
-    b.getInstallStep().dependOn(&installed.step);
-    const installed_raylib = b.addInstallArtifact(raylib_artifact, .{ .dest_dir = .{ .override = .{ .custom = "desktop/lib" } }, .h_dir = .disabled });
-    b.getInstallStep().dependOn(&installed_raylib.step);
-    // Ship runtime assets next to the executable. Cut sounds are embedded;
-    // the gitignored sprites and music come from the local checkout.
-    b.installDirectory(.{
-        .source_dir = b.path("assets"),
-        .install_dir = .{ .custom = "desktop/bin" },
-        .install_subdir = "assets",
-        .exclude_extensions = &.{ "sfx/snip.wav", "sfx/fail.wav", "sfx/reward.wav" },
-    });
+    if (asset_check) |step| exe.step.dependOn(&step.step);
+    if (standalone) {
+        const unstripped = exe.getEmittedBin();
+        const stripped = stripStandalone(b, unstripped, macos);
+        const installed = b.addInstallFile(stripped, b.fmt("{s}/haystack_game", .{bin_dir}));
+        b.getInstallStep().dependOn(&installed.step);
+        const debug = b.addInstallFile(unstripped, "desktop-standalone-debug/haystack_game");
+        b.getInstallStep().dependOn(&debug.step);
+        b.step("standalone-debug", "Save the matching unstripped standalone executable for debugging").dependOn(&debug.step);
+    } else {
+        const installed = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = bin_dir } } });
+        b.getInstallStep().dependOn(&installed.step);
+        const installed_raylib = b.addInstallArtifact(raylib_artifact, .{ .dest_dir = .{ .override = .{ .custom = "desktop/lib" } }, .h_dir = .disabled });
+        b.getInstallStep().dependOn(&installed_raylib.step);
+        b.installDirectory(.{
+            .source_dir = b.path("assets"),
+            .install_dir = .{ .custom = bin_dir },
+            .install_subdir = "assets",
+            .exclude_extensions = &.{ "sfx/snip.wav", "sfx/fail.wav", "sfx/reward.wav" },
+        });
+    }
     b.step("desktop", "Build and install the desktop application only").dependOn(b.getInstallStep());
     b.step("wallet", "Build only the desktop Rust C ABI").dependOn(&rust.step);
-    // Run the *installed* executable, not the cache artifact: the installed
-    // binary records only `$ORIGIN/../lib` (Linux) or `@loader_path/../lib`
-    // (macOS), so it must execute next to its installed raylib.
-    const run = b.addRunFile(b.graph.path(.install_prefix, "desktop/bin/haystack_game"));
+    // Run the installed executable in both modes; the shared build needs
+    // its installed raylib at the relative rpath, not in the cache.
+    const run = b.addRunFile(b.graph.path(.install_prefix, b.fmt("{s}/haystack_game", .{bin_dir})));
     run.step.dependOn(b.getInstallStep());
     run.addPassthruArgs();
     b.step("run", "Run the installed desktop application").dependOn(&run.step);
@@ -100,6 +116,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     const app_tests = b.addTest(.{ .root_module = root });
     if (preflight) |step| app_tests.step.dependOn(&step.step);
     app_tests.step.dependOn(&rust.step);
+    if (asset_check) |step| app_tests.step.dependOn(&step.step);
     test_step.dependOn(&b.addRunArtifact(app_tests).step);
     const wallet_storage_module = b.createModule(.{ .root_source_file = b.path("src/wallet_storage_test.zig"), .target = target, .optimize = options.optimize });
     wallet_storage_module.addImport("shared", shared);
@@ -143,6 +160,33 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     tests.dependOn(&wallet_tests.step);
     tests.dependOn(&wallet_storage_tests.step);
     tests.dependOn(&spilman_tests.step);
+}
+
+fn stripStandalone(b: *std.Build, unstripped: std.Build.LazyPath, macos: bool) std.Build.LazyPath {
+    const strip = if (macos)
+        // Stripping modifies the Mach-O bytes covered by its ad-hoc signature.
+        b.addSystemCommand(&.{ "sh", "-c", "xcrun strip -S -x -o \"$1\" \"$2\" && /usr/bin/codesign --force --sign - \"$1\"", "strip-and-sign" })
+    else
+        b.addSystemCommand(&.{ "strip", "--strip-unneeded", "-o" });
+    strip.setName("strip standalone executable for distribution");
+    const stripped = strip.addOutputFileArg("haystack_game");
+    strip.addFileArg(unstripped);
+    return stripped;
+}
+
+fn addStandaloneAssets(b: *std.Build, root: *std.Build.Module) *std.Build.Step.Run {
+    const check = b.addSystemCommand(&.{ "python3", "build-support/standalone_assets.py", "check" });
+    check.setName("check required standalone assets");
+    check.setCwd(b.path("."));
+    check.has_side_effects = true;
+    for (@import("../src/atlas_assets.zig").all) |atlas| addAsset(b, root, check, atlas.path);
+    for (@import("../src/soundtrack_tracks.zig").paths) |path| addAsset(b, root, check, path);
+    return check;
+}
+
+fn addAsset(b: *std.Build, root: *std.Build.Module, check: *std.Build.Step.Run, path: []const u8) void {
+    check.addArg(path);
+    root.addAnonymousImport(path, .{ .root_source_file = b.path(path) });
 }
 
 /// Remove the raylib bindings module's direct artifact link so the executable

@@ -23,12 +23,8 @@ jobs:
 
       - name: Create empty desktop assets fixture
         run: |
-          # The desktop install copies the checkout-level assets/ directory next
-          # to the executable, but a clean checkout has none. The current
-          # renderer loads no external assets, so this empty directory only
-          # satisfies the existing install and relocation packaging path. It is
-          # not a real asset pack, does not validate asset loading or production
-          # content, and never replaces a local asset source.
+          # The standard desktop install/relocation checks don't launch the game.
+          # The standalone checks below use synthetic sprites and music.
           mkdir -p assets
 
       - name: Install native desktop prerequisites
@@ -38,7 +34,7 @@ jobs:
             build-essential pkg-config libunwind-dev \
             libasound2-dev libgl1-mesa-dev \
             libx11-dev libxrandr-dev libxinerama-dev libxi-dev \
-            libxcursor-dev libxext-dev
+            libxcursor-dev libxext-dev ffmpeg xvfb xauth libgl1-mesa-dri
 
       - name: Install pinned Zig
         run: python3 build-support/install-zig.py
@@ -122,6 +118,21 @@ jobs:
             exit 1
           fi
 
+      - name: Verify standalone desktop build and relocated launch
+        run: |
+          set -euo pipefail
+          python3 build-support/standalone_assets.py fixtures assets
+          prefix="$RUNNER_TEMP/desktop-standalone"
+          zig build -Dstandalone -Doffline --prefix "$prefix"
+          zig build test -Dstandalone -Doffline
+          python3 build-support/check_standalone.py "$prefix"
+          python3 build-support/check_rust_hardening.py
+          smoke_prefix="$RUNNER_TEMP/desktop-standalone-smoke"
+          zig build -Dstandalone -Dstandalone-smoke -Doffline --prefix "$smoke_prefix"
+          printf 'pcm.!default {\n  type null\n}\n' > "$RUNNER_TEMP/haystack-alsa.conf"
+          ALSA_CONFIG_PATH="$RUNNER_TEMP/haystack-alsa.conf" LIBGL_ALWAYS_SOFTWARE=1 \
+            xvfb-run -a python3 build-support/check_standalone.py "$smoke_prefix" --smoke
+
   macos-arm64-desktop:
     name: macOS Apple Silicon desktop
     runs-on: macos-15
@@ -133,12 +144,8 @@ jobs:
 
       - name: Create empty desktop assets fixture
         run: |
-          # The desktop install copies the checkout-level assets/ directory next
-          # to the executable, but a clean checkout has none. The current
-          # renderer loads no external assets, so this empty directory only
-          # satisfies the existing install and relocation packaging path. It is
-          # not a real asset pack, does not validate asset loading or production
-          # content, and never replaces a local asset source.
+          # The standard desktop install/relocation checks don't launch the game.
+          # The standalone checks below use synthetic sprites and music.
           mkdir -p assets
 
       - name: Verify native arm64 host
@@ -236,6 +243,20 @@ jobs:
           test "$(otool -D "$dylib" | tail -n 1 | tr -d '[:space:]')" = "@rpath/libraylib.dylib"
           xcrun vtool -show-build "$bin" | grep -q 'minos 15.0'
           xcrun vtool -show-build "$dylib" | grep -q 'minos 15.0'
+
+      - name: Verify standalone desktop build and relocated launch
+        run: |
+          set -euo pipefail
+          if ! command -v ffmpeg >/dev/null; then brew install ffmpeg; fi
+          python3 build-support/standalone_assets.py fixtures assets
+          prefix="$RUNNER_TEMP/desktop-standalone"
+          zig build -Dstandalone -Doffline --prefix "$prefix"
+          zig build test -Dstandalone -Doffline
+          python3 build-support/check_standalone.py "$prefix"
+          smoke_prefix="$RUNNER_TEMP/desktop-standalone-smoke"
+          zig build -Dstandalone -Dstandalone-smoke -Doffline --prefix "$smoke_prefix"
+          # The macOS smoke runs in the runner's WindowServer session with CoreAudio.
+          python3 build-support/check_standalone.py "$smoke_prefix" --smoke
 
   linux-browser-wasm:
     name: Linux browser (Wasm)

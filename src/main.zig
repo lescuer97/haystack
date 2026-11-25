@@ -24,6 +24,8 @@ const frame_loop = @import("frame_loop.zig");
 const routeFrame = frame_loop.routeFrame;
 const rendering = @import("rendering.zig");
 const Soundtrack = @import("soundtrack.zig").Soundtrack;
+const asset_options = @import("asset_options");
+const standalone_smoke = asset_options.standalone_smoke;
 const world = @import("world.zig");
 const browser_storage = @import("browser_storage.zig");
 const config = @import("config.zig");
@@ -868,6 +870,53 @@ const NativeEffects = struct {
     }
 };
 
+fn verifySmokeHome(io: std.Io) !void {
+    // Refuse to resolve application paths at all unless HOME is an empty,
+    // private directory and XDG cannot redirect reads outside it.
+    const home = std.mem.span(std.c.getenv("HOME") orelse return error.UnsafeSmokeHome);
+    if (!std.fs.path.isAbsolute(home)) return error.UnsafeSmokeHome;
+    for ([_][:0]const u8{ "XDG_CONFIG_HOME", "XDG_DATA_HOME" }) |name| {
+        if (std.c.getenv(name)) |p| if (p[0] != 0) return error.UnsafeSmokeHome;
+    }
+    var dir = try storage_fs.openOwnedDir(io, home, .{ .iterate = true });
+    defer dir.close(io);
+    var iter = dir.iterate();
+    if (try iter.next(io) != null) return error.UnsafeSmokeHome;
+}
+
+fn runStandaloneSmoke(
+    native: native_onboarding.Native,
+    model: *onboarding.Onboarding,
+    game_state: *game_mod.GameState,
+    resources: *rendering.Resources,
+    soundtrack: *Soundtrack,
+) !void {
+    // On a fresh HOME onboarding returns choice without opening a wallet.
+    // Check the underlying wallet inspection too; neither path provisions one.
+    var inspection = try native_wallet.inspect(native.io, native.allocator, native.paths, true);
+    defer inspection.close() catch {};
+    if (inspection.state != .not_initialized) return error.UnexpectedSmokeWallet;
+
+    const job = try startScan(native, model, .start);
+    defer job.destroy();
+    job.thread.join();
+    if (job.result != .choice or !job.result.choice.recover_enabled) return error.UnexpectedSmokeOnboarding;
+    job.deliver(model);
+    if (model.phase != .choice or !model.isBlocking()) return error.UnexpectedSmokeOnboarding;
+    std.log.info("standalone smoke: wallet not initialized; onboarding blocks", .{});
+
+    var driver = frame_loop.Driver{};
+    defer driver.deinit();
+    var reader = input.Reader{};
+    var privacy_blocked = model.isBlocking();
+    // Exercise the real draw and screenshot guard; there is no effect sink to
+    // dispatch onboarding actions and no network worker in this mode.
+    try stepFrame(game_state, resources, soundtrack, &reader, &driver, "shot.png", null, model, null, &privacy_blocked, .playing);
+    if (!model.isBlocking()) return error.UnexpectedSmokeOnboarding;
+
+    try soundtrack.verifyStandalonePlayback();
+}
+
 pub fn main() anyerror!void {
     // Browser builds enter through the exported `webMain` and never reach the
     // blocking loop below.
@@ -888,6 +937,11 @@ pub fn main() anyerror!void {
     // fails without flashing a window. Resolving the user directories is the
     // only hard failure here; configuration failures below are non-fatal.
     const io = std.Io.Threaded.global_single_threaded.io();
+    const smoke = if (standalone_smoke) blk: {
+        const value = std.c.getenv("HAYSTACK_STANDALONE_SMOKE") orelse break :blk false;
+        break :blk std.mem.eql(u8, std.mem.span(value), "1");
+    } else false;
+    if (smoke) try verifySmokeHome(io);
     const locations = paths.resolveCurrent(allocator) catch |err| {
         std.log.err("storage: cannot determine haystack directories error={s}", .{@errorName(err)});
         return err;
@@ -918,7 +972,7 @@ pub fn main() anyerror!void {
     };
     defer storage_lock.release(io);
 
-    try native_wallet.cdk.requireAppMint();
+    if (!smoke) try native_wallet.cdk.requireAppMint();
 
     const loaded_config = config.load(io, allocator, locations.config_path);
     if (!loaded_config.autosaveAllowed()) {
@@ -976,6 +1030,8 @@ pub fn main() anyerror!void {
         .paths = wallet_paths,
         .standard_parents = locations.standard_parents,
     };
+    if (smoke) return runStandaloneSmoke(native, &model, &game_state, &resources, &soundtrack);
+
     var started = false;
     var scan_job: ?*ScanJob = null;
     var wallet_worker: ?*wallet_service.Worker = null;
