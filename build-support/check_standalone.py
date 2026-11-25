@@ -10,6 +10,23 @@ import subprocess
 import tempfile
 
 
+def verify_elf_hardening(binary):
+    dynamic = subprocess.check_output(["readelf", "-dW", binary], text=True)
+    headers = subprocess.check_output(["readelf", "-lW", binary], text=True)
+    if not re.search(r"\(FLAGS_1\).*\bPIE\b", dynamic):
+        raise RuntimeError(f"{binary} must be a PIE")
+    if "GNU_RELRO" not in headers or not re.search(r"\b(?:BIND_NOW|NOW)\b", dynamic):
+        raise RuntimeError(f"{binary} must use full RELRO")
+    stack = re.search(r"(?m)^\s*GNU_STACK\b(.*)$", headers)
+    if stack is None or not re.search(r"\sRW\s", stack.group(1)):
+        raise RuntimeError(f"{binary} must have a non-executable stack")
+    if re.search(r"(?m)^\s*LOAD\b.*\bRW\s*E\b", headers) or re.search(r"\bTEXTREL\b", dynamic):
+        raise RuntimeError(f"{binary} must not have writable-executable segments or text relocations")
+    if "(RPATH)" in dynamic or "(RUNPATH)" in dynamic:
+        raise RuntimeError(f"{binary} has a runtime search path")
+    return dynamic
+
+
 def verify_links(binary):
     if platform.system() == "Darwin":
         dependencies = subprocess.check_output(["otool", "-L", binary], text=True).splitlines()[1:]
@@ -33,17 +50,7 @@ def verify_links(binary):
         sections = subprocess.check_output(["readelf", "--wide", "--sections", binary], text=True)
         if re.search(r"\s\.(?:z?debug_\S*|symtab)\s", sections):
             raise RuntimeError("standalone ELF still contains debug sections or a static symbol table")
-        dynamic = subprocess.check_output(["readelf", "-dW", binary], text=True)
-        headers = subprocess.check_output(["readelf", "-lW", binary], text=True)
-        if not re.search(r"\(FLAGS_1\).*\bPIE\b", dynamic):
-            raise RuntimeError("standalone ELF must be a PIE")
-        if "GNU_RELRO" not in headers or not re.search(r"\b(?:BIND_NOW|NOW)\b", dynamic):
-            raise RuntimeError("standalone ELF must use full RELRO")
-        stack = re.search(r"(?m)^\s*GNU_STACK\b(.*)$", headers)
-        if stack is None or not re.search(r"\sRW\s", stack.group(1)):
-            raise RuntimeError("standalone ELF must have a non-executable stack")
-        if "(RPATH)" in dynamic or "(RUNPATH)" in dynamic:
-            raise RuntimeError("standalone ELF has a runtime search path")
+        dynamic = verify_elf_hardening(binary)
         needed = set(re.findall(r"\(NEEDED\).*\[(.*?)\]", dynamic))
         if "libc.so.6" not in needed:
             raise RuntimeError("the Linux release audit requires a glibc-linked executable (not musl)")
@@ -151,7 +158,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prefix", type=Path, help="fresh standalone install prefix")
     parser.add_argument("--smoke", action="store_true", help="launch a smoke-enabled build on Linux (X11) or Apple Silicon macOS (WindowServer), with audio output")
+    parser.add_argument("--server", type=Path, help="also audit the installed ReleaseSafe Linux server")
     args = parser.parse_args()
+    if args.server and platform.system() != "Linux":
+        parser.error("--server requires Linux")
     if args.smoke and not (platform.system() == "Linux" or (platform.system(), platform.machine()) == ("Darwin", "arm64")):
         parser.error("--smoke requires Linux or a native Apple Silicon macOS session")
     installed = args.prefix / "desktop-standalone/haystack_game"
@@ -169,6 +179,11 @@ def main():
         verify_debug_copy(binary, debug, scratch)
         if args.smoke:
             smoke(binary, scratch / "home")
+    if args.server:
+        verify_elf_hardening(args.server)
+        if platform.machine() == "x86_64":
+            verify_x86_stack_code(args.server)
+        print(f"Verified Linux server hardening: {args.server}")
 
 
 if __name__ == "__main__":

@@ -37,7 +37,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph, standalo
     const raylib = b.dependency("raylib_zig", .{ .target = target, .optimize = options.optimize, .linkage = linkage });
     const raylib_artifact = raylib.artifact(raylib_library_name);
     const raylib_module = raylib.module(raylib_library_name);
-    try hardening.cSources(raylib_artifact.root_module, options.optimize, policy.os);
+    try hardening.cSources(raylib_artifact.root_module, options.optimize);
     if (macos and !standalone) raylib_artifact.install_name = "@rpath/libraylib.dylib";
     if (preflight) |step| raylib_artifact.step.dependOn(&step.step);
     const root = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = options.optimize });
@@ -53,7 +53,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph, standalo
         .target = target,
         .optimize = options.optimize,
         .server_namespace = true,
-        .c_hardening_flags = hardening.cFlags(options.optimize, policy.os),
+        .c_hardening_flags = hardening.cFlags(options.optimize, target.result),
     }) orelse return).module("sqlite");
     root.addImport("sqlite", sqlite);
     root.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
@@ -70,7 +70,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph, standalo
     }
     linkWallet(root, cdk, archive, policy);
     const exe = b.addExecutable(.{ .name = "haystack_game", .root_module = root });
-    try hardening.cSources(root, options.optimize, policy.os);
+    try hardening.cSources(root, options.optimize);
     hardening.executable(exe, options.optimize);
     // Do not add cache fallbacks to either flavor.
     exe.each_lib_rpath = false;

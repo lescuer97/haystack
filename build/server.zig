@@ -10,7 +10,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
         .target = target,
         .optimize = optimize,
         .server_namespace = true,
-        .c_hardening_flags = hardening.cFlags(optimize, native.policy.os),
+        .c_hardening_flags = hardening.cFlags(optimize, target.result),
     }) orelse return).module("sqlite");
     const storage = b.createModule(.{ .root_source_file = b.path("src/native_storage.zig"), .target = target, .optimize = optimize, .link_libc = true });
     storage.addImport("cdk", native.cdk);
@@ -20,7 +20,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     const shared = @import("shared.zig").create(b, target, optimize);
     storage.addImport("shared", shared);
     storage.addCSourceFile(.{ .file = b.path("vendor/qrcodegen/qrcodegen.c"), .flags = &.{"-std=c99"} });
-    try hardening.cSources(storage, optimize, native.policy.os);
+    try hardening.cSources(storage, optimize);
     const server_mod = b.createModule(.{
         .root_source_file = b.path("server/main.zig"),
         .target = target,

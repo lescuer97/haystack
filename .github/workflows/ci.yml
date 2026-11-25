@@ -125,7 +125,9 @@ jobs:
           prefix="$RUNNER_TEMP/desktop-standalone"
           zig build -Dstandalone -Doffline --prefix "$prefix"
           zig build test -Dstandalone -Doffline
-          python3 build-support/check_standalone.py "$prefix"
+          server_prefix="$RUNNER_TEMP/server-release"
+          zig build server -Dgame=false -Doptimize=ReleaseSafe -Doffline --prefix "$server_prefix"
+          python3 build-support/check_standalone.py "$prefix" --server "$server_prefix/bin/haystack_server"
           python3 build-support/check_rust_hardening.py
           smoke_prefix="$RUNNER_TEMP/desktop-standalone-smoke"
           zig build -Dstandalone -Dstandalone-smoke -Doffline --prefix "$smoke_prefix"

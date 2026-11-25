@@ -15,20 +15,22 @@ pub fn executable(exe: *std.Build.Step.Compile, optimize: std.builtin.OptimizeMo
     zigModule(exe.root_module, optimize);
 }
 
-pub fn cFlags(optimize: std.builtin.OptimizeMode, os: std.Target.Os.Tag) []const []const u8 {
+pub fn cFlags(optimize: std.builtin.OptimizeMode, target: std.Target) []const []const u8 {
     if (optimize == .debug) return &.{};
-    return switch (os) {
-        .linux => &.{ "-fstack-protector-strong", "-fstack-clash-protection" },
+    const linux = [_][]const u8{ "-fstack-protector-strong", "-fstack-clash-protection", "-ftrivial-auto-var-init=zero" };
+    return switch (target.os.tag) {
+        .linux => if (target.abi.isGnu()) &(linux ++ [_][]const u8{"-D_FORTIFY_SOURCE=3"}) else &linux,
         .macos, .emscripten => &.{"-fstack-protector-strong"},
         else => unreachable,
     };
 }
 
 /// Preserve source-specific flags, including those from the pinned raylib graph.
-pub fn cSources(module: *std.Build.Module, optimize: std.builtin.OptimizeMode, os: std.Target.Os.Tag) !void {
-    const extra = cFlags(optimize, os);
+pub fn cSources(module: *std.Build.Module, optimize: std.builtin.OptimizeMode) !void {
+    const target = module.resolved_target.?.result;
+    const extra = cFlags(optimize, target);
     if (extra.len == 0) return;
-    if (os != .emscripten) module.pic = true;
+    if (target.os.tag != .emscripten) module.pic = true;
     for (module.link_objects.items) |object| {
         const flags = switch (object) {
             .c_source_file => |source| &source.flags,

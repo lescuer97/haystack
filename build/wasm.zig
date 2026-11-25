@@ -48,8 +48,8 @@ pub fn build(b: *std.Build, options: common.Options) !void {
     root.addImport("raylib", raylib.module("raylib"));
     root.linkLibrary(artifact);
     hardening.zigModule(root, options.optimize);
-    try hardening.cSources(root, options.optimize, .emscripten);
-    try hardening.cSources(artifact.root_module, options.optimize, .emscripten);
+    try hardening.cSources(root, options.optimize);
+    try hardening.cSources(artifact.root_module, options.optimize);
     const renderer = b.addLibrary(.{ .name = "haystack_renderer", .linkage = .static, .root_module = root });
     var flags = rlz.emsdk.emccDefaultFlags(b.allocator, .{ .optimize = options.optimize, .asyncify = false, .fsanitize = false });
     if (options.optimize.runtimeSafety()) try flags.put("-fsanitize=undefined", {});

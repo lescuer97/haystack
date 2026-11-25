@@ -427,8 +427,10 @@ and server are not in the standalone graph. Build the server separately with
   stack, and full RELRO. Zig release modules enable canaries, and Zig x86_64
   also explicitly enables stack probing. Zig 0.17 does not support that option
   on Linux aarch64; C sources built by Zig (including raylib, namespaced SQLite,
-  secp256k1 and the QR encoder) use strong canaries and Clang's stack-clash
-  protection on both architectures.
+  secp256k1 and the QR encoder) use strong canaries, Clang's stack-clash
+  protection, and zero initialization of otherwise uninitialized automatic
+  variables. On glibc targets they also use `_FORTIFY_SOURCE=3` for libc calls
+  that can be checked. These flags do not instrument Zig or Rust code.
 - **Apple Silicon macOS:** Release executables use Mach-O PIE without requesting
   an executable stack. Zig and project-built C code enable canaries. This Zig
   and Clang toolchain does not provide the Linux stack-clash flags on this
@@ -441,10 +443,23 @@ These Zig and C settings do not configure the separately built Cargo archives
 or Rust Wasm module. Rust retains the pinned compiler's target defaults; in
 particular this build does not request an unstable Rust stack-canary option.
 
-CI audits the stripped standalone binary for the applicable executable flags.
-On Linux x86_64 it also checks for generated canary and stack-probe instructions
-in the unstripped copy; `checksec` can miss those after stripping or when Zig
-uses an out-of-line probe. `python3 build-support/check_rust_hardening.py`
+CI audits the stripped standalone binary for the applicable executable flags
+and also audits the Linux `ReleaseSafe` server. To reproduce the Linux audit:
+
+```sh
+zig build -Dstandalone --prefix zig-out-release/client
+zig build server -Dgame=false -Doptimize=ReleaseSafe --prefix zig-out-release/server
+checksec file zig-out-release/client/desktop-standalone/haystack_game
+checksec file zig-out-release/server/bin/haystack_server
+python3 build-support/check_standalone.py zig-out-release/client \
+  --server zig-out-release/server/bin/haystack_server
+```
+
+On Linux x86_64 the verifier checks for generated canary and stack-probe
+instructions in the unstripped client and server. `checksec` can miss these
+after stripping or when Zig uses an out-of-line probe; its FORTIFY counts also
+cover only the imported symbols that it recognizes.
+`python3 build-support/check_rust_hardening.py`
 separately inspects the Cargo-produced Linux x86_64 `cdk_wallet_ffi` codegen
 objects for inline stack probes and canary-related relocations. This is an
 evidence report, not a guarantee of coverage, and does not audit other crates,
