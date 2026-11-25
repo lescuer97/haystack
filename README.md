@@ -100,7 +100,9 @@ zig build test -Dplatform=wasm   # browser database + fake-mint/Chromium tests
 
 ## Soundtrack
 
-Haystack loops four cozy instrumental tracks from [`assets/music`](assets/music/CREDITS.md).
+Haystack loops four cozy instrumental tracks from `assets/music/media/`.
+This directory is gitignored. See the [soundtrack credits](assets/music/CREDITS.md)
+for the source links and expected filenames.
 Music starts only once the game menu and controls are available: wallet
 onboarding must be complete and the server connection ready. The browser
 fetches the current track on demand and may require you to click or tap the

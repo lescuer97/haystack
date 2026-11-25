@@ -65,7 +65,7 @@ fn Player(comptime Backend: type) type {
     };
 }
 
-const reward_wav = @embedFile("cut_audio_assets/reward.wav");
+const reward_wav = @embedFile("reward.wav");
 
 const Desktop = struct {
     allocator: std.mem.Allocator,
@@ -112,8 +112,8 @@ const Desktop = struct {
         if (!cues.snip and !cues.fail and cues.reward == null) return;
         if (!rl.isAudioDeviceReady()) rl.initAudioDevice();
         if (!rl.isAudioDeviceReady()) return;
-        if (cues.snip) self.snip.play(@embedFile("cut_audio_assets/snip.wav"), 0.8);
-        if (cues.fail) self.fail.play(@embedFile("cut_audio_assets/fail.wav"), 0.25);
+        if (cues.snip) self.snip.play(@embedFile("snip.wav"), 0.8);
+        if (cues.fail) self.fail.play(@embedFile("fail.wav"), 0.25);
         if (cues.reward) |cue| self.reward.play(reward_wav, cue.volume());
     }
 

@@ -4,7 +4,11 @@ zig-pkg
 .zig-cache
 :memory*
 /assets/*
-/assets/music/
+!/assets/sfx/
+!/assets/music/
+/assets/music/*
+!/assets/music/CREDITS.md
+/assets/music/media/
 /haystack.sqlite3-wal
 /haystack.sqlite3-shm
 

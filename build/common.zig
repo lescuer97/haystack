@@ -4,6 +4,12 @@ const platform = @import("platform.zig");
 pub const macos_deployment_target = platform.macos_deployment_target;
 pub const macos_deployment_version = platform.macos_deployment_version;
 
+pub fn addCutSoundAssets(b: *std.Build, module: *std.Build.Module) void {
+    for ([_][]const u8{ "snip.wav", "fail.wav", "reward.wav" }) |filename| {
+        module.addAnonymousImport(filename, .{ .root_source_file = b.path(b.fmt("assets/sfx/{s}", .{filename})) });
+    }
+}
+
 pub const Options = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.Optimize,

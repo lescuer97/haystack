@@ -37,6 +37,7 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     if (preflight) |step| raylib_artifact.step.dependOn(&step.step);
     const root = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = options.optimize });
     root.addImport("shared", shared);
+    common.addCutSoundAssets(b, root);
     const websocket = b.lazyDependency("websocket", .{ .target = target, .optimize = options.optimize }) orelse return;
     root.addImport("websocket", websocket.module("websocket"));
     const secp = @import("secp256k1.zig").create(b, target, options.optimize) orelse return;
@@ -72,12 +73,13 @@ pub fn build(b: *std.Build, native: @import("native_wallet.zig").Graph) !void {
     b.getInstallStep().dependOn(&installed.step);
     const installed_raylib = b.addInstallArtifact(raylib_artifact, .{ .dest_dir = .{ .override = .{ .custom = "desktop/lib" } }, .h_dir = .disabled });
     b.getInstallStep().dependOn(&installed_raylib.step);
-    // Ship assets next to the installed executable. Music is tracked; a clean
-    // clone still needs to populate the gitignored visual assets.
+    // Ship runtime assets next to the executable. Cut sounds are embedded;
+    // the gitignored sprites and music come from the local checkout.
     b.installDirectory(.{
         .source_dir = b.path("assets"),
         .install_dir = .{ .custom = "desktop/bin" },
         .install_subdir = "assets",
+        .exclude_extensions = &.{ "sfx/snip.wav", "sfx/fail.wav", "sfx/reward.wav" },
     });
     b.step("desktop", "Build and install the desktop application only").dependOn(b.getInstallStep());
     b.step("wallet", "Build only the desktop Rust C ABI").dependOn(&rust.step);

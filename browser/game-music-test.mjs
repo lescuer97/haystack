@@ -6,8 +6,8 @@ import {setImmediate} from 'node:timers/promises';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('./game-music.js', import.meta.url), 'utf8');
-const rewardWav = await readFile(new URL('../src/cut_audio_assets/reward.wav', import.meta.url));
-const paths = new Map([[1, 'assets/music/cozy-1.ogg'], [2, 'assets/music/cozy-2.ogg']]);
+const rewardWav = await readFile(new URL('../assets/sfx/reward.wav', import.meta.url));
+const paths = new Map([[1, 'assets/music/media/cozy-1.ogg'], [2, 'assets/music/media/cozy-2.ogg']]);
 
 function setup(AudioContext) {
   const tracks = [];

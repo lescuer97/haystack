@@ -18,6 +18,7 @@ PRUNED = {
     ".profiles", "chromium-profile", "secrets", ".secrets",
 }
 REQUIRED = (
+    "assets/sfx/LICENSE.md", "assets/sfx/snip.wav", "assets/sfx/fail.wav", "assets/sfx/reward.wav",
     "shared/root.zig", "shared/tick.zig", "shared/world.zig", "shared/protocol.zig", "shared/wire.zig",
     "server/main.zig", "server/tests.zig", "server/ws_memory_tests.zig",
     "server/actions.zig", "server/app.zig", "server/fixture.zig", "server/memory.zig",

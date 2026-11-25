@@ -376,19 +376,20 @@ Changing the install prefix does not force a second renderer build or copy a
 whole nested build directory into the result. Old `zig-out/bin`, `zig-out/browser`
 and `zig-out/web` products from the previous build layout are not deleted.
 
-The desktop graph installs the checkout-level `assets` directory into
-`<prefix>/desktop/bin/assets`, next to the executable. That directory is
-deliberately gitignored and is not part of a clean checkout; a local desktop
-install therefore requires the asset source directory to exist. A missing
-`assets` directory fails the install step rather than silently skipping the
-assets. The current renderer loads no external assets, so local builds may use an
-empty `assets` directory; a real asset pack is optional, local-only content. The
-CI desktop jobs create an empty `assets` fixture before their first desktop
-install. That fixture only exercises the existing install and relocation
-packaging path: it is not a real asset pack, does not validate asset loading or
-production content, and CI never fetches or downloads assets. The browser
-renderer currently loads no assets; assets are not installed into the Wasm
-bundle.
+Game assets live under the checkout-level `assets/` directory:
+
+- `assets/sfx/` contains the checked-in cut-feedback WAVs and their license.
+  Zig embeds the cues used by each platform, so no loose WAVs are needed at runtime.
+- `assets/Tiles/`, `assets/Outdoor decoration/`, and `assets/Player/` contain
+  the local sprite sheets used by the renderer. The Wasm build preloads the
+  sheets it uses.
+- `assets/music/media/` contains the local soundtrack. The Wasm build installs the
+  Ogg files separately so the browser can fetch tracks on demand.
+
+The sprite pack and soundtrack are gitignored. The desktop install copies
+runtime assets to `<prefix>/desktop/bin/assets`, next to the executable. Provide
+local assets to exercise rendering and music; the Wasm renderer build requires
+the referenced sheets and tracks at build time.
 
 Default optimization is **Debug for desktop**, **ReleaseSmall for Wasm**.
 An unqualified `--release` selects ReleaseSafe on desktop and ReleaseSmall on Wasm.
@@ -641,12 +642,9 @@ claims otherwise.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs three independent jobs. Both desktop jobs create
-an empty `assets/` fixture before their first desktop install: the checkout-level
-asset directory is gitignored, the current renderer loads no external assets, and
-the empty fixture only exercises the existing install/relocation packaging path.
-It is not a real asset pack, is not validation of asset loading and is never
-fetched or downloaded.
+`.github/workflows/ci.yml` runs three independent jobs. The desktop install and
+relocation checks do not provision the local sprite pack or soundtrack, so they
+do not validate loading those assets.
 
 - **Linux desktop**: installs the pinned Zig plus raylib/X11/OpenGL
   prerequisites, runs `zig build setup` to provision the selected Rust
