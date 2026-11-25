@@ -109,12 +109,12 @@ const Desktop = struct {
     }
 
     fn playCutCues(self: *Desktop, cues: CutCues) void {
-        if (!cues.snip and !cues.fail and !cues.reward) return;
+        if (!cues.snip and !cues.fail and cues.reward == null) return;
         if (!rl.isAudioDeviceReady()) rl.initAudioDevice();
         if (!rl.isAudioDeviceReady()) return;
         if (cues.snip) self.snip.play(@embedFile("cut_audio_assets/snip.wav"), 0.8);
         if (cues.fail) self.fail.play(@embedFile("cut_audio_assets/fail.wav"), 0.25);
-        if (cues.reward) self.reward.play(reward_wav, 1);
+        if (cues.reward) |cue| self.reward.play(reward_wav, cue.volume());
     }
 
     fn deinit(self: *Desktop) void {
@@ -137,10 +137,12 @@ const CueSound = struct {
             defer rl.unloadWave(wave);
             const sound = rl.loadSoundFromWave(wave);
             if (!rl.isSoundValid(sound)) return;
-            rl.setSoundVolume(sound, volume);
             self.sound = sound;
         }
-        if (self.sound) |sound| rl.playSound(sound);
+        if (self.sound) |sound| {
+            rl.setSoundVolume(sound, volume);
+            rl.playSound(sound);
+        }
     }
 
     fn unload(self: *CueSound) void {
@@ -153,10 +155,10 @@ const Browser = struct {
     extern "c" fn haystack_music_set_enabled(enabled: c_int) void;
     extern "c" fn haystack_music_status() c_int;
     extern "c" fn haystack_music_close() void;
-    extern "c" fn haystack_reward_audio(action: c_int, data: ?[*]const u8, len: usize) void;
+    extern "c" fn haystack_reward_audio(action: c_int, data: ?[*]const u8, len: usize, volume: f32) void;
 
     fn init(_: std.mem.Allocator) Browser {
-        haystack_reward_audio(1, reward_wav.ptr, reward_wav.len);
+        haystack_reward_audio(1, reward_wav.ptr, reward_wav.len, 0);
         return .{};
     }
 
@@ -182,12 +184,12 @@ const Browser = struct {
     }
 
     fn playCutCues(_: *Browser, cues: CutCues) void {
-        if (cues.reward) haystack_reward_audio(2, null, 0);
+        if (cues.reward) |cue| haystack_reward_audio(2, null, 0, cue.volume());
     }
 
     fn deinit(self: *Browser) void {
         self.closeTrack();
-        haystack_reward_audio(0, null, 0);
+        haystack_reward_audio(0, null, 0, 0);
     }
 };
 

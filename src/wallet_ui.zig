@@ -1,6 +1,7 @@
 //! Pure, bounded wallet presentation. Services own handles and source pagination.
 const std = @import("std");
 const qr_mod = @import("qr.zig");
+const RewardCue = @import("cut_feedback.zig").RewardCue;
 pub const Operation = enum {
     open,
     snapshot,
@@ -45,7 +46,8 @@ pub fn Text(comptime capacity: usize) type {
         }
     };
 }
-const protocol = @import("shared").protocol;
+const shared = @import("shared");
+const protocol = shared.protocol;
 pub const PrizeToken = Text(protocol.max_prize_token_bytes);
 pub const PrizeNotice = struct { tile: protocol.Location, token: PrizeToken };
 const PrizeKey = struct { player: [33]u8, tile: protocol.Location };
@@ -59,6 +61,16 @@ const prize_receipts_full: [:0]const u8 = "Prize collection paused. Contact the 
 comptime {
     if (protocol.max_prize_token_bytes >= @sizeOf(@FieldType(@FieldType(Request, "argument"), "bytes")))
         @compileError("wallet request must fit a maximum-size prize token and terminator");
+}
+
+fn prizeCue(tile: protocol.Location, net_msat: u64) RewardCue {
+    // A prize notice includes the tile even on redelivery. Its original terrain
+    // identifies the tool, so quiet credits that don't exceed the cut price.
+    const terrain = shared.world.sampleTile(shared.world.public_seed, tile.x, tile.y);
+    for (protocol.tools) |tool| {
+        if (tool.terrain() == terrain) return if (net_msat <= tool.priceMsat()) .quiet else .win;
+    }
+    return .win;
 }
 
 const Reward = struct {
@@ -194,9 +206,9 @@ pub const Model = struct {
     prize_acks_due: std.StaticBitSet(prize_receipt_limit) = .empty,
     prize_player: ?[33]u8 = null,
     prize_in_flight: ?usize = null,
-    prize_refresh_msat: ?u64 = null,
+    prize_refresh: ?struct { net_msat: u64, cue: RewardCue } = null,
     reward: ?Reward = null,
-    prize_chime: bool = false,
+    prize_chime: ?RewardCue = null,
     prize_notice: ?[:0]const u8 = null,
     mint: Text(256) = .{},
     message: Text(160) = .{},
@@ -414,7 +426,7 @@ pub const Model = struct {
                 }
                 return;
             }
-            if (self.prize_refresh_msat != null) {
+            if (self.prize_refresh != null) {
                 self.balance_dirty = false;
                 _ = self.enqueue(.snapshot, "");
             } else if (self.recover_needed and now >= self.next_recover) {
@@ -568,7 +580,7 @@ pub const Model = struct {
                 _ = self.message.set("Recovery read failed; retrying automatically.");
             },
             .snapshot => {
-                self.prize_refresh_msat = null;
+                self.prize_refresh = null;
                 _ = self.message.set("Balance read failed; last balance retained. Reopen Wallet to retry.");
             },
             .receive_prize => {
@@ -747,8 +759,10 @@ pub const Model = struct {
                 switch (status.integer) {
                     0 => {
                         const net = try decimal(string(value, "net_msats") orelse return error.Invalid);
+                        const active = self.prize_in_flight orelse return error.Invalid;
+                        const tile = self.pending_prizes[active].key.tile;
                         self.finishPrize(if (net > 0) .credited else .failed);
-                        self.prize_refresh_msat = if (net > 0) net else null;
+                        self.prize_refresh = if (net > 0) .{ .net_msat = net, .cue = prizeCue(tile, net) } else null;
                         self.balance_dirty = true;
                         self.history_dirty = true;
                     },
@@ -785,15 +799,15 @@ pub const Model = struct {
                 if (balance_msat != self.balance_msat) {
                     const previous = self.displayedBalance(now);
                     self.reward = null;
-                    if (self.prize_refresh_msat) |net| {
+                    if (self.prize_refresh) |credit| {
                         if (balance_msat > (self.balance_msat orelse balance_msat)) {
-                            self.reward = .{ .from = previous.?, .to = balance_msat, .net_msat = net, .start = now };
-                            self.prize_chime = true;
+                            self.reward = .{ .from = previous.?, .to = balance_msat, .net_msat = credit.net_msat, .start = now };
+                            self.prize_chime = credit.cue;
                         }
                     }
                 }
                 self.balance_msat = balance_msat;
-                self.prize_refresh_msat = null;
+                self.prize_refresh = null;
                 _ = self.mint.set(mint);
                 self.setRecovery(recovery, now);
                 self.available = true;
@@ -1219,7 +1233,7 @@ test "prizes wait for the wallet, collect once in FIFO order, and animate only c
     model.request = null;
     model.accept(model.serial, "{\"status\":0,\"net_msats\":\"6\"}", 1, t.allocator);
     try t.expectEqual(@as(?u64, 10), model.balance_msat);
-    try t.expect(!model.prize_chime);
+    try t.expect(model.prize_chime == null);
     try t.expect(model.rewardPopup(1) == null);
     model.tick(true, 2);
     try t.expectEqual(Operation.snapshot, model.operation);
@@ -1232,20 +1246,44 @@ test "prizes wait for the wallet, collect once in FIFO order, and animate only c
     try t.expectEqual(@as(f32, 0), model.rewardPopup(2).?.progress);
     try t.expectEqual(@as(u64, 6), model.rewardPopup(3).?.amount_msat);
     try t.expect(model.rewardPopup(3.3) == null);
-    try t.expect(model.prize_chime);
-    model.prize_chime = false;
+    try t.expect(model.prize_chime != null);
+    model.prize_chime = null;
 
     model.tick(true, 3);
     try t.expectEqualStrings("cashuBsecond", model.request.?.argument.slice());
     model.request = null;
     model.fail(model.serial, 3);
     try t.expect(model.prize_notice != null);
-    try t.expect(model.prize_refresh_msat == null and !model.prize_chime);
+    try t.expect(model.prize_refresh == null and model.prize_chime == null);
     model.tick(true, 4);
     try t.expectEqual(Operation.snapshot, model.operation);
     try t.expectEqual(0, model.pending_prize_count);
     try t.expectEqual(2, model.prize_receipt_count);
     try t.expect(model.prize_receipts[0].credited and !model.prize_receipts[1].credited);
+}
+
+test "prize credits at or below the cut price use the quieter cue" {
+    const t = std.testing;
+    const tile: protocol.Location = .{ .x = 0, .y = 1 };
+    try t.expectEqual(protocol.tool.hoe.terrain(), shared.world.sampleTile(shared.world.public_seed, tile.x, tile.y));
+    for ([_]u64{ 3, 4, 5 }, [_]RewardCue{ .quiet, .quiet, .win }) |net, cue| {
+        const player: [33]u8 = @splat(1);
+        var model: Model = .{ .started = true, .available = true, .balance_msat = 10, .prize_player = player };
+        defer model.clearPendingPrizes();
+        var token: PrizeToken = .{};
+        try t.expect(token.set("cashuBtest"));
+        model.queuePrize(player, tile, token);
+        try t.expect(model.startPrize());
+        model.request = null;
+        var buf: [128]u8 = undefined;
+        model.accept(model.serial, try std.fmt.bufPrint(&buf, "{{\"status\":0,\"net_msats\":\"{d}\"}}", .{net}), 0, t.allocator);
+        try t.expect(model.prize_chime == null);
+        model.tick(true, 1);
+        try t.expectEqual(Operation.snapshot, model.operation);
+        model.request = null;
+        model.accept(model.serial, try std.fmt.bufPrint(&buf, "{{\"mint_url\":\"fixture\",\"msats\":\"{d}\",\"creation_recovery\":\"none\"}}", .{10 + net}), 1, t.allocator);
+        try t.expectEqual(cue, model.prize_chime.?);
+    }
 }
 
 test "prize redelivery deduplicates collection and re-ACKs only for its owner" {
@@ -1415,7 +1453,7 @@ test "prize rejection and zero net credit never schedule a reward" {
         model.accept(model.serial, reply, 1, t.allocator);
         try t.expectEqual(0, model.prize_acks_due.count());
         try t.expectEqual(@as(?u64, 10), model.balance_msat);
-        try t.expect(model.prize_refresh_msat == null and !model.prize_chime);
+        try t.expect(model.prize_refresh == null and model.prize_chime == null);
         try t.expect(model.rewardPopup(1) == null);
     }
 }

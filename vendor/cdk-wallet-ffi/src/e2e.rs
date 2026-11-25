@@ -60,8 +60,20 @@ pub(crate) enum SwapFault {
     RejectQuoteOnce,
     StallQuoteOnce(Duration),
     UnpaidQuotes,
-    WithdrawalControl { quotes: Arc<AtomicUsize>, posts: Arc<AtomicUsize>, gets: Arc<AtomicUsize>, hold_pending: Arc<AtomicBool>, fail_get: Arc<AtomicBool> },
-    DepositControl { fail_get: Arc<AtomicBool>, fail_mint: Arc<AtomicBool>, hold_unpaid: Arc<AtomicBool>, gets: Arc<AtomicUsize>, interrupt_mint: bool },
+    WithdrawalControl {
+        quotes: Arc<AtomicUsize>,
+        posts: Arc<AtomicUsize>,
+        gets: Arc<AtomicUsize>,
+        hold_pending: Arc<AtomicBool>,
+        fail_get: Arc<AtomicBool>,
+    },
+    DepositControl {
+        fail_get: Arc<AtomicBool>,
+        fail_mint: Arc<AtomicBool>,
+        hold_unpaid: Arc<AtomicBool>,
+        gets: Arc<AtomicUsize>,
+        interrupt_mint: bool,
+    },
 }
 
 /// Start a fake mint on a random loopback port and return its URL.
@@ -83,6 +95,14 @@ pub(crate) async fn start_fake_mint_ctl(
 pub(crate) async fn start_fake_mint_counted(
     input_fee_ppk: u64,
     fault: SwapFault,
+) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+    start_fake_mint_with_limit(input_fee_ppk, fault, 10_000).await
+}
+
+async fn start_fake_mint_with_limit(
+    input_fee_ppk: u64,
+    fault: SwapFault,
+    max_msat: u64,
 ) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
     let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
     let mut builder = MintBuilder::new(db.clone());
@@ -110,7 +130,7 @@ pub(crate) async fn start_fake_mint_counted(
         .add_payment_processor(
             CurrencyUnit::Msat,
             PaymentMethod::Known(KnownMethod::Bolt11),
-            MintMeltLimits::new(1, 10_000),
+            MintMeltLimits::new(1, max_msat),
             Arc::new(fake),
         )
         .await
@@ -490,12 +510,24 @@ fn e2e_fee_limit_cancels_and_preserves_balance() {
 
 #[test]
 fn e2e_prize_stock_mints_two_compact_offline_payouts() {
-    let mint_url = block_on(start_fake_mint(0));
+    assert_compact_prize_stock(120, 4);
+}
+
+#[test]
+fn e2e_prize_stock_mints_two_compact_jackpot_payouts() {
+    assert_compact_prize_stock(100_000, 6);
+}
+
+fn assert_compact_prize_stock(prize_msat: u64, proof_count: usize) {
+    let (mint_url, _, _) = block_on(start_fake_mint_with_limit(
+        0,
+        SwapFault::None,
+        2 * prize_msat,
+    ));
     let (_dir, path) = temp_db();
     let seed = [37u8; 64];
     let mut handle = open_wallet(seed, &path);
     block_on(handle.add_mint(&mint_url)).unwrap();
-    let prize_msat = 1024;
     let denomination = prize_msat.to_string();
     let invalid = block_on(handle.create_prize_stock(&mint_url, "21", &denomination)).unwrap_err();
     assert_eq!(invalid.status, CdkStatus::InvalidArgument);
@@ -524,7 +556,7 @@ fn e2e_prize_stock_mints_two_compact_offline_payouts() {
         let token = Token::from_str(&payout.token).unwrap();
         assert_eq!(token.value().unwrap(), Amount::from(prize_msat));
         assert_eq!(token.unit(), Some(CurrencyUnit::Msat));
-        assert_eq!(token.token_secrets().len(), 1);
+        assert_eq!(token.token_secrets().len(), proof_count);
     }
     let err = block_on(handle.send_bounded(&mint_url, prize_msat, 4096)).unwrap_err();
     assert_eq!(err.status, CdkStatus::InsufficientFunds);
@@ -719,15 +751,18 @@ fn mint_check_requires_a_live_active_msat_keyset() {
 
         let active_msat = Arc::new(AtomicBool::new(false));
         let mint_state = active_msat.clone();
-        let app = Router::new().route("/v1/keysets", get(move || {
-            let active = mint_state.load(Ordering::SeqCst);
-            async move {
-                Json(json!({"keysets": [
-                    {"id":"0085070c8d13121a", "unit":"sat", "active":true},
-                    {"id":"009a1f293253e41e", "unit":"msat", "active":active}
-                ]}))
-            }
-        }));
+        let app = Router::new().route(
+            "/v1/keysets",
+            get(move || {
+                let active = mint_state.load(Ordering::SeqCst);
+                async move {
+                    Json(json!({"keysets": [
+                        {"id":"0085070c8d13121a", "unit":"sat", "active":true},
+                        {"id":"009a1f293253e41e", "unit":"msat", "active":active}
+                    ]}))
+                }
+            }),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -736,7 +771,13 @@ fn mint_check_requires_a_live_active_msat_keyset() {
         active_msat.store(true, Ordering::SeqCst);
         crate::wallet::check_mint_keysets(&mint).await.unwrap();
         active_msat.store(false, Ordering::SeqCst);
-        assert_eq!(crate::wallet::check_mint_keysets(&mint).await.unwrap_err().status, CdkStatus::MintUnsupportedUnit);
+        assert_eq!(
+            crate::wallet::check_mint_keysets(&mint)
+                .await
+                .unwrap_err()
+                .status,
+            CdkStatus::MintUnsupportedUnit
+        );
         server.abort();
     });
 }
@@ -1121,49 +1162,73 @@ fn take_string(result: crate::status::CdkStringResult) -> String {
 fn ffi_resume_and_background_poll_check_a_real_saved_quote() {
     let mint = block_on(start_fake_mint(0));
     let dir = tempfile::tempdir().unwrap();
-    let (mut wallet, _) = block_on(CdkWallet::open(&[93;64], dir.path().join("wallet.sqlite").to_str().unwrap())).unwrap();
+    let (mut wallet, _) = block_on(CdkWallet::open(
+        &[93; 64],
+        dir.path().join("wallet.sqlite").to_str().unwrap(),
+    ))
+    .unwrap();
     block_on(wallet.add_mint(&mint)).unwrap();
     let mut call = |op: &str, args: serde_json::Value| -> serde_json::Value {
-        let raw = take_string(crate::api::cdk_wallet_quotes(Some(&mut wallet), Some(cstr_ref(&with_nul(op))), Some(cstr_ref(&with_nul(&args.to_string())))));
+        let raw = take_string(crate::api::cdk_wallet_quotes(
+            Some(&mut wallet),
+            Some(cstr_ref(&with_nul(op))),
+            Some(cstr_ref(&with_nul(&args.to_string()))),
+        ));
         serde_json::from_str(&raw).unwrap()
     };
-    let created = call("create_deposit", serde_json::json!([mint,"21"]));
+    let created = call("create_deposit", serde_json::json!([mint, "21"]));
     assert_eq!(created["state"], "UNPAID");
     assert_eq!(created["expired"], false);
-    let local = call("saved_invoice", serde_json::json!([mint,created["id"]]));
+    let local = call("saved_invoice", serde_json::json!([mint, created["id"]]));
     assert_eq!(local, created);
     let resumed = call("resume_deposit", serde_json::json!([mint]));
     assert_eq!(resumed["invoice"]["id"], created["id"]);
     assert!(resumed.get("cursor").is_none());
-    let mut polled = call("poll_deposits", serde_json::json!([mint,""]));
+    let mut polled = call("poll_deposits", serde_json::json!([mint, ""]));
     assert_eq!(polled["cursor"], created["id"]);
     assert_eq!(polled["invoice"]["id"], created["id"]);
     assert!(polled.get("error").is_none());
     let deadline = Instant::now() + Duration::from_secs(15);
     while polled["invoice"]["state"] != "ISSUED" {
-        assert!(Instant::now() < deadline, "poll must check and issue, not just return local unpaid data");
+        assert!(
+            Instant::now() < deadline,
+            "poll must check and issue, not just return local unpaid data"
+        );
         std::thread::sleep(Duration::from_millis(20));
-        polled = call("poll_deposits", serde_json::json!([mint,""]));
+        polled = call("poll_deposits", serde_json::json!([mint, ""]));
         assert!(polled.get("error").is_none());
         assert_eq!(polled["cursor"], created["id"]);
     }
     assert_eq!(polled["invoice"]["confirmed"], true);
-    let local = call("saved_invoice", serde_json::json!([mint,created["id"]]));
-    assert_eq!(local["confirmed"],true);
-    let checked = call("deposit_update",serde_json::json!([mint,"check",created["id"]]));
-    assert_eq!(checked["wallet_changed"],false);
-    assert_eq!(checked["recovery_pending"],false);
-    assert_eq!(checked["invoice"]["confirmed"],true);
+    let local = call("saved_invoice", serde_json::json!([mint, created["id"]]));
+    assert_eq!(local["confirmed"], true);
+    let checked = call(
+        "deposit_update",
+        serde_json::json!([mint, "check", created["id"]]),
+    );
+    assert_eq!(checked["wallet_changed"], false);
+    assert_eq!(checked["recovery_pending"], false);
+    assert_eq!(checked["invoice"]["confirmed"], true);
     assert!(checked["error"].is_null());
-    for kind in ["poll","recover"] {
-        let update=call("deposit_update",serde_json::json!([mint,kind,""]));
+    for kind in ["poll", "recover"] {
+        let update = call("deposit_update", serde_json::json!([mint, kind, ""]));
         assert!(update["invoice"].is_null());
         assert!(update["cursor"].is_null());
-        assert_eq!(update["wallet_changed"],false);
+        assert_eq!(update["wallet_changed"], false);
     }
-    for (op,args) in [("deposit_update",serde_json::json!([mint,"unsupported",""])),("saved_invoice",serde_json::json!([mint,""]))] {
-        let result=crate::api::cdk_wallet_quotes(Some(&mut wallet),Some(cstr_ref(&with_nul(op))),Some(cstr_ref(&with_nul(&args.to_string()))));
-        assert_eq!(result.status,CdkStatus::InvalidArgument);
+    for (op, args) in [
+        (
+            "deposit_update",
+            serde_json::json!([mint, "unsupported", ""]),
+        ),
+        ("saved_invoice", serde_json::json!([mint, ""])),
+    ] {
+        let result = crate::api::cdk_wallet_quotes(
+            Some(&mut wallet),
+            Some(cstr_ref(&with_nul(op))),
+            Some(cstr_ref(&with_nul(&args.to_string()))),
+        );
+        assert_eq!(result.status, CdkStatus::InvalidArgument);
         crate::api::cdk_string_free(result.error);
         crate::api::cdk_string_free(result.value);
     }

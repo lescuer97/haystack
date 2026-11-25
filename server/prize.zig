@@ -9,25 +9,40 @@ const Prize = @import("game_db.zig").Prize;
 const Persistence = @import("persistence.zig").Persistence;
 const log = std.log.scoped(.prizes);
 
-pub const Tier = enum(u8) {
-    small = 8,
-    medium = 32,
-    big = 128,
+pub const Tier = enum {
+    refund,
+    small,
+    medium,
+    big,
+    rare,
+    jackpot,
 
     pub fn amount(self: Tier, tool: p.tool) u64 {
-        return @backingInt(self) * tool.priceMsat();
+        const price = tool.priceMsat();
+        return switch (self) {
+            .refund => price,
+            .small => 2 * price,
+            .medium => 5 * price,
+            .big => 15 * price,
+            .rare => 100 * price,
+            .jackpot => 100_000,
+        };
     }
 };
 
-const bucket_count = 100 * 67;
-const winning_bucket_count = 99 * 67;
+const bucket_count = 1_000_000;
+const jackpot_bucket = 67;
 
 fn tierForBucket(bucket: u64) ?Tier {
-    if (bucket >= winning_bucket_count) return null;
-    return switch (bucket % 67) {
-        0...47 => .small,
-        48...63 => .medium,
-        64...66 => .big,
+    // Keep the jackpot on the same tiles when changing the regular tiers.
+    if (bucket == jackpot_bucket) return .jackpot;
+    if (bucket < jackpot_bucket) return null;
+    return switch (bucket - jackpot_bucket - 1) {
+        0...199_999 => .refund,
+        200_000...299_999 => .small,
+        300_000...339_999 => .medium,
+        340_000...349_999 => .big,
+        350_000...350_499 => .rare,
         else => null,
     };
 }
@@ -39,6 +54,14 @@ pub fn canStock(amount_msat: u64) bool {
         }
     }
     return false;
+}
+
+pub fn canClaimStock(amount_msat: u64) bool {
+    // Invoices created by a previous prize schedule can still be claimed.
+    return canStock(amount_msat) or switch (amount_msat) {
+        32, 64, 128, 256, 500, 512, 1024 => true,
+        else => false,
+    };
 }
 
 pub fn parseSeed(hex: ?[]const u8) !?[32]u8 {
@@ -178,12 +201,34 @@ test "prize seed migration preserves the legacy seed and rejects changes or malf
     try t.expectError(error.InsecureEntry, loadOrCreateSeed(t.io, path, null));
 }
 
-test "99 percent of prize buckets win" {
-    var winners: usize = 0;
+test "slot prize frequencies and payouts keep a house edge for every tool" {
+    const t = std.testing;
+    var counts = std.EnumArray(Tier, u64).initFill(0);
     for (0..bucket_count) |bucket| {
-        if (tierForBucket(bucket) != null) winners += 1;
+        if (tierForBucket(bucket)) |tier| counts.getPtr(tier).* += 1;
     }
-    try std.testing.expectEqual(bucket_count * 99, winners * 100);
+    try t.expectEqual(200_000, counts.get(.refund));
+    try t.expectEqual(100_000, counts.get(.small));
+    try t.expectEqual(40_000, counts.get(.medium));
+    try t.expectEqual(10_000, counts.get(.big));
+    try t.expectEqual(500, counts.get(.rare));
+    try t.expectEqual(1, counts.get(.jackpot));
+    for (p.tools) |tool| {
+        const price = tool.priceMsat();
+        try t.expectEqual(100_000, Tier.jackpot.amount(tool));
+        var regular_payout: u64 = 0;
+        for ([_]Tier{ .refund, .small, .medium, .big, .rare }, [_]u64{ 1, 2, 5, 15, 100 }) |tier, multiplier| {
+            try t.expectEqual(price * multiplier, tier.amount(tool));
+            try t.expect(canStock(tier.amount(tool)));
+            regular_payout += counts.get(tier) * tier.amount(tool);
+        }
+        const spend = bucket_count * price;
+        try t.expectEqual(spend * 4 / 5, regular_payout);
+        try t.expect(regular_payout + counts.get(.jackpot) * Tier.jackpot.amount(tool) < spend);
+    }
+    try t.expect(canStock(100_000));
+    try t.expect(!canStock(1024) and canClaimStock(1024));
+    try t.expect(!canClaimStock(100_001));
 }
 
 test "prize roll is deterministic and scoped to the public world seed and coordinates" {
@@ -201,7 +246,7 @@ test "prize roll is deterministic and scoped to the public world seed and coordi
         try t.expectEqual(tier, roll(secret, world, x, -7).?);
         differs = differs or tier != roll(secret, changed, x, -7);
     }
-    try t.expect(count > 19700 and count < 19900 and differs);
+    try t.expect(count > 6600 and count < 7400 and differs);
 }
 
 test "prize delivery journals intent before wallet I/O and never reissues a token" {

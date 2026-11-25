@@ -114,7 +114,7 @@ mergeInto(LibraryManager.library, {
       };
       for (var type of this.events) window.addEventListener(type, this.unlock, true);
     },
-    play: function () {
+    play: function (volume) {
       var context = this.context;
       if (!context || context.state !== 'running' || !this.decoded) return;
       var self = this;
@@ -122,7 +122,10 @@ mergeInto(LibraryManager.library, {
         if (!buffer || self.context !== context || context.state !== 'running') return;
         var source = context.createBufferSource();
         source.buffer = buffer;
-        source.connect(context.destination);
+        var gain = context.createGain();
+        gain.gain.value = volume;
+        source.connect(gain);
+        gain.connect(context.destination);
         source.start();
       }).catch(function () {});
     },
@@ -135,10 +138,10 @@ mergeInto(LibraryManager.library, {
     },
   },
   haystack_reward_audio__deps: ['$haystackRewardAudio'],
-  haystack_reward_audio__sig: 'viii',
-  haystack_reward_audio: function (action, data, len) {
+  haystack_reward_audio__sig: 'viiif',
+  haystack_reward_audio: function (action, data, len, volume) {
     if (action === 1) haystackRewardAudio.bind(data, len);
-    else if (action === 2) haystackRewardAudio.play();
+    else if (action === 2) haystackRewardAudio.play(volume);
     else haystackRewardAudio.close();
   },
 

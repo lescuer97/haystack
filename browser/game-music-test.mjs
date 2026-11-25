@@ -85,7 +85,7 @@ function setup(AudioContext) {
   };
 }
 
-test('register sound unlocks on a trusted gesture and reuses the decoded WAV without music', async () => {
+test('register sound unlocks on a trusted gesture and plays the same WAV at two volumes', async () => {
   const plays = [];
   const decoded = {};
   let opened = 0, closed = 0, decodes = 0;
@@ -99,8 +99,9 @@ test('register sound unlocks on a trusted gesture and reuses the decoded WAV wit
       decodes++;
       return decoded;
     }
+    createGain() { return {gain: {}, connect() {}}; }
     createBufferSource() {
-      return {connect() {}, start() { plays.push(this.buffer); }};
+      return {connect(node) { this.node = node; }, start() { plays.push([this.buffer, this.node.gain.value]); }};
     }
   }
   const h = setup(Context);
@@ -112,10 +113,10 @@ test('register sound unlocks on a trusted gesture and reuses the decoded WAV wit
   h.gesture('keydown');
   assert.equal(decodes, 1);
   assert.deepEqual(plays, []);
-  h.reward(2);
-  h.reward(2);
+  h.reward(2, 0, 0, 1);
+  h.reward(2, 0, 0, 0.35);
   await setImmediate();
-  assert.deepEqual(plays, [decoded, decoded]);
+  assert.deepEqual(plays, [[decoded, 1], [decoded, 0.35]]);
   h.reward(2);
   h.reward(0);
   await setImmediate();

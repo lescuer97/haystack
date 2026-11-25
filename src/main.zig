@@ -557,7 +557,7 @@ fn stepFrame(
     // Feedback advances on presentation frames, independently of input ticks.
     var cues = game_state.cut_feedback.update(rl.getFrameTime());
     cues.reward = game_state.menu.wallet.prize_chime;
-    game_state.menu.wallet.prize_chime = false;
+    game_state.menu.wallet.prize_chime = null;
     soundtrack.playCutCues(cues);
 
     // 5. Prepare GPU resources, then draw read-only state.

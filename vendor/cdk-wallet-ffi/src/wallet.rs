@@ -38,8 +38,8 @@ use cdk::amount::SplitTarget;
 use cdk::mint_url::MintUrl;
 use cdk::nuts::{
     BlindSignature, BlindedMessage, CheckStateRequest, CurrencyUnit, Id, MintQuoteState,
-    PaymentMethod, Proofs, PublicKey, RestoreRequest, RestoreResponse, SecretKey, State, SwapRequest,
-    SwapResponse, Token,
+    PaymentMethod, Proofs, PublicKey, RestoreRequest, RestoreResponse, SecretKey, State,
+    SwapRequest, SwapResponse, Token,
 };
 use cdk::wallet::{
     HttpClient, MintConnector, PreparedSend, ReceiveOptions, SendKind, SendOptions, Wallet,
@@ -67,9 +67,16 @@ use withdrawal::PreparedWithdrawal;
 
 fn unix_now() -> u64 {
     #[cfg(target_arch = "wasm32")]
-    { (js_sys::Date::now() / 1000.0) as u64 }
+    {
+        (js_sys::Date::now() / 1000.0) as u64
+    }
     #[cfg(not(target_arch = "wasm32"))]
-    { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
 }
 
 fn quote_expired(quote: &cdk_common::wallet::MintQuote, now: u64) -> bool {
@@ -101,9 +108,17 @@ async fn require_active_keyset(mint: &MintUrl, deadline: Duration) -> FfiResult<
     let response = timeout(deadline, client.get_mint_keysets())
         .await
         .map_err(|_| FfiErr::new(CdkStatus::NetworkError, "mint keyset request timed out"))?
-        .map_err(|e| FfiErr::new(CdkStatus::NetworkError, format!("could not fetch mint keysets: {e}")))?;
+        .map_err(|e| {
+            FfiErr::new(
+                CdkStatus::NetworkError,
+                format!("could not fetch mint keysets: {e}"),
+            )
+        })?;
     if !response.keysets.iter().any(|k| k.active && k.unit == UNIT) {
-        return Err(FfiErr::new(CdkStatus::MintUnsupportedUnit, "mint has no active msat keyset"));
+        return Err(FfiErr::new(
+            CdkStatus::MintUnsupportedUnit,
+            "mint has no active msat keyset",
+        ));
     }
     Ok(())
 }
@@ -307,7 +322,12 @@ impl QuoteHistoryRow {
             "mint_url":if self.mint.is_empty(){None}else{Some(self.mint)},"id":self.id,"amount":self.amount,"unit":self.unit,"state":self.state,
             "quote_expiry":self.expiry.to_string(),"expired":self.expired});
         if let Some(w) = self.withdrawal {
-            for key in ["payment_status", "quote_expiry", "invoice_expiry", "expired"] {
+            for key in [
+                "payment_status",
+                "quote_expiry",
+                "invoice_expiry",
+                "expired",
+            ] {
                 value[key] = w[key].clone();
             }
         }
@@ -636,6 +656,7 @@ impl CdkWallet {
 
     // ponytail: small operator-funded batches; no separate prize inventory.
     const MAX_PRIZE_STOCK: u64 = 20;
+    const MAX_PRIZE_MSAT: u64 = 100_000;
     const MAX_PROOFS_PER_PRIZE: usize = 6;
 
     async fn prize_stock_split(
@@ -645,12 +666,15 @@ impl CdkWallet {
         prize: u64,
     ) -> FfiResult<SplitTarget> {
         // Bound the denomination split even if the mint only offers 1-msat proofs.
-        if prize == 0 || prize > 10_000 || amount == 0 || amount % prize != 0
+        if prize == 0
+            || prize > Self::MAX_PRIZE_MSAT
+            || amount == 0
+            || amount % prize != 0
             || amount / prize > Self::MAX_PRIZE_STOCK
         {
             return Err(FfiErr::new(
                 CdkStatus::InvalidArgument,
-                "expected a batch of 1 to 20 whole prizes (up to 10000 msat each)",
+                "expected a batch of 1 to 20 whole prizes (up to 100000 msat each)",
             ));
         }
         let proof_mix = timeout(self.network_deadline(), async {
@@ -671,11 +695,19 @@ impl CdkWallet {
                 CdkStatus::InvalidArgument,
                 format!("cannot split prize using the active keyset: {err}"),
             )),
-            Err(_) => Err(FfiErr::new(CdkStatus::NetworkError, "prize keyset lookup timed out")),
+            Err(_) => Err(FfiErr::new(
+                CdkStatus::NetworkError,
+                "prize keyset lookup timed out",
+            )),
         }
     }
 
-    pub(crate) async fn create_prize_stock(&mut self, mint: &str, count: &str, prize: &str) -> FfiResult<String> {
+    pub(crate) async fn create_prize_stock(
+        &mut self,
+        mint: &str,
+        count: &str,
+        prize: &str,
+    ) -> FfiResult<String> {
         let count = Self::deposit_amount(count)?;
         let prize = Self::deposit_amount(prize)?;
         let amount = count.checked_mul(prize).ok_or_else(|| {
@@ -686,19 +718,42 @@ impl CdkWallet {
         self.create_deposit(mint, &amount.to_string()).await
     }
 
-    pub(crate) async fn claim_prize_stock(&mut self, mint: &str, id: &str, prize: &str) -> FfiResult<String> {
+    pub(crate) async fn claim_prize_stock(
+        &mut self,
+        mint: &str,
+        id: &str,
+        prize: &str,
+    ) -> FfiResult<String> {
         if id.is_empty() || id.len() > 1024 || id.contains('\0') {
-            return Err(FfiErr::new(CdkStatus::InvalidArgument, "invalid saved quote id"));
+            return Err(FfiErr::new(
+                CdkStatus::InvalidArgument,
+                "invalid saved quote id",
+            ));
         }
-        self.check_deposit_inner(mint, id, true, &mut false, Some(Self::deposit_amount(prize)?)).await
+        self.check_deposit_inner(
+            mint,
+            id,
+            true,
+            &mut false,
+            Some(Self::deposit_amount(prize)?),
+        )
+        .await
     }
 
     /// One bounded check, then actual issuance. Never equate Paid with Issued.
     pub(crate) async fn check_deposit(&mut self, mint: &str, id: &str) -> FfiResult<String> {
-        self.check_deposit_inner(mint, id, true, &mut false, None).await
+        self.check_deposit_inner(mint, id, true, &mut false, None)
+            .await
     }
 
-    async fn check_deposit_inner(&mut self, mint: &str, id: &str, recover: bool, changed: &mut bool, prize: Option<u64>) -> FfiResult<String> {
+    async fn check_deposit_inner(
+        &mut self,
+        mint: &str,
+        id: &str,
+        recover: bool,
+        changed: &mut bool,
+        prize: Option<u64>,
+    ) -> FfiResult<String> {
         if self.is_poisoned() {
             return Err(crate::api::poisoned_handle());
         }
@@ -758,19 +813,18 @@ impl CdkWallet {
             let split = match prize {
                 Some(prize) => {
                     let amount = quote.amount.ok_or_else(|| {
-                        FfiErr::new(CdkStatus::InvalidArgument, "prize funding quote has no amount")
+                        FfiErr::new(
+                            CdkStatus::InvalidArgument,
+                            "prize funding quote has no amount",
+                        )
                     })?;
-                    self.prize_stock_split(&wallet, amount.to_u64(), prize).await?
+                    self.prize_stock_split(&wallet, amount.to_u64(), prize)
+                        .await?
                 }
                 None => SplitTarget::default(),
             };
             *changed = true;
-            match timeout(
-                self.network_deadline(),
-                wallet.mint(id, split, None),
-            )
-            .await
-            {
+            match timeout(self.network_deadline(), wallet.mint(id, split, None)).await {
                 Ok(Ok(_)) => {}
                 _ => {
                     self.unresolved.insert(mint);
@@ -808,7 +862,8 @@ impl CdkWallet {
         if self.is_poisoned() {
             return Err(crate::api::poisoned_handle());
         }
-        let (mint_quotes, melt_quotes, metadata, sagas, transactions) = self.quote_history_data().await?;
+        let (mint_quotes, melt_quotes, metadata, sagas, transactions) =
+            self.quote_history_data().await?;
         let withdrawal_lookup = withdrawal::WithdrawalLookup::new(&sagas, &transactions);
         let created = |direction, mint: &str, id: &str| {
             metadata
@@ -952,7 +1007,9 @@ impl CdkWallet {
             .collect()
     }
 
-    async fn quote_history_data(&self) -> FfiResult<(
+    async fn quote_history_data(
+        &self,
+    ) -> FfiResult<(
         Vec<cdk_common::wallet::MintQuote>,
         Vec<cdk_common::wallet::MeltQuote>,
         HashMap<String, Vec<u8>>,
@@ -966,8 +1023,18 @@ impl CdkWallet {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut metadata = HashMap::new();
-            for key in self.db.kv_list(KV_NAMESPACE, "quote_created_v1").await.map_err(db_error)? {
-                if let Some(value) = self.db.kv_read(KV_NAMESPACE, "quote_created_v1", &key).await.map_err(db_error)? {
+            for key in self
+                .db
+                .kv_list(KV_NAMESPACE, "quote_created_v1")
+                .await
+                .map_err(db_error)?
+            {
+                if let Some(value) = self
+                    .db
+                    .kv_read(KV_NAMESPACE, "quote_created_v1", &key)
+                    .await
+                    .map_err(db_error)?
+                {
                     metadata.insert(key, value);
                 }
             }
@@ -976,12 +1043,19 @@ impl CdkWallet {
                 self.db.get_melt_quotes().await.map_err(db_error)?,
                 metadata,
                 self.db.get_incomplete_sagas().await.map_err(db_error)?,
-                self.db.list_transactions(None, None, None).await.map_err(db_error)?,
+                self.db
+                    .list_transactions(None, None, None)
+                    .await
+                    .map_err(db_error)?,
             ))
         }
     }
 
-    async fn eligible_deposits(&self, mint: &MintUrl, mut quotes: Vec<cdk_common::wallet::MintQuote>) -> FfiResult<Vec<cdk_common::wallet::MintQuote>> {
+    async fn eligible_deposits(
+        &self,
+        mint: &MintUrl,
+        mut quotes: Vec<cdk_common::wallet::MintQuote>,
+    ) -> FfiResult<Vec<cdk_common::wallet::MintQuote>> {
         if self.is_poisoned() {
             return Err(crate::api::poisoned_handle());
         }
@@ -1013,28 +1087,47 @@ impl CdkWallet {
         let mint = parse_mint_url(mint)?;
         let (quotes, _, metadata, _, _) = self.quote_history_data().await?;
         let mut quotes = self.eligible_deposits(&mint, quotes).await?;
-        let created = |q: &cdk_common::wallet::MintQuote| metadata.get(&Self::quote_key("In", &mint.to_string(), &q.id))
-            .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok()).map(u64::from_le_bytes).unwrap_or(0);
-        quotes.sort_by(|a,b| created(b).cmp(&created(a)).then_with(|| b.id.cmp(&a.id)));
+        let created = |q: &cdk_common::wallet::MintQuote| {
+            metadata
+                .get(&Self::quote_key("In", &mint.to_string(), &q.id))
+                .and_then(|b| <[u8; 8]>::try_from(b.as_slice()).ok())
+                .map(u64::from_le_bytes)
+                .unwrap_or(0)
+        };
+        quotes.sort_by(|a, b| created(b).cmp(&created(a)).then_with(|| b.id.cmp(&a.id)));
         let Some(quote) = quotes.first() else {
             return Ok(serde_json::json!({"invoice":null}).to_string());
         };
-        if quote.id.len() > 1024 || quote.id.contains('\0') || quote.request.len() > 4096 || quote.request.contains('\0') {
+        if quote.id.len() > 1024
+            || quote.id.contains('\0')
+            || quote.request.len() > 4096
+            || quote.request.contains('\0')
+        {
             return Ok(serde_json::json!({"invoice":null,"error":"Saved invoice exceeds display limit; retained in wallet"}).to_string());
         }
         Ok(serde_json::json!({"invoice": Self::invoice_view(quote)}).to_string())
     }
 
     pub(crate) async fn poll_deposits(&mut self, mint: &str, after_id: &str) -> FfiResult<String> {
-        self.poll_deposits_inner(mint, after_id, true, &mut false).await
+        self.poll_deposits_inner(mint, after_id, true, &mut false)
+            .await
     }
 
-    async fn poll_deposits_inner(&mut self, mint: &str, after_id: &str, recover: bool, changed: &mut bool) -> FfiResult<String> {
+    async fn poll_deposits_inner(
+        &mut self,
+        mint: &str,
+        after_id: &str,
+        recover: bool,
+        changed: &mut bool,
+    ) -> FfiResult<String> {
         if self.is_poisoned() {
             return Err(crate::api::poisoned_handle());
         }
         if after_id.len() > 1024 || after_id.contains('\0') {
-            return Err(FfiErr::new(CdkStatus::InvalidArgument, "invalid poll cursor"));
+            return Err(FfiErr::new(
+                CdkStatus::InvalidArgument,
+                "invalid poll cursor",
+            ));
         }
         let mint = parse_mint_url(mint)?;
         self.guard_prepared_withdrawal(Some(&mint))?;
@@ -1074,12 +1167,20 @@ impl CdkWallet {
             || quote.request.contains('\0')
         {
             // Check even oversized saved quotes, but never put them on the wire.
-            let _ = self.check_deposit_inner(&mint.to_string(), &quote.id, recover, changed, None).await;
+            let _ = self
+                .check_deposit_inner(&mint.to_string(), &quote.id, recover, changed, None)
+                .await;
             return Ok(serde_json::json!({"invoice":null,"cursor":cursor(quote),"error":"Saved invoice exceeds display limit; retained in wallet"}).to_string());
         }
         let mut reply = serde_json::json!({"invoice":null,"cursor":cursor(quote)});
-        match self.check_deposit_inner(&mint.to_string(), &quote.id, recover, changed, None).await {
-            Ok(raw) => reply["invoice"] = serde_json::from_str(&raw).map_err(|_| FfiErr::new(CdkStatus::DatabaseError, "invalid invoice view"))?,
+        match self
+            .check_deposit_inner(&mint.to_string(), &quote.id, recover, changed, None)
+            .await
+        {
+            Ok(raw) => {
+                reply["invoice"] = serde_json::from_str(&raw)
+                    .map_err(|_| FfiErr::new(CdkStatus::DatabaseError, "invalid invoice view"))?
+            }
             Err(error) => reply["error"] = serde_json::json!(error.message),
         }
         Ok(reply.to_string())
@@ -1087,56 +1188,124 @@ impl CdkWallet {
 
     /// Exact local CDK quote lookup. Never performs recovery or a mint request.
     pub(crate) async fn saved_invoice(&self, mint: &str, id: &str) -> FfiResult<String> {
-        if self.is_poisoned() { return Err(crate::api::poisoned_handle()); }
+        if self.is_poisoned() {
+            return Err(crate::api::poisoned_handle());
+        }
         let mint = parse_mint_url(mint)?;
         if id.is_empty() || id.len() > 1024 || id.contains('\0') {
-            return Err(FfiErr::new(CdkStatus::InvalidArgument, "invalid saved quote id"));
+            return Err(FfiErr::new(
+                CdkStatus::InvalidArgument,
+                "invalid saved quote id",
+            ));
         }
-        let quote = self.db.get_mint_quote(id).await.map_err(db_error)?
+        let quote = self
+            .db
+            .get_mint_quote(id)
+            .await
+            .map_err(db_error)?
             .ok_or_else(|| FfiErr::new(CdkStatus::InvalidArgument, "saved quote not found"))?;
-        if quote.mint_url != mint || quote.unit != UNIT || quote.payment_method != PaymentMethod::BOLT11 {
-            return Err(FfiErr::new(CdkStatus::InvalidArgument, "quote identity mismatch"));
+        if quote.mint_url != mint
+            || quote.unit != UNIT
+            || quote.payment_method != PaymentMethod::BOLT11
+        {
+            return Err(FfiErr::new(
+                CdkStatus::InvalidArgument,
+                "quote identity mismatch",
+            ));
         }
         if quote.request.len() > 4096 || quote.request.contains('\0') {
-            return Err(FfiErr::new(CdkStatus::InvalidArgument, "saved invoice exceeds display limit"));
+            return Err(FfiErr::new(
+                CdkStatus::InvalidArgument,
+                "saved invoice exceeds display limit",
+            ));
         }
         self.checked_invoice_view(&quote).await
     }
 
     /// Application envelope: recovery metadata survives later quote/read errors.
-    pub(crate) async fn deposit_update(&mut self, mint: &str, kind: &str, argument: &str) -> FfiResult<String> {
-        if self.is_poisoned() { return Err(crate::api::poisoned_handle()); }
+    pub(crate) async fn deposit_update(
+        &mut self,
+        mint: &str,
+        kind: &str,
+        argument: &str,
+    ) -> FfiResult<String> {
+        if self.is_poisoned() {
+            return Err(crate::api::poisoned_handle());
+        }
         let selected = parse_mint_url(mint)?;
         self.guard_prepared_withdrawal(Some(&selected))?;
-        if !matches!(kind, "check" | "poll" | "recover") || argument.len() > 1024 || argument.contains('\0')
-            || (kind == "check" && argument.is_empty()) || (kind == "recover" && !argument.is_empty()) {
-            return Err(FfiErr::new(CdkStatus::InvalidArgument, "invalid deposit update arguments"));
+        if !matches!(kind, "check" | "poll" | "recover")
+            || argument.len() > 1024
+            || argument.contains('\0')
+            || (kind == "check" && argument.is_empty())
+            || (kind == "recover" && !argument.is_empty())
+        {
+            return Err(FfiErr::new(
+                CdkStatus::InvalidArgument,
+                "invalid deposit update arguments",
+            ));
         }
         let mut changed = false;
         let mut operational_error = None;
         if self.unresolved.contains(&selected) {
             match self.run_recovery(Some(&selected)).await {
-                Ok(reports) => changed = reports.iter().any(|r| r.recovered > 0 || r.compensated > 0 || r.failed > 0 || r.skipped > 0 || r.status != CdkStatus::Ok),
-                Err(e) => { changed = true; operational_error = Some(e); }
+                Ok(reports) => {
+                    changed = reports.iter().any(|r| {
+                        r.recovered > 0
+                            || r.compensated > 0
+                            || r.failed > 0
+                            || r.skipped > 0
+                            || r.status != CdkStatus::Ok
+                    })
+                }
+                Err(e) => {
+                    changed = true;
+                    operational_error = Some(e);
+                }
             }
         }
         let mut reply = serde_json::json!({"wallet_changed":false,"recovery_pending":false,"creation_recovery":"unknown","invoice":null,"cursor":null,"error":null});
         let mut recovered_quote = None;
         match self.reconcile_deposit(&selected).await {
-            Ok((status, quote)) => { reply["creation_recovery"] = serde_json::json!(status); recovered_quote = quote; },
+            Ok((status, quote)) => {
+                reply["creation_recovery"] = serde_json::json!(status);
+                recovered_quote = quote;
+            }
             Err(e) => operational_error = Some(e),
         }
         let result = if self.unresolved.contains(&selected) {
-            Err(FfiErr::new(CdkStatus::RecoveryPending, "selected mint recovery remains pending"))
+            Err(FfiErr::new(
+                CdkStatus::RecoveryPending,
+                "selected mint recovery remains pending",
+            ))
         } else if operational_error.is_some() {
             Ok(None)
         } else {
             match kind {
-                "check" => self.check_deposit_inner(mint, argument, false, &mut changed, None).await.map(Some),
-                "poll" => self.poll_deposits_inner(mint, argument, false, &mut changed).await.map(Some),
+                "check" => self
+                    .check_deposit_inner(mint, argument, false, &mut changed, None)
+                    .await
+                    .map(Some),
+                "poll" => self
+                    .poll_deposits_inner(mint, argument, false, &mut changed)
+                    .await
+                    .map(Some),
                 _ => match recovered_quote {
-                    Some(q) if q.id.len() > 1024 || q.id.contains('\0') || q.request.len() > 4096 || q.request.contains('\0') => Err(FfiErr::new(CdkStatus::InvalidArgument, "recovered invoice exceeds display limit")),
-                    Some(q) => self.checked_invoice_value(&q).await.map(|invoice| Some(serde_json::json!({"invoice":invoice}).to_string())),
+                    Some(q)
+                        if q.id.len() > 1024
+                            || q.id.contains('\0')
+                            || q.request.len() > 4096
+                            || q.request.contains('\0') =>
+                    {
+                        Err(FfiErr::new(
+                            CdkStatus::InvalidArgument,
+                            "recovered invoice exceeds display limit",
+                        ))
+                    }
+                    Some(q) => self
+                        .checked_invoice_value(&q)
+                        .await
+                        .map(|invoice| Some(serde_json::json!({"invoice":invoice}).to_string())),
                     None => Ok(None),
                 },
             }
@@ -1144,25 +1313,40 @@ impl CdkWallet {
         match result {
             Ok(Some(raw)) => match serde_json::from_str::<serde_json::Value>(&raw) {
                 Ok(value) => {
-                    if kind == "check" { reply["invoice"] = value; }
-                    else {
+                    if kind == "check" {
+                        reply["invoice"] = value;
+                    } else {
                         reply["invoice"] = value["invoice"].clone();
                         reply["cursor"] = value["cursor"].clone();
-                        if !value["error"].is_null() { operational_error = Some(FfiErr::new(CdkStatus::NetworkError, "saved deposit update unavailable; retained in wallet")); }
+                        if !value["error"].is_null() {
+                            operational_error = Some(FfiErr::new(
+                                CdkStatus::NetworkError,
+                                "saved deposit update unavailable; retained in wallet",
+                            ));
+                        }
                     }
                 }
-                Err(_) => operational_error = Some(FfiErr::new(CdkStatus::DatabaseError, "invalid local invoice view")),
+                Err(_) => {
+                    operational_error = Some(FfiErr::new(
+                        CdkStatus::DatabaseError,
+                        "invalid local invoice view",
+                    ))
+                }
             },
-            Ok(None) => {},
+            Ok(None) => {}
             Err(e) => operational_error = Some(e),
         }
         if !reply["invoice"].is_null() {
             let id = reply["invoice"]["id"].as_str();
             let request = reply["invoice"]["invoice"].as_str();
             if id.is_none_or(|s| s.is_empty() || s.len() > 1024 || s.contains('\0'))
-                || request.is_none_or(|s| s.is_empty() || s.len() > 4096 || s.contains('\0')) {
+                || request.is_none_or(|s| s.is_empty() || s.len() > 4096 || s.contains('\0'))
+            {
                 reply["invoice"] = serde_json::Value::Null;
-                operational_error = Some(FfiErr::new(CdkStatus::InvalidArgument, "saved invoice exceeds display limit"));
+                operational_error = Some(FfiErr::new(
+                    CdkStatus::InvalidArgument,
+                    "saved invoice exceeds display limit",
+                ));
             }
         }
         reply["wallet_changed"] = serde_json::json!(changed);
@@ -1232,16 +1416,26 @@ mod deposit_tests {
     use serde_json::Value;
 
     #[test]
-    fn application_check_and_poll_invalidate_actual_remote_issued_state_without_claiming_local_issuance() {
+    fn application_check_and_poll_invalidate_actual_remote_issued_state_without_claiming_local_issuance(
+    ) {
         runtime().block_on(async {
             for kind in ["check", "poll"] {
                 let (mint, server) = start_fake_mint_ctl(0, SwapFault::None).await;
                 let dir = tempfile::tempdir().unwrap();
-                let (mut h, _) = CdkWallet::open(&[77;64], dir.path().join("local.sqlite").to_str().unwrap()).await.unwrap();
-                let (mut issuer, _) = CdkWallet::open(&[78;64], dir.path().join("issuer.sqlite").to_str().unwrap()).await.unwrap();
+                let (mut h, _) =
+                    CdkWallet::open(&[77; 64], dir.path().join("local.sqlite").to_str().unwrap())
+                        .await
+                        .unwrap();
+                let (mut issuer, _) = CdkWallet::open(
+                    &[78; 64],
+                    dir.path().join("issuer.sqlite").to_str().unwrap(),
+                )
+                .await
+                .unwrap();
                 h.add_mint(&mint).await.unwrap();
                 issuer.add_mint(&mint).await.unwrap();
-                let created:Value = serde_json::from_str(&h.create_deposit(&mint,"21").await.unwrap()).unwrap();
+                let created: Value =
+                    serde_json::from_str(&h.create_deposit(&mint, "21").await.unwrap()).unwrap();
                 let id = created["id"].as_str().unwrap();
                 let saved = h.db.get_mint_quote(id).await.unwrap().unwrap();
                 assert_eq!(saved.state, MintQuoteState::Unpaid);
@@ -1249,26 +1443,50 @@ mod deposit_tests {
                 // The selected wallet retains its Unpaid quote and no proofs
                 // or completed transaction, so remote Issued is unconfirmed.
                 issuer.db.add_mint_quote(saved).await.unwrap();
-                let deadline = std::time::Instant::now()+Duration::from_secs(15);
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
                 loop {
-                    let issued:Value = serde_json::from_str(&issuer.check_deposit(&mint,id).await.unwrap()).unwrap();
-                    if issued["confirmed"] == true { break; }
-                    assert!(std::time::Instant::now()<deadline);
+                    let issued: Value =
+                        serde_json::from_str(&issuer.check_deposit(&mint, id).await.unwrap())
+                            .unwrap();
+                    if issued["confirmed"] == true {
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline);
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                assert_eq!(h.db.get_mint_quote(id).await.unwrap().unwrap().state, MintQuoteState::Unpaid);
-                let update:Value = serde_json::from_str(&h.deposit_update(&mint,kind,if kind=="check" {id} else {""}).await.unwrap()).unwrap();
-                assert_eq!(update["wallet_changed"],true,"{kind}: {update}");
-                assert_eq!(update["invoice"]["state"],"ISSUED");
-                assert_eq!(update["invoice"]["confirmed"],false);
+                assert_eq!(
+                    h.db.get_mint_quote(id).await.unwrap().unwrap().state,
+                    MintQuoteState::Unpaid
+                );
+                let update: Value = serde_json::from_str(
+                    &h.deposit_update(&mint, kind, if kind == "check" { id } else { "" })
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(update["wallet_changed"], true, "{kind}: {update}");
+                assert_eq!(update["invoice"]["state"], "ISSUED");
+                assert_eq!(update["invoice"]["confirmed"], false);
                 assert!(update["error"].is_null());
-                let screen:Value = serde_json::from_str(&h.wallet_screen(&mint).await.unwrap()).unwrap();
-                assert_eq!(screen["msats"],"0");
-                let history:Value = serde_json::from_str(&h.quote_history().await.unwrap()).unwrap();
-                assert_eq!(history[0]["state"],"ISSUED");
-                assert!(h.db.list_transactions(None,None,None).await.unwrap().is_empty());
-                let unchanged:Value = serde_json::from_str(&h.deposit_update(&mint,kind,if kind=="check" {id} else {""}).await.unwrap()).unwrap();
-                assert_eq!(unchanged["wallet_changed"],false);
+                let screen: Value =
+                    serde_json::from_str(&h.wallet_screen(&mint).await.unwrap()).unwrap();
+                assert_eq!(screen["msats"], "0");
+                let history: Value =
+                    serde_json::from_str(&h.quote_history().await.unwrap()).unwrap();
+                assert_eq!(history[0]["state"], "ISSUED");
+                assert!(h
+                    .db
+                    .list_transactions(None, None, None)
+                    .await
+                    .unwrap()
+                    .is_empty());
+                let unchanged: Value = serde_json::from_str(
+                    &h.deposit_update(&mint, kind, if kind == "check" { id } else { "" })
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(unchanged["wallet_changed"], false);
                 server.abort();
             }
         });
@@ -1277,48 +1495,73 @@ mod deposit_tests {
     #[test]
     fn application_unchanged_unpaid_has_no_refresh_and_saved_lookup_is_local_and_exact() {
         runtime().block_on(async {
-            let (mint,server,posts)=crate::e2e::start_fake_mint_counted(0,SwapFault::UnpaidQuotes).await;
-            let dir=tempfile::tempdir().unwrap();
-            let (mut h,_)=CdkWallet::open(&[76;64],dir.path().join("wallet.sqlite").to_str().unwrap()).await.unwrap();
+            let (mint, server, posts) =
+                crate::e2e::start_fake_mint_counted(0, SwapFault::UnpaidQuotes).await;
+            let dir = tempfile::tempdir().unwrap();
+            let (mut h, _) = CdkWallet::open(
+                &[76; 64],
+                dir.path().join("wallet.sqlite").to_str().unwrap(),
+            )
+            .await
+            .unwrap();
             h.add_mint(&mint).await.unwrap();
-            let a:Value=serde_json::from_str(&h.create_deposit(&mint,"21").await.unwrap()).unwrap();
-            let id=a["id"].as_str().unwrap();
+            let a: Value =
+                serde_json::from_str(&h.create_deposit(&mint, "21").await.unwrap()).unwrap();
+            let id = a["id"].as_str().unwrap();
             for _ in 0..3 {
-                let update:Value=serde_json::from_str(&h.deposit_update(&mint,"check",id).await.unwrap()).unwrap();
-                assert_eq!(update["wallet_changed"],false,"{update}");
-                assert_eq!(update["invoice"]["state"],"UNPAID");
+                let update: Value =
+                    serde_json::from_str(&h.deposit_update(&mint, "check", id).await.unwrap())
+                        .unwrap();
+                assert_eq!(update["wallet_changed"], false, "{update}");
+                assert_eq!(update["invoice"]["state"], "UNPAID");
                 assert!(update["error"].is_null());
             }
-            assert_eq!(posts.load(Ordering::SeqCst),1);
+            assert_eq!(posts.load(Ordering::SeqCst), 1);
             server.abort();
             // With the server gone, exact saved reads and unsupported identity
             // rejections still succeed locally, including bounded input checks.
-            let saved:Value=serde_json::from_str(&h.saved_invoice(&mint,id).await.unwrap()).unwrap();
-            assert_eq!(saved["id"],id);
-            assert_eq!(saved["confirmed"],false);
-            for case in ["unit","method","mint","request"] {
-                let mut q=quote(case,&parse_mint_url(&mint).unwrap());
+            let saved: Value =
+                serde_json::from_str(&h.saved_invoice(&mint, id).await.unwrap()).unwrap();
+            assert_eq!(saved["id"], id);
+            assert_eq!(saved["confirmed"], false);
+            for case in ["unit", "method", "mint", "request"] {
+                let mut q = quote(case, &parse_mint_url(&mint).unwrap());
                 match case {
-                    "unit"=>q.unit=CurrencyUnit::Sat,
-                    "method"=>q.payment_method=PaymentMethod::BOLT12,
-                    "mint"=>q.mint_url=parse_mint_url("http://127.0.0.1:9").unwrap(),
-                    _=>{q.request="x".repeat(4097); q.expiry=unix_now()-1;},
+                    "unit" => q.unit = CurrencyUnit::Sat,
+                    "method" => q.payment_method = PaymentMethod::BOLT12,
+                    "mint" => q.mint_url = parse_mint_url("http://127.0.0.1:9").unwrap(),
+                    _ => {
+                        q.request = "x".repeat(4097);
+                        q.expiry = unix_now() - 1;
+                    }
                 }
                 h.db.add_mint_quote(q).await.unwrap();
-                assert_eq!(h.saved_invoice(&mint,case).await.unwrap_err().status,CdkStatus::InvalidArgument);
+                assert_eq!(
+                    h.saved_invoice(&mint, case).await.unwrap_err().status,
+                    CdkStatus::InvalidArgument
+                );
             }
-            let oversized=h.deposit_update(&mint,"check","request").await.unwrap();
-            assert!(oversized.len()<1024);
-            let oversized:Value=serde_json::from_str(&oversized).unwrap();
+            let oversized = h.deposit_update(&mint, "check", "request").await.unwrap();
+            assert!(oversized.len() < 1024);
+            let oversized: Value = serde_json::from_str(&oversized).unwrap();
             assert!(oversized["invoice"].is_null() && oversized["error"].is_object());
-            for bad in ["".to_string(),"x".repeat(1025),"bad\0id".to_string()] {
-                assert_eq!(h.saved_invoice(&mint,&bad).await.unwrap_err().status,CdkStatus::InvalidArgument);
+            for bad in ["".to_string(), "x".repeat(1025), "bad\0id".to_string()] {
+                assert_eq!(
+                    h.saved_invoice(&mint, &bad).await.unwrap_err().status,
+                    CdkStatus::InvalidArgument
+                );
             }
-            let selected=parse_mint_url(&mint).unwrap();
+            let selected = parse_mint_url(&mint).unwrap();
             h.unresolved.insert(selected.clone());
-            for (kind,arg) in [("invalid",""),("recover","nonempty"),("check","")] {
-                assert_eq!(h.deposit_update(&mint,kind,arg).await.unwrap_err().status,CdkStatus::InvalidArgument);
-                assert!(h.unresolved.contains(&selected),"invalid requests must not recover or mutate");
+            for (kind, arg) in [("invalid", ""), ("recover", "nonempty"), ("check", "")] {
+                assert_eq!(
+                    h.deposit_update(&mint, kind, arg).await.unwrap_err().status,
+                    CdkStatus::InvalidArgument
+                );
+                assert!(
+                    h.unresolved.contains(&selected),
+                    "invalid requests must not recover or mutate"
+                );
             }
         });
     }
@@ -1329,29 +1572,54 @@ mod deposit_tests {
             for kind in ["poll", "recover"] {
                 let fail_get = Arc::new(AtomicBool::new(true));
                 let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                let fault = SwapFault::DepositControl { fail_get: fail_get.clone(), fail_mint: Arc::new(AtomicBool::new(false)), hold_unpaid: Arc::new(AtomicBool::new(false)), gets: gets.clone(), interrupt_mint: false };
+                let fault = SwapFault::DepositControl {
+                    fail_get: fail_get.clone(),
+                    fail_mint: Arc::new(AtomicBool::new(false)),
+                    hold_unpaid: Arc::new(AtomicBool::new(false)),
+                    gets: gets.clone(),
+                    interrupt_mint: false,
+                };
                 let (mint, server, posts) = crate::e2e::start_fake_mint_counted(0, fault).await;
                 let dir = tempfile::tempdir().unwrap();
-                let (mut h, _) = CdkWallet::open(&[74;64], dir.path().join("wallet.sqlite").to_str().unwrap()).await.unwrap();
+                let (mut h, _) = CdkWallet::open(
+                    &[74; 64],
+                    dir.path().join("wallet.sqlite").to_str().unwrap(),
+                )
+                .await
+                .unwrap();
                 h.add_mint(&mint).await.unwrap();
-                let invoice: Value = serde_json::from_str(&h.create_deposit(&mint,"21").await.unwrap()).unwrap();
+                let invoice: Value =
+                    serde_json::from_str(&h.create_deposit(&mint, "21").await.unwrap()).unwrap();
                 let id = invoice["id"].as_str().unwrap();
-                assert!(h.check_deposit(&mint,id).await.is_err());
+                assert!(h.check_deposit(&mint, id).await.is_err());
                 assert!(h.unresolved.contains(&parse_mint_url(&mint).unwrap()));
-                assert_eq!(h.create_deposit(&mint,"22").await.unwrap_err().status,CdkStatus::RecoveryPending);
+                assert_eq!(
+                    h.create_deposit(&mint, "22").await.unwrap_err().status,
+                    CdkStatus::RecoveryPending
+                );
                 let mut saved = h.db.get_mint_quote(id).await.unwrap().unwrap();
-                saved.expiry = unix_now()-1;
+                saved.expiry = unix_now() - 1;
                 saved.state = MintQuoteState::Unpaid;
                 h.db.add_mint_quote(saved).await.unwrap();
                 let before = gets.load(Ordering::SeqCst);
-                let update: Value = serde_json::from_str(&h.deposit_update(&mint,kind,"").await.unwrap()).unwrap();
-                assert_eq!(update["recovery_pending"],false);
+                let update: Value =
+                    serde_json::from_str(&h.deposit_update(&mint, kind, "").await.unwrap())
+                        .unwrap();
+                assert_eq!(update["recovery_pending"], false);
                 assert!(update["invoice"].is_null());
                 assert!(update["cursor"].is_null());
-                assert_eq!(gets.load(Ordering::SeqCst),before,"expired unpaid quote must never be checked");
-                assert_eq!(posts.load(Ordering::SeqCst),1,"recovery must not create a replacement");
-                h.create_deposit(&mint,"22").await.unwrap();
-                assert_eq!(posts.load(Ordering::SeqCst),2);
+                assert_eq!(
+                    gets.load(Ordering::SeqCst),
+                    before,
+                    "expired unpaid quote must never be checked"
+                );
+                assert_eq!(
+                    posts.load(Ordering::SeqCst),
+                    1,
+                    "recovery must not create a replacement"
+                );
+                h.create_deposit(&mint, "22").await.unwrap();
+                assert_eq!(posts.load(Ordering::SeqCst), 2);
                 server.abort();
             }
         });
@@ -1365,73 +1633,145 @@ mod deposit_tests {
                 let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let fail_mint = Arc::new(AtomicBool::new(false));
                 let hold_unpaid = Arc::new(AtomicBool::new(false));
-                let fault = SwapFault::DepositControl { fail_get: fail_get.clone(), fail_mint: fail_mint.clone(), hold_unpaid: hold_unpaid.clone(), gets: gets.clone(), interrupt_mint: true };
-                let (mint,server,posts) = crate::e2e::start_fake_mint_counted(0,fault).await;
-                let dir=tempfile::tempdir().unwrap();
-                let (mut h,_)=CdkWallet::open(&[75;64],dir.path().join("wallet.sqlite").to_str().unwrap()).await.unwrap();
+                let fault = SwapFault::DepositControl {
+                    fail_get: fail_get.clone(),
+                    fail_mint: fail_mint.clone(),
+                    hold_unpaid: hold_unpaid.clone(),
+                    gets: gets.clone(),
+                    interrupt_mint: true,
+                };
+                let (mint, server, posts) = crate::e2e::start_fake_mint_counted(0, fault).await;
+                let dir = tempfile::tempdir().unwrap();
+                let (mut h, _) = CdkWallet::open(
+                    &[75; 64],
+                    dir.path().join("wallet.sqlite").to_str().unwrap(),
+                )
+                .await
+                .unwrap();
                 h.add_mint(&mint).await.unwrap();
-                let b_id = if outcome=="unchanged" {
-                    let b:Value=serde_json::from_str(&h.create_deposit(&mint,"21").await.unwrap()).unwrap();
+                let b_id = if outcome == "unchanged" {
+                    let b: Value =
+                        serde_json::from_str(&h.create_deposit(&mint, "21").await.unwrap())
+                            .unwrap();
                     b["id"].as_str().unwrap().to_string()
-                } else {"B".to_string()};
-                let a:Value=serde_json::from_str(&h.create_deposit(&mint,"21").await.unwrap()).unwrap();
-                let id=a["id"].as_str().unwrap();
-                let deadline=std::time::Instant::now()+Duration::from_secs(15);
+                } else {
+                    "B".to_string()
+                };
+                let a: Value =
+                    serde_json::from_str(&h.create_deposit(&mint, "21").await.unwrap()).unwrap();
+                let id = a["id"].as_str().unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(15);
                 loop {
-                    if h.check_deposit(&mint,id).await.is_err() { break; }
-                    assert!(std::time::Instant::now()<deadline);
+                    if h.check_deposit(&mint, id).await.is_err() {
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline);
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 // A is an actual interrupted CDK saga. B is an independent
                 // locally retained quote; no shadow ledger is involved.
-                let selected=parse_mint_url(&mint).unwrap();
+                let selected = parse_mint_url(&mint).unwrap();
                 if outcome == "empty" || outcome == "oversized" {
                     // An already observed remote Issued quote still has an
                     // interrupted local CDK saga. Once recovery completes its
                     // local transaction, eligibility must exclude it.
-                    let mut saved=h.db.get_mint_quote(id).await.unwrap().unwrap();
-                    saved.state=MintQuoteState::Issued;
+                    let mut saved = h.db.get_mint_quote(id).await.unwrap().unwrap();
+                    saved.state = MintQuoteState::Issued;
                     h.db.add_mint_quote(saved).await.unwrap();
                 }
-                let mut b=quote("B",&selected);
-                if outcome=="oversized" { b.request="x".repeat(4097); }
-                if outcome!="empty" && outcome!="unchanged" { h.db.add_mint_quote(b).await.unwrap(); }
-                fail_get.store(outcome=="error",Ordering::SeqCst);
-                fail_mint.store(outcome=="pending",Ordering::SeqCst);
-                hold_unpaid.store(outcome=="unchanged",Ordering::SeqCst);
-                let before=gets.load(Ordering::SeqCst);
-                let update:Value=serde_json::from_str(&h.deposit_update(&mint,if outcome=="empty" || outcome=="oversized" {"poll"} else {"check"},if outcome=="empty" || outcome=="oversized" {""} else {&b_id}).await.unwrap()).unwrap();
-                assert_eq!(update["wallet_changed"],true,"{outcome}: {update}");
-                if outcome=="pending" {
-                    assert_eq!(update["recovery_pending"],true);
+                let mut b = quote("B", &selected);
+                if outcome == "oversized" {
+                    b.request = "x".repeat(4097);
+                }
+                if outcome != "empty" && outcome != "unchanged" {
+                    h.db.add_mint_quote(b).await.unwrap();
+                }
+                fail_get.store(outcome == "error", Ordering::SeqCst);
+                fail_mint.store(outcome == "pending", Ordering::SeqCst);
+                hold_unpaid.store(outcome == "unchanged", Ordering::SeqCst);
+                let before = gets.load(Ordering::SeqCst);
+                let update: Value = serde_json::from_str(
+                    &h.deposit_update(
+                        &mint,
+                        if outcome == "empty" || outcome == "oversized" {
+                            "poll"
+                        } else {
+                            "check"
+                        },
+                        if outcome == "empty" || outcome == "oversized" {
+                            ""
+                        } else {
+                            &b_id
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(update["wallet_changed"], true, "{outcome}: {update}");
+                if outcome == "pending" {
+                    assert_eq!(update["recovery_pending"], true);
                     assert!(update["error"].is_object());
-                    assert_eq!(gets.load(Ordering::SeqCst),before,"unresolved recovery must skip subsequent B check");
-                    assert_eq!(h.create_deposit(&mint,"22").await.unwrap_err().status,CdkStatus::RecoveryPending);
-                    fail_mint.store(false,Ordering::SeqCst);
-                    let recovered:Value=serde_json::from_str(&h.deposit_update(&mint,"recover","").await.unwrap()).unwrap();
-                    assert_eq!(recovered["recovery_pending"],false);
-                    assert_eq!(recovered["wallet_changed"],true);
-                    assert_eq!(h.list_balances().await.unwrap()[0].1,21);
-                    assert_eq!(posts.load(Ordering::SeqCst),1);
+                    assert_eq!(
+                        gets.load(Ordering::SeqCst),
+                        before,
+                        "unresolved recovery must skip subsequent B check"
+                    );
+                    assert_eq!(
+                        h.create_deposit(&mint, "22").await.unwrap_err().status,
+                        CdkStatus::RecoveryPending
+                    );
+                    fail_mint.store(false, Ordering::SeqCst);
+                    let recovered: Value = serde_json::from_str(
+                        &h.deposit_update(&mint, "recover", "").await.unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(recovered["recovery_pending"], false);
+                    assert_eq!(recovered["wallet_changed"], true);
+                    assert_eq!(h.list_balances().await.unwrap()[0].1, 21);
+                    assert_eq!(posts.load(Ordering::SeqCst), 1);
                     server.abort();
                     continue;
                 }
-                assert_eq!(h.list_balances().await.unwrap()[0].1,21);
-                let screen:Value=serde_json::from_str(&h.wallet_screen(&mint).await.unwrap()).unwrap();
-                assert_eq!(screen["msats"],"21");
-                let history:Value=serde_json::from_str(&h.quote_history().await.unwrap()).unwrap();
-                assert!(history.as_array().unwrap().iter().any(|r|r["id"]==id && r["state"]==if outcome=="error" || outcome=="unchanged" {"PAID"} else {"ISSUED"}), "{outcome}: {history}");
-                let completed=CdkWallet::completed_quotes(h.db.list_transactions(None,None,None).await.unwrap());
-                assert!(completed.contains(&(mint.clone(),UNIT.to_string(),id.to_string())));
-                assert_eq!(posts.load(Ordering::SeqCst),if outcome=="unchanged" {2} else {1});
-                if outcome=="unchanged" {
-                    assert_eq!(update["invoice"]["state"],"UNPAID");
+                assert_eq!(h.list_balances().await.unwrap()[0].1, 21);
+                let screen: Value =
+                    serde_json::from_str(&h.wallet_screen(&mint).await.unwrap()).unwrap();
+                assert_eq!(screen["msats"], "21");
+                let history: Value =
+                    serde_json::from_str(&h.quote_history().await.unwrap()).unwrap();
+                assert!(
+                    history.as_array().unwrap().iter().any(|r| r["id"] == id
+                        && r["state"]
+                            == if outcome == "error" || outcome == "unchanged" {
+                                "PAID"
+                            } else {
+                                "ISSUED"
+                            }),
+                    "{outcome}: {history}"
+                );
+                let completed = CdkWallet::completed_quotes(
+                    h.db.list_transactions(None, None, None).await.unwrap(),
+                );
+                assert!(completed.contains(&(mint.clone(), UNIT.to_string(), id.to_string())));
+                assert_eq!(
+                    posts.load(Ordering::SeqCst),
+                    if outcome == "unchanged" { 2 } else { 1 }
+                );
+                if outcome == "unchanged" {
+                    assert_eq!(update["invoice"]["state"], "UNPAID");
                     assert!(update["error"].is_null());
-                    let again:Value=serde_json::from_str(&h.deposit_update(&mint,"check",&b_id).await.unwrap()).unwrap();
-                    assert_eq!(again["wallet_changed"],false);
+                    let again: Value = serde_json::from_str(
+                        &h.deposit_update(&mint, "check", &b_id).await.unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(again["wallet_changed"], false);
                 }
-                if outcome=="error" || outcome=="oversized" { assert!(update["error"].is_object()); }
-                if outcome=="empty" { assert!(update["invoice"].is_null()); }
+                if outcome == "error" || outcome == "oversized" {
+                    assert!(update["error"].is_object());
+                }
+                if outcome == "empty" {
+                    assert!(update["invoice"].is_null());
+                }
                 server.abort();
             }
         });
@@ -1749,9 +2089,10 @@ mod deposit_tests {
                 ));
             }
             drop(h);
-            let (mut h, _) = CdkWallet::open_selected(&[64; 64], path.to_str().unwrap(), Some(&mint))
-                .await
-                .unwrap();
+            let (mut h, _) =
+                CdkWallet::open_selected(&[64; 64], path.to_str().unwrap(), Some(&mint))
+                    .await
+                    .unwrap();
             assert!(h.quote_history().await.unwrap().len() > 128 * 1024);
             assert!(
                 h.unfinished_deposits(&mint.to_string())
@@ -1790,7 +2131,8 @@ mod deposit_tests {
             let mut expired = quote("quote-expired", &mint);
             expired.expiry = 1;
             h.db.add_mint_quote(expired).await.unwrap();
-            let resumed: Value = serde_json::from_str(&h.resume_deposit(&mint.to_string()).await.unwrap()).unwrap();
+            let resumed: Value =
+                serde_json::from_str(&h.resume_deposit(&mint.to_string()).await.unwrap()).unwrap();
             assert_eq!(resumed["invoice"]["id"], "quote-0900");
             assert!(resumed.get("cursor").is_none());
             for _ in 0..300 {
@@ -1808,8 +2150,16 @@ mod deposit_tests {
             huge.state = MintQuoteState::Issued;
             huge.request = "a".repeat(140000);
             h.db.add_mint_quote(huge).await.unwrap();
-            h.db.kv_write(KV_NAMESPACE, "quote_created_v1", &CdkWallet::quote_key("In", &mint.to_string(), "aaa-oversized"), &u64::MAX.to_le_bytes()).await.unwrap();
-            let newest: Value = serde_json::from_str(&h.resume_deposit(&mint.to_string()).await.unwrap()).unwrap();
+            h.db.kv_write(
+                KV_NAMESPACE,
+                "quote_created_v1",
+                &CdkWallet::quote_key("In", &mint.to_string(), "aaa-oversized"),
+                &u64::MAX.to_le_bytes(),
+            )
+            .await
+            .unwrap();
+            let newest: Value =
+                serde_json::from_str(&h.resume_deposit(&mint.to_string()).await.unwrap()).unwrap();
             assert!(newest["invoice"].is_null() && newest["error"].is_string());
             assert!(newest.get("cursor").is_none());
             let oversized: Value =
@@ -1875,27 +2225,49 @@ mod deposit_tests {
         runtime().block_on(async {
             let mint = parse_mint_url("http://127.0.0.1:9").unwrap();
             let dir = tempfile::tempdir().unwrap();
-            let (mut h, _) = CdkWallet::open(&[94;64], dir.path().join("wallet.sqlite").to_str().unwrap()).await.unwrap();
+            let (mut h, _) = CdkWallet::open(
+                &[94; 64],
+                dir.path().join("wallet.sqlite").to_str().unwrap(),
+            )
+            .await
+            .unwrap();
             let mut expired = quote("expired", &mint);
             expired.expiry = 1;
             assert!(!quote_expired(&expired, 1));
             assert!(quote_expired(&expired, 2));
             h.db.add_mint_quote(expired.clone()).await.unwrap();
-            let checked: Value = serde_json::from_str(&h.check_deposit(&mint.to_string(), "expired").await.unwrap()).unwrap();
+            let checked: Value =
+                serde_json::from_str(&h.check_deposit(&mint.to_string(), "expired").await.unwrap())
+                    .unwrap();
             assert_eq!(checked["expired"], true);
             assert!(h.unresolved.is_empty());
-            let resumed: Value = serde_json::from_str(&h.resume_deposit(&mint.to_string()).await.unwrap()).unwrap();
+            let resumed: Value =
+                serde_json::from_str(&h.resume_deposit(&mint.to_string()).await.unwrap()).unwrap();
             assert!(resumed["invoice"].is_null());
-            let polled: Value = serde_json::from_str(&h.poll_deposits(&mint.to_string(), "").await.unwrap()).unwrap();
+            let polled: Value =
+                serde_json::from_str(&h.poll_deposits(&mint.to_string(), "").await.unwrap())
+                    .unwrap();
             assert!(polled["invoice"].is_null() && polled["cursor"].is_null());
             expired.state = MintQuoteState::Paid;
             assert!(!quote_expired(&expired, unix_now()));
             h.db.add_mint_quote(expired.clone()).await.unwrap();
-            assert_eq!(h.eligible_deposits(&mint, h.db.get_mint_quotes().await.unwrap()).await.unwrap().len(), 1);
+            assert_eq!(
+                h.eligible_deposits(&mint, h.db.get_mint_quotes().await.unwrap())
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
             expired = h.db.get_mint_quote("expired").await.unwrap().unwrap();
             expired.state = MintQuoteState::Issued;
             h.db.add_mint_quote(expired).await.unwrap();
-            assert_eq!(h.eligible_deposits(&mint, h.db.get_mint_quotes().await.unwrap()).await.unwrap().len(), 1);
+            assert_eq!(
+                h.eligible_deposits(&mint, h.db.get_mint_quotes().await.unwrap())
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
             assert!(!quote_expired(&quote("legacy", &mint), unix_now()));
         });
     }
@@ -3885,7 +4257,10 @@ fn receive_options(signing_keys: &[SecretKey]) -> ReceiveOptions {
 /// Convert a CDK [`KeySet`](cdk::nuts::KeySet) into Spilman `KeysetInfo` JSON.
 fn keyset_to_json(keyset: cdk::nuts::KeySet) -> FfiResult<String> {
     if keyset.unit != UNIT {
-        return Err(FfiErr::new(CdkStatus::MintUnsupportedUnit, "keyset is not denominated in msat"));
+        return Err(FfiErr::new(
+            CdkStatus::MintUnsupportedUnit,
+            "keyset is not denominated in msat",
+        ));
     }
     let info = cdk_spilman::KeysetInfo::new(
         keyset.id,

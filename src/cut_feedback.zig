@@ -8,10 +8,19 @@ pub const ConfirmedCut = struct {
     refill_needed: bool = false,
 };
 
+pub const RewardCue = enum {
+    win,
+    quiet,
+
+    pub fn volume(self: RewardCue) f32 {
+        return if (self == .quiet) 0.35 else 1;
+    }
+};
+
 pub const Cues = struct {
     snip: bool = false,
     fail: bool = false,
-    reward: bool = false,
+    reward: ?RewardCue = null,
 };
 
 pub const burst_seconds: f32 = 0.42;

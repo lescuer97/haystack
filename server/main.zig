@@ -59,7 +59,11 @@ pub fn main(init: std.process.Init) !void {
     const stock_amount = if (stock) |command| blk: {
         if (args.len != 4) return error.UsageExpectedPrizeAmountAndCountOrQuoteId;
         const amount_msat = try std.fmt.parseInt(u64, args[2], 10);
-        if (!prize.canStock(amount_msat) and !(command == .@"claim-prize-funding" and amount_msat == 500)) return error.InvalidPrizeFundingDenomination;
+        const valid = switch (command) {
+            .@"fund-prizes" => prize.canStock(amount_msat),
+            .@"claim-prize-funding" => prize.canClaimStock(amount_msat),
+        };
+        if (!valid) return error.InvalidPrizeFundingDenomination;
         break :blk amount_msat;
     } else 0;
     const options = try Options.parse(if (stock != null) args[0..1] else args);

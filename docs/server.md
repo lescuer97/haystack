@@ -150,19 +150,27 @@ a value that conflicts with the saved seed, or an invalid seed file prevents
 startup rather than silently changing prize rolls.
 
 Each newly successful paid cut gets one deterministic roll from the tile and
-seeds. The payout is a multiple of the cut price (axe 2 msat, hoe 4 msat,
-pickaxe 8 msat):
+seeds. Regular payouts are multiples of the cut price (axe 2 msat, hoe 4 msat,
+pickaxe 8 msat). The jackpot pays the same on every tool:
 
 | Tier | Chance per cut | Multiplier | Axe | Hoe | Pickaxe |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Small | 70.93% | 8× | 16 msat | 32 msat | 64 msat |
-| Medium | 23.64% | 32× | 64 msat | 128 msat | 256 msat |
-| Big | 4.43% | 128× | 256 msat | 512 msat | 1,024 msat |
-| No award | 1% | — | — | — | — |
+| Refund | 20% | 1× | 2 msat | 4 msat | 8 msat |
+| Small | 10% | 2× | 4 msat | 8 msat | 16 msat |
+| Medium | 4% | 5× | 10 msat | 20 msat | 40 msat |
+| Big | 1% | 15× | 30 msat | 60 msat | 120 msat |
+| Rare | 0.05% | 100× | 200 msat | 400 msat | 800 msat |
+| Jackpot | 0.0001% (1 in 1,000,000) | Fixed | 100,000 msat | 100,000 msat | 100,000 msat |
+| No award | 64.9499% | — | — | — | — |
 
-At these experimental odds, the expected face value is about 18.91× cut spending,
-before redemption fees and assuming all prizes are paid. Wallet inventory does
-not change the odds.
+The regular tiers return 80% of cut spending in expected face value. With the
+jackpot (100 sats), expected return is 85% for axe, 82.5% for hoe, and 81.25% for
+pickaxe, before redemption fees and assuming all prizes are paid. The corresponding
+house edges are 15%, 17.5%, and 18.75% before operating costs. Wallet inventory does
+not change the odds. The 1× refund breaks even at face value only; redemption
+fees can reduce the credit. The clients play a quieter cue for positive credits
+that don't exceed the cut price.
+
 The award is an ordinary serialized Cashu bearer token, which may contain
 multiple proofs, not a channel credit. The server attempts immediate
 payout from exact proofs held by its test wallet, without a swap or sender fee.
@@ -176,24 +184,27 @@ To stock compact prize proofs, stop the server and use the same storage and
 mint configuration:
 
 ```sh
-zig build run-server -Dgame=false -- fund-prizes 64 10
+zig build run-server -Dgame=false -- fund-prizes 120 10
 # Pay the returned `request` using test funds only; save the returned `id`.
-zig build run-server -Dgame=false -- claim-prize-funding 64 QUOTE_ID
+zig build run-server -Dgame=false -- claim-prize-funding 120 QUOTE_ID
 ```
 
 `fund-prizes PRIZE_MSAT COUNT` takes 1–20 prizes of one denomination from the
-table. The example stocks ten 64-msat prizes. Check that the invoice amount is
+table. The example stocks ten 120-msat prizes. Check that the invoice amount is
 `PRIZE_MSAT × COUNT` before paying: recovery may return a previously saved
 invoice. Claim with the same denomination and quote ID; if claim returns
-`"confirmed":false`, check that quote again rather than creating another. Use
-`500` only to claim a funding invoice created under the previous schedule.
+`"confirmed":false`, check that quote again rather than creating another.
+Existing funding invoices from previous schedules can still be claimed.
 Both commands exit without listening. A loopback fixture build requires its
 existing fixture ledger.
 
-Each award size uses one proof on a standard power-of-two msat keyset. Proofs
-are ordinary wallet inventory, not reserved sets. The byte limit is checked
-on every payout, and topping up does not automatically pay old debts or change
-the amounts previously recorded.
+On a standard power-of-two msat keyset a regular award uses one to four proofs,
+and the jackpot uses six. Use `fund-prizes 100000 1` to stock one jackpot and
+`claim-prize-funding 100000 QUOTE_ID` to claim it. Your test mint must accept a
+100,000-msat funding invoice and support a split into at most six proofs. Proofs
+are ordinary wallet inventory, not reserved sets. The byte limit is checked on
+every payout, and topping up does not automatically pay old debts or change the
+amounts previously recorded.
 
 A winning tile and its debt commit together in `game.sqlite`. The private
 `pending_prizes` table records the tile, winner's authenticated public key,
