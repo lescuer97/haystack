@@ -137,10 +137,17 @@ and serializes channel requests and settlement under the same wallet lock.
 
 ## Paid-cut prizes (test funds only)
 
-To enable prizes, supply `HAYSTACK_PRIZE_SEED` as 64 hex characters from an
-independently generated 32-byte secret. Keep it stable across restarts, backed
-up privately, and out of source control and logs. Omitting it disables prizes;
-a malformed value prevents startup. The public world seed is unchanged.
+Prizes are enabled automatically. On first startup, the server generates a
+private 32-byte seed with the OS cryptographic RNG, saves it as `prize-seed.bin`
+(mode `0600`) in the server configuration directory, and reuses it on subsequent
+starts. Back up this file privately and keep it out of source control and logs.
+The public world seed is unchanged.
+
+If you previously set `HAYSTACK_PRIZE_SEED`, keep the same 64-character hex value
+for the first startup after upgrading so the server imports it and preserves
+existing prize rolls. You can remove the variable after that. A malformed value,
+a value that conflicts with the saved seed, or an invalid seed file prevents
+startup rather than silently changing prize rolls.
 
 Each newly successful paid cut gets one deterministic roll from the tile and
 seeds. The payout is a multiple of the cut price (axe 2 msat, hoe 4 msat,
@@ -148,13 +155,14 @@ pickaxe 8 msat):
 
 | Tier | Chance per cut | Multiplier | Axe | Hoe | Pickaxe |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Small | 3% | 8× | 16 msat | 32 msat | 64 msat |
-| Medium | 1% | 32× | 64 msat | 128 msat | 256 msat |
-| Big | 0.1875% | 128× | 256 msat | 512 msat | 1,024 msat |
-| No award | 95.8125% | — | — | — | — |
+| Small | 70.93% | 8× | 16 msat | 32 msat | 64 msat |
+| Medium | 23.64% | 32× | 64 msat | 128 msat | 256 msat |
+| Big | 4.43% | 128× | 256 msat | 512 msat | 1,024 msat |
+| No award | 1% | — | — | — | — |
 
-The expected face value is 80% of cut spending, before redemption fees and
-assuming all prizes are paid. Wallet inventory does not change the odds.
+At these experimental odds, the expected face value is about 18.91× cut spending,
+before redemption fees and assuming all prizes are paid. Wallet inventory does
+not change the odds.
 The award is an ordinary serialized Cashu bearer token, which may contain
 multiple proofs, not a channel credit. The server attempts immediate
 payout from exact proofs held by its test wallet, without a swap or sender fee.

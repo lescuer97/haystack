@@ -65,7 +65,7 @@ test "application worker owns one locked handle across reads and joins before re
         }
         try testing.expect(!model.pending);
         try testing.expectEqualStrings("Prize not collected. Contact the game server operator.", model.prize_notice.?);
-        try testing.expect(!model.prize_chime and !model.prize_refresh and !model.balance_dirty);
+        try testing.expect(!model.prize_chime and model.prize_refresh_msat == null and !model.balance_dirty);
         try testing.expectEqualStrings("0 msat", model.balance.slice());
     }
     var reopened = try wallet.inspect(testing.io, testing.allocator, h.paths, true);

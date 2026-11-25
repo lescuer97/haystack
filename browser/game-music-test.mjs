@@ -2,9 +2,11 @@
 import {strict as assert} from 'node:assert';
 import {readFile} from 'node:fs/promises';
 import {test} from 'node:test';
+import {setImmediate} from 'node:timers/promises';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('./game-music.js', import.meta.url), 'utf8');
+const rewardWav = await readFile(new URL('../src/cut_audio_assets/reward.wav', import.meta.url));
 const paths = new Map([[1, 'assets/music/cozy-1.ogg'], [2, 'assets/music/cozy-2.ogg']]);
 
 function setup(AudioContext) {
@@ -65,8 +67,10 @@ function setup(AudioContext) {
   }
 
   const library = {};
+  const HEAPU8 = new Uint8Array(1 + rewardWav.length);
+  HEAPU8.set(rewardWav, 1);
   const context = vm.createContext({LibraryManager: {library}, mergeInto: Object.assign,
-    UTF8ToString: ptr => paths.get(ptr), Audio, window});
+    UTF8ToString: ptr => paths.get(ptr), Audio, window, HEAPU8});
   vm.runInContext(source, context);
   context.haystackMusic = library.$haystackMusic;
   context.haystackRewardAudio = library.$haystackRewardAudio;
@@ -81,32 +85,41 @@ function setup(AudioContext) {
   };
 }
 
-test('reward chime unlocks on a trusted gesture and plays two short notes without music', () => {
-  const notes = [];
-  let opened = 0, closed = 0;
+test('register sound unlocks on a trusted gesture and reuses the decoded WAV without music', async () => {
+  const plays = [];
+  const decoded = {};
+  let opened = 0, closed = 0, decodes = 0;
   class Context {
     state = 'suspended';
-    currentTime = 1;
     constructor() { opened++; }
     async resume() { this.state = 'running'; }
     async close() { closed++; }
-    createGain() {
-      return {gain: {setValueAtTime() {}, linearRampToValueAtTime() {}, exponentialRampToValueAtTime() {}}, connect() {}};
+    async decodeAudioData(data) {
+      assert.deepEqual(Buffer.from(data), rewardWav);
+      decodes++;
+      return decoded;
     }
-    createOscillator() {
-      return {frequency: {}, connect() {}, start() { notes.push(this.frequency.value); }, stop() {}};
+    createBufferSource() {
+      return {connect() {}, start() { plays.push(this.buffer); }};
     }
   }
   const h = setup(Context);
-  h.reward(1);
+  h.reward(1, 1, rewardWav.length);
   h.gesture('click', {isTrusted: false});
   h.reward(2);
   assert.equal(opened, 0);
   h.gesture('click');
-  assert.deepEqual(notes, []);
+  h.gesture('keydown');
+  assert.equal(decodes, 1);
+  assert.deepEqual(plays, []);
   h.reward(2);
-  assert.deepEqual(notes, [660, 880]);
+  h.reward(2);
+  await setImmediate();
+  assert.deepEqual(plays, [decoded, decoded]);
+  h.reward(2);
   h.reward(0);
+  await setImmediate();
+  assert.equal(plays.length, 2);
   assert.equal(closed, 1);
   assert.equal(h.listeners.size, 0);
 });

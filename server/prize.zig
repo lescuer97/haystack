@@ -2,7 +2,9 @@
 const std = @import("std");
 const shared = @import("shared");
 const p = shared.protocol;
-const wallet = @import("native_storage").wallet_service.Headless;
+const native = @import("native_storage");
+const wallet = native.wallet_service.Headless;
+const sf = native.storage_fs;
 const Prize = @import("game_db.zig").Prize;
 const Persistence = @import("persistence.zig").Persistence;
 const log = std.log.scoped(.prizes);
@@ -17,10 +19,12 @@ pub const Tier = enum(u8) {
     }
 };
 
-const bucket_count = 1600;
+const bucket_count = 100 * 67;
+const winning_bucket_count = 99 * 67;
 
 fn tierForBucket(bucket: u64) ?Tier {
-    return switch (bucket) {
+    if (bucket >= winning_bucket_count) return null;
+    return switch (bucket % 67) {
         0...47 => .small,
         48...63 => .medium,
         64...66 => .big,
@@ -42,6 +46,42 @@ pub fn parseSeed(hex: ?[]const u8) !?[32]u8 {
     const value = hex orelse return null;
     if (value.len != 2 * seed.len) return error.InvalidPrizeSeed;
     _ = std.fmt.hexToBytes(&seed, value) catch return error.InvalidPrizeSeed;
+    return seed;
+}
+
+const seed_file_name = "prize-seed.bin";
+
+/// Call with the server instance lock held, so first startup cannot replace another seed.
+pub fn loadOrCreateSeed(io: std.Io, config_dir: []const u8, legacy_seed: ?[32]u8) ![32]u8 {
+    const dir = try sf.openOwnedDir(io, config_dir, .{ .iterate = true });
+    defer dir.close(io);
+
+    const stat = dir.statFile(io, seed_file_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => {
+            var seed: [32]u8 = undefined;
+            defer std.crypto.secureZero(u8, &seed);
+            if (legacy_seed) |seed_value| seed = seed_value else try io.randomSecure(&seed);
+            try sf.writeAtomicIn(dir, io, seed_file_name, &seed);
+            return seed;
+        },
+        else => return err,
+    };
+    try sf.verifyFile(stat);
+    const file = try dir.openFile(io, seed_file_name, .{ .follow_symlinks = false });
+    defer file.close(io);
+    const opened = try file.stat(io);
+    try sf.verifyFile(opened);
+    try sf.verifyNoExtendedAcl(file);
+    var seed: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
+    if (opened.size != seed.len) return error.InvalidPrizeSeed;
+    var reader = file.reader(io, &.{});
+    if (try reader.interface.readSliceShort(&seed) != seed.len) return error.InvalidPrizeSeed;
+    if (legacy_seed) |seed_value| {
+        if (!std.crypto.timing_safe.eql([32]u8, seed_value, seed)) return error.PrizeSeedMismatch;
+    }
+    // A previous startup may have renamed the seed but failed to sync the directory.
+    try sf.syncDirectory(dir);
     return seed;
 }
 
@@ -89,7 +129,7 @@ pub fn deliver(storage: *Persistence, prize: Prize, sender: anytype, out: *[p.ma
     return null;
 }
 
-test "prize seed is optional and only accepts exactly 32 bytes of hex" {
+test "legacy prize seed is optional and only accepts exactly 32 bytes of hex" {
     const t = std.testing;
     try t.expectEqual(null, try parseSeed(null));
     try t.expectError(error.InvalidPrizeSeed, parseSeed(""));
@@ -101,12 +141,49 @@ test "prize seed is optional and only accepts exactly 32 bytes of hex" {
     try t.expectEqual(@as([32]u8, @splat(0xab)), (try parseSeed(&valid)).?);
 }
 
-test "prize buckets return 80 percent of spending in expectation" {
-    var total_multiplier: u64 = 0;
+test "first startup generates a private prize seed and restarts reuse it" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(t.io, "server", sf.mode_dir);
+    const path = try tmp.dir.realPathFileAlloc(t.io, "server", t.allocator);
+    defer t.allocator.free(path);
+
+    const first = try loadOrCreateSeed(t.io, path, null);
+    const stat = try tmp.dir.statFile(t.io, "server/" ++ seed_file_name, .{ .follow_symlinks = false });
+    try sf.verifyFile(stat);
+    try t.expectEqual(32, stat.size);
+    try t.expectEqual(first, try loadOrCreateSeed(t.io, path, null));
+}
+
+test "prize seed migration preserves the legacy seed and rejects changes or malformed storage" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(t.io, "server", sf.mode_dir);
+    const path = try tmp.dir.realPathFileAlloc(t.io, "server", t.allocator);
+    defer t.allocator.free(path);
+    const legacy: [32]u8 = @splat(0xab);
+
+    try t.expectEqual(legacy, try loadOrCreateSeed(t.io, path, legacy));
+    try t.expectEqual(legacy, try loadOrCreateSeed(t.io, path, legacy));
+    try t.expectError(error.PrizeSeedMismatch, loadOrCreateSeed(t.io, path, @splat(0xcd)));
+    try t.expectEqual(legacy, try loadOrCreateSeed(t.io, path, null));
+
+    const entry = "server/" ++ seed_file_name;
+    try tmp.dir.writeFile(t.io, .{ .sub_path = entry, .data = "truncated" });
+    try t.expectError(error.InvalidPrizeSeed, loadOrCreateSeed(t.io, path, legacy));
+    try tmp.dir.deleteFile(t.io, entry);
+    try tmp.dir.symLink(t.io, "missing", entry, .{});
+    try t.expectError(error.InsecureEntry, loadOrCreateSeed(t.io, path, null));
+}
+
+test "99 percent of prize buckets win" {
+    var winners: usize = 0;
     for (0..bucket_count) |bucket| {
-        if (tierForBucket(bucket)) |tier| total_multiplier += @backingInt(tier);
+        if (tierForBucket(bucket) != null) winners += 1;
     }
-    try std.testing.expectEqual(bucket_count * 4, total_multiplier * 5);
+    try std.testing.expectEqual(bucket_count * 99, winners * 100);
 }
 
 test "prize roll is deterministic and scoped to the public world seed and coordinates" {
@@ -124,12 +201,11 @@ test "prize roll is deterministic and scoped to the public world seed and coordi
         try t.expectEqual(tier, roll(secret, world, x, -7).?);
         differs = differs or tier != roll(secret, changed, x, -7);
     }
-    try t.expect(count > 0 and count < 1200 and differs);
+    try t.expect(count > 19700 and count < 19900 and differs);
 }
 
 test "prize delivery journals intent before wallet I/O and never reissues a token" {
     const t = std.testing;
-    const native = @import("native_storage");
     const GameDb = @import("game_db.zig").GameDb;
     const Fake = struct {
         const Result = struct {

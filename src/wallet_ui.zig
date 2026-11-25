@@ -64,8 +64,10 @@ comptime {
 const Reward = struct {
     from: u64,
     to: u64,
+    net_msat: u64,
     start: f64,
     const duration = 0.65;
+    const popup_duration = 1.2;
 
     fn progress(self: Reward, now: f64) f64 {
         return std.math.clamp((now - self.start) / duration, 0, 1);
@@ -192,7 +194,7 @@ pub const Model = struct {
     prize_acks_due: std.StaticBitSet(prize_receipt_limit) = .empty,
     prize_player: ?[33]u8 = null,
     prize_in_flight: ?usize = null,
-    prize_refresh: bool = false,
+    prize_refresh_msat: ?u64 = null,
     reward: ?Reward = null,
     prize_chime: bool = false,
     prize_notice: ?[:0]const u8 = null,
@@ -329,6 +331,13 @@ pub const Model = struct {
         return reward.from + delta;
     }
 
+    pub fn rewardPopup(self: *const Model, now: f64) ?struct { amount_msat: u64, progress: f32 } {
+        const reward = self.reward orelse return null;
+        const elapsed = now - reward.start;
+        if (elapsed >= Reward.popup_duration) return null;
+        return .{ .amount_msat = reward.net_msat, .progress = @floatCast(@max(0, elapsed) / Reward.popup_duration) };
+    }
+
     pub fn rewardPulse(self: *const Model, now: f64) f32 {
         const reward = self.reward orelse return 0;
         const progress = reward.progress(now);
@@ -405,7 +414,7 @@ pub const Model = struct {
                 }
                 return;
             }
-            if (self.prize_refresh) {
+            if (self.prize_refresh_msat != null) {
                 self.balance_dirty = false;
                 _ = self.enqueue(.snapshot, "");
             } else if (self.recover_needed and now >= self.next_recover) {
@@ -559,7 +568,7 @@ pub const Model = struct {
                 _ = self.message.set("Recovery read failed; retrying automatically.");
             },
             .snapshot => {
-                self.prize_refresh = false;
+                self.prize_refresh_msat = null;
                 _ = self.message.set("Balance read failed; last balance retained. Reopen Wallet to retry.");
             },
             .receive_prize => {
@@ -739,7 +748,7 @@ pub const Model = struct {
                     0 => {
                         const net = try decimal(string(value, "net_msats") orelse return error.Invalid);
                         self.finishPrize(if (net > 0) .credited else .failed);
-                        self.prize_refresh = net > 0;
+                        self.prize_refresh_msat = if (net > 0) net else null;
                         self.balance_dirty = true;
                         self.history_dirty = true;
                     },
@@ -776,13 +785,15 @@ pub const Model = struct {
                 if (balance_msat != self.balance_msat) {
                     const previous = self.displayedBalance(now);
                     self.reward = null;
-                    if (self.prize_refresh and balance_msat > (self.balance_msat orelse balance_msat)) {
-                        self.reward = .{ .from = previous.?, .to = balance_msat, .start = now };
-                        self.prize_chime = true;
+                    if (self.prize_refresh_msat) |net| {
+                        if (balance_msat > (self.balance_msat orelse balance_msat)) {
+                            self.reward = .{ .from = previous.?, .to = balance_msat, .net_msat = net, .start = now };
+                            self.prize_chime = true;
+                        }
                     }
                 }
                 self.balance_msat = balance_msat;
-                self.prize_refresh = false;
+                self.prize_refresh_msat = null;
                 _ = self.mint.set(mint);
                 self.setRecovery(recovery, now);
                 self.available = true;
@@ -1209,14 +1220,18 @@ test "prizes wait for the wallet, collect once in FIFO order, and animate only c
     model.accept(model.serial, "{\"status\":0,\"net_msats\":\"6\"}", 1, t.allocator);
     try t.expectEqual(@as(?u64, 10), model.balance_msat);
     try t.expect(!model.prize_chime);
+    try t.expect(model.rewardPopup(1) == null);
     model.tick(true, 2);
     try t.expectEqual(Operation.snapshot, model.operation);
     model.request = null;
-    model.accept(model.serial, "{\"mint_url\":\"fixture\",\"msats\":\"16\",\"creation_recovery\":\"none\"}", 2, t.allocator);
-    try t.expectEqual(@as(?u64, 16), model.balance_msat);
+    model.accept(model.serial, "{\"mint_url\":\"fixture\",\"msats\":\"19\",\"creation_recovery\":\"none\"}", 2, t.allocator);
+    try t.expectEqual(@as(?u64, 19), model.balance_msat);
     try t.expectEqual(@as(?u64, 10), model.displayedBalance(2));
-    try t.expect(model.displayedBalance(2.4).? > 10 and model.displayedBalance(2.4).? < 16);
-    try t.expectEqual(@as(?u64, 16), model.displayedBalance(3));
+    try t.expect(model.displayedBalance(2.4).? > 10 and model.displayedBalance(2.4).? < 19);
+    try t.expectEqual(@as(?u64, 19), model.displayedBalance(3));
+    try t.expectEqual(@as(f32, 0), model.rewardPopup(2).?.progress);
+    try t.expectEqual(@as(u64, 6), model.rewardPopup(3).?.amount_msat);
+    try t.expect(model.rewardPopup(3.3) == null);
     try t.expect(model.prize_chime);
     model.prize_chime = false;
 
@@ -1225,7 +1240,7 @@ test "prizes wait for the wallet, collect once in FIFO order, and animate only c
     model.request = null;
     model.fail(model.serial, 3);
     try t.expect(model.prize_notice != null);
-    try t.expect(!model.prize_refresh and !model.prize_chime);
+    try t.expect(model.prize_refresh_msat == null and !model.prize_chime);
     model.tick(true, 4);
     try t.expectEqual(Operation.snapshot, model.operation);
     try t.expectEqual(0, model.pending_prize_count);
@@ -1400,8 +1415,8 @@ test "prize rejection and zero net credit never schedule a reward" {
         model.accept(model.serial, reply, 1, t.allocator);
         try t.expectEqual(0, model.prize_acks_due.count());
         try t.expectEqual(@as(?u64, 10), model.balance_msat);
-        try t.expect(!model.prize_refresh and !model.prize_chime);
-        try t.expect(model.reward == null);
+        try t.expect(model.prize_refresh_msat == null and !model.prize_chime);
+        try t.expect(model.rewardPopup(1) == null);
     }
 }
 

@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk amount_msat;
     } else 0;
     const options = try Options.parse(if (stock != null) args[0..1] else args);
-    const prize_seed = if (stock == null) try prize.parseSeed(init.environ_map.get("HAYSTACK_PRIZE_SEED")) else null;
+    const legacy_prize_seed = if (stock == null) try prize.parseSeed(init.environ_map.get("HAYSTACK_PRIZE_SEED")) else null;
     startup_log.info("configuration parsed: websocket_budget={d}, application_budget={d}", .{
         options.websocket_budget, options.application_budget,
     });
@@ -85,6 +85,7 @@ pub fn main(init: std.process.Init) !void {
     startup_log.info("wallet opened", .{});
     if (wallet.hasReceiver()) startup_log.info("hoe ledger ready (test funds only)", .{});
     if (stock) |command| return wallet.prizeStock(init.gpa, command == .@"claim-prize-funding", args[3], stock_amount);
+    const prize_seed = try prize.loadOrCreateSeed(init.io, locations.config_dir, legacy_prize_seed);
 
     const data_dir = std.fs.path.dirname(locations.wallet_dir) orelse return error.InvalidPath;
     const game_path = try std.fs.path.joinZ(init.gpa, &.{ data_dir, "game.sqlite" });

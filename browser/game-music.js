@@ -93,9 +93,10 @@ mergeInto(LibraryManager.library, {
 
   $haystackRewardAudio: {
     context: null,
+    decoded: null,
     unlock: null,
     events: ['keydown', 'pointerup', 'click'],
-    bind: function () {
+    bind: function (data, len) {
       if (this.unlock) return;
       var self = this;
       this.unlock = function (event) {
@@ -105,40 +106,38 @@ mergeInto(LibraryManager.library, {
           if (!AudioContext) return;
           var context = self.context || (self.context = new AudioContext());
           if (context.state === 'suspended') context.resume().catch(function () {});
+          if (!self.decoded) {
+            // decodeAudioData takes ownership of the buffer; copy out of Wasm memory.
+            self.decoded = context.decodeAudioData(HEAPU8.slice(data, data + len).buffer).catch(function () { return null; });
+          }
         } catch (_) {}
       };
       for (var type of this.events) window.addEventListener(type, this.unlock, true);
     },
     play: function () {
       var context = this.context;
-      if (!context || context.state !== 'running') return;
-      try {
-        var now = context.currentTime;
-        for (var note of [[660, 0, 0.16], [880, 0.085, 0.18]]) {
-          var start = now + note[1], end = start + note[2];
-          var tone = context.createOscillator(), gain = context.createGain();
-          tone.frequency.value = note[0];
-          gain.gain.setValueAtTime(0, start);
-          gain.gain.linearRampToValueAtTime(0.10, start + 0.008);
-          gain.gain.exponentialRampToValueAtTime(0.001, end);
-          tone.connect(gain);
-          gain.connect(context.destination);
-          tone.start(start);
-          tone.stop(end);
-        }
-      } catch (_) {}
+      if (!context || context.state !== 'running' || !this.decoded) return;
+      var self = this;
+      this.decoded.then(function (buffer) {
+        if (!buffer || self.context !== context || context.state !== 'running') return;
+        var source = context.createBufferSource();
+        source.buffer = buffer;
+        source.connect(context.destination);
+        source.start();
+      }).catch(function () {});
     },
     close: function () {
       if (this.unlock) for (var type of this.events) window.removeEventListener(type, this.unlock, true);
       this.unlock = null;
       if (this.context) this.context.close().catch(function () {});
       this.context = null;
+      this.decoded = null;
     },
   },
   haystack_reward_audio__deps: ['$haystackRewardAudio'],
-  haystack_reward_audio__sig: 'vi',
-  haystack_reward_audio: function (action) {
-    if (action === 1) haystackRewardAudio.bind();
+  haystack_reward_audio__sig: 'viii',
+  haystack_reward_audio: function (action, data, len) {
+    if (action === 1) haystackRewardAudio.bind(data, len);
     else if (action === 2) haystackRewardAudio.play();
     else haystackRewardAudio.close();
   },

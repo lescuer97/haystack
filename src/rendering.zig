@@ -1387,7 +1387,7 @@ fn drawWalletBadge(state: *const menu.Menu, vw: f32, vh: f32) void {
     const pulse = wallet.rewardPulse(now);
     if (pulse > 0) {
         const spread = 2 + pulse * 3;
-        rl.drawRectangleRec(.{ .x = @as(f32, @floatFromInt(x)) - spread, .y = @as(f32, @floatFromInt(y)) - spread, .width = 18 + 2 * spread, .height = 14 + 2 * spread }, rl.fade(menu_accent, pulse * 0.5));
+        rl.drawRectangleRec(.{ .x = @as(f32, @floatFromInt(x)) - spread, .y = @as(f32, @floatFromInt(y)) - spread, .width = 18 + 2 * spread, .height = 14 + 2 * spread }, rl.fade(.gold, pulse * 0.5));
     }
     rl.drawRectangle(x + 2, y, 13, 3, menu_accent);
     rl.drawRectangle(x, y + 3, 17, 11, menu_accent);
@@ -1396,6 +1396,57 @@ fn drawWalletBadge(state: *const menu.Menu, vw: f32, vh: f32) void {
     rl.drawText(if (wallet.prize_notice != null) "Wallet !" else "Wallet", x + 25, y, 16, menu_title_color);
     var buf: [32]u8 = undefined;
     rl.drawText(walletAnimatedBalance(wallet, now, &buf) orelse walletBadgeBalance(wallet), x, y + 20, 14, if (wallet.available) menu_text_color else menu_muted);
+}
+
+fn drawPrizePopup(game: *const game_mod.GameState, view: camera.View, vw: f32, vh: f32) void {
+    const popup = game.menu.wallet.rewardPopup(rl.getTime()) orelse return;
+    const feet = camera.relativeTileCenter(game.player_pos.x, game.player_pos.y, game.camera.tile_x, game.camera.tile_y);
+    const anchor = rl.getWorldToScreen2D(feet, view.transform);
+    if (anchor.x < 0 or anchor.x > vw or anchor.y < 0 or anchor.y > vh) return;
+
+    const p = popup.progress;
+    const t = @min(p / 0.24, 1) - 1;
+    const scale = 1 + 0.36 * t * t * (2.7 * t + 1.7);
+    const slide = 1 - (1 - p) * (1 - p);
+    const alpha = @min(1, @min(p / 0.06, (1 - p) / 0.32));
+    const rim = rl.Color.init(247, 184, 72, 255);
+    const gleam = rl.Color.init(255, 239, 172, 255);
+    const cocoa = rl.Color.init(57, 34, 28, 255);
+    const font = rl.getFontDefault() catch return;
+    var buf: [24]u8 = undefined;
+    const amount = std.fmt.bufPrintSentinel(&buf, "+{d}", .{popup.amount_msat}, 0) catch unreachable;
+    const amount_size = 21 * scale;
+    const unit_size = 14 * scale;
+    const amount_w = rl.measureTextEx(font, amount, amount_size, 1).x;
+    const unit_w = rl.measureTextEx(font, "msat", unit_size, 1).x;
+    const w = amount_w + unit_w + 42 * scale;
+    const h = 30 * scale;
+    if (vw < w + 8) return;
+    const x = std.math.clamp(anchor.x + 10 * slide - w / 2, 4, vw - w - 4);
+    const y = @max(4, anchor.y - 42 - 43 * slide - h);
+    const mid_y = y + h / 2;
+    const rect: rl.Rectangle = .{ .x = x, .y = y, .width = w, .height = h };
+    rl.drawRectangleRounded(.{ .x = x, .y = y + 3, .width = w, .height = h }, 1, 8, rl.fade(.black, 0.36 * alpha));
+    rl.drawRectangleRounded(rect, 1, 8, rl.fade(rim, alpha));
+    rl.drawRectangleRounded(.{ .x = x + 1.5, .y = y + 1.5, .width = w - 3, .height = h - 3 }, 1, 8, rl.fade(cocoa, alpha));
+
+    const coin: rl.Vector2 = .{ .x = x + 16 * scale, .y = mid_y };
+    rl.drawCircleV(coin, 8 * scale, rl.fade(gleam, alpha));
+    rl.drawCircleV(coin, 6 * scale, rl.fade(rim, alpha));
+    rl.drawRectangleRec(.{ .x = coin.x - scale, .y = coin.y - 3 * scale, .width = 2 * scale, .height = 6 * scale }, rl.fade(cocoa, alpha));
+    const text_x = x + 29 * scale;
+    rl.drawTextEx(font, amount, .{ .x = text_x, .y = mid_y - amount_size / 2 }, amount_size, 1, rl.fade(gleam, alpha));
+    rl.drawTextEx(font, "msat", .{ .x = text_x + amount_w + 4 * scale, .y = mid_y + amount_size / 2 - unit_size }, unit_size, 1, rl.fade(rim, alpha));
+
+    const burst = @min(p / 0.58, 1);
+    const sparkle_alpha = alpha * (1 - burst);
+    if (sparkle_alpha > 0) {
+        for ([_]rl.Vector2{ .{ .x = -1, .y = -0.4 }, .{ .x = -0.64, .y = 0.85 }, .{ .x = 0.68, .y = -0.82 }, .{ .x = 1, .y = 0.42 } }, 0..) |dir, i| {
+            const center: rl.Vector2 = .{ .x = x + w / 2 + dir.x * (w / 2 + 8 + 17 * burst), .y = mid_y + dir.y * (h / 2 + 12 * burst) };
+            const size = @as(f32, if (i % 2 == 0) 5 else 3) * (1 - 0.5 * burst);
+            rl.drawPoly(center, 4, size, 0, rl.fade(gleam, sparkle_alpha));
+        }
+    }
 }
 
 fn drawRefillNotice(viewport_w: f32, viewport_h: f32) void {
@@ -1436,6 +1487,7 @@ pub fn draw(game: *const game_mod.GameState, view: camera.View, viewport_w: f32,
     if (game.menu.opened) {
         drawMenu(game, viewport_w, viewport_h);
     } else if (connected and !onboarding_blocked) {
+        drawPrizePopup(game, view, viewport_w, viewport_h);
         drawToolbar(game, viewport_w, viewport_h);
         drawWalletBadge(&game.menu, viewport_w, viewport_h);
         const channel_visible = game.paid_hoe.view.status != .hidden;

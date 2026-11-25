@@ -65,6 +65,8 @@ fn Player(comptime Backend: type) type {
     };
 }
 
+const reward_wav = @embedFile("cut_audio_assets/reward.wav");
+
 const Desktop = struct {
     allocator: std.mem.Allocator,
     stream: ?rl.Music = null,
@@ -112,7 +114,7 @@ const Desktop = struct {
         if (!rl.isAudioDeviceReady()) return;
         if (cues.snip) self.snip.play(@embedFile("cut_audio_assets/snip.wav"), 0.8);
         if (cues.fail) self.fail.play(@embedFile("cut_audio_assets/fail.wav"), 0.25);
-        if (cues.reward) self.reward.play(@embedFile("cut_audio_assets/reward.wav"), 0.45);
+        if (cues.reward) self.reward.play(reward_wav, 1);
     }
 
     fn deinit(self: *Desktop) void {
@@ -151,10 +153,10 @@ const Browser = struct {
     extern "c" fn haystack_music_set_enabled(enabled: c_int) void;
     extern "c" fn haystack_music_status() c_int;
     extern "c" fn haystack_music_close() void;
-    extern "c" fn haystack_reward_audio(action: c_int) void;
+    extern "c" fn haystack_reward_audio(action: c_int, data: ?[*]const u8, len: usize) void;
 
     fn init(_: std.mem.Allocator) Browser {
-        haystack_reward_audio(1);
+        haystack_reward_audio(1, reward_wav.ptr, reward_wav.len);
         return .{};
     }
 
@@ -180,12 +182,12 @@ const Browser = struct {
     }
 
     fn playCutCues(_: *Browser, cues: CutCues) void {
-        if (cues.reward) haystack_reward_audio(2);
+        if (cues.reward) haystack_reward_audio(2, null, 0);
     }
 
     fn deinit(self: *Browser) void {
         self.closeTrack();
-        haystack_reward_audio(0);
+        haystack_reward_audio(0, null, 0);
     }
 };
 
