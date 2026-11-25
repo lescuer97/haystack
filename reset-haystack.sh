@@ -1,5 +1,5 @@
 #!/bin/sh
-# Reset the local Linux client and server by backing up their config and data.
+# Reset the local Linux or macOS client and server by backing up their config and data.
 set -eu
 
 case "${HOME:-}" in
@@ -7,7 +7,7 @@ case "${HOME:-}" in
     *) printf '%s\n' 'HOME must be an absolute path.' >&2; exit 1 ;;
 esac
 
-if pgrep -a -x 'haystack_game|haystack_server'; then
+if pgrep -x 'haystack_game|haystack_server'; then
     printf '%s\n' 'Stop Haystack and its server before running this script.' >&2
     exit 1
 else
@@ -15,20 +15,30 @@ else
     [ "$status" -eq 1 ] || exit "$status"
 fi
 
-case "${XDG_CONFIG_HOME:-}" in
-    /*) config=$XDG_CONFIG_HOME ;;
-    *) config=$HOME/.config ;;
-esac
-case "${XDG_DATA_HOME:-}" in
-    /*) data=$XDG_DATA_HOME ;;
-    *) data=$HOME/.local/share ;;
+case "$(uname -s)" in
+    Linux)
+        case "${XDG_CONFIG_HOME:-}" in
+            /*) config=$XDG_CONFIG_HOME ;;
+            *) config=$HOME/.config ;;
+        esac
+        case "${XDG_DATA_HOME:-}" in
+            /*) data=$XDG_DATA_HOME ;;
+            *) data=$HOME/.local/share ;;
+        esac
+        set -- config data
+        ;;
+    Darwin)
+        set -- application-support
+        ;;
+    *) printf '%s\n' 'This script supports only Linux and macOS.' >&2; exit 1 ;;
 esac
 
 backup=
-for kind in config data; do
+for kind do
     case "$kind" in
         config) base=$config ;;
         data) base=$data ;;
+        application-support) base=$HOME/Library/"Application Support" ;;
     esac
     for app in haystack haystack-server; do
         source=$base/$app
