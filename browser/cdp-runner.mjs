@@ -24,11 +24,17 @@ export async function makeProfile(prefix) {
 }
 
 // `flags` carries per-runner switches such as wallet GL options.
+export function chromiumArgs(profile, flags = [], platform = process.platform) {
+  return [
+    '--headless', '--no-sandbox', '--no-first-run', '--no-default-browser-check',
+    ...(platform === 'darwin' ? ['--use-mock-keychain'] : []),
+    ...flags, `--user-data-dir=${profile}`, '--remote-debugging-port=0', 'about:blank',
+  ];
+}
+
 export function launchBrowser(profile, flags = []) {
-  const browser = spawn(process.env.CHROMIUM || 'chromium', [
-    '--headless', '--no-sandbox', ...flags, `--user-data-dir=${profile}`,
-    '--remote-debugging-port=0', 'about:blank',
-  ], {stdio:['ignore', 'ignore', 'pipe']});
+  const browser = spawn(process.env.CHROMIUM || 'chromium', chromiumArgs(profile, flags),
+    {stdio:['ignore', 'ignore', 'pipe']});
   // Discovery attaches its own bounded listeners; a later spawn error must not
   // crash the runner as an unhandled event.
   browser.on('error', () => {});

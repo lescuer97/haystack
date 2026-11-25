@@ -61,6 +61,9 @@ async function run() {
     }
     console.log(JSON.stringify({flow, ...report}));
     if (!report.ok) throw new Error('onboarding checks failed');
+    // Close completed fixture tabs before the renderer's frame-paced input checks.
+    await send('Target.disposeBrowserContext', {browserContextId});
+    contexts.pop();
   }
   for (const flow of selectedFlow === 'all' ? ['create', 'recovery'] : [selectedFlow]) {
     await runGame(flow);

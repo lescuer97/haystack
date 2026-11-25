@@ -14,6 +14,12 @@ or set its executable explicitly for the browser test commands:
 export CHROMIUM=/absolute/path/to/chromium
 ```
 
+On macOS, point to the executable inside the app bundle:
+
+```sh
+export CHROMIUM=/Applications/Chromium.app/Contents/MacOS/Chromium
+```
+
 Provision the pinned Wasm tools once (this step may need network access):
 
 ```sh
@@ -56,6 +62,17 @@ adds no storage warning or relay.
 
 ## Automated checks
 
+The shared CDP launcher (`browser/cdp-runner.mjs`) starts headless Chromium
+with a fresh temporary profile and a separate DevTools port for each run. It
+skips first-run setup and default-browser checks, and uses a mock Keychain on
+macOS. These options do not bypass Gatekeeper or other macOS permission dialogs.
+
+With `-Dplatform=wasm`, `test-storage` is Node-only and available on Linux and
+macOS. The fake-mint Chromium targets, including `test-onboarding`, the broader
+`test`, and `test-mint`, are currently gated to Linux in Zig. Setting `CHROMIUM`
+on macOS selects the executable for direct runner invocations; it does not
+change that gating.
+
 ```sh
 zig build browser-fixture -Dplatform=wasm -Doffline
 zig build test-storage -Dplatform=wasm -Doffline
@@ -69,10 +86,10 @@ start an ephemeral local fake mint and use fresh disposable Chromium contexts.
 The ReleaseSafe run checks that fixture isolation also holds in that mode.
 The runner includes the actual game canvas creation/backup/reload/completion
 flow, recovery failure/retry/generation and a second-tab guard check, in addition
-to the direct Rust recovery fixture. Automated game clipboard writes are
-stubbed, never sent to clipboard history. Gameplay readiness is checked by a
-trusted G keypress that changes the committed grid setting, then restores its
-baseline, after both completion and ready-wallet reload in each flow. Runtime
+to the direct Rust recovery fixture. Page-level stubs intercept automated game
+clipboard writes without touching the system clipboard. After completion and
+again after a ready-wallet reload, a trusted `G` keypress checks gameplay
+readiness by changing the committed grid setting, then restoring its baseline. Runtime
 error/rejection counters live in the Node runner and survive document reloads;
 only fixed category tokens cross the diagnostic binding, never error contents.
 Real clipboard permissions and funded recovery controls below still need
@@ -129,17 +146,29 @@ In a terminal, start the fixture server (it blocks until stopped with Ctrl-C):
 zig build test-mint -Dplatform=wasm -Doffline
 ```
 
-It serves the fixture and fake mint at `127.0.0.1:18787` by default. In a
-fresh Chromium incognito context, open <http://127.0.0.1:18787/> or
-<http://127.0.0.1:18787/renderer/index.html> for the actual game. Keep the
-server running. Use only disposable fixture phrases and data.
+It serves the fixture and fake mint at `127.0.0.1:18787` by default. Keep
+it running and use `agent-browser` for live testing of the game. Start a
+fresh, disposable session for each independent flow; do not attach to your
+regular browser profile. Load the CLI guide and get a worktree-specific
+session name:
+
+```sh
+agent-browser skills get core
+agent-browser session id --scope worktree --prefix haystack-onboarding
+```
+
+Use the printed name with `--session` on each command. Open
+<http://127.0.0.1:18787/> or <http://127.0.0.1:18787/renderer/index.html>, then
+use screenshots to inspect the game canvas. Keep the same session for reload
+and second-tab checks that need to share wallet state. Run `close` in that
+session when finished. Use only disposable fixture phrases and data.
 
 For the separate noninteractive test-only page, first run `test-onboarding`
 above to install its assets, then open
 <http://127.0.0.1:18787/onboarding-test.html?flow=create>. This page is not the
 game and is not installed by `test-mint` alone.
 
-Check the following in the game, using fresh disposable incognito contexts as
+Check the following in the game, using fresh disposable browser sessions as
 needed rather than touching an existing wallet:
 
 1. On first launch, verify the choice to create or recover a wallet.

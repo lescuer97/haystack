@@ -6,7 +6,7 @@ import {access, mkdir, writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {strict as assert} from 'node:assert';
 import {
-  bounded, CdpConnection, discoverEndpoint, disposableRoot, makeProfile,
+  bounded, CdpConnection, chromiumArgs, discoverEndpoint, disposableRoot, makeProfile,
   removeProfile, stopBrowser, watchdog,
 } from './cdp-runner.mjs';
 
@@ -222,6 +222,24 @@ test('discoverEndpoint resolves the reported DevTools URL', async () => {
   browser.stderr.emit('data', 'DevTools listening on ws://127.0.0.1:9222/devtools/browser/abc\n');
   assert.equal(await endpoint, 'ws://127.0.0.1:9222/devtools/browser/abc');
   assert.equal(browser.listenerCount('exit'), 0);
+});
+
+test('Chromium suppresses setup prompts and isolates CDP launch arguments', async () => {
+  const profiles = [];
+  try {
+    for (const platform of ['darwin', 'linux']) {
+      const profile = await makeProfile('cdp-runner-test-');
+      profiles.push(profile);
+      assert.deepEqual(chromiumArgs(profile, ['--use-gl=angle'], platform), [
+        '--headless', '--no-sandbox', '--no-first-run', '--no-default-browser-check',
+        ...(platform === 'darwin' ? ['--use-mock-keychain'] : []),
+        '--use-gl=angle', `--user-data-dir=${profile}`, '--remote-debugging-port=0', 'about:blank',
+      ]);
+    }
+    assert.notEqual(profiles[0], profiles[1]);
+  } finally {
+    await Promise.all(profiles.map(profile => removeProfile(profile)));
+  }
 });
 
 test('profiles live under the preferred scratch root and are removed', async () => {
