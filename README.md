@@ -1,157 +1,77 @@
-# CDK wallet bindings — desktop and browser
+# Haystack Game
 
-Separate builds, coordinated entirely by Zig:
+Haystack is a desktop and browser game that explores what happens when a game
+can charge tiny amounts for actions and pay prizes back as **Cashu ecash**.
+Players explore a shared world and use an axe, a hoe, or a pickaxe to clear
+terrain. The client sends what the player wants to do; the server decides what
+happens and sends back the result.
 
-```sh
-zig build                       # native desktop: Linux x86_64/aarch64 or macOS Apple Silicon
-zig build -Dstandalone          # native single-file client; requires local sprite sheets and soundtrack
-zig build -Dplatform=wasm        # complete browser application
-```
+**Experimental: use test funds and disposable recovery phrases only.** The game
+server runs locally by default; the browser client is not configured for a
+remote deployment.
 
-The independent [local server](docs/server.md) builds with
-`zig build server -Dgame=false` and has socket-free tests via `test-server`.
-It requires the native Rust/CDK toolchain and initializes a separate headless
-`haystack-server` wallet before listening; operators must back up its seed and DB.
-The server is not part of the default client install. For local play, run
-`zig build run-server` in one terminal and either `zig build run` (desktop) or
-`zig build run -Dplatform=wasm` (browser) in another. Both clients authenticate to
-`ws://127.0.0.1:9224/` after wallet onboarding and sync movement. If the server is
-unavailable, they show a disconnected screen and retry. The browser endpoint is
-loopback; it is not a remote deployment or `wss://` configuration.
+## How a paid action works
 
-The browser graph is selected **only** by `-Dplatform=wasm`. A Wasm
-`-Dtarget` alone (including `-Dtarget=wasm32-emscripten`, `wasm64-*` or WASI)
-is rejected with an explanation; it never infers the browser build. An explicit
-`-Dplatform=wasm -Dtarget=wasm32-emscripten` remains valid. Desktop builds are
-native only: foreign OS/architecture/ABI targets and macOS Intel are rejected
-before tool provisioning.
+1. **Fund a tool.** After setting up a wallet, the player funds a Spilman payment
+   channel for the tool. Prices are in millisatoshis (`msat`): an axe costs 2,
+   a hoe 4, and a pickaxe 8 per use. One satoshi is 1,000 msat.
+2. **Send an action.** The client sends the tool, target tile, and a signed update
+   to the channel's running payment total. Funding and settlement involve the
+   mint, but each tool use doesn't need its own mint transaction. Movement and
+   requests for nearby tiles don't use the payment channel.
+3. **Apply the change.** The server checks the action and the payment. If it
+   accepts both, it clears the tile and sends back the updated state.
+4. **Pay a prize.** Some successful paid actions win a prize. If the server's
+   own wallet can pay it, the server returns a regular Cashu bearer token that
+   the client imports into the player's wallet. A prize is not channel credit.
+   If the server can't issue the token, it records what it owes instead.
 
-Outputs are isolated under `zig-out/desktop` and `zig-out/wasm`. The desktop
-build installs `zig-out/desktop/bin/haystack_game` and a shared raylib library
-(`libraylib.so` on Linux, `libraylib.dylib` on macOS) under
-`zig-out/desktop/lib`. The executable records only a relative
-`$ORIGIN/../lib` (Linux) or `@loader_path/../lib` (macOS) lookup, so the
-installed `desktop` directory can be moved outside the repository.
+Both clients use the **same binary wire protocol over WebSockets** for
+movement, world updates, paid actions, channel messages, and prizes. The format
+is TLV (type, length, value), defined by [`shared/protocol.zig`](shared/protocol.zig)
+and [`shared/wire.zig`](shared/wire.zig). It's Haystack's own protocol, not a
+Cashu or Spilman standard. WebSockets carry the messages; Spilman channels
+handle the payments.
 
-For one-file deployment, `zig build -Dstandalone` builds the client with static
-raylib and embedded game assets at `zig-out/desktop-standalone/haystack_game`.
-Keep the matching copy in `zig-out/desktop-standalone-debug/` private for
-crash analysis. The deployable executable still needs the host's desktop system libraries and a separate server for
-play. The existing local sprite pack prohibits redistribution; don't distribute a
-binary containing it without permission. See [standalone build requirements](docs/build.md#standalone-desktop-release).
+## Stack and bindings
 
-On Linux and macOS the desktop binary creates its window and world first, then
-runs native wallet startup inspection. A validated existing wallet proceeds to
-server authentication. A new or pending wallet shows a blocking onboarding
-overlay that requires saving and acknowledging the recovery words (or recovering
-an existing wallet) before gameplay. The desktop wallet is persistent: a plaintext BIP-39
-mnemonic (`seed-words.txt`) and a CDK SQLite database (`wallet.sqlite`) live in a
-Haystack-owned wallet directory with owner-only permissions; macOS extended ACLs
-are rejected. Startup inspection is local and makes no mint request. Invalid or
-unavailable storage blocks startup rather than repairing or replacing existing
-records. This remains an experimental, test-funds-only wallet, not a production
-key store. See [game-loop.md](docs/game-loop.md#native-wallet-startup) and
-[cdk-wallet-ffi.md](docs/cdk-wallet-ffi.md) for the native startup and storage
-contracts.
+| Layer | Tools |
+| --- | --- |
+| Game and server | **Zig** for gameplay, rendering code, the server, and the shared wire protocol. **raylib** for graphics and audio; **SQLite** for server persistence. |
+| Wallet and payments | **Rust** and the **Cashu Development Kit (CDK v0.18.1)** for wallet and mint operations, with **Spilman channels (v0.2.0)** for pay-per-use tools. |
+| Desktop and server bindings | [`vendor/cdk-wallet-ffi`](vendor/cdk-wallet-ffi/README.md) uses **SaferFFI** to expose Rust wallet and channel functions through a C interface. Zig consumes the generated C header. Native wallets use SQLite. |
+| Browser bindings | **Emscripten** builds the Zig/raylib game for WebAssembly. The separate Rust wallet in [`browser/wallet`](browser/wallet/Cargo.toml) exposes CDK and Spilman through **wasm-bindgen** and JavaScript, and stores wallet data in **IndexedDB**. It doesn't load the native SaferFFI library. |
+| Build and test tools | `zig build` coordinates the builds, **Cargo/Rustup** handle Rust, and **Python** supports setup and local serving. Browser tests use **Node.js and Chromium**. |
 
-The browser application is the game only: `/` redirects to `renderer/index.html`,
-where a blocking shared Zig modal handles persistent `haystack-user` wallet
-creation, backup and recovery. The renderer runs while asynchronous wallet
-inspection completes; gameplay remains gated until onboarding succeeds. Missing
-modules or invalid storage block setup rather than replacing wallet records. The
-browser wallet regression suites use a separate non-interactive test fixture at
-`wallet-test.html`, installed only for `test`/`test-mint`.
+The two wallet bindings let desktop and browser use the same Cashu and Spilman
+libraries and talk to the same server without requiring the same runtime.
 
-Browser play uses the same local server as desktop for paid axe, pickaxe, and
-hoe actions. Choose **Tools** in the main menu or right-click a hotbar slot to
-see remaining uses, refill, or close a depleted channel. Tools without a channel
-can load up to 10 uses, or 20 when the wallet can cover a larger refill. On the browser, the
-first refill click quotes the amount and the second confirms the debit. Browser
-funding returns change in the same mint swap. Use test funds only. See
-[paid tool recovery and limitations](docs/browser-wallet.md#browser-paid-tools).
+## Run locally
 
-Host prerequisites are Zig 0.17.0, Python 3, Rustup/Cargo and a native C
-toolchain. Linux additionally needs the normal raylib/X11/OpenGL development
-libraries and libunwind. macOS requires **native Apple Silicon (arm64)**,
-macOS 15.0 or newer, Xcode Command Line Tools and a macOS SDK; `zig build` runs
-an actionable preflight and never uses sudo or installs system packages. macOS
-Intel, universal binaries, distribution signing, notarization, and `.app`/DMG
-output are not supported. Standalone binaries are ad-hoc signed after stripping.
-
-Provision the selected platform once. This is the only path that installs Rust
-components, wasm-bindgen or Emscripten:
+Install Zig 0.17.0, Python 3, Rustup/Cargo, and a native C toolchain. See the
+[build guide](docs/build.md) for Linux system libraries and macOS Apple Silicon
+requirements. Run commands from the repository root.
 
 ```sh
-zig build setup                  # desktop Rust toolchain/target + native checks
-zig build setup -Dplatform=wasm  # Wasm target, local wasm-bindgen, Emscripten
+zig build setup                  # once for the native server and desktop client
+zig build setup -Dplatform=wasm  # also run this once if playing in a browser
+zig build run-server -Dgame=false # leave running in its own terminal
 ```
 
-Normal builds, tests, `run`, `header-check`, `wallet` and `renderer` only
-**check** the selected installed tools, then build. They never install or update
-Rust toolchains/targets, wasm-bindgen or Emscripten; a missing tool fails with
-the required setup command. `zig build setup -Doffline` only checks and explains
-what is missing. Online dependency fetching by Cargo or Zig is separate from
-tool installation. The macOS desktop graph fixes the deployment target at macOS
-15.0 for Zig, raylib and Rust, requires the running OS to be 15.0+ and rejects
-conflicting `SDKROOT`, CC-family compiler or effective `CFLAGS` sysroot
-overrides. The macOS path is implemented but has not been executed on real macOS
-hardware or in CI; `.github/workflows/ci.yml` contains the Apple Silicon job that
-must provide that validation. This Linux checkout verifies only the source/unit
-contracts. See [build.md](docs/build.md) for the exact scope and remaining
-validation limits.
+In another terminal, choose a client:
 
 ```sh
-zig build run -Dplatform=wasm    # build and serve at localhost:8000
-zig build test-wallet           # native Rust + Zig C-ABI regression suites
-zig build test -Dplatform=wasm   # browser database + fake-mint/Chromium tests
+zig build run                   # desktop
+zig build run -Dplatform=wasm    # browser: open http://127.0.0.1:8000/
 ```
 
-## Soundtrack
+Both clients connect to `ws://127.0.0.1:9224/` after wallet onboarding. Open
+**Tools** to fund a channel and see how many uses remain. To try prize payouts,
+follow the [server wallet stocking guide](docs/server.md#paid-cut-prizes-test-funds-only).
 
-Haystack loops four cozy instrumental tracks from `assets/music/media/`.
-This directory is gitignored. See the [soundtrack credits](assets/music/CREDITS.md)
-for the source links and expected filenames.
-Music starts only once the game menu and controls are available: wallet
-onboarding must be complete and the server connection ready. The browser
-fetches the current track on demand and may require you to click or tap the
-game, or press Play, before audio can start.
+## More details
 
-Use **Settings → Music** to pause or resume playback. If the soundtrack is
-unavailable, turn **Music** off and back on to retry. This choice lasts only
-for the current session; music is enabled by default in each new session.
-
-## Dependencies
-
-Both Cargo roots (`vendor/cdk-wallet-ffi` for the native C ABI, `browser/wallet`
-for the Wasm module) resolve **one** CDK source: Git tag `v0.18.1` of
-`https://github.com/cashubtc/cdk.git` (commit
-`a056e0f0f69e94f431b1aeb90d883f18c61ea4c6`), with `version = "=0.18.1"` guards.
-Spilman comes from `https://github.com/SatsAndSports/cashu_spilman_channels` at
-rev `8a5350dfd4d7c2902dc15c726a91dbfb2c793d43` (`v0.2.0`). There is no Cargo
-workspace merge, `[patch]`, fork or local Spilman crate copy.
-
-This is a deliberate step from the registry `0.18.3` crates to `v0.18.1`,
-because upstream Spilman `v0.2.0` itself pins `v0.18.1`. It is **not** a claim
-that the releases are equivalent and not a production certification; the wallet
-SQL schema is identical between them. As confirmed by the maintainer on
-2026-11-15, no production wallets currently exist, so funded-wallet downgrade
-validation is not a blocker for this pre-production migration; the CDK pairing
-and its risks are accepted for now, for **test funds only**. See the
-[current wallet status](docs/build.md#current-wallet-status) for when to revisit
-this decision. Any funded test wallets (and future production wallets) should
-be backed up before switching builds. Details, the reviewed upstream differences
-and the limits of the empty-wallet reopen evidence are in
-[build.md](docs/build.md#dependency-provenance-cdk-v0181-and-spilman-v020).
-
-Verify the resolved graph after provisioning tools (check-only; never installs):
-
-```sh
-python3 build-support/check_dependency_pins.py           # --offline to forbid Cargo network
-```
-
-Browser tests require Node 22+ and Chromium. They start and stop their own
-localhost-only fake mint. The browser wallet is **experimental: test funds only**.
-
-- [Build graphs, automatic tooling, optimization and offline builds](docs/build.md)
-- [Browser wallet, runtime verification and remaining limitations](docs/browser-wallet.md)
-- [Desktop C-ABI consumer guide](docs/cdk-wallet-ffi.md)
+- [Builds, tool setup, and tests](docs/build.md)
+- [Server, wire format, and channel messages](docs/server.md)
+- [Native CDK C interface](docs/cdk-wallet-ffi.md) and [browser wallet](docs/browser-wallet.md)
+- [Optional soundtrack and asset credits](assets/music/CREDITS.md)
