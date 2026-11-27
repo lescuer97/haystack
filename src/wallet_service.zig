@@ -215,6 +215,20 @@ pub const Headless = struct {
         try self.owner.close();
     }
 
+    /// Read the wallet before server tasks start borrowing its handle.
+    pub fn spendableBalanceMsat(self: *const Headless) !u64 {
+        const result = cdk.c.cdk_wallet_list_balances(try self.owner.borrowHandle());
+        defer cdk.c.cdk_string_free(result.@"error");
+        defer cdk.c.cdk_balance_list_free(result.balances);
+        if (result.status != cdk.c.CDK_STATUS_OK) return error.BalanceUnavailable;
+
+        var total: u64 = 0;
+        for (0..result.balances.len) |i| {
+            total = try std.math.add(u64, total, result.balances.ptr[i].balance_msats);
+        }
+        return total;
+    }
+
     pub fn hasReceiver(self: *const Headless) bool {
         return self.ledger != null;
     }

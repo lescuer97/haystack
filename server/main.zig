@@ -89,6 +89,11 @@ pub fn main(init: std.process.Init) !void {
     startup_log.info("wallet opened", .{});
     if (wallet.hasReceiver()) startup_log.info("hoe ledger ready (test funds only)", .{});
     if (stock) |command| return wallet.prizeStock(init.gpa, command == .@"claim-prize-funding", args[3], stock_amount);
+    if (wallet.spendableBalanceMsat()) |balance| {
+        startup_log.info("server wallet balance: {d} msats", .{balance});
+    } else |err| {
+        startup_log.warn("could not read server wallet balance: {s}", .{@errorName(err)});
+    }
     const prize_seed = try prize.loadOrCreateSeed(init.io, locations.config_dir, legacy_prize_seed);
 
     const data_dir = std.fs.path.dirname(locations.wallet_dir) orelse return error.InvalidPath;
